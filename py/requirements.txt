@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+starlette
+ecdsa
+eciespy
+psutil
+aiohttp
+croniter
+pydantic
+pycryptodome
