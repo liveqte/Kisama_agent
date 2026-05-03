@@ -560,7 +560,7 @@ class Config:
     PORT = int(os.getenv("PORT") or os.environ.get('SERVER_PORT') or 8002)
     
     # 代理版本信息
-    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.0.2-python")
+    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.0.3-python")
     
     # ================= 启动校验 =================
     
@@ -1017,8 +1017,6 @@ class AuthEncryptMiddleware(BaseHTTPMiddleware):
 # ============================================================================
 class SystemInfoCollector:
     """系统信息收集器"""
-    
-    VERSION = "0.0.2"
     
     def __init__(self):
         self.last_network_stats = {'rx': 0, 'tx': 0}
@@ -2067,9 +2065,9 @@ class TerminalSessionHandler:
         # self.AGENT_PRIVATE_KEY = self._read_key_file("noise_keys/agent_private.key")
         # self.CONTROL_PUBLIC_KEY = self._read_key_file("noise_keys/control_public.key")
         self.AGENT_PRIVATE_KEY=Config.keys['agent'].private_b64
-        print(self.AGENT_PRIVATE_KEY)
+        Logger.debug(self.AGENT_PRIVATE_KEY)
         self.CONTROL_PUBLIC_KEY=Config.keys['control'].public_b64
-        print(self.CONTROL_PUBLIC_KEY)
+        Logger.debug(self.CONTROL_PUBLIC_KEY)
         self.cipher = NoiseSessionWrapper(
             is_initiator=False,  # 服务端是 Responder
             local_priv_b64=self.AGENT_PRIVATE_KEY,
@@ -3259,8 +3257,8 @@ async def terminal_websocket(websocket: WebSocket, request_id: str = Query(...),
         use_noise = False
         # 🔥 认证逻辑：校验传来的 token 是否等于服务端的 AGENT_PUBLIC_KEY
         expected_token = Config.keys['agent'].public_b64
-        print(f"expected_token{expected_token}")
-        print(f"token:{token}")
+        Logger.debug(f"expected_token{expected_token}")
+        Logger.debug(f"token:{token}")
         if token != expected_token:
             await websocket.close(code=1008, reason="Authentication failed: Invalid Token")
             Logger.warning(f"🚨 [终端会话 {request_id}] 认证失败，非法 Token！")

@@ -28,7 +28,6 @@
 python3 X25516.py
 ```
 ###  步骤 2.1 WebSocket 测试
-先生成密钥python X25516.py，在同主机上分别运行控制端和代理端
 ```bash
 uvicorn test_ws:app --reload --host 0.0.0.0 --port 8002
 python test_ws_client.py   --url ws://localhost:8002/api/ws/terminal   --request-id test123
