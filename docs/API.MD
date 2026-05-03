@@ -282,11 +282,22 @@
 ### 23. 手动触发启动任务
 路径：POST /api/task/onetime/execute
 用途：强制立即重新执行所有已配置的一次性启动任务（不受 InitTask 状态限制）。
-输入：无
-返回示例：
+输入：无  
+返回示例： 
 ```
 {"status":"ok","executed":2,"results":[{"cmd":"echo 'init'","exitcode":0,"output":"init\n","timeout":false},{"cmd":"/opt/scripts/setup.sh","exitcode":127,"output":"sh: /opt/scripts/setup.sh: not found\n","timeout":false}]}
 ```
+
+### 24. 超级终端（可选）
+路径：/api/ws/terminal  
+用途：使用websocket建立完整双向终端上下文环境，在http条件下使用noise端到端加密，在https条件下会使用https加密，此时认证功能使用代理端公钥进行身份认证。  
+输入：
+
+```
+request_id：用来区分每个会话。  
+token：仅在https传输下使用，其使用代理端noise公钥进行认证。
+```
+返回示例：无。 
 
 ## 六、FastAPI 自动帮助页面说明
 
@@ -349,7 +360,7 @@
 | **任务日志-清** | DELETE | `/api/task/log/onetime` | 清空启动任务日志 | ✅ | ✅ |
 | **任务日志-清** | DELETE | `/api/task/log/cron` | 清空定时任务日志 | ✅ | ✅ |
 | **日志统计** | GET | `/api/task/log/summary` | 获取统计摘要 | ✅ | ✅ |
-
+| **超级终端** | POST | `/api/ws/terminal` | 使用交互性终端 | ✅ | ✅ |
 ---
 
 ### 通用请求头要求 (Headers)
