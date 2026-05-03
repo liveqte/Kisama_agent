@@ -1018,8 +1018,6 @@ class AuthEncryptMiddleware(BaseHTTPMiddleware):
 class SystemInfoCollector:
     """系统信息收集器"""
     
-    VERSION = "0.0.3"
-    
     def __init__(self):
         self.last_network_stats = {'rx': 0, 'tx': 0}
         self.total_network_up = 0
@@ -1064,7 +1062,7 @@ class SystemInfoCollector:
             "os": os_name,
             "kernel_version": platform.release(),
             "swap_total": psutil.swap_memory().total,  # 字节单位
-            "version": self.VERSION,
+            "version": Config.AGENT_VERSION,
             "virtualization": self._get_virtualization()
         }
         
@@ -1505,7 +1503,7 @@ class SystemInfoCollector:
         """获取 IP 地址"""
         timeout = aiohttp.ClientTimeout(total=5)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, headers={'User-Agent': self.VERSION}) as response:
+            async with session.get(url, headers={'User-Agent': Config.AGENT_VERSION}) as response:
                 if response.status == 200:
                     return (await response.text()).strip()
                 else:
