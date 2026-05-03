@@ -1018,6 +1018,8 @@ class AuthEncryptMiddleware(BaseHTTPMiddleware):
 class SystemInfoCollector:
     """系统信息收集器"""
     
+    VERSION = "0.0.3"
+    
     def __init__(self):
         self.last_network_stats = {'rx': 0, 'tx': 0}
         self.total_network_up = 0
