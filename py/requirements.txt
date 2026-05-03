@@ -8,3 +8,5 @@ aiohttp
 croniter
 pydantic
 pycryptodome
+noiseprotocol
+websockets
