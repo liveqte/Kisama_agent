@@ -4,6 +4,8 @@ on:
   push:
     paths:
       - py/agent.py
+      - js/agent.js
+      
   workflow_dispatch: {}
 
 permissions:
@@ -26,14 +28,26 @@ jobs:
       - name: Obfuscate py/agent.py
         run: python tools/obfuscator.py
 
-      - name: Commit generated py/agent_obs.py if changed
+      - name: Obfuscate js/agent.js
+        run: 
+          npx javascript-obfuscator js/agent.js \
+          --output js/agent_obs.js \
+          --compact true \
+          --identifier-names-generator mangled \
+          --string-array true \
+          --string-array-encoding base64 \
+          --control-flow-flattening true \
+          --dead-code-injection true \
+          --reserved-strings "ECDSA公钥内容,ECIES公钥内容"
+
+      - name: Commit generated files if changed
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add py/agent_obs.py
+          git add py/agent_obs.py js/agent_obs.js
           if git diff --cached --quiet; then
             echo "No obfuscated changes to commit."
           else
-            git commit -m "Auto-update py/agent_obs.py from py/agent.py"
+            git commit -m "Auto-update obfuscated files"
             git push
           fi
