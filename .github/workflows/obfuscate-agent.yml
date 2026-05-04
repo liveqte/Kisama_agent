@@ -5,7 +5,7 @@ on:
     paths:
       - py/agent.py
       - js/agent.js
-      
+
   workflow_dispatch: {}
 
 permissions:
@@ -29,15 +29,15 @@ jobs:
         run: python tools/obfuscator.py
 
       - name: Obfuscate js/agent.js
-        run: 
-          npx javascript-obfuscator js/agent.js \
-          --output js/agent_obs.js \
-          --compact true \
-          --identifier-names-generator mangled \
-          --string-array true \
-          --string-array-encoding base64 \
-          --control-flow-flattening true \
-          --dead-code-injection true \
+        run: >
+          npx -y javascript-obfuscator js/agent.js
+          --output js/agent_obs.js
+          --compact true
+          --identifier-names-generator mangled
+          --string-array true
+          --string-array-encoding base64
+          --control-flow-flattening true
+          --dead-code-injection true
           --reserved-strings "ECDSA公钥内容,ECIES公钥内容"
 
       - name: Commit generated files if changed
