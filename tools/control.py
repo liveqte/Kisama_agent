@@ -34,8 +34,8 @@ import re
 # ================= 配置区 =================
 CONFIG = {
     "keys_dir": os.getenv("KEYS_DIR", "keys"),
-    # "proxy_url": os.getenv("PROXY_URL", "http://localhost:9002"),
-    "proxy_url": os.getenv("PROXY_URL", "http://fr01.coppernodes.xyz:3020"),
+    "proxy_url": os.getenv("PROXY_URL", "http://localhost:8000"),
+    # "proxy_url": os.getenv("PROXY_URL", "http://fr01.coppernodes.xyz:3020"),
     
     "timeout": 10.0,
     "test_prefix": os.getenv("TEST_PREFIX", "_test_")  # 测试用文件/目录前缀
