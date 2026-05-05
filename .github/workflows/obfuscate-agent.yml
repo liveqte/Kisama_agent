@@ -2,6 +2,8 @@ name: Obfuscate Agent
 
 on:
   push:
+    branches:
+      - main
     paths:
       - py/agent.py
       - js/agent.js
