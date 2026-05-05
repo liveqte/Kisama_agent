@@ -43,7 +43,7 @@ const Logger = {
     },
     
     // 级别 2: 黄色字体
-    warning: (msg) => {
+    warn: (msg) => {
         if (Logger.currentLevel <= Logger.LEVELS.WARN) {
             console.log(`\x1b[33m[WARN]\x1b[0m ${msg}`);
         }
@@ -174,7 +174,7 @@ class NoiseKeyGenerator {
     // Logger.debug(`[DEBUG-NOISE-KEY] 长度检查 -> Private: ${privBuf.length} bytes, Public: ${pubBuf.length} bytes (必须为32)`);
     
     if (privBuf.length !== 32 || pubBuf.length !== 32) {
-        console.error(`[🚨 严重警告] X25519 密钥长度非 32 字节，Noise 协议必定崩溃！`);
+        Logger.error(`[🚨 严重警告] X25519 密钥长度非 32 字节，Noise 协议必定崩溃！`);
     }
 
     return {
@@ -277,8 +277,8 @@ class Config {
       }
 
       if (errors.length > 0) {
-        console.error('❌ 配置校验失败 (非DEBUG模式必须配置密钥):');
-        errors.forEach(err => console.error(`   • ${err}`));
+        Logger.error('❌ 配置校验失败 (非DEBUG模式必须配置密钥):');
+        errors.forEach(err => Logger.error(`   • ${err}`));
         Logger.debug('\n💡 解决方法:');
         Logger.debug('   1. 设置环境变量: export ECDSA_PUBKEY=\'-----BEGIN PUBLIC KEY-----\'...\'');
         Logger.debug('   2. 或将密钥文件放入 ./keys/ 目录 (运行 generate_keys.py 生成)');
@@ -304,7 +304,7 @@ class CryptoManager {
       try {
         this.eciesPubkey = base64.toByteArray(eciesPubkeyB64.trim());
       } catch (e) {
-        console.warn(`⚠️ ECIES公钥解码失败: ${e.message}`);
+        Logger.warn(`⚠️ ECIES公钥解码失败: ${e.message}`);
       }
     }
   }
@@ -458,7 +458,7 @@ function authEncryptMiddleware(cryptoManager) {
           if (req.body.trim() === '') req.body = {};
         }
       } catch (e) {
-        console.error(`💥 [Body Parse Error]: ${e.message}`);
+        Logger.error(`💥 [Body Parse Error]: ${e.message}`);
         return res.status(400).json({ error: `Invalid body format: ${e.message}` });
       }
     }
@@ -484,7 +484,7 @@ function authEncryptMiddleware(cryptoManager) {
           return originalSend.call(this, encoded);
           
         } catch (e) {
-          if (Config.DEBUG) console.error(`💥 [Response Encrypt]: ${e.message}`);
+          if (Config.DEBUG) Logger.error(`💥 [Response Encrypt]: ${e.message}`);
         }
       }
       return originalSend.call(this, data);
@@ -626,7 +626,7 @@ class SystemInfoCollector {
                   return ip;
               }
           } catch (error) {
-              console.debug(`访问 ${service} 失败: ${error.message}`);
+              Logger.debug(`访问 ${service} 失败: ${error.message}`);
               continue;
           }
       }
@@ -1474,7 +1474,7 @@ const noiseReady = new Promise((resolve, reject) => {
         createNoise(function (noise) {
             if (!noise) {
                 noiseError = new Error("Failed to load noise-c.wasm module");
-                console.warn('[WARN] Noise WASM module failed to load:', noiseError.message);
+                Logger.warn('[WARN] Noise WASM module failed to load:', noiseError.message);
                 resolve(); // 不reject，允许程序继续运行
                 return;
             }
@@ -1484,19 +1484,19 @@ const noiseReady = new Promise((resolve, reject) => {
         });
     } catch (e) {
         noiseError = e;
-        console.warn('[WARN] Exception loading Noise module:', e.message);
+        Logger.warn('[WARN] Exception loading Noise module:', e.message);
         resolve(); // 不reject，允许程序继续运行
     }
 });
 
 // ==================== 全局未处理Promise rejection处理器 ====================
 process.on('unhandledRejection', (reason, promise) => {
-    console.error('Unhandled Promise Rejection:', reason);
+    Logger.error('Unhandled Promise Rejection:', reason);
     // 不退出进程，只记录错误
 });
 
 process.on('uncaughtException', (error) => {
-    console.error('Uncaught Exception:', error);
+    Logger.error('Uncaught Exception:', error);
     // 对于严重的未捕获异常，可以选择退出
     process.exit(1);
 });
@@ -2190,14 +2190,14 @@ async function main() {
   
   Logger.debug('SIGINT handler registered');
   } catch (err) {
-    console.error('Fatal error in main():', err);
+    Logger.error('Fatal error in main():', err);
     process.exit(1);
   }
 }
 
 // 启动应用
 if (require.main === module) {
-  main().catch(console.error);
+  main().catch(Logger.error);
 }
 
 module.exports = { Config, CryptoManager, SystemInfoCollector, CommandExecutor, FileManager, TaskManager };
