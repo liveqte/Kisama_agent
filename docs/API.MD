@@ -134,7 +134,7 @@
 
 ### 8. 上传文件
 路径：POST /api/file  
-用途：上传文件至代理端（支持 >20MB 自动分块合并）  
+用途：上传文件至代理端（支持 >2MB 自动分块合并）  
 输入示例：
 ```
 { "path": "/tmp/uploads", "filename": "data.tar.gz", "content": "<Base64文件内容>" } 
@@ -152,7 +152,7 @@
 { "path": "/tmp/backup.tar.gz" }  
 ```
 响应头：X-File-Size, X-Original-Path, X-Encrypted: true  
-响应体：加密后的 Base64 字符串或二进制流（控制端需先解密）
+响应体：blob二进制字节、base64编码的二进制内容。
 
 ### 10. 批量删除文件/目录  
 路径：DELETE /api/file  

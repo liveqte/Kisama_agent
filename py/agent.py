@@ -560,7 +560,7 @@ class Config:
     PORT = int(os.getenv("PORT") or os.environ.get('SERVER_PORT') or 8002)
     
     # 代理版本信息
-    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.0.5-python")
+    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.0.6-python")
     
     # ================= 启动校验 =================
     
@@ -1698,8 +1698,8 @@ class FileManager:
         }
     
     def upload_file(self, file_content: bytes, target_path: str, 
-                    filename: str = None, chunk_id: str = None,
-                    total_chunks: int = None) -> dict:
+                filename: str = None, chunk_id: int = None,
+                total_chunks: int = None) -> dict:
         """
         上传文件 (支持分块)
         :param chunk_id: 分块索引 (0~N-1), None 表示完整上传
@@ -1711,7 +1711,7 @@ class FileManager:
                 raise HTTPException(400, "filename required for directory upload")
             target = target / filename
         
-        # 检查大小
+        # 完整上传模式的大小检查
         if len(file_content) > self.max_upload and chunk_id is None:
             raise HTTPException(413, f"File too large: use chunked upload")
         
@@ -1719,26 +1719,48 @@ class FileManager:
             target.parent.mkdir(parents=True, exist_ok=True)
             
             if chunk_id is not None and total_chunks is not None:
-                # 分块上传模式
-                chunk_file = self.chunk_dir / f"{target.as_posix()}.chunk.{chunk_id}"
+                # 【优化1】将路径扁平化并哈希，防止子目录导致的 FileNotFoundError
+                safe_prefix = hashlib.md5(target.as_posix().encode()).hexdigest()
+                
+                # 确保临时分块目录存在
+                self.chunk_dir.mkdir(parents=True, exist_ok=True)
+                chunk_file = self.chunk_dir / f"{safe_prefix}.chunk.{chunk_id}"
+                
                 with open(chunk_file, 'wb') as f:
                     f.write(file_content)
                 
                 # 检查是否所有分块已到达
-                received = list(self.chunk_dir.glob(f"{target.as_posix()}.chunk.*"))
+                received = list(self.chunk_dir.glob(f"{safe_prefix}.chunk.*"))
                 if len(received) == total_chunks:
-                    # 合并分块
-                    with open(target, 'wb') as outf:
-                        for i in range(total_chunks):
-                            cf = self.chunk_dir / f"{target.as_posix()}.chunk.{i}"
-                            with open(cf, 'rb') as inf:
-                                outf.write(inf.read())
-                            cf.unlink()  # 清理临时分块
-                    self._audit("upload_chunked", str(target), "merged", 
-                               {"chunks": total_chunks, "size": target.stat().st_size})
-                    return {"status": "ok", "path": str(target.relative_to(self.root)), "chunked": True}
+                    # 【优化2】防并发冲突：通过创建锁文件来确保只有一个请求能执行合并
+                    lock_file = self.chunk_dir / f"{safe_prefix}.lock"
+                    try:
+                        # 尝试独占创建锁文件 (如果文件已存在会抛出 FileExistsError)
+                        with open(lock_file, 'x'):
+                            pass
+                    except FileExistsError:
+                        # 锁已存在，说明其他线程正在合并，当前线程直接返回 pending
+                        return {"status": "pending", "received": len(received), "total": total_chunks, "msg": "merging in progress"}
+
+                    try:
+                        # 开始安全合并
+                        with open(target, 'wb') as outf:
+                            for i in range(total_chunks):
+                                cf = self.chunk_dir / f"{safe_prefix}.chunk.{i}"
+                                with open(cf, 'rb') as inf:
+                                    outf.write(inf.read())
+                                cf.unlink()  # 清理临时分块
+                                
+                        self._audit("upload_chunked", str(target), "merged", 
+                                   {"chunks": total_chunks, "size": target.stat().st_size})
+                        return {"status": "ok", "path": str(target.relative_to(self.root)), "chunked": True}
+                    finally:
+                        # 确保合并完成后清理锁文件
+                        if lock_file.exists():
+                            lock_file.unlink()
                 else:
                     return {"status": "pending", "received": len(received), "total": total_chunks}
+                    
             else:
                 # 完整上传模式
                 with open(target, 'wb') as f:
