@@ -235,7 +235,7 @@ class Config {
 
   static HOST = process.env.HOST || '0.0.0.0';
   static PORT = parseInt(process.env.PORT || process.env.SERVER_PORT || '8000');
-  static AGENT_VERSION = process.env.AGENT_VERSION || '0.0.4-js';
+  static AGENT_VERSION = process.env.AGENT_VERSION || '0.0.5-js';
   static SESSION_KEY = crypto.randomBytes(32).toString('base64');
   // static SESSION_KEY =""
   static NOISE_KEYS_INTERNAL = NoiseKeyGenerator.generatePair();
@@ -545,8 +545,9 @@ class SystemInfoCollector {
       const nets = os.networkInterfaces();
       for (const name of Object.keys(nets)) {
           for (const net of nets[name]) {
-              if (net.family === 'IPv4' && !net.internal) {
-                  // 过滤掉典型的内网地址段
+              // 兼容 Node.js < 18 ('IPv4') 和 >= 18 (4)
+              const isIPv4 = net.family === 'IPv4' || net.family === 4;
+              if (isIPv4 && !net.internal) {
                   if (!/^10\./.test(net.address) &&
                       !/^192\.168\./.test(net.address) &&
                       !/^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(net.address)) {
@@ -577,7 +578,7 @@ class SystemInfoCollector {
 
       for (const service of services) {
           try {
-              const ip = await this.fetchIP(service);
+              const ip = await this.fetchIP(service,4);
               if (ip && this.isValidIPv4(ip)) {
                   return ip;
               }
@@ -591,9 +592,11 @@ class SystemInfoCollector {
       const nets = os.networkInterfaces();
       for (const name of Object.keys(nets)) {
           for (const net of nets[name]) {
-              if (net.family === 'IPv6' && !net.internal) {
+              // 兼容 Node.js < 18 ('IPv6') 和 >= 18 (6)
+              const isIPv6 = net.family === 'IPv6' || net.family === 6;
+              if (isIPv6 && !net.internal) {
                   // 过滤掉链路本地地址 (fe80::/10)
-                  if (!net.address.startsWith('fe80:')) {
+                  if (!net.address.toLowerCase().startsWith('fe80:')) {
                       return net.address;
                   }
               }
@@ -618,24 +621,25 @@ class SystemInfoCollector {
 
       for (const service of services) {
           try {
-              const ip = await this.fetchIP(service);
+              const ip = await this.fetchIP(service,6);
               if (ip && this.isValidIPv6(ip)) {
                   return ip;
               }
           } catch (error) {
+              console.debug(`访问 ${service} 失败: ${error.message}`);
               continue;
           }
       }
       return null;
   }
 
-  async fetchIP(url) {
+  async fetchIP(url,family = 0) {
       return new Promise((resolve, reject) => {
           const https = require('https');
           const options = {
               timeout: 5000,
+              family: family,
               headers: {
-                  'User-Agent': 'komari-agent-node',
                   'Accept': 'text/plain'
               }
           };
@@ -666,7 +670,21 @@ class SystemInfoCollector {
   }
 
   isValidIPv6(ip) {
-      return /^[0-9a-fA-F:]+$/.test(ip) && ip.includes(':');
+      // 1. 基础语法校验：必须只包含 16 进制字符和冒号，且至少包含一个冒号
+      if (!/^[0-9a-fA-F:]+$/.test(ip) || !ip.includes(':')) {
+          return false;
+      }
+
+      // 2. 过滤本地、私有和特殊 IPv6 地址
+      // ^(fe[89ab])  匹配链路本地地址 (fe80::/10)
+      // ^(f[cd])     匹配唯一本地地址 (fc00::/7，涵盖了 fc 和 fd)
+      // ^::1$        匹配本地回环地址
+      // ^::$         匹配未指定地址
+      if (/^(fe[89ab]|f[cd]|::1$|::$)/i.test(ip)) {
+          return false;
+      }
+
+      return true;
   }
   async getRealtimeInfo() {
     const [cpuLoad, mem, networkStats, load] = await Promise.all([
