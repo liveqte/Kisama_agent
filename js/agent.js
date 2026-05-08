@@ -6,6 +6,7 @@
 const express = require('express');
 const crypto = require('crypto');
 const fs = require('fs');
+const fsp = require('fs').promises;
 const path = require('path');
 const os = require('os');
 const { exec } = require('child_process');
@@ -504,11 +505,43 @@ class SystemInfoCollector {
     this.totalNetworkDown = 0;
     this.lastNetworkTime = Date.now() / 1000;
   }
+  async getContainerMemory() {
+    let total, used;
 
+    try {
+      // 1. 尝试 cgroup v2 (Docker 20.10+ 主流环境)
+      const limitStr = (await fsp.readFile('/sys/fs/cgroup/memory.max', 'utf8')).trim();
+      total = limitStr === 'max' ? null : parseInt(limitStr, 10);
+      used = parseInt((await fsp.readFile('/sys/fs/cgroup/memory.current', 'utf8')).trim(), 10);
+    } catch {
+      try {
+        // 2. 尝试 cgroup v1 (老版本 Docker/宿主机)
+        total = parseInt((await fsp.readFile('/sys/fs/cgroup/memory/memory.limit_in_bytes', 'utf8')).trim(), 10);
+        used = parseInt((await fsp.readFile('/sys/fs/cgroup/memory/memory.usage_in_bytes', 'utf8')).trim(), 10);
+        // v1 未限制时会返回极大值，视为无限制
+        if (total > 9223372036854771712) total = null;
+      } catch {
+        // 3. 非容器环境或无权限时，降级到宿主机内存
+        const hostMem = await si.mem();
+        total = hostMem.total;
+        used = hostMem.used;
+      }
+    }
+
+    return {
+      total,          // 容器分配的最大内存（字节），null 表示未限制
+      used,           // 当前已用内存（字节）
+      available: total !== null ? total - used : null,
+      // 保留 si.mem() 的其他字段供兼容（可选）
+      free: total !== null ? total - used : 0,
+      cached: 0,
+      buffers: 0
+    };
+  }
   async getBasicInfo() {
     const [cpu, mem, osInfo, network] = await Promise.all([
       si.cpu(),
-      si.mem(),
+      this.getContainerMemory(),
       si.osInfo(),
       si.networkInterfaces()
     ]);
@@ -732,28 +765,58 @@ class SystemInfoCollector {
   }
 
   async _getVirtualization() {
-    try {
-            if (fs.existsSync('/.dockerenv')) {
-                return 'Docker';
-            }
+      try {
+          // 1. 检查特征文件 (最快速，命中率高)
+          if (fs.existsSync('/.dockerenv')) {
+              return 'Docker';
+          }
+          if (fs.existsSync('/run/.containerenv')) {
+              return 'Podman'; // Podman 的专属特征文件
+          }
 
-            if (fs.existsSync('/proc/1/environ')) {
-                const environ = fs.readFileSync('/proc/1/environ', 'utf8');
-                if (environ.includes('container=lxc')) {
-                    return 'LXC';
-                }
-            }
+          // 2. 检查 Cgroup (兼容 V1，并增加 containerd/kubepods 识别)
+          if (fs.existsSync('/proc/1/cgroup')) {
+              const cgroup = fs.readFileSync('/proc/1/cgroup', 'utf8').toLowerCase();
+              if (cgroup.includes('docker') || cgroup.includes('containerd')) {
+                  return 'Docker';
+              } else if (cgroup.includes('kubepods')) {
+                  return 'Kubernetes'; // K8s 环境
+              } else if (cgroup.includes('lxc')) {
+                  return 'LXC';
+              }
+          }
 
-            if (fs.existsSync('/proc/cpuinfo')) {
-                const cpuinfo = fs.readFileSync('/proc/cpuinfo', 'utf8');
-                if (cpuinfo.includes('QEMU') || cpuinfo.includes('KVM')) {
-                    return 'QEMU';
-                }
-            }
-        } catch (error) {
-            // 忽略错误
-        }
-        return 'None';
+          // 3. 检查挂载点信息 (突破 Cgroup V2 限制的最有效方案)
+          if (fs.existsSync('/proc/self/mountinfo')) {
+              const mountinfo = fs.readFileSync('/proc/self/mountinfo', 'utf8');
+              if (mountinfo.includes('/docker/containers/') || mountinfo.includes('workdir=/var/lib/docker')) {
+                  return 'Docker';
+              } else if (mountinfo.includes('/pods/') || mountinfo.includes('kubelet')) {
+                  return 'Kubernetes';
+              }
+          }
+
+          // 4. 检查初始进程的环境变量 (LXC 等有时会在这里暴露)
+          if (fs.existsSync('/proc/1/environ')) {
+              const environ = fs.readFileSync('/proc/1/environ', 'utf8');
+              if (environ.includes('container=lxc')) {
+                  return 'LXC';
+              }
+          }
+
+          // 5. 检查硬件级/系统级虚拟化 (KVM/QEMU)
+          if (fs.existsSync('/proc/cpuinfo')) {
+              const cpuinfo = fs.readFileSync('/proc/cpuinfo', 'utf8');
+              if (cpuinfo.includes('QEMU') || cpuinfo.includes('KVM')) {
+                  return 'QEMU';
+              }
+          }
+      } catch (error) {
+          // 建议在调试阶段把错误打出来，比如文件权限问题：
+          // console.error("❌ 获取虚拟化信息失败:", error.message);
+      }
+      
+      return 'None';
   }
 
   async _getDiskInfo() {

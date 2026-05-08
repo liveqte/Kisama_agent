@@ -1058,7 +1058,7 @@ class SystemInfoCollector:
             "gpu_name": "",  # Python 暂不支持 GPU 检测
             "ipv4": ipv4,
             "ipv6": ipv6,
-            "mem_total": psutil.virtual_memory().total,  # 字节单位
+            "mem_total": self._get_container_mem_limit(),  # 字节单位
             "os": os_name,
             "kernel_version": platform.release(),
             "swap_total": psutil.swap_memory().total,  # 字节单位
@@ -1156,17 +1156,63 @@ class SystemInfoCollector:
             Logger.debug(f"获取CPU使用率失败: {e}", 2)
             return 0.0 # 出错时返回0
     
+    def _get_container_mem_limit(self) -> int:
+        """获取容器内存限制（字节），兼容 cgroup v1/v2，无限制时回退 psutil"""
+        # cgroup v2
+        try:
+            with open("/sys/fs/cgroup/memory.max", "r") as f:
+                val = f.read().strip()
+                if val != "max":
+                    return int(val)
+        except (OSError, ValueError):
+            pass
+            
+        # cgroup v1
+        try:
+            with open("/sys/fs/cgroup/memory/memory.limit_in_bytes", "r") as f:
+                val = int(f.read().strip())
+                if val < 2**63 - 1:  # 2^63-1 表示未限制
+                    return val
+        except (OSError, ValueError):
+            pass
+            
+        # 降级：物理机或未读取到 cgroup 信息
+        return psutil.virtual_memory().total
+
+    def _get_container_mem_usage(self) -> int:
+        """获取容器当前内存使用量（字节），兼容 cgroup v1/v2"""
+        # cgroup v2
+        try:
+            with open("/sys/fs/cgroup/memory.current", "r") as f:
+                return int(f.read().strip())
+        except (OSError, ValueError):
+            pass
+            
+        # cgroup v1
+        try:
+            with open("/sys/fs/cgroup/memory/memory.usage_in_bytes", "r") as f:
+                return int(f.read().strip())
+        except (OSError, ValueError):
+            pass
+            
+        # 降级
+        return psutil.virtual_memory().used
+
     async def _get_memory_info(self) -> Dict[str, int]:
         """获取内存信息（字节单位）"""
         try:
-            virtual_memory = psutil.virtual_memory()
-            swap_memory = psutil.swap_memory()
+            # 优先使用容器感知的内存值
+            ram_total = self._get_container_mem_limit()
+            ram_used = self._get_container_mem_usage()
+            
+            # Swap 通常由宿主机统一管理，容器一般不单独限制，保留 psutil
+            swap = psutil.swap_memory()
             
             return {
-                "ram_total": virtual_memory.total,
-                "ram_used": virtual_memory.used,
-                "swap_total": swap_memory.total,
-                "swap_used": swap_memory.used
+                "ram_total": ram_total,
+                "ram_used": ram_used,
+                "swap_total": swap.total,
+                "swap_used": swap.used
             }
         except Exception as e:
             Logger.debug(f"获取内存信息失败: {e}", 2)
@@ -1220,7 +1266,24 @@ class SystemInfoCollector:
 
         return None
 
-    async def _get_disk_info(self) -> Dict[str, int]:
+    def _get_container_disk_info(self) -> Dict[str, int]:
+        """容器内获取磁盘：直接取根分区 '/'，不追溯物理设备"""
+        try:
+            # 容器视角：'/' 就是全部可用磁盘（已自动应用 quota 限制）
+            usage = psutil.disk_usage('/')
+            Logger.debug(
+                f"[容器模式] 磁盘统计: 总空间={usage.total/1024**3:.2f}GB, "
+                f"已用={usage.used/1024**3:.2f}GB, 使用率={usage.percent:.2f}%,5"
+            )
+            return {
+                "total": int(usage.total),
+                "used": int(usage.used)
+            }
+        except Exception as e:
+            Logger.debug(f"[容器模式] 获取磁盘信息失败: {e}", 5)
+            return {"total": 0, "used": 0}
+    
+    async def _get_host_disk_info(self) -> Dict[str, int]:
         try:
             total_bytes = 0
             used_bytes = 0
@@ -1273,7 +1336,13 @@ class SystemInfoCollector:
         except Exception as e:
             Logger.debug(f"获取磁盘信息失败: {e}", 5)
             return {"total": 0, "used": 0}
-    
+    async def _get_disk_info(self) -> Dict[str, int]:
+        """统一入口：自动识别环境并分发"""
+        if self._get_virtualization() in ['Docker', 'Lxc', 'Podman']:
+            return self._get_container_disk_info()
+        else:
+            return await self._get_host_disk_info()
+
     async def _get_disk_total(self) -> int:
         """获取磁盘总容量"""
         disk_info = await self._get_disk_info()
@@ -1438,28 +1507,56 @@ class SystemInfoCollector:
         return {'name': 'Unknown', 'version': 'Unknown'}
     
     def _get_virtualization(self) -> str:
-        """获取虚拟化信息"""
+        """获取虚拟化/容器化信息"""
         try:
             if platform.system() == "Linux":
+                
+                # 1. 检查特征文件 (最快速，命中率高)
                 if os.path.exists('/.dockerenv'):
                     return 'Docker'
-                
+                if os.path.exists('/run/.containerenv'):
+                    return 'Podman'  # Podman 容器的专属特征文件
+
+                # 2. 检查 Cgroup (兼容 V1，并增加 containerd/kubepods 识别)
                 if os.path.exists('/proc/1/cgroup'):
-                    with open('/proc/1/cgroup', 'r') as f:
-                        content = f.read()
-                        if 'docker' in content:
+                    with open('/proc/1/cgroup', 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read().lower()
+                        if 'docker' in content or 'containerd' in content:
                             return 'Docker'
+                        elif 'kubepods' in content:
+                            return 'Kubernetes' # K8s 环境，底层可能是 containerd/docker
                         elif 'lxc' in content:
                             return 'LXC'
-                
+
+                # 3. 检查挂载点信息 (应对 Cgroup V2 和被隐藏特征的容器)
+                # 容器内部通常会将根目录 / 或特定目录通过 overlayfs 或带有 docker/containers 字眼的路径挂载
+                if os.path.exists('/proc/self/mountinfo'):
+                    with open('/proc/self/mountinfo', 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
+                        # 检查是否有典型的 docker 容器挂载路径
+                        if '/docker/containers/' in content or 'workdir=/var/lib/docker' in content:
+                            return 'Docker'
+                        # 检查是否有 K8s 挂载特征
+                        elif '/pods/' in content or 'kubelet' in content:
+                            return 'Kubernetes'
+
+                # 4. 检查初始进程的环境变量 (LXC 等有时会在这里暴露)
+                if os.path.exists('/proc/1/environ'):
+                    with open('/proc/1/environ', 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
+                        if 'container=lxc' in content:
+                            return 'LXC'
+
+                # 5. 检查硬件级/系统级虚拟化 (KVM/QEMU)
                 if os.path.exists('/proc/cpuinfo'):
-                    with open('/proc/cpuinfo', 'r') as f:
+                    with open('/proc/cpuinfo', 'r', encoding='utf-8', errors='ignore') as f:
                         content = f.read()
                         if 'QEMU' in content or 'KVM' in content:
                             return 'QEMU'
-        except Exception:
-            Logger.error("❌ 获取虚拟化信息失败")
-            pass
+
+        except Exception as e:
+            # 建议把具体的错误异常打出来，方便日后排查权限或 I/O 问题
+            Logger.error(f"❌ 获取虚拟化信息失败: {e}")
         
         return 'None'
     
