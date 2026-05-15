@@ -592,13 +592,8 @@ class SystemInfoCollector {
       return null;
   }
   async getPublicIpV4() {
-      // 优先尝试本地接口
-      const localIp = this.getLocalIPv4();
-      if (localIp && this.isValidIPv4(localIp)) {
-          return localIp;
-      }
-
-      // 回退到外部服务
+      
+      // 外部服务
       const services = [
           'https://api.ipify.org',
           'https://icanhazip.com',
@@ -618,6 +613,11 @@ class SystemInfoCollector {
           } catch (error) {
               continue;
           }
+      }
+      // 最后尝试本地接口
+      const localIp = this.getLocalIPv4();
+      if (localIp && this.isValidIPv4(localIp)) {
+          return localIp;
       }
       return null;
   }
