@@ -39,7 +39,6 @@ jobs:
           --string-array true
           --string-array-encoding base64
           --control-flow-flattening true
-          --dead-code-injection true
           --reserved-strings "ECDSA公钥内容,ECIES公钥内容"
 
       - name: Commit generated files if changed
