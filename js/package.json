@@ -1,19 +1,21 @@
 {
   "name": "kisama-agent-nodejs",
-  "version": "0.0.3",
+  "version": "0.0.7",
   "description": "Kisama Agent - Node.js implementation",
   "main": "agent.js",
   "scripts": {
     "start": "node agent.js",
-    "dev": "node agent.js"
+    "dev": "node age
+    nt.js"
   },
   "dependencies": {
+    "@lydell/node-pty": "^1.1.0",
     "base64-js": "^1.5.1",
+    "bun-pty": "^0.4.8",
     "eciesjs": "^0.5.0",
     "express": "^4.18.2",
     "express-ws": "^5.0.2",
     "node-cron": "^4.2.1",
-    "node-pty": "^1.0.0",
     "noise-c.wasm": "^0.4.0",
     "systeminformation": "^5.21.15"
   },

@@ -14,9 +14,16 @@ const cron = require('node-cron');
 const si = require('systeminformation');
 const { encrypt: ecies_encrypt } = require('eciesjs');
 const base64 = require('base64-js');
-const pty = require('node-pty');
 const expressWs = require('express-ws');
 const createNoise = require('noise-c.wasm');
+let pty;
+try {
+    if (typeof Bun !== 'undefined') {
+        pty = require('bun-pty');
+    } else {
+        pty = require('node-pty');
+    }
+} catch (e) {}
 // ==================== 日志工具 ====================
 const Logger = {
     // 定义日志等级枚举
@@ -236,7 +243,7 @@ class Config {
 
   static HOST = process.env.HOST || '0.0.0.0';
   static PORT = parseInt(process.env.PORT || process.env.SERVER_PORT || '8000');
-  static AGENT_VERSION = process.env.AGENT_VERSION || '0.0.6-js';
+  static AGENT_VERSION = process.env.AGENT_VERSION || '0.0.7-js';
   static SESSION_KEY = crypto.randomBytes(32).toString('base64');
   // static SESSION_KEY =""
   static NOISE_KEYS_INTERNAL = NoiseKeyGenerator.generatePair();
