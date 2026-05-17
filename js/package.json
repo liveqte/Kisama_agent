@@ -5,8 +5,7 @@
   "main": "agent.js",
   "scripts": {
     "start": "node agent.js",
-    "dev": "node age
-    nt.js"
+    "dev": "node agent.js"
   },
   "dependencies": {
     "@lydell/node-pty": "^1.1.0",
