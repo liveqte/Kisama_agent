@@ -243,7 +243,7 @@ class Config {
 
   static HOST = process.env.HOST || '0.0.0.0';
   static PORT = parseInt(process.env.PORT || process.env.SERVER_PORT || '8000');
-  static AGENT_VERSION = process.env.AGENT_VERSION || '0.0.7-js';
+  static AGENT_VERSION = process.env.AGENT_VERSION || '0.0.9-js';
   static SESSION_KEY = crypto.randomBytes(32).toString('base64');
   // static SESSION_KEY =""
   static NOISE_KEYS_INTERNAL = NoiseKeyGenerator.generatePair();
@@ -2225,9 +2225,14 @@ async function main() {
 
   // WebSocket终端
   Logger.debug('Setting up WebSocket terminal route...');
-  app.ws('/api/ws/terminal', async (ws, req) => {
-    // express-ws 可能不自动解析query参数，手动解析
-    Logger.debug('WebSocket request URL:', req.url);
+  app.ws('/api/ws/*', async (ws, req) => {
+    // req.params[0] 会捕获 '*' 匹配到的具体路径部分
+    // 例如请求 /api/ws/terminal/user1，req.params[0] 就是 'terminal/user1'
+    const subPath = req.params[0];
+    
+    Logger.debug(`WebSocket request URL: ${req.url}`);
+    Logger.debug(`Matched Sub-path: ${subPath}`);
+
     const requestId = req.query.request_id;
     const token = req.query.token;
 
@@ -2238,7 +2243,6 @@ async function main() {
       ws.close(1008, "Missing request_id");
       return;
     }
-
     const handler = new TerminalSessionHandler();
     await handler.startSession(ws, requestId, token);
   });

@@ -87,14 +87,13 @@ class NoiseSessionWrapper {
 
     _splitAndFinish() {
         const ciphers = this.hs.Split();
-        // 🚀 核心修复：作为 Responder (Agent)，第一个密钥 ciphers[0] 是用来解密的，第二个 ciphers[1] 是用来加密的
-        if (this.isInitiator) {
-            this.sendCipher = ciphers[0];
-            this.recvCipher = ciphers[1];
-        } else {
-            this.recvCipher = ciphers[0]; // 客户端发来的消息用这个解密
-            this.sendCipher = ciphers[1]; // 发往客户端的消息用这个加密
-        }
+        
+        // 🚀 核心修复：noise-c.wasm 的 Split() 已经根据 Initiator/Responder 角色处理好了收发方向。
+        // 返回的数组永远固定为：[用于加密发送的 Cipher, 用于解密接收的 Cipher]
+        // 绝对不能再手动翻转它们！
+        this.sendCipher = ciphers[0];
+        this.recvCipher = ciphers[1];
+        
         this.handshakeFinished = true;
         
         try {
