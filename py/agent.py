@@ -560,7 +560,7 @@ class Config:
     PORT = int(os.getenv("PORT") or os.environ.get('SERVER_PORT') or 8002)
     
     # 代理版本信息
-    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.0.6-python")
+    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.0.9-python")
     
     # ================= 启动校验 =================
     
@@ -3367,8 +3367,8 @@ async def root():
         }
     }
 #超级终端
-@app.websocket("/api/ws/terminal")
-async def terminal_websocket(websocket: WebSocket, request_id: str = Query(...),token: str = Query(None)):
+@app.websocket("/api/ws/{path:path}")
+async def terminal_websocket(websocket: WebSocket, path: str, request_id: str = Query(...),token: str = Query(None)):
     handler = TerminalSessionHandler()
     use_noise = True
     
