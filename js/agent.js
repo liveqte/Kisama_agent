@@ -21,7 +21,7 @@ try {
     if (typeof Bun !== 'undefined') {
         pty = require('bun-pty');
     } else {
-        pty = require('node-pty');
+        pty = require('@lydell/node-pty');
     }
 } catch (e) {}
 // ==================== 日志工具 ====================
