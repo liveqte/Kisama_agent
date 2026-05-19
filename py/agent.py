@@ -560,7 +560,7 @@ class Config:
     PORT = int(os.getenv("PORT") or os.environ.get('SERVER_PORT') or 8002)
     
     # 代理版本信息
-    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.0.9-python")
+    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.1.1-python")
     
     # ================= 启动校验 =================
     
@@ -892,15 +892,15 @@ class AuthEncryptMiddleware(BaseHTTPMiddleware):
         
         # === 阶段 1: 请求认证 (DEBUG 模式跳过) ===
         if not Config.DEBUG and request.method not in ["OPTIONS", "HEAD"]:
-            nonce = headers.get("X-Nonce")
-            timestamp = headers.get("X-Timestamp") 
-            auth_token = headers.get("X-Auth-Token")
+            nonce = headers.get("x-nonce")
+            timestamp = headers.get("x-timestamp") 
+            auth_token = headers.get("x-auth-token")
              # ========== 添加以下调试输出 ==========
             Logger.debug("=" * 50)
             Logger.debug(f"[Auth Debug] {request.method} {request.url.path}")
-            Logger.debug(f"X-Nonce     : {nonce}")
-            Logger.debug(f"X-Timestamp : {timestamp}")
-            Logger.debug(f"X-Auth-Token: {auth_token[:30] if auth_token else 'MISSING'}...")
+            Logger.debug(f"x-nonce     : {nonce}")
+            Logger.debug(f"x-timestamp : {timestamp}")
+            Logger.debug(f"x-auth-token: {auth_token[:30] if auth_token else 'MISSING'}...")
             Logger.debug(f"All Headers : {dict(headers)}")
             Logger.debug("=" * 50)
             # ====================================
@@ -921,7 +921,7 @@ class AuthEncryptMiddleware(BaseHTTPMiddleware):
         # === 阶段 1.5: AES 请求体解密 (核心修复) ===
         decrypted_body_bytes = None
         
-        if headers.get("X-AES-Encrypted") == "true":
+        if headers.get("x-aes-encrypted") == "true":
             # 1. 获取原始加密流
             original_body = await request.body()
             Logger.debug(original_body)
@@ -998,8 +998,8 @@ class AuthEncryptMiddleware(BaseHTTPMiddleware):
                 response.headers["content-length"] = str(len(encoded))
                 
                 if not Config.DEBUG:
-                    response.headers["X-Encrypted"] = "true"
-                    response.headers["X-Agent-Version"] = Config.AGENT_VERSION
+                    response.headers["x-encrypted"] = "true"
+                    response.headers["x-agent-version"] = Config.AGENT_VERSION
                     
             except json.JSONDecodeError:
                 pass # 非 JSON 不加密
@@ -1600,7 +1600,7 @@ class SystemInfoCollector:
         """获取 IP 地址"""
         timeout = aiohttp.ClientTimeout(total=5)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, headers={'User-Agent': Config.AGENT_VERSION}) as response:
+            async with session.get(url, headers={'user-agent': Config.AGENT_VERSION}) as response:
                 if response.status == 200:
                     return (await response.text()).strip()
                 else:
@@ -2518,7 +2518,7 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],   # 或指定 ["X-Nonce", "X-Timestamp", ...]
-    expose_headers=["X-Encrypted"], 
+    expose_headers=["x-encrypted"], 
 )
 # 注册中间件
 app.add_middleware(AuthEncryptMiddleware)
@@ -3116,8 +3116,8 @@ async def file_download(
         filename=file_path.name,
         media_type=mime_type,
         headers={
-            "X-File-Size": str(size),
-            "X-Original-Path": str(file_path.relative_to(Path(Config.FILE_ROOT)))
+            "x-file-size": str(size),
+            "x-original-path": str(file_path.relative_to(Path(Config.FILE_ROOT)))
         }
     )
 
@@ -3396,7 +3396,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     return JSONResponse(
         status_code=exc.status_code,
         content=json.loads(encrypted) if Config.DEBUG else {"_encrypted": encrypted},
-        headers={"X-Encrypted": "false" if Config.DEBUG else "true"}
+        headers={"x-encrypted": "false" if Config.DEBUG else "true"}
     )
 
 

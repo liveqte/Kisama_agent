@@ -243,7 +243,7 @@ class Config {
 
   static HOST = process.env.HOST || '0.0.0.0';
   static PORT = parseInt(process.env.PORT || process.env.SERVER_PORT || '8000');
-  static AGENT_VERSION = process.env.AGENT_VERSION || '0.0.9-js';
+  static AGENT_VERSION = process.env.AGENT_VERSION || '0.1.1-js';
   static SESSION_KEY = crypto.randomBytes(32).toString('base64');
   // static SESSION_KEY =""
   static NOISE_KEYS_INTERNAL = NoiseKeyGenerator.generatePair();
@@ -484,8 +484,8 @@ function authEncryptMiddleware(cryptoManager) {
           const encoded = typeof encryptedContent === 'string' ? encryptedContent : JSON.stringify(encryptedContent);
 
           if (!Config.DEBUG) {
-            res.set('X-Encrypted', 'true');
-            res.set('X-Agent-Version', Config.AGENT_VERSION);
+            res.set('x-encrypted', 'true');
+            res.set('x-agent-version', Config.AGENT_VERSION);
           }
           
           res.set('Content-Length', Buffer.byteLength(encoded, 'utf8').toString());
@@ -1937,13 +1937,13 @@ async function main() {
       // 允许前端发送的请求头 (allow_headers)
       res.header(
         'Access-Control-Allow-Headers', 
-        'Content-Type, Authorization, X-Nonce, X-Timestamp, X-Auth-Token, X-AES-Encrypted, X-Debug'
+        'content-type, user-agent,authorization, x-nonce, x-timestamp, x-auth-token, x-aes-encrypted, x-debug'
       );
       
       // 允许前端读取的响应头 (expose_headers)
       res.header(
         'Access-Control-Expose-Headers', 
-        'X-Encrypted, X-Agent-Version, X-File-Size, X-Original-Path'
+        'x-encrypted, x-agent-version, x-file-size, x-original-path'
       );
 
       // 快速放行 OPTIONS 预检请求 (Preflight)
@@ -2087,9 +2087,9 @@ async function main() {
     try {
       const result = await FileManager.downloadFile(req.body.path);
       const fileBuffer = Buffer.from(result.content, 'base64');
-      res.set('X-File-Size', result.size.toString());
-      res.set('X-Original-Path', result.path);
-      res.set('Content-Type', 'application/octet-stream');
+      res.set('x-file-size', result.size.toString());
+      res.set('x-original-path', result.path);
+      res.set('content-type', 'application/octet-stream');
       return res.send(fileBuffer);
     } catch (e) {
       res.status(500).json({ status: 'error', message: e.message });
