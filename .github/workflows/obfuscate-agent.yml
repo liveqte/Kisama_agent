@@ -32,13 +32,14 @@ jobs:
 
       - name: Obfuscate js/agent.js
         run: >
-          npx -y javascript-obfuscator js/agent.js
-          --output js/agent_obs.js
-          --compact true
-          --identifier-names-generator mangled
-          --string-array true
-          --string-array-encoding base64
-          --control-flow-flattening true
+          npx -y javascript-obfuscator js/agent.js \
+          --output js/agent_obs.js \
+          --compact false \
+          --identifier-names-generator mangled \
+          --rename-globals true \
+          --string-array true \
+          --string-array-encoding 'base64' \
+          --control-flow-flattening true \
           --reserved-strings "ECDSA公钥内容,ECIES公钥内容"
 
       - name: Commit generated files if changed
