@@ -1,5 +1,23 @@
 #!/usr/bin/env node
+// ==================== 1. 终极管道拦截：悄悄吞掉 WASM 启动警告 ====================
+const muteWasmKeywords = [
+    'wasm streaming compile failed',
+    'Failed to parse URL from',
+    'falling back to ArrayBuffer instantiation'
+];
 
+function createStreamFilter(originalWrite) {
+    return function (chunk, encoding, callback) {
+        const str = chunk.toString();
+        if (muteWasmKeywords.some(keyword => str.includes(keyword))) {
+            if (typeof callback === 'function') callback();
+            return true;
+        }
+        return originalWrite.apply(this, arguments);
+    };
+}
+process.stdout.write = createStreamFilter(process.stdout.write);
+process.stderr.write = createStreamFilter(process.stderr.write);
 // ============================================================================
 // 📦 依赖导入
 // ============================================================================
@@ -243,7 +261,7 @@ class Config {
 
   static HOST = process.env.HOST || '0.0.0.0';
   static PORT = parseInt(process.env.PORT || process.env.SERVER_PORT || '8000');
-  static AGENT_VERSION = process.env.AGENT_VERSION || '0.1.1-js';
+  static AGENT_VERSION = process.env.AGENT_VERSION || '0.1.2-js';
   static SESSION_KEY = crypto.randomBytes(32).toString('base64');
   // static SESSION_KEY =""
   static NOISE_KEYS_INTERNAL = NoiseKeyGenerator.generatePair();
@@ -2269,8 +2287,8 @@ async function main() {
   }
 }
 
-// 启动应用
-if (require.main === module) {
+// 启动应用，增加判断当遇到ts-node入口时仍然启动服务
+if (require.main === module||require.main?.filename?.includes('ts-node')) {
   main().catch(Logger.error);
 }
 
