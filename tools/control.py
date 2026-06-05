@@ -455,7 +455,10 @@ def test_baseinfo():
     
     if not result:
         return _test_result("baseinfo 返回有效数据", False, "result=None")
-    
+        
+    print("====== [DEBUG] 当前 baseinfo 完整响应结构 ======")
+    print(json.dumps(result, indent=4, ensure_ascii=False))
+    print("================================================")
     # --- 核心逻辑：提取并保存 Session Key ---
     encoded_key = result.get("session_key")
     if encoded_key:
@@ -475,7 +478,7 @@ def test_baseinfo():
     if all(f in result for f in required_fields):
         arch = result.get("arch", "N/A")
         cpu = result.get("cpu_name", "N/A")[:30]
-        mem_gb = result.get("mem_total", 0) / 1024 / 1024 / 1024
+        mem_gb = (result.get("mem_total") or 0) / 1024 / 1024 / 1024
         version = result.get("version", "N/A")
         
         return _test_result("baseinfo 返回基础字段", True, 

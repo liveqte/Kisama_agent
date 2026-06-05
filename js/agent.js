@@ -523,42 +523,50 @@ function authEncryptMiddleware(cryptoManager) {
 // ============================================================================
 // 📊 系统信息收集器
 // ============================================================================
-class SystemInfoCollector {
-  constructor() {
-    this.lastNetworkStats = { rx: 0, tx: 0 };
-    this.totalNetworkUp = 0;
-    this.totalNetworkDown = 0;
-    this.lastNetworkTime = Date.now() / 1000;
-  }
-  async getContainerMemory() {
-    let total, used;
+  class SystemInfoCollector {
+    constructor() {
+      this.lastNetworkStats = { rx: 0, tx: 0 };
+      this.totalNetworkUp = 0;
+      this.totalNetworkDown = 0;
+      this.lastNetworkTime = Date.now() / 1000;
+    }
+    async getContainerMemory() {
+    let total = null, used = null;
 
     try {
-      // 1. 尝试 cgroup v2 (Docker 20.10+ 主流环境)
+      // 1. 尝试 cgroup v2
       const limitStr = (await fsp.readFile('/sys/fs/cgroup/memory.max', 'utf8')).trim();
       total = limitStr === 'max' ? null : parseInt(limitStr, 10);
       used = parseInt((await fsp.readFile('/sys/fs/cgroup/memory.current', 'utf8')).trim(), 10);
     } catch {
       try {
-        // 2. 尝试 cgroup v1 (老版本 Docker/宿主机)
+        // 2. 尝试 cgroup v1
         total = parseInt((await fsp.readFile('/sys/fs/cgroup/memory/memory.limit_in_bytes', 'utf8')).trim(), 10);
         used = parseInt((await fsp.readFile('/sys/fs/cgroup/memory/memory.usage_in_bytes', 'utf8')).trim(), 10);
-        // v1 未限制时会返回极大值，视为无限制
         if (total > 9223372036854771712) total = null;
       } catch {
-        // 3. 非容器环境或无权限时，降级到宿主机内存
+        // 3. 非容器环境，直接走宿主机
         const hostMem = await si.mem();
         total = hostMem.total;
         used = hostMem.used;
       }
     }
 
+    // 👇 【核心修改】如果容器没限制内存，用宿主机的物理内存上限代替 null
+    if (total === null) {
+      const hostMem = await si.mem();
+      total = hostMem.total; 
+      // 如果 cgroup 读取 used 失败了，才用宿主机的 used
+      if (used === null || isNaN(used)) {
+        used = hostMem.used;
+      }
+    }
+
     return {
-      total,          // 容器分配的最大内存（字节），null 表示未限制
-      used,           // 当前已用内存（字节）
-      available: total !== null ? total - used : null,
-      // 保留 si.mem() 的其他字段供兼容（可选）
-      free: total !== null ? total - used : 0,
+      total,                                      // 不再是 null，而是容器限制值或宿主机总内存
+      used,                                       // 当前已用内存
+      available: total - used,                    // 不再是 null
+      free: total - used,
       cached: 0,
       buffers: 0
     };
