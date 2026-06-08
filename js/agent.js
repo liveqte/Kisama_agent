@@ -41,7 +41,14 @@ try {
     } else {
         pty = require('@lydell/node-pty');
     }
-} catch (e) {}
+} catch (e) {
+    console.error('\x1b[31m[FATAL ERROR]\x1b[0m 核心终端依赖 (pty) 加载失败，程序终止！');
+    console.error('\x1b[31m[FATAL ERROR]\x1b[0m 详细错误: ' + e.message);
+    console.error('💡 修复建议: 请在项目目录下运行 npm install @lydell/node-pty');
+    
+    // 强制退出程序，状态码 1 表示异常退出
+    process.exit(1);
+}
 // ==================== 日志工具 ====================
 const Logger = {
     // 定义日志等级枚举
