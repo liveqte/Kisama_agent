@@ -5,9 +5,9 @@ on:
     branches:
       - main  # 当推送到 main 分支时触发，如果是 master 分支请修改
     paths:
-      - 'src/**'       # 当 src 目录下的 Java 源码有修改时触发
-      - 'pom.xml'      # 当 Maven 依赖有修改时触发
-      - 'build.sh'     # 当构建脚本有修改时触发
+      - 'java/src/**'       # 当 src 目录下的 Java 源码有修改时触发
+      - 'java/pom.xml'      # 当 Maven 依赖有修改时触发
+      - 'java/build.sh'     # 当构建脚本有修改时触发
   workflow_dispatch: # 允许在 GitHub 网页端手动点击运行
 
 # 赋予工作流推送代码到仓库的权限（非常重要）
