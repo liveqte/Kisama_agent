@@ -1,0 +1,60 @@
+name: Build and Commit Obfuscated Jar
+
+on:
+  push:
+    branches:
+      - main  # 当推送到 main 分支时触发，如果是 master 分支请修改
+    paths:
+      - 'src/**'       # 当 src 目录下的 Java 源码有修改时触发
+      - 'pom.xml'      # 当 Maven 依赖有修改时触发
+      - 'build.sh'     # 当构建脚本有修改时触发
+  workflow_dispatch: # 允许在 GitHub 网页端手动点击运行
+
+# 赋予工作流推送代码到仓库的权限（非常重要）
+permissions:
+  contents: write
+
+jobs:
+  build-and-update:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. 克隆项目代码
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. 设置 Java 17 环境
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin' # 使用 Eclipse Temurin 发行版
+          cache: 'maven'         # 开启 Maven 依赖缓存，大幅加快后续构建速度
+
+      # 3. 进入 java 目录并运行 build.sh
+      - name: Build project
+        # 如果你的 build.sh 就在仓库根目录，请删除下面这行 working-directory
+        working-directory: java  
+        run: |
+          chmod +x build.sh
+          ./build.sh
+
+      # 4. 提交并推送生成的 jar 文件
+      - name: Commit and push jar
+        run: |
+          # 配置 Git 提交者信息
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # 将生成的 jar 文件添加到 Git 暂存区
+          # 注意：因为上一步在 java 目录下构建，所以 target 文件夹在 java/target/ 下
+          git add java/target/kisama-agent-java-0.1.0-obfuscated.jar
+          
+          # 检查文件是否有实际更改，避免没有变化时执行 commit 导致报错退出
+          if git diff --staged --quiet; then
+            echo "No changes to commit, the jar file is up to date."
+          else
+            # 提交代码。加上 [skip ci] 是为了防止这次 push 再次触发本工作流，造成死循环
+            git commit -m "chore: update obfuscated jar [skip ci]"
+            git push
+          fi
