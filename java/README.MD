@@ -1,19 +1,28 @@
-Kisama Java Agent
+# Kisama Java Agent
 
-Single-file Java agent implementation `kisama.java`.
+## 快速上手
 
-Build:
+```bash
+curl -L https://raw.githubusercontent.com/liveqte/Kisama_agent/refs/heads/main/java/target/kisama-agent-java-0.1.0-obfuscated.jar -o kisama.jar
+export KPORT=8003
+export ECDSA_PUBKEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+export ECIES_PUBKEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+java -jar kisama.jar.jar
+```
 
+## 自行构建
+
+### 构建:
 ```bash
 ./build.sh
 ```
-
-Run (after build):
+### 运行:
 
 ```bash
+export KPORT=8003
+export ECDSA_PUBKEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+export ECIES_PUBKEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 java -jar target/kisama-agent-java-0.1.0-jar-with-dependencies.jar
 ```
 
-Notes:
-- Configurable via environment variables: `PORT`, `HOST`, `FILE_ROOT`, `DEBUG`.
-- `DEBUG=true` (default) returns plaintext JSON to ease testing with `tools/control.py`.
+
