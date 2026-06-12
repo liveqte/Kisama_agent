@@ -98,7 +98,7 @@ public class kisama {
             return;
         }
 
-        webSocket("/api/ws/*", new KisamaWebSocketHandler());
+        webSocket("/api/ws/*", new KisamaWebSocketHandler(this));
         port(this.PORT);
         ipAddress(this.HOST);
 
@@ -617,6 +617,9 @@ public class kisama {
         if (!isRunning) return;
         log("[TRACE-INIT] 正在关闭 Kisama Agent...");
         spark.Spark.stop();
+        // 🌟 核心补全：在内部强制阻塞主线程，死等 Jetty 清理完所有 Servlet 并彻底烟消云散！
+        // 这样可以确保在该方法返回前，所有类加载行为全部安全结束。
+        spark.Spark.awaitStop();
         this.scheduler.shutdownNow();
         try {
             if (!this.scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
@@ -1223,10 +1226,15 @@ public class kisama {
         return new String(c.doFinal(ctWithTag), StandardCharsets.UTF_8);
     }
 
-    // ==================== 内部类 (改为非静态，以访问外部实例状态) ====================
+    // ==================== 内部类重构：改为 static 静态内部类，彻底解决反射膨胀 Bug ====================
     @WebSocket
-    public class KisamaWebSocketHandler {
+    public static class KisamaWebSocketHandler {
+        private final kisama agent; // 👈 显式持有外部引用
         private final Map<Session, TerminalSession> activeSessions = new ConcurrentHashMap<>();
+
+        public KisamaWebSocketHandler(kisama agent) {
+            this.agent = agent;
+        }
 
         @OnWebSocketConnect
         public void onConnect(Session session) {
@@ -1240,12 +1248,14 @@ public class kisama {
                 String requestId = rIds.get(0);
                 List<String> tokens = queryParams.get("token");
                 String token = (tokens != null && !tokens.isEmpty()) ? tokens.get(0) : null;
-                log("[TRACE-WS] 收到超级终端连接请求, request_id: " + requestId);
-                TerminalSession terminalSession = new TerminalSession(session, requestId, token);
+                agent.log("[TRACE-WS] 收到超级终端连接请求, request_id: " + requestId);
+                
+                // 传入 agent 实例
+                TerminalSession terminalSession = new TerminalSession(this.agent, session, requestId, token);
                 activeSessions.put(session, terminalSession);
                 terminalSession.start();
             } catch (Exception e) {
-                log("[TRACE-WS] 终端进程初始化失败: " + e.getMessage());
+                agent.log("[TRACE-WS] 终端进程初始化失败: " + e.getMessage());
                 session.close(1011, "Internal server error");
             }
         }
@@ -1273,7 +1283,7 @@ public class kisama {
             if (ts != null) {
                 ts.cleanup();
             }
-            log("[TRACE-WS] 超级终端会话正常断开: Code=" + statusCode + ", Reason=" + reason);
+            agent.log("[TRACE-WS] 超级终端会话正常断开: Code=" + statusCode + ", Reason=" + reason);
         }
 
         @OnWebSocketError
@@ -1282,11 +1292,19 @@ public class kisama {
             if (ts != null) {
                 ts.cleanup();
             }
-            log("[TRACE-WS] 超级终端异常捕获: " + error.getMessage());
+            // 🌟 修正：通过 agent 实例调用非静态方法
+            agent.log("[TRACE-WS] 超级终端异常捕获: " + error.getMessage());
+            error.printStackTrace();
+            if (error.getCause() != null) {
+                agent.log("[TRACE-WS] 🚨 发现隐藏在框架底层的真实元凶：");
+                error.getCause().printStackTrace();
+            }
         }
     }
 
-    private class TerminalSession {
+    // 👈 改为 static
+    private static class TerminalSession {
+        private final kisama agent; // 👈 显式持有外部引用
         private final Session wsSession;
         private final String requestId;
         private final String token;
@@ -1298,13 +1316,14 @@ public class kisama {
         private Thread pipeOutputThread;
         private volatile boolean isRunning = true;
 
-        public TerminalSession(Session wsSession, String requestId, String token) {
+        public TerminalSession(kisama agent, Session wsSession, String requestId, String token) {
+            this.agent = agent;
             this.wsSession = wsSession;
             this.requestId = requestId;
             this.token = token;
             this.useNoise = (token == null || token.isBlank());
             if (this.useNoise) {
-                this.noiseCipher = new NoiseSession(kisama.this.AGENT_PRIVATE_KEY);
+                this.noiseCipher = new NoiseSession(agent.AGENT_PRIVATE_KEY);
             }
         }
 
@@ -1312,7 +1331,7 @@ public class kisama {
             if (!useNoise) {
                 startProcess();
             } else {
-                log("[TRACE-WS] [" + requestId + "] 已就绪，挂起外壳进程，死等待 Noise 三次交互加密握手机制...");
+                agent.log("[TRACE-WS] [" + requestId + "] 已就绪，挂起外壳进程，死等待 Noise 三次交互加密握手机制...");
             }
         }
 
@@ -1322,16 +1341,15 @@ public class kisama {
             env.put("TERM", "xterm-256color");
             env.put("LANG", "C.UTF-8");
 
-            log("[TRACE-WS] 🚀 正在使用 Pty4J 启动真正的原生伪终端...");
+            agent.log("[TRACE-WS] 🚀 正在使用 Pty4J 启动真正的原生伪终端...");
 
-            // 🌟 修复点：直接决定启动 bash 还是 sh，不要用 script/python 包装
             String[] shellCmd = new File("/bin/bash").exists() ? 
                     new String[]{"/bin/bash"} : new String[]{"/bin/sh"};
 
             this.ptyProcess = new PtyProcessBuilder()
-                    .setCommand(shellCmd) // 👈 纯净的 Shell 命令
+                    .setCommand(shellCmd)
                     .setEnvironment(env)
-                    .setDirectory(kisama.this.FILE_ROOT)
+                    .setDirectory(agent.FILE_ROOT)
                     .start();
 
             this.processStdin = ptyProcess.getOutputStream();
@@ -1362,7 +1380,7 @@ public class kisama {
 
         public void handleTextMessage(String text) {
             if (useNoise && handshakePhase != 4) {
-                log("[TRACE-WS] 握手建立前拒绝处理任何明文文本包。");
+                agent.log("[TRACE-WS] 握手建立前拒绝处理任何明文文本包。");
                 return;
             }
             processIncomingPayload(text.getBytes(StandardCharsets.UTF_8));
@@ -1372,26 +1390,27 @@ public class kisama {
             if (useNoise) {
                 if (handshakePhase == 1) {
                     try {
-                        log("[TRACE-WS] [" + requestId + "] 捕获 Noise 握手包 [Msg 1], 长度: " + data.length);
+                        agent.log("[TRACE-WS] [" + requestId + "] 捕获 Noise 握手包 [Msg 1], 长度: " + data.length);
                         noiseCipher.readMsg1(data);
                         byte[] msg2 = noiseCipher.writeMsg2();
-                        log("[TRACE-WS] [" + requestId + "] 回发加密响应包 [Msg 2], 长度: " + msg2.length);
+                        agent.log("[TRACE-WS] [" + requestId + "] 回发加密响应包 [Msg 2], 长度: " + msg2.length);
                         wsSession.getRemote().sendBytes(ByteBuffer.wrap(msg2));
                         handshakePhase = 3;
                     } catch (Exception e) {
-                        log("[TRACE-WS] Noise 第一阶段握手崩溃流产: " + e.getMessage());
+                        agent.log("[TRACE-WS] Noise 第一阶段握手崩溃流产: " + e.getMessage());
                         cleanup();
                     }
                     return;
                 } else if (handshakePhase == 3) {
                     try {
-                        log("[TRACE-WS] [" + requestId + "] 捕获最终确认包 [Msg 3], 长度: " + data.length);
+                        agent.log("[TRACE-WS] [" + requestId + "] 捕获最终确认包 [Msg 3], 长度: " + data.length);
                         noiseCipher.readMsg3(data);
-                        log("[TRACE-WS] ✅ Noise 握手大获成功！端到端隧道已锁定安全边界。");
+                        agent.log("[TRACE-WS] ✅ Noise 握手大获成功！端到端隧道已锁定安全边界。");
                         handshakePhase = 4;
                         startProcess();
-                    } catch (Exception e) {
-                        log("[TRACE-WS] Noise 第二阶段核验爆裂: " + e.getMessage());
+                    } catch (Throwable t) { // 🌟 核心修改：由 Exception 改为 Throwable，确保能捕获底层的 LinkageError
+                        agent.log("[TRACE-WS] Noise 第二阶段核验或伪终端启动瞬间爆裂: " + t.getMessage());
+                        t.printStackTrace(); // 打印底层真实的 Error 堆栈
                         cleanup();
                     }
                     return;
@@ -1400,7 +1419,7 @@ public class kisama {
                         byte[] decrypted = noiseCipher.decryptTransport(data);
                         processIncomingPayload(decrypted);
                     } catch (Exception e) {
-                        log("[TRACE-WS] 运行期数据面解密 MAC 失败: " + e.getMessage());
+                        agent.log("[TRACE-WS] 运行期数据面解密 MAC 失败: " + e.getMessage());
                     }
                     return;
                 }
@@ -1415,12 +1434,11 @@ public class kisama {
                 String textMsg = new String(payload, StandardCharsets.UTF_8).trim();
                 if (textMsg.startsWith("{")) {
                     try {
-                        Map<String, Object> data = kisama.this.gson.fromJson(textMsg, new TypeToken<Map<String, Object>>() {
-                        }.getType());
+                        Map<String, Object> data = agent.gson.fromJson(textMsg, new TypeToken<Map<String, Object>>() {}.getType());
                         if (data != null && data.containsKey("type")) {
                             String frameType = Objects.toString(data.get("type"), "");
                             if ("heartbeat".equals(frameType)) {
-                                wsSession.getRemote().sendString(kisama.this.gson.toJson(Map.of("type", "heartbeat")));
+                                wsSession.getRemote().sendString(agent.gson.toJson(Map.of("type", "heartbeat")));
                                 return;
                             }
                             if ("resize".equals(frameType)) {
@@ -1446,7 +1464,7 @@ public class kisama {
                 }
                 writeRaw(payload);
             } catch (Exception e) {
-                log("[TRACE-WS] 流洗涤分发器发生内部错误: " + e.getMessage());
+                agent.log("[TRACE-WS] 流洗涤分发器发生内部错误: " + e.getMessage());
             }
         }
 
@@ -1457,33 +1475,10 @@ public class kisama {
             }
         }
 
-        // 🌟 完整保留原版超级终端智能回退机制
-        private String[] getAvailableShellCommands() {
-            String shell = "/bin/sh";
-            if (new File("/bin/bash").exists()) {
-                shell = "/bin/bash";
-            }
-            if (new File("/usr/bin/script").exists() || new File("/bin/script").exists()) {
-                return new String[]{"script", "-q", "-c", shell, "/dev/null"};
-            }
-            if (new File("/usr/bin/python3").exists()) {
-                return new String[]{"python3", "-c", "import pty; pty.spawn('" + shell + "')"};
-            }
-            if (new File("/usr/bin/python").exists()) {
-                return new String[]{"python", "-c", "import pty; pty.spawn('" + shell + "')"};
-            }
-            if (new File("/usr/bin/socat").exists()) {
-                return new String[]{"socat", "-", "EXEC:" + shell + ",pty,stderr,setsid,sigint,sane"};
-            }
-            log("[TRACE-WS] ⚠️ 警告: 未找到任何 PTY 欺骗工具 (script/python/socat)，已降级为原始管道交互模式。");
-            return new String[]{shell, "-i"};
-        }
-
         public void cleanup() {
             if (!isRunning) return;
             isRunning = false;
             try {
-                // 修复了原版中 process 和 ptyProcess 变量名不一致的潜在 Bug
                 if (ptyProcess != null) ptyProcess.destroyForcibly();
                 if (wsSession.isOpen()) wsSession.close();
             } catch (Exception ignored) {
@@ -1491,7 +1486,8 @@ public class kisama {
         }
     }
 
-    private class NoiseSession {
+    // 👈 改为 static
+    private static class NoiseSession {
         byte[] ck = new byte[32];
         byte[] h = new byte[32];
         byte[] s_priv = new byte[32];
