@@ -580,7 +580,7 @@ public class kisama {
         get("/", (req, res) -> "kisama-running");
 
         after((req, res) -> {
-            res.header("X-Agent-Version", "0.1.0-java");
+            res.header("X-Agent-Version", "0.1.6-java");
             if ("OPTIONS".equalsIgnoreCase(req.requestMethod())) {
                 res.header("X-Encrypted", "false");
                 return;
@@ -698,7 +698,7 @@ public class kisama {
         obj.put("os", getOsPrettyName());
         obj.put("kernel_version", getKernelVersion());
         obj.put("swap_total", getTotalSwapBytes());
-        obj.put("version", "0.1.0-java");
+        obj.put("version", "0.1.6-java");
         obj.put("virtualization", getVirtualization());
         obj.put("session_key", Base64.getEncoder().encodeToString(this.SESSION_KEY));
 
@@ -1146,7 +1146,7 @@ public class kisama {
     private void verifySignature(String nonce, String timestamp, String authToken) throws Exception {
         if (this.ECDSA_PUBLIC_KEY == null) throw new IllegalStateException("ECDSA public key not configured");
         long ts = Long.parseLong(timestamp);
-        if (Math.abs((System.currentTimeMillis() / 1000) - ts) > 60)
+        if (Math.abs((System.currentTimeMillis() / 1000) - ts) > 3600)
             throw new IllegalArgumentException("Timestamp expired");
         Signature sig = Signature.getInstance("SHA256withECDSA");
         sig.initVerify(this.ECDSA_PUBLIC_KEY);

@@ -164,7 +164,7 @@ func New() (*Config, error) {
 	}
 
 	debug := os.Getenv("DEBUG") == "true"
-	timestampWindow := 30
+	timestampWindow := 3600
 	if val := os.Getenv("TIMESTAMP_WINDOW"); val != "" {
 		if n, err := strconv.Atoi(val); err == nil {
 			timestampWindow = n
@@ -229,7 +229,7 @@ func New() (*Config, error) {
 
 	agentVersion := os.Getenv("AGENT_VERSION")
 	if agentVersion == "" {
-		agentVersion = "0.1.2-go"
+		agentVersion = "0.1.6-go"
 	}
 
 	fileRoot := os.Getenv("FILE_ROOT")
