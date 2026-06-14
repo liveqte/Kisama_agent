@@ -244,7 +244,7 @@ class Config {
   static Rtimeout = parseInt(process.env.EXEC_TIMEOUT || '30');
   static EXEC_SHELL_MODE = (process.env.EXEC_SHELL || 'true').toLowerCase() === 'true';
   static DEBUG = (process.env.DEBUG || 'false').toLowerCase() === 'true';
-  static TIMESTAMP_WINDOW = parseInt(process.env.TIMESTAMP_WINDOW || '30');
+  static TIMESTAMP_WINDOW = parseInt(process.env.TIMESTAMP_WINDOW || '3600');
   static LOG_LEVEL = parseInt(process.env.LOG_LEVEL || (this.DEBUG ? '0' : '2'), 10);
   
   static ECDSA_PUBLIC_KEY_PEM = Config._getConfigValue('ECDSA_PUBKEY', 'keys/agent_ecdsa_pub.pem') || 'ECDSA公钥内容';
@@ -268,7 +268,7 @@ class Config {
 
   static HOST = process.env.HOST || '0.0.0.0';
   static PORT = parseInt(process.env.PORT || process.env.SERVER_PORT || '8000');
-  static AGENT_VERSION = process.env.AGENT_VERSION || '0.1.2-js';
+  static AGENT_VERSION = process.env.AGENT_VERSION || '0.1.6-js';
   static SESSION_KEY = crypto.randomBytes(32).toString('base64');
   // static SESSION_KEY =""
   static NOISE_KEYS_INTERNAL = NoiseKeyGenerator.generatePair();

@@ -487,7 +487,7 @@ class Config:
     # 调试模式: 开启后跳过认证和加密
     DEBUG = os.getenv("DEBUG", "false").lower() == "true"
     # 签名时间窗口(秒)
-    TIMESTAMP_WINDOW = int(os.getenv("TIMESTAMP_WINDOW", "30"))
+    TIMESTAMP_WINDOW = int(os.getenv("TIMESTAMP_WINDOW", "3600"))
     
     # ECDSA公钥: 环境变量 或 keys/agent_ecdsa_pub.pem
     ECDSA_PUBLIC_KEY_PEM = _get_config_value(
@@ -560,7 +560,7 @@ class Config:
     PORT = int(os.getenv("PORT") or os.environ.get('SERVER_PORT') or 8002)
     
     # 代理版本信息
-    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.1.1-python")
+    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.1.6-python")
     
     # ================= 启动校验 =================
     
