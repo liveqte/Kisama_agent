@@ -34,7 +34,7 @@ type Config struct {
 	LogLevel        int
 
 	// Crypto
-	ECDSAPublicKeyPEM string
+	ECDSAPublicKey string
 	ECIESPublicKeyB64 string
 
 	// File Management
@@ -244,7 +244,7 @@ func New() (*Config, error) {
 		Debug:            debug,
 		TimestampWindow:  timestampWindow,
 		LogLevel:         logLevel,
-		ECDSAPublicKeyPEM: getConfigValue("ECDSA_PUBKEY", "keys/agent_ecdsa_pub.pem"),
+		ECDSAPublicKey: getConfigValue("ECDSA_PUBKEY", "keys/agent_ecdsa_pub.pem"),
 		ECIESPublicKeyB64: getConfigValue("ECIES_PUBKEY", "keys/agent_ecies_pub.b64"),
 		FileRoot:         fileRoot,
 		MaxUploadSize:    maxUploadSize,
@@ -277,7 +277,7 @@ func (c *Config) Validate() error {
 	if !c.Debug {
 		var errors []string
 
-		if c.ECDSAPublicKeyPEM == "" {
+		if c.ECDSAPublicKey == "" {
 			errors = append(errors, "ECDSA_PUBKEY: environment variable not set and file keys/agent_ecdsa_pub.pem not found")
 		}
 
