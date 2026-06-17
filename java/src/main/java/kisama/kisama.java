@@ -62,6 +62,13 @@ public class kisama {
 
     private volatile boolean isRunning = false;
 
+    // 🌟 新增：用于动态计算网速的上下文变量
+    private long lastNetworkRx = 0;
+    private long lastNetworkTx = 0;
+    private long lastNetworkTime = 0;
+    private long totalNetworkUp = 0;
+    private long totalNetworkDown = 0;
+    private final Object netLock = new Object();
    // ==================== 构造函数 ====================
     // 1. 无参构造函数：保持原汁原味，完全不改，全部通过原本的逻辑和全局提取初始化
     public kisama() {
@@ -158,44 +165,64 @@ public class kisama {
             if (endpoint != null && endpoint.startsWith("/api/ws/")) {
                 return;
             }
-            if (!this.DEBUG && !"OPTIONS".equalsIgnoreCase(req.requestMethod())) {
-                if (!"/api/baseinfo".equals(endpoint)) {
-                    String nonce = req.headers("X-Nonce");
-                    String timestamp = req.headers("X-Timestamp");
-                    String authToken = req.headers("X-Auth-Token");
 
-                    if (nonce == null || timestamp == null || authToken == null) {
-                        log("[TRACE-AUTH] ❌ 强认证失败: 核心头部要素缺失");
+            // 🌟 新增：初始化当前请求的认证状态标签与免密放行白名单判定
+            req.attribute("is_authenticated", true);
+            boolean isBypassPath = "/api/baseinfo".equals(endpoint) || "/api/status".equals(endpoint);
+
+            if (!this.DEBUG && !"OPTIONS".equalsIgnoreCase(req.requestMethod())) {
+                String nonce = req.headers("X-Nonce");
+                String timestamp = req.headers("X-Timestamp");
+                String authToken = req.headers("X-Auth-Token");
+
+                if (nonce == null || timestamp == null || authToken == null) {
+                    log("[TRACE-AUTH] ❌ 强认证失败: 核心头部要素缺失");
+                    // 🌟 修改：如果是白名单路由，允许放行但标记为未认证
+                    if (isBypassPath) {
+                        req.attribute("is_authenticated", false);
+                    } else {
                         halt(401, this.gson.toJson(Map.of("error", "Missing auth headers")));
                     }
+                }
+
+                // 🌟 修改：只有在未被标记为“未认证”的情况下，才去执行签名校验
+                if (Boolean.TRUE.equals(req.attribute("is_authenticated"))) {
                     try {
                         verifySignature(nonce, timestamp, authToken);
                         log("[TRACE-AUTH] ✅ ECDSA 签名核验完全匹配，予以放行");
                     } catch (Exception e) {
                         log("[TRACE-AUTH] ❌ 强认证失败: 验签爆裂 -> " + e.getMessage());
-                        halt(401, this.gson.toJson(Map.of("error", "Signature verification failed: " + e.getMessage())));
+                        // 🌟 修改：验签失败如果是白名单路由，同样放行并标记
+                        if (isBypassPath) {
+                            req.attribute("is_authenticated", false);
+                        } else {
+                            halt(401, this.gson.toJson(Map.of("error", "Signature verification failed: " + e.getMessage())));
+                        }
                     }
                 }
             }
 
             if ("true".equalsIgnoreCase(req.headers("X-AES-Encrypted"))) {
-                log("[TRACE-DECRYPT] 检测到 X-AES-Encrypted=true, 启动反向 AES-GCM 解密流程...");
-                try {
-                    String body = req.body();
-                    String json = decryptAesPayload(body, this.SESSION_KEY);
-                    log("[TRACE-DECRYPT] ✅ 逆向解密明文成功: " + json);
-                    Object parsed = this.gson.fromJson(json, new TypeToken<Object>() {
-                    }.getType());
-                    req.attribute("json_body", parsed);
-                } catch (Exception e) {
-                    log("[TRACE-DECRYPT] ❌ 逆向解密失败: " + e.getMessage());
-                    halt(400, this.gson.toJson(Map.of("error", "Invalid encrypted body: " + e.getMessage())));
+                // 🌟 修复边界：只有通过认证的请求才允许执行其 AES 解密流
+                if (Boolean.TRUE.equals(req.attribute("is_authenticated"))) {
+                    log("[TRACE-DECRYPT] 检测到 X-AES-Encrypted=true, 启动反向 AES-GCM 解密流程...");
+                    try {
+                        String body = req.body();
+                        String json = decryptAesPayload(body, this.SESSION_KEY);
+                        log("[TRACE-DECRYPT] ✅ 逆向解密明文成功: " + json);
+                        Object parsed = this.gson.fromJson(json, new TypeToken<Object>() {}.getType());
+                        req.attribute("json_body", parsed);
+                    } catch (Exception e) {
+                        log("[TRACE-DECRYPT] ❌ 逆向解密失败: " + e.getMessage());
+                        halt(400, this.gson.toJson(Map.of("error", "Invalid encrypted body: " + e.getMessage())));
+                    }
+                } else {
+                    log("[TRACE-DECRYPT] ⚠️ 未认证请求，跳过 AES 解密流程");
                 }
             } else {
                 if (req.body() != null && !req.body().isBlank()) {
                     try {
-                        Object parsed = this.gson.fromJson(req.body(), new TypeToken<Object>() {
-                        }.getType());
+                        Object parsed = this.gson.fromJson(req.body(), new TypeToken<Object>() {}.getType());
                         req.attribute("json_body", parsed);
                     } catch (Exception ignored) {
                     }
@@ -206,18 +233,56 @@ public class kisama {
         // ==================== 完整保留所有业务路由 ====================
         get("/api/baseinfo", (req, res) -> {
             res.type("application/json");
-            return this.gson.toJson(buildBaseInfo());
+            // 🌟 动态获取验证状态
+            boolean isAuthenticated = req.attribute("is_authenticated") == null || Boolean.TRUE.equals(req.attribute("is_authenticated"));
+            return this.gson.toJson(buildBaseInfo(isAuthenticated));
         });
 
         get("/api/status", (req, res) -> {
+            // 1. 获取实时网络流量与连接数 (保持上回计算逻辑不变)
+            Map<String, Long> netInfo = getNetworkInfo();
+            int tcpCount = getConnectionCount("tcp");
+            int udpCount = getConnectionCount("udp");
+            
+            // 2. 获取 JVM 级别的系统 CPU 使用率
+            double cpuUsage = 0.0;
+            try {
+                java.lang.management.OperatingSystemMXBean bean = ManagementFactory.getOperatingSystemMXBean();
+                if (bean instanceof com.sun.management.OperatingSystemMXBean) {
+                    com.sun.management.OperatingSystemMXBean sunBean = (com.sun.management.OperatingSystemMXBean) bean;
+                    cpuUsage = sunBean.getCpuLoad() * 100.0;
+                    if (cpuUsage < 0) cpuUsage = 0.0;
+                }
+            } catch (Exception ignored) {}
+
+            // 3. 🌟 升级：全面的 cgroup 容器级总上限与净已用内存计算
+            long totalMem = getTotalMemoryBytes(); // 内部已包含 cgroup 限制与物理上限的 Math.min
+            long usedMem = getMemoryUsedBytes();   // 内部已排除 cgroup v1/v2 及宿主机的 Cache
+            
+            // 边界防御：极端情况下防止已用内存计算溢出总量
+            if (usedMem > totalMem) {
+                usedMem = totalMem;
+            }
+
             Map<String, Object> st = new LinkedHashMap<>();
-            st.put("cpu", Map.of("usage", 1.0));
-            st.put("ram", Map.of("total", Runtime.getRuntime().totalMemory(), "used", Runtime.getRuntime().freeMemory()));
-            st.put("swap", Map.of("total", 0, "used", 0));
+            st.put("cpu", Map.of("usage", Math.round(cpuUsage * 100) / 100.0));
+            st.put("ram", Map.of("total", totalMem, "used", usedMem)); // 👈 动态下发真实过滤后的内存
+            st.put("swap", Map.of("total", getTotalSwapBytes(), "used", 0));
             st.put("load", Map.of("load1", 0.1, "load5", 0.05, "load15", 0.01));
             st.put("disk", Map.of("total", Files.getFileStore(Paths.get(this.FILE_ROOT)).getTotalSpace(), "used", Files.getFileStore(Paths.get(this.FILE_ROOT)).getTotalSpace() - Files.getFileStore(Paths.get(this.FILE_ROOT)).getUsableSpace()));
-            st.put("network", Map.of("up", 0, "down", 0, "totalUp", 0, "totalDown", 0));
-            st.put("connections", Map.of("tcp", 0, "udp", 0));
+            
+            st.put("network", Map.of(
+                "up", netInfo.get("up"),
+                "down", netInfo.get("down"),
+                "totalUp", netInfo.get("totalUp"),
+                "totalDown", netInfo.get("totalDown")
+            ));
+            
+            st.put("connections", Map.of(
+                "tcp", tcpCount,
+                "udp", udpCount
+            ));
+            
             st.put("uptime", ManagementFactory.getRuntimeMXBean().getUptime() / 1000);
             st.put("process", 1);
             st.put("message", " ");
@@ -580,13 +645,16 @@ public class kisama {
         get("/", (req, res) -> "kisama-running");
 
         after((req, res) -> {
-            res.header("X-Agent-Version", "0.1.6-java");
+            res.header("X-Agent-Version", "0.1.7-java");
             if ("OPTIONS".equalsIgnoreCase(req.requestMethod())) {
                 res.header("X-Encrypted", "false");
                 return;
             }
             if (res.body() != null && !res.body().isBlank()) {
-                if (!this.DEBUG) {
+                // 🌟 新增：提取当前的认证标签状态
+                boolean isAuthenticated = req.attribute("is_authenticated") == null || Boolean.TRUE.equals(req.attribute("is_authenticated"));
+
+                if (!this.DEBUG && isAuthenticated) {
                     log("[TRACE-OUT] <<< 捕获到出口明文响应流，长度: " + res.body().length());
                     try {
                         String encrypted = encryptResponse(res.body().getBytes(StandardCharsets.UTF_8));
@@ -605,6 +673,7 @@ public class kisama {
                         res.body(this.gson.toJson(Map.of("error", "Crypto Exception: " + e.getMessage())));
                     }
                 } else {
+                    // 🌟 匿名放行或开启 DEBUG 情况下，直接透传明文，不执行 ECIES 加密封包
                     res.header("X-Encrypted", "false");
                 }
             }
@@ -682,8 +751,94 @@ public class kisama {
             logList.add(entry);
         }
     }
+    // 🌟 新增：解析 /proc/net/dev 动态计算瞬时网速和累计流量
+    private Map<String, Long> getNetworkInfo() {
+        long currentRx = 0;
+        long currentTx = 0;
+        long now = System.currentTimeMillis();
 
-    private Map<String, Object> buildBaseInfo() throws Exception {
+        Path p = Paths.get("/proc/net/dev");
+        if (Files.isReadable(p)) {
+            try {
+                List<String> lines = Files.readAllLines(p, StandardCharsets.UTF_8);
+                String[] excludePatterns = {"lo", "docker", "veth", "br-", "tun", "virbr"};
+                
+                for (String line : lines) {
+                    line = line.trim();
+                    if (!line.contains(":")) continue;
+                    
+                    String[] parts = line.split(":");
+                    String iface = parts[0].trim();
+                    
+                    // 过滤虚拟网卡
+                    boolean exclude = false;
+                    for (String pattern : excludePatterns) {
+                        if (iface.contains(pattern)) { exclude = true; break; }
+                    }
+                    if (exclude) continue;
+                    
+                    String dataStr = parts[1].trim();
+                    String[] stats = dataStr.split("\\s+");
+                    if (stats.length >= 9) {
+                        currentRx += Long.parseLong(stats[0]); // 接收字节数
+                        currentTx += Long.parseLong(stats[8]); // 发送字节数
+                    }
+                }
+            } catch (Exception ignored) {}
+        }
+
+        long upSpeed = 0;
+        long downSpeed = 0;
+
+        synchronized (netLock) {
+            if (lastNetworkTime > 0) {
+                double timeDiff = (now - lastNetworkTime) / 1000.0;
+                if (timeDiff > 0) {
+                    downSpeed = Math.max(0, (long) ((currentRx - lastNetworkRx) / timeDiff));
+                    upSpeed = Math.max(0, (long) ((currentTx - lastNetworkTx) / timeDiff));
+                }
+            }
+            totalNetworkDown = currentRx;
+            totalNetworkUp = currentTx;
+            
+            lastNetworkRx = currentRx;
+            lastNetworkTx = currentTx;
+            lastNetworkTime = now;
+        }
+
+        Map<String, Long> res = new HashMap<>();
+        res.put("up", upSpeed);
+        res.put("down", downSpeed);
+        res.put("totalUp", totalNetworkUp);
+        res.put("totalDown", totalNetworkDown);
+        return res;
+    }
+
+    // 🌟 新增：解析 /proc/net/tcp(udp) 统计当前处于 ESTABLISHED 状态的真实连接数
+    private int getConnectionCount(String protocol) {
+        Path p = Paths.get("/proc/net/" + protocol);
+        if (!Files.isReadable(p)) return 0;
+        try {
+            List<String> lines = Files.readAllLines(p, StandardCharsets.UTF_8);
+            if (lines.size() <= 1) return 0;
+            if ("tcp".equalsIgnoreCase(protocol)) {
+                int established = 0;
+                for (int i = 1; i < lines.size(); i++) {
+                    String[] parts = lines.get(i).trim().split("\\s+");
+                    // TCP 状态码 "01" 代表 ESTABLISHED
+                    if (parts.length >= 4 && "01".equals(parts[3])) {
+                        established++;
+                    }
+                }
+                return established;
+            }
+            return lines.size() - 1; // UDP 直接返回连接行数
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+    // 🌟 修改：为函数增加 boolean isAuthenticated 参数
+    private Map<String, Object> buildBaseInfo(boolean isAuthenticated) throws Exception {
         Map<String, Object> obj = new LinkedHashMap<>();
         Map<String, String> ips = getPrimaryIpAddresses();
 
@@ -698,15 +853,21 @@ public class kisama {
         obj.put("os", getOsPrettyName());
         obj.put("kernel_version", getKernelVersion());
         obj.put("swap_total", getTotalSwapBytes());
-        obj.put("version", "0.1.6-java");
+        obj.put("version", "0.1.7-java");
         obj.put("virtualization", getVirtualization());
-        obj.put("session_key", Base64.getEncoder().encodeToString(this.SESSION_KEY));
 
-        Map<String, Object> noise = Map.of(
-                "controller", Map.of("private", this.CTRL_PRIVATE_KEY_B64),
-                "agent", Map.of("public", this.AGENT_PUBLIC_KEY_B64)
-        );
-        obj.put("noise_key", noise);
+        // 🌟 修改：根据是否通过验证状态，动态清空核心敏感凭证
+        if (isAuthenticated) {
+            obj.put("session_key", Base64.getEncoder().encodeToString(this.SESSION_KEY));
+            Map<String, Object> noise = Map.of(
+                    "controller", Map.of("private", this.CTRL_PRIVATE_KEY_B64),
+                    "agent", Map.of("public", this.AGENT_PUBLIC_KEY_B64)
+            );
+            obj.put("noise_key", noise);
+        } else {
+            obj.put("session_key", null);
+            obj.put("noise_key", null);
+        }
         return obj;
     }
 
@@ -750,7 +911,71 @@ public class kisama {
         }
         return null;
     }
+    // 🌟 新增：获取容器或宿主机真实的、不含 Cache/Buffers 的已用内存（字节单位）
+    private long getMemoryUsedBytes() {
+        // 1. 尝试 cgroup v2 (现代 Linux 宿主机 / K8s 1.25+ 环境)
+        Path v2Current = Paths.get("/sys/fs/cgroup/memory.current");
+        Path v2Stat = Paths.get("/sys/fs/cgroup/memory.stat");
+        if (Files.isReadable(v2Current) && Files.isReadable(v2Stat)) {
+            try {
+                long currentRaw = Long.parseLong(Files.readString(v2Current).trim());
+                long fileCache = 0;
+                for (String line : Files.readAllLines(v2Stat, StandardCharsets.UTF_8)) {
+                    String[] parts = line.trim().split("\\s+");
+                    if (parts.length == 2 && "file".equals(parts[0])) {
+                        fileCache = Long.parseLong(parts[1]);
+                        break;
+                    }
+                }
+                return Math.max(0, currentRaw - fileCache);
+            } catch (Exception ignored) {}
+        }
 
+        // 2. 尝试 cgroup v1 (经典 Docker / 较旧的容器环境)
+        Path v1Usage = Paths.get("/sys/fs/cgroup/memory/memory.usage_in_bytes");
+        Path v1Stat = Paths.get("/sys/fs/cgroup/memory/memory.stat");
+        if (Files.isReadable(v1Usage) && Files.isReadable(v1Stat)) {
+            try {
+                long currentRaw = Long.parseLong(Files.readString(v1Usage).trim());
+                long cache = 0;
+                for (String line : Files.readAllLines(v1Stat, StandardCharsets.UTF_8)) {
+                    String[] parts = line.trim().split("\\s+");
+                    if (parts.length == 2 && "cache".equals(parts[0])) {
+                        cache = Long.parseLong(parts[1]);
+                        break;
+                    }
+                }
+                return Math.max(0, currentRaw - cache);
+            } catch (Exception ignored) {}
+        }
+
+        // 3. 非容器环境降级：直接分析宿主机 /proc/meminfo 
+        // 真实已用 = Total - Free - Buffers - Cached - SReclaimable
+        Path meminfoPath = Paths.get("/proc/meminfo");
+        if (Files.isReadable(meminfoPath)) {
+            try {
+                long memTotal = 0, memFree = 0, buffers = 0, cached = 0, sReclaimable = 0;
+                for (String line : Files.readAllLines(meminfoPath, StandardCharsets.UTF_8)) {
+                    String[] parts = line.trim().split("\\s+");
+                    if (parts.length >= 2) {
+                        String key = parts[0];
+                        long val = Long.parseLong(parts[1]) * 1024L; // kB 转换为 Byte
+                        if ("MemTotal:".equals(key)) memTotal = val;
+                        else if ("MemFree:".equals(key)) memFree = val;
+                        else if ("Buffers:".equals(key)) buffers = val;
+                        else if ("Cached:".equals(key)) cached = val;
+                        else if ("SReclaimable:".equals(key)) sReclaimable = val;
+                    }
+                }
+                if (memTotal > 0) {
+                    return Math.max(0, memTotal - memFree - buffers - cached - sReclaimable);
+                }
+            } catch (Exception ignored) {}
+        }
+
+        // 4. 终极保底：若以上皆失败，回退计算 JVM 当前已申请并占用的净内存
+        return Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();
+    }
     private long getTotalMemoryBytes() {
         long memInfo = readMemInfoBytes("MemTotal");
         long cgroupLimit = readCgroupMemoryLimitBytes();
