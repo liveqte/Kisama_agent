@@ -9,6 +9,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/x509"
+	"encoding/pem"
+	"strings"
 
 	ecies "github.com/ecies/go"
 	"github.com/liveqte/kisama_agent/logger"
@@ -16,7 +21,7 @@ import (
 
 // CryptoManager handles encryption/decryption and signature verification
 type CryptoManager struct {
-	ecdsaPubKey   string // PEM format
+	ecdsaPublicKey *ecdsa.PublicKey
 	eciesPublicKey *ecies.PublicKey // ECIES public key
 }
 
@@ -28,9 +33,17 @@ type AESPayload struct {
 }
 
 // NewCryptoManager creates a new CryptoManager
-func NewCryptoManager(ecdsaPubKeyPem string, eciesPublicKeyB64 string) (*CryptoManager, error) {
-	manager := &CryptoManager{
-		ecdsaPubKey: ecdsaPubKeyPem,
+func NewCryptoManager(ecdsaPubKeyStr string, eciesPublicKeyB64 string) (*CryptoManager, error) {
+	manager := &CryptoManager{}
+
+	// 解析 ECDSA 公钥（同时支持 PEM 和 压缩Base64）
+	if ecdsaPubKeyStr != "" {
+		pubKey, err := parseECDSAPublicKey(ecdsaPubKeyStr)
+		if err != nil {
+			logger.Warnf("⚠️ Failed to parse ECDSA public key: %v", err)
+		} else {
+			manager.ecdsaPublicKey = pubKey
+		}
 	}
 
 	// Decode ECIES public key from base64
@@ -49,6 +62,50 @@ func NewCryptoManager(ecdsaPubKeyPem string, eciesPublicKeyB64 string) (*CryptoM
 	}
 
 	return manager, nil
+}
+
+// 🚀 新增：兼容 PEM 与 压缩Base64 的公钥解析函数
+func parseECDSAPublicKey(keyStr string) (*ecdsa.PublicKey, error) {
+	keyStr = strings.TrimSpace(keyStr)
+
+	// 1. 如果包含 PEM 标头，按传统 PEM 格式解析
+	if strings.Contains(keyStr, "-----BEGIN") {
+		block, _ := pem.Decode([]byte(keyStr))
+		if block == nil {
+			return nil, fmt.Errorf("failed to decode PEM block")
+		}
+		pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse PKIX public key: %w", err)
+		}
+		ecdsaPub, ok := pub.(*ecdsa.PublicKey)
+		if !ok {
+			return nil, fmt.Errorf("key is not an ECDSA public key")
+		}
+		return ecdsaPub, nil
+	}
+
+	// 2. 否则，视作 Base64 编码的压缩公钥解析
+	data, err := base64.StdEncoding.DecodeString(keyStr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode base64 key: %w", err)
+	}
+
+	// 压缩格式的 256 位公钥长度固定为 33 字节 (1字节无压缩标志 0x02/0x03 + 32字节 X 坐标)
+	if len(data) == 33 && (data[0] == 0x02 || data[0] == 0x03) {
+		// 💡 默认假设你使用的是标准的 NIST P-256 曲线 (Go 自带)
+		x, y := elliptic.UnmarshalCompressed(elliptic.P256(), data)
+		if x == nil {
+			return nil, fmt.Errorf("failed to unmarshal compressed P-256 public key")
+		}
+		return &ecdsa.PublicKey{
+			Curve: elliptic.P256(),
+			X:     x,
+			Y:     y,
+		}, nil // ✅ 已修复：添加了错误返回占位
+	}
+
+	return nil, fmt.Errorf("unsupported public key format (expected PEM or 33-byte compressed Base64)")
 }
 
 // VerifySignature verifies ECDSA signature (simplified for now)
