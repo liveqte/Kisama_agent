@@ -268,7 +268,7 @@ class Config {
 
   static HOST = process.env.HOST || '0.0.0.0';
   static PORT = parseInt(process.env.PORT || process.env.SERVER_PORT || '8000');
-  static AGENT_VERSION = process.env.AGENT_VERSION || '0.1.6-js';
+  static AGENT_VERSION = process.env.AGENT_VERSION || '0.1.7-js';
   static SESSION_KEY = crypto.randomBytes(32).toString('base64');
   // static SESSION_KEY =""
   static NOISE_KEYS_INTERNAL = NoiseKeyGenerator.generatePair();
@@ -450,6 +450,10 @@ function authEncryptMiddleware(cryptoManager) {
       return next();
     }
 
+    // 🌟 新增：初始化认证状态标签与免密放行白名单
+    req.is_authenticated = true;
+    const bypassPaths = ['/api/baseinfo', '/api/status'];
+
     // === 阶段 1: 请求认证 (DEBUG 模式跳过) ===
     if (!Config.DEBUG && !req.headers['x-debug']) {
       const nonce = req.headers['x-nonce'] || req.headers['X-Nonce'];
@@ -457,13 +461,26 @@ function authEncryptMiddleware(cryptoManager) {
       const authToken = req.headers['x-auth-token'] || req.headers['X-Auth-Token'];
 
       if (!nonce || !timestamp || !authToken) {
-        return res.status(401).json({ error: 'Missing auth headers' });
+        // 🌟 修改：如果缺失认证头且在白名单内，标记未认证并允许放行
+        if (bypassPaths.includes(req.path)) {
+          req.is_authenticated = false;
+        } else {
+          return res.status(401).json({ error: 'Missing auth headers' });
+        }
       }
 
-      try {
-        cryptoManager.verifySignature(nonce, timestamp, authToken);
-      } catch (e) {
-        return res.status(401).json({ error: `Signature verification failed: ${e.message}` });
+      // 只有在目前仍视为“可能已认证”的情况下，才去执行签名校验
+      if (req.is_authenticated) {
+        try {
+          cryptoManager.verifySignature(nonce, timestamp, authToken);
+        } catch (e) {
+          // 🌟 修改：验签失败如果是白名单路由，同样打标签放行
+          if (bypassPaths.includes(req.path)) {
+            req.is_authenticated = false;
+          } else {
+            return res.status(401).json({ error: `Signature verification failed: ${e.message}` });
+          }
+        }
       }
     }
 
@@ -472,22 +489,17 @@ function authEncryptMiddleware(cryptoManager) {
       const isAesEncrypted = (req.headers['x-aes-encrypted'] || '').toLowerCase() === 'true';
       
       try {
-        if (isAesEncrypted) {
-          // 1. 如果是 AES 加密，解密后再解析
+        // 🌟 修复边界：只有通过认证的请求才允许执行 AES 解密
+        if (isAesEncrypted && req.is_authenticated) {
           const rawKeyBuffer = Buffer.from(Config.SESSION_KEY, 'base64');
           const decryptedJsonStr = cryptoManager.decryptData(req.body, rawKeyBuffer);
           req.body = JSON.parse(decryptedJsonStr);
-
         } else if (req.body.startsWith('eyJ')) {
-          // 2. 兼容 Base64 编码的 JSON
           const decodedStr = Buffer.from(req.body, 'base64').toString('utf-8');
           req.body = JSON.parse(decodedStr);
-
         } else if (req.body.trim().startsWith('{') || req.body.trim().startsWith('[')) {
-          // 3. 🚀 核心修复：正常的明文 JSON 字符串 (处理握手阶段未加密的请求)
           req.body = JSON.parse(req.body);
         } else {
-          // 空或纯文本
           if (req.body.trim() === '') req.body = {};
         }
       } catch (e) {
@@ -504,17 +516,24 @@ function authEncryptMiddleware(cryptoManager) {
         try {
           const jsonData = typeof data === 'string' ? JSON.parse(data) : data;
           
-          const encryptedContent = cryptoManager.encryptResponse(jsonData);
-          
-          const encoded = typeof encryptedContent === 'string' ? encryptedContent : JSON.stringify(encryptedContent);
+          // 🌟 修改：只有在【已认证】状态下才执行 ECIES 密文加密
+          if (req.is_authenticated) {
+            const encryptedContent = cryptoManager.encryptResponse(jsonData);
+            const encoded = typeof encryptedContent === 'string' ? encryptedContent : JSON.stringify(encryptedContent);
 
-          if (!Config.DEBUG) {
-            res.set('x-encrypted', 'true');
-            res.set('x-agent-version', Config.AGENT_VERSION);
+            if (!Config.DEBUG) {
+              res.set('x-encrypted', 'true');
+              res.set('x-agent-version', Config.AGENT_VERSION);
+            }
+            res.set('Content-Length', Buffer.byteLength(encoded, 'utf8').toString());
+            return originalSend.call(this, encoded);
+          } else {
+            // 🌟 匿名放行情况下，直接透传未经加密的明文 JSON 字符串
+            const encoded = typeof data === 'string' ? data : JSON.stringify(jsonData);
+            res.set('x-encrypted', 'false');
+            res.set('Content-Length', Buffer.byteLength(encoded, 'utf8').toString());
+            return originalSend.call(this, encoded);
           }
-          
-          res.set('Content-Length', Buffer.byteLength(encoded, 'utf8').toString());
-          return originalSend.call(this, encoded);
           
         } catch (e) {
           if (Config.DEBUG) Logger.error(`💥 [Response Encrypt]: ${e.message}`);
@@ -783,7 +802,7 @@ function authEncryptMiddleware(cryptoManager) {
     const processInfo = await si.processes();
     return {
       cpu: { usage: Math.round(cpuLoad.currentLoad) },
-      ram: { total: mem.total, used: mem.used },
+      ram: { total: mem.total, used: mem.active },
       swap: { total: mem.swaptotal, used: mem.swapused },
       load: {
         load1: Math.round(load.avgLoad * 100) / 100,
@@ -862,8 +881,18 @@ function authEncryptMiddleware(cryptoManager) {
   async _getDiskInfo() {
     try {
       const disks = await si.fsSize();
-      const total = disks.reduce((sum, disk) => sum + disk.size, 0);
-      const used = disks.reduce((sum, disk) => sum + disk.used, 0);
+      
+      // 过滤掉内存盘、联合文件系统以及重复的 loop 设备
+      const validDisks = disks.filter(disk => {
+        return disk.size > 0 && 
+              disk.type !== 'tmpfs' && 
+              disk.type !== 'overlay' && 
+              disk.fs.startsWith('/dev/'); // 只保留真正的 /dev/ 块设备
+      });
+
+      const total = validDisks.reduce((sum, disk) => sum + disk.size, 0);
+      const used = validDisks.reduce((sum, disk) => sum + disk.used, 0);
+      
       return { total, used };
     } catch {
       return { total: 0, used: 0 };
@@ -2006,6 +2035,13 @@ async function main() {
   app.get('/api/baseinfo', async (req, res) => {
     try {
       const info = await systemInfo.getBasicInfo();
+      
+      // 🌟 新增：如果判定为匿名未认证访问，动态剔除核心安全密钥
+      if (req.is_authenticated === false) {
+        info.session_key = null;
+        info.noise_key = null;
+      }
+      
       res.json(info);
     } catch (e) {
       res.status(500).json({ status: 'error', message: e.message });
@@ -2016,6 +2052,7 @@ async function main() {
   app.get('/api/status', async (req, res) => {
     try {
       const status = await systemInfo.getRealtimeInfo();
+      // 🌟 无需额外处理密钥，中间件会自动判定未认证并输出不加密的明文
       res.json(status);
     } catch (e) {
       res.status(500).json({ status: 'error', message: e.message });

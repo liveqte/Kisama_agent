@@ -87,7 +87,7 @@ class BaseInfoResponse(BaseModel):
     swap_total: int = Field(..., description="交换分区总量(字节)", examples=[0])
     version: str = Field(..., description="代理版本", examples=["0.0.1"])
     virtualization: str = Field(..., description="虚拟化环境", examples=["None"])
-    session_key: bytes = Field(..., description="本次会话的动态 AES-256 密钥 (明文，由中间件负责加密)", examples=["k7Bv9...32位密钥字符串或Base64"] )
+    session_key: Optional[bytes] = Field(None, description="本次会话的动态 AES-256 密钥 (明文，由中间件负责加密)", examples=["k7Bv9...32位密钥字符串或Base64"] )
     noise_key: Optional[Dict[str, Any]] = Field(
         None, 
         description="Noise 密钥配置，接收任意字典结构"
@@ -560,7 +560,7 @@ class Config:
     PORT = int(os.getenv("PORT") or os.environ.get('SERVER_PORT') or 8002)
     
     # 代理版本信息
-    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.1.6-python")
+    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.1.7-python")
     
     # ================= 启动校验 =================
     
@@ -889,53 +889,55 @@ class AuthEncryptMiddleware(BaseHTTPMiddleware):
     
     async def dispatch(self, request: Request, call_next):
         headers = request.headers
+        path = request.url.path  # 获取当前请求路径
+        
+        # 🌟 新增：免密放行路由白名单
+        bypass_paths = ["/api/baseinfo", "/api/status"]
         
         # === 阶段 1: 请求认证 (DEBUG 模式跳过) ===
+        request.state.is_authenticated = True  # 默认初始化认证状态为 True
+        
         if not Config.DEBUG and request.method not in ["OPTIONS", "HEAD"]:
             nonce = headers.get("x-nonce")
             timestamp = headers.get("x-timestamp") 
             auth_token = headers.get("x-auth-token")
-             # ========== 添加以下调试输出 ==========
-            Logger.debug("=" * 50)
-            Logger.debug(f"[Auth Debug] {request.method} {request.url.path}")
-            Logger.debug(f"x-nonce     : {nonce}")
-            Logger.debug(f"x-timestamp : {timestamp}")
-            Logger.debug(f"x-auth-token: {auth_token[:30] if auth_token else 'MISSING'}...")
-            Logger.debug(f"All Headers : {dict(headers)}")
-            Logger.debug("=" * 50)
-            # ====================================
-            if not all([nonce, timestamp, auth_token]):
-                return JSONResponse(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    content={"error": "Missing auth headers"}
-                )
             
-            try:
-                crypto.verify_signature(nonce, timestamp, auth_token)
-            except Exception as e:
-                return JSONResponse(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    content={"error": f"Signature verification failed: {str(e)}"}
-                )
+            # 检查是否缺失认证头
+            if not all([nonce, timestamp, auth_token]):
+                # 🌟 修改：如果在白名单内，允许放行但标记为未认证
+                if path in bypass_paths:
+                    request.state.is_authenticated = False
+                else:
+                    return JSONResponse(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        content={"error": "Missing auth headers"}
+                    )
+            
+            # 如果认证头完整，且未被前面标记为伪认证，则执行签名校验
+            if request.state.is_authenticated:
+                try:
+                    crypto.verify_signature(nonce, timestamp, auth_token)
+                except Exception as e:
+                    # 🌟 修改：验签失败如果是白名单路由，同样放行并标记
+                    if path in bypass_paths:
+                        request.state.is_authenticated = False
+                    else:
+                        return JSONResponse(
+                            status_code=status.HTTP_401_UNAUTHORIZED,
+                            content={"error": f"Signature verification failed: {str(e)}"}
+                        )
 
-        # === 阶段 1.5: AES 请求体解密 (核心修复) ===
+        # === 阶段 1.5: AES 请求体解密 (保持不变) ===
         decrypted_body_bytes = None
-        
         if headers.get("x-aes-encrypted") == "true":
-            # 1. 获取原始加密流
             original_body = await request.body()
-            Logger.debug(original_body)
             if original_body:
                 try:
                     encrypted_str = original_body.decode('utf-8')
                     decrypted_json_str = CryptoManager.decrypt_data(encrypted_str, Config._raw_key)
-                    
                     if Config.DEBUG:
                         Logger.debug(f" [AES Decrypt] Success: {decrypted_json_str[:100]}...")
-                    
-                    # 验证 JSON
                     json.loads(decrypted_json_str) 
-                    
                     decrypted_body_bytes = decrypted_json_str.encode('utf-8')
                     request._body = decrypted_body_bytes
                 except Exception as e:
@@ -944,42 +946,27 @@ class AuthEncryptMiddleware(BaseHTTPMiddleware):
                         status_code=status.HTTP_400_BAD_REQUEST,
                         content={"error": f"AES Decrypt failed: {str(e)}"}
                     )
-        # === 关键：拦截 receive 方法 (已修复) ===
+                    
         original_receive = request.receive
-        has_returned_body = False  # 增加状态标记，防止下游死循环读取
+        has_returned_body = False
         
         async def wrapped_receive():
             nonlocal has_returned_body
-            
             if decrypted_body_bytes is not None:
-                # 如果有解密数据，按照 ASGI 规范构建消息体
                 if not has_returned_body:
                     has_returned_body = True
-                    return {
-                        "type": "http.request",
-                        "body": decrypted_body_bytes,
-                        "more_body": False  # 告诉下游：数据发完了
-                    }
+                    return {"type": "http.request", "body": decrypted_body_bytes, "more_body": False}
                 else:
-                    # 如果下游继续请求，返回空报文结束流
-                    return {
-                        "type": "http.request",
-                        "body": b"",
-                        "more_body": False
-                    }
+                    return {"type": "http.request", "body": b"", "more_body": False}
             else:
-                # 如果没有解密（且没有在此中间件中执行过 await request.body()）
-                # 透传原始的 receive
                 return await original_receive()
 
-        # 【重点】将函数对象本身赋值给 _receive，而不是 await 执行它
         request._receive = wrapped_receive
 
         # === 阶段 2: 处理业务逻辑 ===
         try:
             response = await call_next(request)
         except Exception as exc:
-            # 捕获路由中的异常，避免中间件崩溃
             raise exc
 
         # === 阶段 3: 响应加密 ===
@@ -991,21 +978,24 @@ class AuthEncryptMiddleware(BaseHTTPMiddleware):
             
             try:
                 original_data = json.loads(original_body.decode('utf-8'))
-                encrypted_content = crypto.encrypt_response(original_data)
-                encoded = encrypted_content.encode('utf-8')
+                
+                # 🌟 修改：只有在【已认证】状态下才执行加密；未认证请求直接返回明文
+                if getattr(request.state, "is_authenticated", True):
+                    encrypted_content = crypto.encrypt_response(original_data)
+                    encoded = encrypted_content.encode('utf-8')
+                    if not Config.DEBUG:
+                        response.headers["x-encrypted"] = "true"
+                        response.headers["x-agent-version"] = Config.AGENT_VERSION
+                else:
+                    # 未认证情况，直接透传明文
+                    encoded = original_body
+                    response.headers["x-encrypted"] = "false"
                 
                 response.body_iterator = self._async_iter([encoded])
                 response.headers["content-length"] = str(len(encoded))
                 
-                if not Config.DEBUG:
-                    response.headers["x-encrypted"] = "true"
-                    response.headers["x-agent-version"] = Config.AGENT_VERSION
-                    
             except json.JSONDecodeError:
-                pass # 非 JSON 不加密
-            except Exception:
-                if Config.DEBUG:
-                    raise
+                pass 
         return response
     
     @staticmethod
@@ -1016,28 +1006,30 @@ class AuthEncryptMiddleware(BaseHTTPMiddleware):
 #  获取系统信息类
 # ============================================================================
 class SystemInfoCollector:
-    """系统信息收集器"""
+    """系统信息收集器 (已修复跨请求实例化生命周期导致的 0% 状态 Bug)"""
+    
+    # 🌟 核心修复：将增量统计状态提升为类变量，使跨请求创建的瞬时实例能持久共享历史上下文
+    _last_cpu_times = None
+    _last_network_stats = {'rx': 0, 'tx': 0}
+    _total_network_up = 0
+    _total_network_down = 0
+    _last_network_time = time.time()
+    _cpu_init_lock = asyncio.Lock()
     
     def __init__(self):
-        self.last_network_stats = {'rx': 0, 'tx': 0}
-        self.total_network_up = 0
-        self.total_network_down = 0
-        self.last_network_time = time.time()
-        self._cpu_initialized = False
-        self._cpu_init_lock = asyncio.Lock()
+        # 保持空的构造函数，完美兼容原路由层 SystemInfoCollector() 的瞬时调用方式
+        pass
     
     async def get_basic_info(self) -> Dict[str, Any]:
         """获取基础系统信息"""
         dist_info = self._get_linux_distribution()
         
-        # 异步获取 IP 地址
         ipv4, ipv6 = await asyncio.gather(
             self._get_public_ip_v4(),
             self._get_public_ip_v6(),
             return_exceptions=True
         )
         
-        # 处理异常情况
         ipv4 = ipv4 if not isinstance(ipv4, Exception) else None
         ipv6 = ipv6 if not isinstance(ipv6, Exception) else None
         
@@ -1055,13 +1047,13 @@ class SystemInfoCollector:
             "cpu_cores": psutil.cpu_count(),
             "cpu_name": self._get_cpu_name(),
             "disk_total": await self._get_disk_total(),
-            "gpu_name": "",  # Python 暂不支持 GPU 检测
+            "gpu_name": "",  
             "ipv4": ipv4,
             "ipv6": ipv6,
-            "mem_total": self._get_container_mem_limit(),  # 字节单位
+            "mem_total": self._get_container_mem_limit(),  
             "os": os_name,
             "kernel_version": platform.release(),
-            "swap_total": psutil.swap_memory().total,  # 字节单位
+            "swap_total": psutil.swap_memory().total,  
             "version": Config.AGENT_VERSION,
             "virtualization": self._get_virtualization()
         }
@@ -1085,12 +1077,12 @@ class SystemInfoCollector:
                 "usage": cpu_usage
             },
             "ram": {
-                "total": memory_info["ram_total"],    # 字节
-                "used": memory_info["ram_used"]       # 字节
+                "total": memory_info["ram_total"],    
+                "used": memory_info["ram_used"]       
             },
             "swap": {
-                "total": memory_info["swap_total"],   # 字节
-                "used": memory_info["swap_used"]      # 字节
+                "total": memory_info["swap_total"],   
+                "used": memory_info["swap_used"]      
             },
             "load": {
                 "load1": round(psutil.getloadavg()[0] if hasattr(psutil, 'getloadavg') and psutil.getloadavg() else 0, 2),
@@ -1098,8 +1090,8 @@ class SystemInfoCollector:
                 "load15": round(psutil.getloadavg()[2] if hasattr(psutil, 'getloadavg') and psutil.getloadavg() else 0, 2)
             },
             "disk": {
-                "total": disk_info["total"],          # 字节
-                "used": disk_info["used"]             # 字节
+                "total": disk_info["total"],          
+                "used": disk_info["used"]             
             },
             "network": {
                 "up": network_stats["up"],
@@ -1135,79 +1127,91 @@ class SystemInfoCollector:
                             return line.split(':')[1].strip()
         except Exception as e:
             Logger.debug(f"获取CPU名称失败: {e}", 1)
-        
         return "Unknown CPU"
     
     async def _get_cpu_usage(self) -> float:
-        """获取 CPU 使用率 (非阻塞，基于初始化的基准)"""
-        async with self._cpu_init_lock:
-            if not self._cpu_initialized:
-                # 第一次调用时，执行一次阻塞的 cpu_percent 来设置基准
-                # 这会在首次调用 get_realtime_info 时发生，只阻塞一次
-                psutil.cpu_percent(interval=0.1) # 这里阻塞0.1秒设置初始值
-                self._cpu_initialized = True
-                # 返回0.0，因为这是第一次计算，没有可比较的前一个值
-                return 0.0
-        # 后续调用使用 interval=None，不阻塞，基于上一次的基准计算
+        """🌟 升级：获取 CPU 使用率 (通过手动计算 cpu_times 差值，百分百规避缓存失效与生命周期问题)"""
         try:
-            usage = psutil.cpu_percent(interval=None)
-            return round(max(0, min(100, usage)), 2)
+            current_times = psutil.cpu_times()
+            
+            async with SystemInfoCollector._cpu_init_lock:
+                if SystemInfoCollector._last_cpu_times is None:
+                    # 第一次冷启动：建立初始快照基准
+                    SystemInfoCollector._last_cpu_times = current_times
+                    # 微阻塞 0.1 秒提供初次请求的有效值，防止控制端面板第一次加载刷出 0
+                    await asyncio.sleep(0.1)
+                    current_times = psutil.cpu_times()
+                
+                last_times = SystemInfoCollector._last_cpu_times
+                SystemInfoCollector._last_cpu_times = current_times
+            
+            # 计算系统总时间差 (所有 CPU 状态时间片求和)
+            delta_total = sum(current_times) - sum(last_times)
+            # 计算纯空闲时间差
+            delta_idle = current_times.idle - last_times.idle
+            
+            if delta_total <= 0:
+                return 0.0
+                
+            # CPU 使用率 = (总运行时间 - 空闲时间) / 总运行时间 * 100
+            usage = ((delta_total - delta_idle) / delta_total) * 100
+            return round(max(0.0, min(100.0, usage)), 2)
         except Exception as e:
             Logger.debug(f"获取CPU使用率失败: {e}", 2)
-            return 0.0 # 出错时返回0
+            return 0.0
     
     def _get_container_mem_limit(self) -> int:
         """获取容器内存限制（字节），兼容 cgroup v1/v2，无限制时回退 psutil"""
-        # cgroup v2
         try:
-            with open("/sys/fs/cgroup/memory.max", "r") as f:
-                val = f.read().strip()
-                if val != "max":
-                    return int(val)
-        except (OSError, ValueError):
-            pass
-            
-        # cgroup v1
+            if os.path.exists("/sys/fs/cgroup/memory.max"):
+                with open("/sys/fs/cgroup/memory.max", "r") as f:
+                    val = f.read().strip()
+                    if val != "max": return int(val)
+        except (OSError, ValueError): pass
         try:
-            with open("/sys/fs/cgroup/memory/memory.limit_in_bytes", "r") as f:
-                val = int(f.read().strip())
-                if val < 2**63 - 1:  # 2^63-1 表示未限制
-                    return val
-        except (OSError, ValueError):
-            pass
-            
-        # 降级：物理机或未读取到 cgroup 信息
+            if os.path.exists("/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+                with open("/sys/fs/cgroup/memory/memory.limit_in_bytes", "r") as f:
+                    val = int(f.read().strip())
+                    if val < 9223372036854771712: return val
+        except (OSError, ValueError): pass
         return psutil.virtual_memory().total
 
     def _get_container_mem_usage(self) -> int:
-        """获取容器当前内存使用量（字节），兼容 cgroup v1/v2"""
-        # cgroup v2
-        try:
-            with open("/sys/fs/cgroup/memory.current", "r") as f:
-                return int(f.read().strip())
-        except (OSError, ValueError):
-            pass
-            
-        # cgroup v1
-        try:
-            with open("/sys/fs/cgroup/memory/memory.usage_in_bytes", "r") as f:
-                return int(f.read().strip())
-        except (OSError, ValueError):
-            pass
-            
-        # 降级
+        """获取容器当前内存使用量（字节），严格排除 Cache 缓存"""
+        if os.path.exists("/sys/fs/cgroup/memory.current") and os.path.exists("/sys/fs/cgroup/memory.stat"):
+            try:
+                with open("/sys/fs/cgroup/memory.current", "r") as f:
+                    current_raw = int(f.read().strip())
+                file_cache = 0
+                with open("/sys/fs/cgroup/memory.stat", "r") as f:
+                    for line in f:
+                        parts = line.strip().split()
+                        if len(parts) == 2 and parts[0] == "file":
+                            file_cache = int(parts[1])
+                            break
+                return max(0, current_raw - file_cache)
+            except (OSError, ValueError): pass
+        if os.path.exists("/sys/fs/cgroup/memory/memory.usage_in_bytes") and os.path.exists("/sys/fs/cgroup/memory/memory.stat"):
+            try:
+                with open("/sys/fs/cgroup/memory/memory.usage_in_bytes", "r") as f:
+                    current_raw = int(f.read().strip())
+                cache = 0
+                with open("/sys/fs/cgroup/memory/memory.stat", "r") as f:
+                    for line in f:
+                        parts = line.strip().split()
+                        if len(parts) == 2 and parts[0] == "cache":
+                            cache = int(parts[1])
+                            break
+                return max(0, current_raw - cache)
+            except (OSError, ValueError): pass
         return psutil.virtual_memory().used
 
     async def _get_memory_info(self) -> Dict[str, int]:
         """获取内存信息（字节单位）"""
         try:
-            # 优先使用容器感知的内存值
             ram_total = self._get_container_mem_limit()
             ram_used = self._get_container_mem_usage()
-            
-            # Swap 通常由宿主机统一管理，容器一般不单独限制，保留 psutil
             swap = psutil.swap_memory()
-            
             return {
                 "ram_total": ram_total,
                 "ram_used": ram_used,
@@ -1216,25 +1220,15 @@ class SystemInfoCollector:
             }
         except Exception as e:
             Logger.debug(f"获取内存信息失败: {e}", 2)
-            return {
-                "ram_total": 0,
-                "ram_used": 0,
-                "swap_total": 0,
-                "swap_used": 0
-            }
+            return {"ram_total": 0, "ram_used": 0, "swap_total": 0, "swap_used": 0}
     
     def _get_physical_disk_device(self, device_path: str) -> Optional[str]:
         if platform.system() != "Linux":
             return device_path
-            
         import re
-
         dev_name = device_path.replace("/dev/", "")
-        if not dev_name:
-            return None
-        
+        if not dev_name: return None
         if re.match(r'^[a-zA-Z0-9\.\-_]+:', dev_name) or dev_name.startswith('//'):
-            Logger.debug(f"检测到远程存储（NFS/CIFS）: {device_path}，视为有效磁盘", 5)
             return device_path
         DEVICE_PATTERNS = [
             r'^(md[0-9]+)$',
@@ -1244,15 +1238,10 @@ class SystemInfoCollector:
             r'^(mmcblk\d+)p?\d*$',
             r'^(nvme\d+n\d+)p?\d*$',
         ]
-
         for pattern in DEVICE_PATTERNS:
             m = re.match(pattern, dev_name)
-            if m:
-                return f"/dev/{m.group(1)}"
-
-        if not re.search(r'\d', dev_name):
-            return device_path
-
+            if m: return f"/dev/{m.group(1)}"
+        if not re.search(r'\d', dev_name): return device_path
         sys_block_path = f"/sys/block/{dev_name}"
         if os.path.exists(sys_block_path):
             real_parent = os.path.realpath(os.path.dirname(sys_block_path))
@@ -1263,22 +1252,12 @@ class SystemInfoCollector:
                     physical_name = os.path.basename(real_parent)
                     if self._is_physical_disk(f"/dev/{physical_name}"):
                         return f"/dev/{physical_name}"
-
         return None
 
     def _get_container_disk_info(self) -> Dict[str, int]:
-        """容器内获取磁盘：直接取根分区 '/'，不追溯物理设备"""
         try:
-            # 容器视角：'/' 就是全部可用磁盘（已自动应用 quota 限制）
             usage = psutil.disk_usage('/')
-            Logger.debug(
-                f"[容器模式] 磁盘统计: 总空间={usage.total/1024**3:.2f}GB, "
-                f"已用={usage.used/1024**3:.2f}GB, 使用率={usage.percent:.2f}%,5"
-            )
-            return {
-                "total": int(usage.total),
-                "used": int(usage.used)
-            }
+            return {"total": int(usage.total), "used": int(usage.used)}
         except Exception as e:
             Logger.debug(f"[容器模式] 获取磁盘信息失败: {e}", 5)
             return {"total": 0, "used": 0}
@@ -1288,339 +1267,202 @@ class SystemInfoCollector:
             total_bytes = 0
             used_bytes = 0
             seen_physical_devices = set()
-
             partitions = psutil.disk_partitions(all=True)
-            Logger.debug(f"获取到 {len(partitions)} 个分区", 5)
             for partition in partitions:
                 device = partition.device
                 mountpoint = partition.mountpoint
                 fstype = partition.fstype
-
                 if fstype in {'tmpfs', 'devtmpfs', 'overlay', 'squashfs', 'proc', 'sysfs', 'debugfs', 'configfs', 'cgroup', 'cgroup2', 'pstore', 'bpf', 'tracefs', 'securityfs', 'efivarfs'}:
-                    Logger.debug(f"跳过虚拟文件系统: {fstype} (设备: {device}, 挂载点: {mountpoint})", 5)
                     continue
-
                 physical_device = self._get_physical_disk_device(device)
-                if not physical_device:
-                    Logger.debug(f"无法解析物理磁盘设备名，跳过分区: {device} (挂载点: {mountpoint})", 5)
+                if not physical_device or physical_device in seen_physical_devices:
                     continue
-
-                if physical_device in seen_physical_devices:
-                    Logger.debug(f"物理磁盘 {physical_device} 已处理，跳过分区: {device} (挂载点: {mountpoint})", 5)
-                    continue
-
                 if not self._is_physical_disk(physical_device):
-                    Logger.debug(f"设备 {physical_device} (来自分区 {device}) 不是物理磁盘，跳过", 5)
                     continue
-
                 try:
                     usage = psutil.disk_usage(mountpoint)
-                    Logger.debug(
-                        f"统计物理磁盘 {physical_device} (来自分区 {device}): 挂载点={mountpoint}, "
-                        f"总空间={usage.total} 字节, 已用={usage.used} 字节, 可用={usage.free} 字节, 使用率={usage.percent:.2f}%",
-                        5
-                    )
                     total_bytes += usage.total
                     used_bytes += usage.used
-                    Logger.debug(f"当前累计统计量: 总空间={total_bytes} 字节, 已用={used_bytes} 字节", 5)
                     seen_physical_devices.add(physical_device)
-                except (PermissionError, OSError) as e:
-                    Logger.debug(f"跳过分区 {device}（挂载点: {mountpoint}, 物理磁盘: {physical_device}）: {e}", 5)
+                except (PermissionError, OSError):
                     continue
-
-            Logger.debug(f"磁盘统计完成 (按物理磁盘去重): 总空间={total_bytes} 字节, 已用={used_bytes} 字节", 5)
-            return {
-                "total": total_bytes,
-                "used": used_bytes
-            }
+            return {"total": total_bytes, "used": used_bytes}
         except Exception as e:
             Logger.debug(f"获取磁盘信息失败: {e}", 5)
             return {"total": 0, "used": 0}
+
     async def _get_disk_info(self) -> Dict[str, int]:
-        """统一入口：自动识别环境并分发"""
         if self._get_virtualization() in ['Docker', 'Lxc', 'Podman']:
             return self._get_container_disk_info()
-        else:
-            return await self._get_host_disk_info()
+        return await self._get_host_disk_info()
 
     async def _get_disk_total(self) -> int:
-        """获取磁盘总容量"""
         disk_info = await self._get_disk_info()
         return disk_info["total"]
     
     def _is_physical_disk(self, device: str) -> bool:
         if platform.system() == "Windows":
             return any(device.lower().startswith(drive) for drive in ['c:', 'd:', 'e:', 'f:', 'g:', 'h:'])
-        else:
-            import re
-            #nfs也作为有效磁盘
-            if re.match(r'^[a-zA-Z0-9\.\-_]+:', device) or device.startswith('//'):
-                return True
-            physical_patterns = [
-                r'^/dev/sd[a-z]+$',
-                r'^/dev/vd[a-z]+$',
-                r'^/dev/xvd[a-z]+$',
-                r'^/dev/nvme[0-9]+n[0-9]+$',
-                r'^/dev/mmcblk[0-9]+$',
-                r'^/dev/md[0-9]+$', 
-                r'^zroot/.*$',
-            ]
-            is_physical_device = any(re.match(pattern, device) for pattern in physical_patterns)
-            return is_physical_device
+        import re
+        if re.match(r'^[a-zA-Z0-9\.\-_]+:', device) or device.startswith('//'):
+            return True
+        physical_patterns = [
+            r'^/dev/sd[a-z]+$', r'^/dev/vd[a-z]+$', r'^/dev/xvd[a-z]+$',
+            r'^/dev/nvme[0-9]+n[0-9]+$', r'^/dev/mmcblk[0-9]+$',
+            r'^/dev/md[0-9]+$', r'^zroot/.*$',
+        ]
+        return any(re.match(pattern, device) for pattern in physical_patterns)
     
     async def _get_network_stats(self) -> Dict[str, int]:
-        """
-        使用 psutil 按网卡获取网络统计（推荐）
-        返回所有物理网卡的总和，排除虚拟网卡
-        """
+        """🌟 升级：按网卡获取网络统计（通过类变量维持上一秒的状态快照）"""
         try:
-            # 获取所有网卡的IO统计
             net_io = psutil.net_io_counters(pernic=True)
             current_time = time.time()
             
-            # 初始化累计变量
             total_current_rx = 0
             total_current_tx = 0
-            
-            # 定义要排除的虚拟网卡模式
             exclude_patterns = ['lo', 'docker', 'veth', 'br-', 'tun', 'virbr']
             
-            # 遍历所有网卡，累加物理网卡的数据
             for interface, stats in net_io.items():
-                # 检查是否为虚拟网卡
                 if any(pattern in interface for pattern in exclude_patterns):
-                    Logger.debug(f"排除虚拟网卡: {interface}", 4)
                     continue
-                
-                Logger.debug(f"统计物理网卡 {interface}: RX={stats.bytes_recv}, TX={stats.bytes_sent}", 4)
                 total_current_rx += stats.bytes_recv
                 total_current_tx += stats.bytes_sent
             
-            # 后续计算逻辑与之前相同（瞬时速率和累计流量）
-            # 第一次运行，初始化总流量为当前网卡累计值
-            if self.last_network_stats['rx'] == 0:
-                Logger.debug(f"第一次网络统计(psutil按网卡)，初始化总流量: 下载={total_current_rx}, 上传={total_current_tx}", 4)
-                self.total_network_down = total_current_rx
-                self.total_network_up = total_current_tx
-                self.last_network_stats = {'rx': total_current_rx, 'tx': total_current_tx}
-                self.last_network_time = current_time
-                
+            # 第一轮请求初始化
+            if SystemInfoCollector._last_network_stats['rx'] == 0:
+                SystemInfoCollector._total_network_down = total_current_rx
+                SystemInfoCollector._total_network_up = total_current_tx
+                SystemInfoCollector._last_network_stats = {'rx': total_current_rx, 'tx': total_current_tx}
+                SystemInfoCollector._last_network_time = current_time
                 return {
-                    "up": 0,
-                    "down": 0,
-                    "total_up": self.total_network_up,
-                    "total_down": self.total_network_down
+                    "up": 0, "down": 0,
+                    "total_up": SystemInfoCollector._total_network_up,
+                    "total_down": SystemInfoCollector._total_network_down
                 }
             
-            # 计算瞬时速率
-            time_diff = current_time - self.last_network_time
+            # 跨请求计算瞬时速率
+            time_diff = current_time - SystemInfoCollector._last_network_time
+            up_speed = 0
+            down_speed = 0
             if time_diff > 0:
-                down_speed = (total_current_rx - self.last_network_stats['rx']) / time_diff
-                up_speed = (total_current_tx - self.last_network_stats['tx']) / time_diff
-                
-                # 确保速率不为负
+                down_speed = (total_current_rx - SystemInfoCollector._last_network_stats['rx']) / time_diff
+                up_speed = (total_current_tx - SystemInfoCollector._last_network_stats['tx']) / time_diff
                 down_speed = max(0, down_speed)
                 up_speed = max(0, up_speed)
                 
-                # 更新总流量：直接使用当前网卡累计值
-                self.total_network_down = total_current_rx
-                self.total_network_up = total_current_tx
-                
-                Logger.debug(f"网络统计(psutil按网卡): 下载速度={int(down_speed)} B/s, 上传速度={int(up_speed)} B/s, 总下载={self.total_network_down}, 总上传={self.total_network_up}", 4)
+                SystemInfoCollector._total_network_down = total_current_rx
+                SystemInfoCollector._total_network_up = total_current_tx
             
-            # 更新统计值
-            self.last_network_stats = {'rx': total_current_rx, 'tx': total_current_tx}
-            self.last_network_time = current_time
+            SystemInfoCollector._last_network_stats = {'rx': total_current_rx, 'tx': total_current_tx}
+            SystemInfoCollector._last_network_time = current_time
             
             return {
                 "up": int(up_speed),
                 "down": int(down_speed),
-                "total_up": self.total_network_up,
-                "total_down": self.total_network_down
+                "total_up": SystemInfoCollector._total_network_up,
+                "total_down": SystemInfoCollector._total_network_down
             }
-            
         except Exception as e:
             Logger.debug(f"psutil 按网卡统计失败: {e}", 4)
             return {"up": 0, "down": 0, "total_up": 0, "total_down": 0}
     
     async def _get_tcp_connections(self) -> int:
-        """获取 TCP 连接数"""
         try:
             if platform.system() == "Windows":
-                # Windows 使用 netstat 命令
-                result = subprocess.run(
-                    ['netstat', '-n', '-p', 'tcp'], 
-                    capture_output=True, 
-                    text=True, 
-                    timeout=5
-                )
-                count = len([line for line in result.stdout.split('\n') if 'ESTABLISHED' in line])
-                return count
-            else:
-                # Linux 使用 psutil
-                connections = psutil.net_connections(kind='tcp')
-                return len([conn for conn in connections if conn.status == 'ESTABLISHED'])
+                result = subprocess.run(['netstat', '-n', '-p', 'tcp'], capture_output=True, text=True, timeout=5)
+                return len([line for line in result.stdout.split('\n') if 'ESTABLISHED' in line])
+            connections = psutil.net_connections(kind='tcp')
+            return len([conn for conn in connections if conn.status == 'ESTABLISHED'])
         except Exception as e:
             Logger.debug(f"获取TCP连接数失败: {e}", 2)
             return 0
     
     async def _get_udp_connections(self) -> int:
-        """获取 UDP 连接数"""
         try:
             if platform.system() == "Windows":
-                result = subprocess.run(
-                    ['netstat', '-n', '-p', 'udp'], 
-                    capture_output=True, 
-                    text=True, 
-                    timeout=5
-                )
-                count = len([line for line in result.stdout.split('\n') if 'UDP' in line and line.strip()])
-                return count
-            else:
-                connections = psutil.net_connections(kind='udp')
-                return len(connections)
+                result = subprocess.run(['netstat', '-n', '-p', 'udp'], capture_output=True, text=True, timeout=5)
+                return len([line for line in result.stdout.split('\n') if 'UDP' in line and line.strip()])
+            return len(psutil.net_connections(kind='udp'))
         except Exception as e:
             Logger.debug(f"获取UDP连接数失败: {e}", 2)
             return 0
     
     def _get_linux_distribution(self) -> Dict[str, str]:
-        """获取 Linux 发行版信息"""
         try:
-            if platform.system() == "Linux":
-                if os.path.exists('/etc/os-release'):
-                    with open('/etc/os-release', 'r') as f:
-                        content = f.read()
-                    
-                    name = 'Unknown'
-                    version = 'Unknown'
-                    
-                    for line in content.split('\n'):
-                        if line.startswith('ID='):
-                            name = line.replace('ID=', '').replace('"', '').strip()
-                        elif line.startswith('VERSION_ID='):
-                            version = line.replace('VERSION_ID=', '').replace('"', '').strip()
-                    
-                    return {'name': name, 'version': version}
-        except Exception:
-            pass
-        
+            if platform.system() == "Linux" and os.path.exists('/etc/os-release'):
+                with open('/etc/os-release', 'r') as f: content = f.read()
+                name, version = 'Unknown', 'Unknown'
+                for line in content.split('\n'):
+                    if line.startswith('ID='): name = line.replace('ID=', '').replace('"', '').strip()
+                    elif line.startswith('VERSION_ID='): version = line.replace('VERSION_ID=', '').replace('"', '').strip()
+                return {'name': name, 'version': version}
+        except Exception: pass
         return {'name': 'Unknown', 'version': 'Unknown'}
     
     def _get_virtualization(self) -> str:
-        """获取虚拟化/容器化信息"""
         try:
             if platform.system() == "Linux":
-                
-                # 1. 检查特征文件 (最快速，命中率高)
-                if os.path.exists('/.dockerenv'):
-                    return 'Docker'
-                if os.path.exists('/run/.containerenv'):
-                    return 'Podman'  # Podman 容器的专属特征文件
-
-                # 2. 检查 Cgroup (兼容 V1，并增加 containerd/kubepods 识别)
+                if os.path.exists('//.dockerenv'): return 'Docker'
+                if os.path.exists('/run/.containerenv'): return 'Podman'
                 if os.path.exists('/proc/1/cgroup'):
-                    with open('/proc/1/cgroup', 'r', encoding='utf-8', errors='ignore') as f:
+                    with open('/proc/proc/1/cgroup', 'r', encoding='utf-8', errors='ignore') as f:
                         content = f.read().lower()
-                        if 'docker' in content or 'containerd' in content:
-                            return 'Docker'
-                        elif 'kubepods' in content:
-                            return 'Kubernetes' # K8s 环境，底层可能是 containerd/docker
-                        elif 'lxc' in content:
-                            return 'LXC'
-
-                # 3. 检查挂载点信息 (应对 Cgroup V2 和被隐藏特征的容器)
-                # 容器内部通常会将根目录 / 或特定目录通过 overlayfs 或带有 docker/containers 字眼的路径挂载
+                        if 'docker' in content or 'containerd' in content: return 'Docker'
+                        elif 'kubepods' in content: return 'Kubernetes'
+                        elif 'lxc' in content: return 'LXC'
                 if os.path.exists('/proc/self/mountinfo'):
                     with open('/proc/self/mountinfo', 'r', encoding='utf-8', errors='ignore') as f:
                         content = f.read()
-                        # 检查是否有典型的 docker 容器挂载路径
-                        if '/docker/containers/' in content or 'workdir=/var/lib/docker' in content:
-                            return 'Docker'
-                        # 检查是否有 K8s 挂载特征
-                        elif '/pods/' in content or 'kubelet' in content:
-                            return 'Kubernetes'
-
-                # 4. 检查初始进程的环境变量 (LXC 等有时会在这里暴露)
+                        if '/docker/containers/' in content or 'workdir=/var/lib/docker' in content: return 'Docker'
+                        elif '/pods/' in content or 'kubelet' in content: return 'Kubernetes'
                 if os.path.exists('/proc/1/environ'):
                     with open('/proc/1/environ', 'r', encoding='utf-8', errors='ignore') as f:
-                        content = f.read()
-                        if 'container=lxc' in content:
-                            return 'LXC'
-
-                # 5. 检查硬件级/系统级虚拟化 (KVM/QEMU)
+                        if 'container=lxc' in f.read(): return 'LXC'
                 if os.path.exists('/proc/cpuinfo'):
                     with open('/proc/cpuinfo', 'r', encoding='utf-8', errors='ignore') as f:
                         content = f.read()
-                        if 'QEMU' in content or 'KVM' in content:
-                            return 'QEMU'
-
+                        if 'QEMU' in content or 'KVM' in content: return 'QEMU'
         except Exception as e:
-            # 建议把具体的错误异常打出来，方便日后排查权限或 I/O 问题
             Logger.error(f"❌ 获取虚拟化信息失败: {e}")
-        
         return 'None'
     
     async def _get_public_ip_v4(self) -> Optional[str]:
-        """获取公网 IPv4 地址"""
-        services = [
-            'https://api.ipify.org',
-            'https://icanhazip.com',
-            'https://checkip.amazonaws.com',
-            'https://ifconfig.me/ip',
-        ]
-        
+        services = ['https://api.ipify.org', 'https://icanhazip.com', 'https://checkip.amazonaws.com', 'https://ifconfig.me/ip']
         for service in services:
             try:
                 ip = await self._fetch_ip(service)
-                if ip and self._is_valid_ipv4(ip):
-                    return ip
-            except Exception:
-                continue
-        
+                if ip and self._is_valid_ipv4(ip): return ip
+            except Exception: continue
         return None
     
     async def _get_public_ip_v6(self) -> Optional[str]:
-        """获取公网 IPv6 地址"""
-        services = [
-            'https://api6.ipify.org',
-            'https://icanhazip.com',
-        ]
-        
+        services = ['https://api6.ipify.org', 'https://icanhazip.com']
         for service in services:
             try:
                 ip = await self._fetch_ip(service)
-                if ip and self._is_valid_ipv6(ip):
-                    return ip
-            except Exception:
-                continue
-        
+                if ip and self._is_valid_ipv6(ip): return ip
+            except Exception: continue
         return None
     
     async def _fetch_ip(self, url: str) -> str:
-        """获取 IP 地址"""
         timeout = aiohttp.ClientTimeout(total=5)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(url, headers={'user-agent': Config.AGENT_VERSION}) as response:
-                if response.status == 200:
-                    return (await response.text()).strip()
-                else:
-                    raise Exception(f"HTTP {response.status}")
+                if response.status == 200: return (await response.text()).strip()
+                raise Exception(f"HTTP {response.status}")
     
     def _is_valid_ipv4(self, ip: str) -> bool:
-        """验证 IPv4 地址"""
         try:
             socket.inet_pton(socket.AF_INET, ip)
             return True
-        except socket.error:
-            return False
+        except socket.error: return False
     
     def _is_valid_ipv6(self, ip: str) -> bool:
-        """验证 IPv6 地址"""
         try:
             socket.inet_pton(socket.AF_INET6, ip)
             return True
-        except socket.error:
-            return False
+        except socket.error: return False
 # ============================================================================
 # 📁 文件模块: FileManager 类 (面向对象封装)
 # ============================================================================
@@ -2545,26 +2387,32 @@ async def get_smart_payload(request: Request) -> ExecRequestJSON:
         return ExecRequestJSON(cmd=body_str)
 
 @app.get("/api/baseinfo", response_model=BaseInfoResponse)
-async def get_status():
+async def get_baseinfo(request: Request):  # 🌟 修正函数名，注入 request
     """
-    获取代理端状态信息
-    🔐 需要签名认证 (DEBUG模式除外)
-    🔒 响应体自动加密 (DEBUG模式除外)
+    获取代理端基础信息
+    🔐 有认证头时返回完整加密信息，无认证头时返回基础明文（剔除动态密钥）
     """
     basic_info = await SystemInfoCollector().get_basic_info()
-    basic_info["session_key"]=Config.SESSION_KEY
-    basic_info["noise_key"]=Config.NOISE_KEY
+    
+    # 根据中间件标记的认证状态，动态决定是否下发敏感密钥
+    if getattr(request.state, "is_authenticated", True):
+        basic_info["session_key"] = Config.SESSION_KEY
+        basic_info["noise_key"] = Config.NOISE_KEY
+    else:
+        basic_info["session_key"] = None
+        basic_info["noise_key"] = None
+        
     return basic_info
 
+
 @app.get("/api/status", response_model=StatusResponse)
-async def get_status():
+async def get_realtime_status(request: Request):  # 🌟 修正函数名，注入 request 保持行为一致
     """
-    获取代理端状态信息
-    🔐 需要签名认证 (DEBUG模式除外)
-    🔒 响应体自动加密 (DEBUG模式除外)
+    获取代理端实时监控信息
+    🔐 有认证头时返回加密密文，无认证头时直接放行返回明文 JSON
     """
-    status = await SystemInfoCollector().get_realtime_info()
-    return status
+    status_info = await SystemInfoCollector().get_realtime_info()
+    return status_info
 
 @app.post("/api/exec", response_model=ExecResponse)
 async def exec_command(

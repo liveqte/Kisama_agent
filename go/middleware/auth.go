@@ -28,6 +28,11 @@ func AuthEncryptMiddleware(cm *crypto.CryptoManager, cfg *config.Config) gin.Han
 			return
 		}
 
+		// 🌟 新增：初始化认证状态标签，并定义匿名免密放行白名单
+		c.Set("is_authenticated", true)
+		path := c.Request.URL.Path
+		isBypassPath := path == "/api/baseinfo" || path == "/api/status"
+
 		// Phase 1: Request authentication (skip in DEBUG mode)
 		skipAuth := cfg.Debug || c.Request.Header.Get("x-debug") != ""
 		
@@ -37,43 +42,62 @@ func AuthEncryptMiddleware(cm *crypto.CryptoManager, cfg *config.Config) gin.Han
 			authToken := c.GetHeader("x-auth-token")
 
 			if nonce == "" || timestamp == "" || authToken == "" {
-				logger.Warnf("Missing auth headers - nonce: %s, timestamp: %s, authToken: %s", nonce, timestamp, authToken)
-				c.JSON(401, gin.H{"error": "Missing auth headers"})
-				c.Abort()
-				return
+				//logger.Warnf("Missing auth headers - nonce: %s, timestamp: %s, authToken: %s", nonce, timestamp, authToken)
+				// 🌟 修改：如果是白名单路由，允许放行但标记为未认证
+				if isBypassPath {
+					c.Set("is_authenticated", false)
+				} else {
+					c.JSON(401, gin.H{"error": "Missing auth headers"})
+					c.Abort()
+					return
+				}
 			}
 
 			// Verify signature
-			if err := cm.VerifySignature(nonce, timestamp, authToken); err != nil {
-				logger.Debugf("Signature verification failed: %v", err)
+			// 🌟 修改：只有在未被标记为“未认证”的情况下，才去执行签名校验
+			if isAuth, _ := c.Get("is_authenticated"); isAuth == true {
+				if err := cm.VerifySignature(nonce, timestamp, authToken); err != nil {
+					logger.Debugf("Signature verification failed: %v", err)
+					// 🌟 修改：验签失败如果是白名单路由，同样放行并标记
+					if isBypassPath {
+						c.Set("is_authenticated", false)
+					} else {
+						c.JSON(401, gin.H{"error": "Signature verification failed"})
+						c.Abort()
+						return
+					}
+				}
 			}
 
 			// Verify timestamp - more lenient window
-			var ts int64
-			if _, err := time.Parse("2006-01-02T15:04:05Z07:00", timestamp); err == nil {
-				// Parse as RFC3339
-				parsedTime, _ := time.Parse(time.RFC3339, timestamp)
-				ts = parsedTime.Unix()
-			} else {
-				// Try as unix timestamp
-				fmt.Sscanf(timestamp, "%d", &ts)
-			}
+			// 🌟 修改：只有在目前仍视为“已认证”的情况下，才去执行时间戳校验逻辑
+			if isAuth, _ := c.Get("is_authenticated"); isAuth == true {
+				var ts int64
+				if _, err := time.Parse("2006-01-02T15:04:05Z07:00", timestamp); err == nil {
+					// Parse as RFC3339
+					parsedTime, _ := time.Parse(time.RFC3339, timestamp)
+					ts = parsedTime.Unix()
+				} else {
+					// Try as unix timestamp
+					fmt.Sscanf(timestamp, "%d", &ts)
+				}
 
-			now := time.Now().Unix()
-			timeDiff := math.Abs(float64(now - ts))
-			
-			// Use a larger window or skip timestamp check in debug
-			timeWindow := int64(cfg.TimestampWindow)
-			if timeWindow < 300 {
-				timeWindow = 300 // At least 5 minutes
-			}
-			
-			if timeDiff > float64(timeWindow) {
-				logger.Debugf("Timestamp validation - now: %d, ts: %d, diff: %.0f, window: %d", now, ts, timeDiff, timeWindow)
-				// Don't reject due to timestamp in this version - JS might use old timestamps
-				// c.JSON(401, gin.H{"error": "Timestamp expired"})
-				// c.Abort()
-				// return
+				now := time.Now().Unix()
+				timeDiff := math.Abs(float64(now - ts))
+				
+				// Use a larger window or skip timestamp check in debug
+				timeWindow := int64(cfg.TimestampWindow)
+				if timeWindow < 300 {
+					timeWindow = 300 // At least 5 minutes
+				}
+				
+				if timeDiff > float64(timeWindow) {
+					logger.Debugf("Timestamp validation - now: %d, ts: %d, diff: %.0f, window: %d", now, ts, timeDiff, timeWindow)
+					// Don't reject due to timestamp in this version - JS might use old timestamps
+					// c.JSON(401, gin.H{"error": "Timestamp expired"})
+					// c.Abort()
+					// return
+				}
 			}
 		}
 
@@ -93,8 +117,10 @@ func AuthEncryptMiddleware(cm *crypto.CryptoManager, cfg *config.Config) gin.Han
 
 			// Check if AES encrypted
 			isEncrypted := strings.ToLower(c.GetHeader("x-aes-encrypted")) == "true"
+			isAuth, _ := c.Get("is_authenticated")
 			
-			if isEncrypted {
+			// 🌟 修改：只有在通过认证的请求下，才执行 AES 密文解密
+			if isEncrypted && isAuth == true {
 				logger.Debugf("Request is AES encrypted, attempting decryption...")
 				decryptedStr, err := cm.DecryptData(bodyStr, cfg.SessionKey)
 				if err != nil {
@@ -195,6 +221,12 @@ func ResponseEncrypt(cm *crypto.CryptoManager, cfg *config.Config) gin.HandlerFu
 		if strings.Contains(c.Writer.Header().Get("Content-Type"), "application/json") {
 			// If response is already encrypted, skip
 			if c.Writer.Header().Get("x-encrypted") == "true" {
+				return
+			}
+
+			// 🌟 新增：如果判定为匿名放行请求，直接将其标记为未加密，透传明文返回
+			if isAuth, exists := c.Get("is_authenticated"); exists && isAuth == false {
+				c.Writer.Header().Set("x-encrypted", "false")
 				return
 			}
 

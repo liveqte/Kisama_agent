@@ -21,6 +21,28 @@ func GetBaseInfo(c *gin.Context) {
 		return
 	}
 
+	// 🌟 新增：根据中间件注入的认证标签状态，动态清空核心敏感密钥
+	sessionKey := cfg.SessionKey
+	var noiseKey models.NoiseKeyConfig
+
+	if isAuth, exists := c.Get("is_authenticated"); exists && isAuth == false {
+		sessionKey = ""
+		// noiseKey 保持 Go 的零值/空结构体返回（不填充密钥内容）
+	} else {
+		noiseKey = models.NoiseKeyConfig{
+			Controller: struct {
+				Private string `json:"private"`
+			}{
+				Private: cfg.NoiseKeys.Control.PrivateB64,
+			},
+			Agent: struct {
+				Public string `json:"public"`
+			}{
+				Public: cfg.NoiseKeys.Agent.PublicB64,
+			},
+		}
+	}
+
 	response := models.BaseInfoResponse{
 		BaseResponse: models.BaseResponse{Status: "ok"},
 		Arch:         runtime.GOARCH,
@@ -36,21 +58,12 @@ func GetBaseInfo(c *gin.Context) {
 		SwapTotal:    sysInfo.SwapTotal,
 		Version:      cfg.AgentVersion,
 		Virtualization: sysInfo.Virtualization,
-		SessionKey:   cfg.SessionKey,
-		NoiseKey: models.NoiseKeyConfig{
-			Controller: struct {
-				Private string `json:"private"`
-			}{
-				Private: cfg.NoiseKeys.Control.PrivateB64,
-			},
-			Agent: struct {
-				Public string `json:"public"`
-			}{
-				Public: cfg.NoiseKeys.Agent.PublicB64,
-			},
-		},
+		SessionKey:   sessionKey, // 🌟 使用动态过滤后的 SessionKey
+		NoiseKey:     noiseKey,   // 🌟 使用动态过滤后的 NoiseKey
 	}
 
+	// 🌟 额外塞入 context，用于适配并在正常流程下激活 ResponseEncrypt 中间件进行响应体自动处理
+	c.Set("responseBody", response)
 	c.JSON(http.StatusOK, response)
 }
 
@@ -99,5 +112,7 @@ func GetStatus(c *gin.Context) {
 		Message: "",
 	}
 
+	// 🌟 额外塞入 context，用于适配并在正常流程下激活 ResponseEncrypt 中间件
+	c.Set("responseBody", response)
 	c.JSON(http.StatusOK, response)
 }
