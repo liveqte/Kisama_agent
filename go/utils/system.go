@@ -87,7 +87,16 @@ func GetSystemInfo() (*SystemInfo, error) {
 	kernelVersion := ""
 	virtualization := "None"
 	if osInfo != nil {
-		osName = fmt.Sprintf("%s %s", osInfo.OS, osInfo.PlatformVersion)
+		// 优先使用具体的发行版名称（如 ubuntu），如果没有则用大类（如 linux）兜底
+		sysName := osInfo.Platform
+		if sysName == "" {
+			sysName = osInfo.OS
+		}
+		
+		// 如果想让首字母大写（比如 ubuntu 变成 Ubuntu），可以加上 strings.Title
+		// 但直接用 sysName 也完全没问题
+		osName = fmt.Sprintf("%s %s", sysName, osInfo.PlatformVersion)
+		
 		kernelVersion = osInfo.KernelVersion
 		virtualization = osInfo.VirtualizationSystem
 	}
