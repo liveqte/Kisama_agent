@@ -30,7 +30,7 @@ func main() {
 	}
 
 	// Create crypto manager
-	cm, err := crypto.NewCryptoManager(cfg.ECDSAPublicKeyPEM, cfg.ECIESPublicKeyB64)
+	cm, err := crypto.NewCryptoManager(cfg.ECDSAPublicKey, cfg.ECIESPublicKeyB64)
 	if err != nil {
 		logger.Errorf("Failed to create crypto manager: %v", err)
 		os.Exit(1)
