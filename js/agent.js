@@ -35,7 +35,7 @@ const base64 = require('base64-js');
 const expressWs = require('express-ws');
 const createNoise = require('noise-c.wasm');
 
-const { p256 } = require('@noble/curves/nist.js');
+let p256;
 
 let pty;
 try {
@@ -271,7 +271,7 @@ class Config {
 
   static HOST = process.env.HOST || '0.0.0.0';
   static PORT = parseInt(process.env.PORT || process.env.SERVER_PORT || '8000');
-  static AGENT_VERSION = process.env.AGENT_VERSION || '0.1.9-js';
+  static AGENT_VERSION = process.env.AGENT_VERSION || '0.2.0-js';
   static SESSION_KEY = crypto.randomBytes(32).toString('base64');
   // static SESSION_KEY =""
   static NOISE_KEYS_INTERNAL = NoiseKeyGenerator.generatePair();
@@ -2021,6 +2021,8 @@ class TerminalSessionHandler {
  */
 async function main(options = {}) {
   try {
+    const curves = await import('@noble/curves/nist.js');
+    p256 = curves.p256;
     Logger.debug('Starting main() function...');
     Config.merge(options);
     // 配置校验
