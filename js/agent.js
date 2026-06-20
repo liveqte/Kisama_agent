@@ -322,6 +322,26 @@ class Config {
       }
     }
   }
+  // ==========================================
+  // ✨ 新增核心方法：允许外部动态合并/注入配置
+  // ==========================================
+  static merge(options = {}) {
+    if (!options) return;
+
+    // 1. 动态覆盖端口（顺便贴心地做一下类型转换，防止外部传了字符串类型的端口）
+    if (options.PORT !== undefined && options.PORT !== null) {
+      this.PORT = parseInt(String(options.PORT), 10);
+    }
+
+    // 2. 动态覆盖密钥（如果有传，就直接碾压原先从文件或环境读取的值）
+    if (options.ECDSA_PUBLIC_KEY_PEM) {
+      this.ECDSA_PUBLIC_KEY_PEM = options.ECDSA_PUBLIC_KEY_PEM.trim();
+    }
+    
+    if (options.ECIES_PUBLIC_KEY_PEM) {
+      this.ECIES_PUBLIC_KEY_PEM = options.ECIES_PUBLIC_KEY_PEM.trim();
+    }
+  }
 }
 
 // ============================================================================
@@ -1991,11 +2011,17 @@ class TerminalSessionHandler {
         }
     }
 }
-
-async function main() {
+/**
+ * 启动主服务
+ * @param {Object} [options] - 可选的配置参数对象
+ * @param {number|string} [options.PORT] - 端口号
+ * @param {string} [options.ECDSA_PUBLIC_KEY_PEM] - ECDSA 公钥
+ * @param {string} [options.ECIES_PUBLIC_KEY_PEM] - ECIES 公钥
+ */
+async function main(options = {}) {
   try {
     Logger.debug('Starting main() function...');
-    
+    Config.merge(options);
     // 配置校验
     Logger.debug('Validating config...');
     Config.validate();
@@ -2373,4 +2399,4 @@ if (require.main === module||require.main?.filename?.includes('ts-node')) {
   main().catch(Logger.error);
 }
 
-module.exports = { Config, CryptoManager, SystemInfoCollector, CommandExecutor, FileManager, TaskManager };
+module.exports = { main,Config, CryptoManager, SystemInfoCollector, CommandExecutor, FileManager, TaskManager };
