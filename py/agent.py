@@ -561,7 +561,7 @@ class Config:
     PORT = int(os.getenv("PORT") or os.environ.get('SERVER_PORT') or 8002)
     
     # 代理版本信息
-    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.1.8-python")
+    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.1.9-python")
     
     # ================= 启动校验 =================
     
