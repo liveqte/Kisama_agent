@@ -35,8 +35,8 @@ const base64 = require('base64-js');
 const expressWs = require('express-ws');
 const createNoise = require('noise-c.wasm');
 
-const elliptic = require('elliptic');
-const ec = new elliptic.ec('p256');
+const { p256 } = require('@noble/curves/nist.js');
+
 let pty;
 try {
     if (typeof Bun !== 'undefined') {
@@ -271,7 +271,7 @@ class Config {
 
   static HOST = process.env.HOST || '0.0.0.0';
   static PORT = parseInt(process.env.PORT || process.env.SERVER_PORT || '8000');
-  static AGENT_VERSION = process.env.AGENT_VERSION || '0.1.8-js';
+  static AGENT_VERSION = process.env.AGENT_VERSION || '0.1.9-js';
   static SESSION_KEY = crypto.randomBytes(32).toString('base64');
   // static SESSION_KEY =""
   static NOISE_KEYS_INTERNAL = NoiseKeyGenerator.generatePair();
@@ -356,15 +356,39 @@ class CryptoManager {
       try {
         const trimmedKey = ecdsaPubkeyPem.trim();
 
-        // 1. 识别传统的 PEM 格式包装
+        // 1. 如果是标准的 PEM 格式包装，直接原生加载
         if (trimmedKey.startsWith('-----BEGIN')) {
           this.ecdsaPubkey = crypto.createPublicKey(trimmedKey);
         } else {
-          // 🚀 核心修改：如果是纯 Base64（通常是 33 字节压缩或 65 字节未压缩公钥）
-          const keyBuffer = Buffer.from(trimmedKey, 'base64');
+          // 🚀 将 Base64 字符串解码为原始字节流 Buffer
+          const keyBytes = Buffer.from(trimmedKey, 'base64');
           
-          // ec.keyFromPublic 会自动识别 02/03 前缀并将其还原为解压的公钥点对象
-          this.ecdsaPubkey = ec.keyFromPublic(keyBuffer);
+          // 使用 v2 版本的 fromBytes 完美加载公钥点
+          const point = p256.Point.fromBytes(keyBytes);
+          
+          // ⚠️ 终极修复：使用 toBytes 获取 65 字节的非压缩数据 (0x04 + 32字节X + 32字节Y)
+          const uncompressed = point.toBytes(false); 
+          
+          // 实现安全的 base64url 转换，严格剔除 +、/ 和 =
+          const toBase64Url = (buf) => buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+          
+          // 提取 X 和 Y 坐标 (跳过首字节 0x04 标识符)
+          const xB64Url = toBase64Url(Buffer.from(uncompressed.slice(1, 33)));
+          const yB64Url = toBase64Url(Buffer.from(uncompressed.slice(33, 65)));
+          
+          // 组装为标准的 JWK (JSON Web Key) 对象
+          const jwk = {
+            kty: 'EC',
+            crv: 'P-256',
+            x: xB64Url,
+            y: yB64Url
+          };
+          
+          // 直接转换为原生的 KeyObject，交给 Node.js 原生底层引擎处理
+          this.ecdsaPubkey = crypto.createPublicKey({
+            key: jwk,
+            format: 'jwk'
+          });
         }
       } catch (e) {
         Logger.error(`⚠️ ECDSA公钥加载失败: ${e.message}`);
@@ -394,18 +418,10 @@ class CryptoManager {
       const message = `${nonce}${timestamp}`;
       const signature = base64.toByteArray(authToken);
 
-      // 🚀 核心修改：通过特征判断当前公钥是 elliptic 实例还是原生 KeyObject
-      if (typeof this.ecdsaPubkey.verify === 'function') {
-        // 使用 elliptic 验签：需要手动对原始消息做 SHA256 哈希
-        const msgHash = crypto.createHash('sha256').update(message).digest();
-        // elliptic 会自适应识别传入的二进制 DER 签名格式
-        return this.ecdsaPubkey.verify(msgHash, signature);
-      } else {
-        // 使用 Node.js 原生 crypto 验签
-        const verify = crypto.createVerify('SHA256');
-        verify.update(message);
-        return verify.verify(this.ecdsaPubkey, signature);
-      }
+      // 100% 纯原生验签
+      const verify = crypto.createVerify('SHA256');
+      verify.update(message);
+      return verify.verify(this.ecdsaPubkey, signature);
 
     } catch (e) {
       throw new Error(`Signature verification failed: ${e.message}`);
@@ -414,8 +430,6 @@ class CryptoManager {
 
   /**
    * 加密响应数据
-   * @param {object} data - 待加密的字典/对象数据
-   * @returns {string} DEBUG模式返回明文JSON，否则返回Base64编码的ECIES密文
    */
   encryptResponse(data) {
     if (Config.DEBUG || !this.eciesPubkey) {
@@ -429,7 +443,6 @@ class CryptoManager {
       
       const ciphertext = ecies_encrypt(pubKeyBuffer, plaintextBuffer);
       
-      // 强制将 Uint8Array 包装为原生 Buffer，否则 toString('base64') 会变成逗号拼接的字符串
       return Buffer.from(ciphertext).toString('base64');
       
     } catch (e) {
@@ -442,11 +455,7 @@ class CryptoManager {
   }
 
   /**
-   * 🔒 AES-256-GCM 解密 (适配 Python 端的 JSON Dict 双层 Base64 结构)
-   * 预期格式: Base64( JSON.stringify({ nonce: "...", tag: "...", ciphertext: "..." }) )
-   * @param {string} encryptedBase64 - 客户端传来的最外层 Base64 密文
-   * @param {Buffer} rawKeyBuffer - 32字节的 AES 密钥
-   * @returns {string} 解密后的明文字符串
+   * 🔒 AES-256-GCM 解密
    */
   decryptData(encryptedBase64, rawKeyBuffer) {
     if (!rawKeyBuffer || rawKeyBuffer.length !== 32) {
@@ -454,28 +463,20 @@ class CryptoManager {
     }
 
     try {
-      // 1. 解码最外层的 Base64，得到 JSON 字符串
       const jsonStr = Buffer.from(encryptedBase64, 'base64').toString('utf8');
-      
-      // 2. 解析 JSON 对象
       const payload = JSON.parse(jsonStr);
 
       if (!payload.nonce || !payload.tag || !payload.ciphertext) {
         throw new Error("Missing required AES-GCM fields (nonce, tag, ciphertext) in payload.");
       }
 
-      // 3. 提取内层的 Base64 字符串并转为 Buffer
       const iv = Buffer.from(payload.nonce, 'base64');
       const authTag = Buffer.from(payload.tag, 'base64');
       const ciphertext = Buffer.from(payload.ciphertext, 'base64');
 
-      // 4. 创建解密器
       const decipher = crypto.createDecipheriv('aes-256-gcm', rawKeyBuffer, iv);
-      
-      // 设置 AuthTag 进行防篡改校验
       decipher.setAuthTag(authTag);
 
-      // 5. 执行解密
       let decrypted = decipher.update(ciphertext, null, 'utf8');
       decrypted += decipher.final('utf8');
 
