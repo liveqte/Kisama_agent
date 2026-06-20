@@ -17,9 +17,10 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 # 加密相关
-from ecdsa import VerifyingKey, BadSignatureError
+from ecdsa import VerifyingKey, BadSignatureError, NIST256p
 from ecdsa.util import sigdecode_der, sigdecode_string
 from ecies import encrypt as ecies_encrypt
+import binascii
 
 # 服务启动
 import uvicorn
@@ -560,7 +561,7 @@ class Config:
     PORT = int(os.getenv("PORT") or os.environ.get('SERVER_PORT') or 8002)
     
     # 代理版本信息
-    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.1.7-python")
+    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.1.8-python")
     
     # ================= 启动校验 =================
     
@@ -677,12 +678,8 @@ class CryptoManager:
     @staticmethod
     def _load_ecdsa_pubkey(pem_or_der: str) -> VerifyingKey:
         """
-        加载ECDSA公钥，支持多种格式并给出清晰错误提示
-        :param pem_or_der: PEM字符串 / DER的base64 / 原始base64
-        :return: VerifyingKey 实例
+        加载ECDSA公钥，支持PEM、DER(X.509)以及纯SEC1压缩/非压缩格式
         """
-        import binascii
-        
         pubkey_str = pem_or_der.strip()
         
         # 尝试1: PEM格式
@@ -692,31 +689,37 @@ class CryptoManager:
             except Exception as e:
                 raise ValueError(f"Invalid PEM public key: {e}")
         
-        # 尝试2: DER格式的base64编码
-        if "-----BEGIN" not in pubkey_str:
-            try:
-                # 移除可能的空白/换行
-                der_str = "".join(pubkey_str.split())
-                der_bytes = base64.b64decode(der_str, validate=True)
-                return VerifyingKey.from_der(der_bytes)
-            except (binascii.Error, ValueError):
-                pass  # 不是base64，继续尝试
-            except Exception as e:
-                raise ValueError(f"Invalid DER public key (base64): {e}")
-        
-        # 尝试3: 原始DER bytes (极少用)
+        # 将无标头的数据统一提取出 bytes 供后续判断
         try:
-            return VerifyingKey.from_der(pubkey_str.encode('latin1'))
+            clean_str = "".join(pubkey_str.split())
+            key_bytes = base64.b64decode(clean_str, validate=True)
+        except (binascii.Error, ValueError):
+            # 如果不是 Base64，当做原始 latin1 字节流回退处理
+            key_bytes = pubkey_str.encode('latin1')
+
+        # 尝试2: 标准 DER (X.509 ASN.1) 格式
+        try:
+            return VerifyingKey.from_der(key_bytes)
         except Exception:
-            pass
-        
-        # 全部失败，给出友好提示
+            pass  # 不是标准的复合 DER 结构，继续向下
+
+        # 🚀 尝试 3: 纯 SEC1 编码（包含 33字节压缩公钥 和 65字节未压缩公钥）
+        # 压缩公钥通常以 \x02 或 \x03 开头，长度为 33 字节 (对于 P-256)
+        # 未压缩公钥通常以 \x04 开头，长度为 65 字节
+        if len(key_bytes) in (33, 65) and key_bytes[0] in (2, 3, 4):
+            try:
+                # 注意：此处必须明确指定你的项目用的曲线是什么
+                return VerifyingKey.from_string(key_bytes, curve=NIST256p)
+            except Exception as e:
+                raise ValueError(f"Invalid raw SEC1/Compressed public key: {e}")
+
+        # 全部失败
         raise ValueError(
             "Failed to load ECDSA public key. Please check:\n"
-            "1. Key must be valid ECDSA (P-256/NIST256p recommended)\n"
-            "2. PEM format should start with '-----BEGIN PUBLIC KEY-----'\n"
-            "3. Or provide raw DER as base64 string\n"
-            f"Provided key preview: {pubkey_str[:100]}..."
+            "1. PEM format (starts with '-----BEGIN PUBLIC KEY-----')\n"
+            "2. Standard X.509 DER in Base64\n"
+            "3. Raw SEC1 Compressed (33 bytes) or Uncompressed (65 bytes) in Base64\n"
+            f"Provided key length (decoded): {len(key_bytes)} bytes."
         )
 
     @staticmethod

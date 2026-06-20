@@ -1,17 +1,32 @@
 {
-  "name": "kisama-agent-nodejs",
-  "version": "0.1.7",
+  "name": "kisamajs",
+  "version": "0.1.8",
   "description": "Kisama Agent - Node.js implementation",
   "main": "agent.js",
   "scripts": {
     "start": "node agent.js",
     "dev": "node agent.js"
   },
+  "bin": {
+    "start": "agent.js"
+  },
+  "keywords": [
+    "kisama",
+    "探针",
+    "玩具",
+    "游戏机",
+    "终端管理",
+    "Probe",
+    "Toy",
+    "Game console",
+    "Terminal management"
+  ],
   "dependencies": {
     "@lydell/node-pty": "^1.1.0",
     "base64-js": "^1.5.1",
     "bun-pty": "^0.4.8",
     "eciesjs": "^0.5.0",
+    "elliptic": "^6.6.1",
     "express": "^4.18.2",
     "express-ws": "^5.0.2",
     "node-cron": "^4.2.1",
@@ -21,6 +36,10 @@
   "engines": {
     "node": ">=16.0.0"
   },
-  "author": "",
-  "license": "MIT"
+  "author": "liming",
+  "license": "GPL-3.0",
+  "files": [
+    "agent.js",
+    "README.md"
+  ]
 }

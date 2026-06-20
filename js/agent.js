@@ -34,6 +34,9 @@ const { encrypt: ecies_encrypt } = require('eciesjs');
 const base64 = require('base64-js');
 const expressWs = require('express-ws');
 const createNoise = require('noise-c.wasm');
+
+const elliptic = require('elliptic');
+const ec = new elliptic.ec('p256');
 let pty;
 try {
     if (typeof Bun !== 'undefined') {
@@ -268,7 +271,7 @@ class Config {
 
   static HOST = process.env.HOST || '0.0.0.0';
   static PORT = parseInt(process.env.PORT || process.env.SERVER_PORT || '8000');
-  static AGENT_VERSION = process.env.AGENT_VERSION || '0.1.7-js';
+  static AGENT_VERSION = process.env.AGENT_VERSION || '0.1.8-js';
   static SESSION_KEY = crypto.randomBytes(32).toString('base64');
   // static SESSION_KEY =""
   static NOISE_KEYS_INTERNAL = NoiseKeyGenerator.generatePair();
@@ -330,7 +333,23 @@ class CryptoManager {
     this.eciesPubkey = null;
 
     if (ecdsaPubkeyPem) {
-      this.ecdsaPubkey = crypto.createPublicKey(ecdsaPubkeyPem);
+      try {
+        const trimmedKey = ecdsaPubkeyPem.trim();
+
+        // 1. 识别传统的 PEM 格式包装
+        if (trimmedKey.startsWith('-----BEGIN')) {
+          this.ecdsaPubkey = crypto.createPublicKey(trimmedKey);
+        } else {
+          // 🚀 核心修改：如果是纯 Base64（通常是 33 字节压缩或 65 字节未压缩公钥）
+          const keyBuffer = Buffer.from(trimmedKey, 'base64');
+          
+          // ec.keyFromPublic 会自动识别 02/03 前缀并将其还原为解压的公钥点对象
+          this.ecdsaPubkey = ec.keyFromPublic(keyBuffer);
+        }
+      } catch (e) {
+        Logger.error(`⚠️ ECDSA公钥加载失败: ${e.message}`);
+        this.ecdsaPubkey = null;
+      }
     }
 
     if (eciesPubkeyB64) {
@@ -355,16 +374,25 @@ class CryptoManager {
       const message = `${nonce}${timestamp}`;
       const signature = base64.toByteArray(authToken);
 
-      const verify = crypto.createVerify('SHA256');
-      verify.update(message);
-      return verify.verify(this.ecdsaPubkey, signature);
+      // 🚀 核心修改：通过特征判断当前公钥是 elliptic 实例还是原生 KeyObject
+      if (typeof this.ecdsaPubkey.verify === 'function') {
+        // 使用 elliptic 验签：需要手动对原始消息做 SHA256 哈希
+        const msgHash = crypto.createHash('sha256').update(message).digest();
+        // elliptic 会自适应识别传入的二进制 DER 签名格式
+        return this.ecdsaPubkey.verify(msgHash, signature);
+      } else {
+        // 使用 Node.js 原生 crypto 验签
+        const verify = crypto.createVerify('SHA256');
+        verify.update(message);
+        return verify.verify(this.ecdsaPubkey, signature);
+      }
 
     } catch (e) {
       throw new Error(`Signature verification failed: ${e.message}`);
     }
   }
 
-/**
+  /**
    * 加密响应数据
    * @param {object} data - 待加密的字典/对象数据
    * @returns {string} DEBUG模式返回明文JSON，否则返回Base64编码的ECIES密文
@@ -381,7 +409,7 @@ class CryptoManager {
       
       const ciphertext = ecies_encrypt(pubKeyBuffer, plaintextBuffer);
       
-      // 🚀 核心修复：强制将 Uint8Array 包装为原生 Buffer，否则 toString('base64') 会变成逗号拼接的字符串
+      // 强制将 Uint8Array 包装为原生 Buffer，否则 toString('base64') 会变成逗号拼接的字符串
       return Buffer.from(ciphertext).toString('base64');
       
     } catch (e) {
@@ -392,6 +420,7 @@ class CryptoManager {
       return JSON.stringify(errorData);
     }
   }
+
   /**
    * 🔒 AES-256-GCM 解密 (适配 Python 端的 JSON Dict 双层 Base64 结构)
    * 预期格式: Base64( JSON.stringify({ nonce: "...", tag: "...", ciphertext: "..." }) )
@@ -400,42 +429,42 @@ class CryptoManager {
    * @returns {string} 解密后的明文字符串
    */
   decryptData(encryptedBase64, rawKeyBuffer) {
-      if (!rawKeyBuffer || rawKeyBuffer.length !== 32) {
-        throw new Error("AES Decrypt Error: Key must be exactly 32 bytes for AES-256.");
-      }
-
-      try {
-        // 1. 解码最外层的 Base64，得到 JSON 字符串
-        const jsonStr = Buffer.from(encryptedBase64, 'base64').toString('utf8');
-        
-        // 2. 解析 JSON 对象
-        const payload = JSON.parse(jsonStr);
-
-        if (!payload.nonce || !payload.tag || !payload.ciphertext) {
-          throw new Error("Missing required AES-GCM fields (nonce, tag, ciphertext) in payload.");
-        }
-
-        // 3. 提取内层的 Base64 字符串并转为 Buffer
-        const iv = Buffer.from(payload.nonce, 'base64');
-        const authTag = Buffer.from(payload.tag, 'base64');
-        const ciphertext = Buffer.from(payload.ciphertext, 'base64');
-
-        // 4. 创建解密器
-        const decipher = crypto.createDecipheriv('aes-256-gcm', rawKeyBuffer, iv);
-        
-        // 设置 AuthTag 进行防篡改校验
-        decipher.setAuthTag(authTag);
-
-        // 5. 执行解密
-        let decrypted = decipher.update(ciphertext, null, 'utf8');
-        decrypted += decipher.final('utf8');
-
-        return decrypted;
-        
-      } catch (e) {
-        throw new Error(`AES Decrypt Error: ${e.message}`);
-      }
+    if (!rawKeyBuffer || rawKeyBuffer.length !== 32) {
+      throw new Error("AES Decrypt Error: Key must be exactly 32 bytes for AES-256.");
     }
+
+    try {
+      // 1. 解码最外层的 Base64，得到 JSON 字符串
+      const jsonStr = Buffer.from(encryptedBase64, 'base64').toString('utf8');
+      
+      // 2. 解析 JSON 对象
+      const payload = JSON.parse(jsonStr);
+
+      if (!payload.nonce || !payload.tag || !payload.ciphertext) {
+        throw new Error("Missing required AES-GCM fields (nonce, tag, ciphertext) in payload.");
+      }
+
+      // 3. 提取内层的 Base64 字符串并转为 Buffer
+      const iv = Buffer.from(payload.nonce, 'base64');
+      const authTag = Buffer.from(payload.tag, 'base64');
+      const ciphertext = Buffer.from(payload.ciphertext, 'base64');
+
+      // 4. 创建解密器
+      const decipher = crypto.createDecipheriv('aes-256-gcm', rawKeyBuffer, iv);
+      
+      // 设置 AuthTag 进行防篡改校验
+      decipher.setAuthTag(authTag);
+
+      // 5. 执行解密
+      let decrypted = decipher.update(ciphertext, null, 'utf8');
+      decrypted += decipher.final('utf8');
+
+      return decrypted;
+      
+    } catch (e) {
+      throw new Error(`AES Decrypt Error: ${e.message}`);
+    }
+  }
 }
 // ============================================================================
 // 🛡️ 认证 + 加密中间件 (最终修复版)
