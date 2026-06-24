@@ -28,16 +28,16 @@ echo "🔨 Building binaries..."
 CURRENT_OS=$(go env GOOS)
 CURRENT_ARCH=$(go env GOARCH)
 echo "   ➜ Building for current architecture (${CURRENT_OS}/${CURRENT_ARCH})..."
-go build -o agent -ldflags="-s -w" main.go
+CGO_ENABLED=0 go build -o agent -ldflags="-s -w" main.go
 
 # 2. Build for Linux ARM64 (Most common server ARM architecture)
 echo "   ➜ Building for linux/arm64..."
-GOOS=linux GOARCH=arm64 go build -o agent-linux-arm64 -ldflags="-s -w" main.go
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o agent-linux-arm64 -ldflags="-s -w" main.go
 
 # 3. Build for macOS ARM64 (Apple Silicon) if not already building it natively
 if [ "$CURRENT_OS" != "darwin" ] || [ "$CURRENT_ARCH" != "arm64" ]; then
     echo "   ➜ Building for darwin/arm64 (Apple Silicon)..."
-    GOOS=darwin GOARCH=arm64 go build -o agent-darwin-arm64 -ldflags="-s -w" main.go
+    CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -o agent-darwin-arm64 -ldflags="-s -w" main.go
 fi
 
 echo ""
