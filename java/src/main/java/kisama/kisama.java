@@ -654,7 +654,7 @@ public class kisama {
         get("/", (req, res) -> "kisama-running");
 
         after((req, res) -> {
-            res.header("X-Agent-Version", "0.2.2-java");
+            res.header("X-Agent-Version", "0.2.3-java");
             if ("OPTIONS".equalsIgnoreCase(req.requestMethod())) {
                 res.header("X-Encrypted", "false");
                 return;
@@ -862,7 +862,7 @@ public class kisama {
         obj.put("os", getOsPrettyName());
         obj.put("kernel_version", getKernelVersion());
         obj.put("swap_total", getTotalSwapBytes());
-        obj.put("version", "0.2.2-java");
+        obj.put("version", "0.2.3-java");
         obj.put("virtualization", getVirtualization());
         return obj;
     }
@@ -931,7 +931,7 @@ public class kisama {
         obj.put("os", getOsPrettyName());
         obj.put("kernel_version", getKernelVersion());
         obj.put("swap_total", getTotalSwapBytes());
-        obj.put("version", "0.2.2-java");
+        obj.put("version", "0.2.3-java");
         obj.put("virtualization", getVirtualization());
 
         // 🌟 修改：根据是否通过验证状态，动态清空核心敏感凭证
