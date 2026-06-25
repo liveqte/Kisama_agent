@@ -271,7 +271,7 @@ class Config {
 
   static HOST = process.env.HOST || '0.0.0.0';
   static PORT = parseInt(process.env.PORT || process.env.SERVER_PORT || '8000');
-  static AGENT_VERSION = process.env.AGENT_VERSION || '0.2.0-js';
+  static AGENT_VERSION = process.env.AGENT_VERSION || '0.2.2-js';
   static SESSION_KEY = crypto.randomBytes(32).toString('base64');
   // static SESSION_KEY =""
   static NOISE_KEYS_INTERNAL = NoiseKeyGenerator.generatePair();
@@ -283,6 +283,18 @@ class Config {
       public: this.NOISE_KEYS_INTERNAL.agent.public_b64
     }
   };
+  // ================= 🚀 新增：缓存模块配置 =================
+  static BASEINFO_CACHE_TTL = 3600; // 基础信息缓存 1 小时 (单位: 秒)
+  static STATUS_CACHE_TTL = 30;     // 实时状态缓存 30 秒 (单位: 秒)
+
+  static _baseinfo_cache = null;
+  static _baseinfo_cache_time = 0;
+  static _baseinfo_fetch_promise = null; // 用于高并发下的异步复用锁
+
+  static _status_cache = null;
+  static _status_cache_time = 0;
+  static _status_fetch_promise = null;   // 用于高并发下的异步复用锁
+
   static _getConfigValue(key, filePath) {
     // 优先环境变量
     const envValue = process.env[key];
@@ -2088,16 +2100,43 @@ async function main(options = {}) {
   Logger.debug('Middleware applied, setting up routes...');
 
   // 路由定义
-
   // 基础信息
   app.get('/api/baseinfo', async (req, res) => {
     try {
-      const info = await systemInfo.getBasicInfo();
+      const now = Math.floor(Date.now() / 1000);
+
+      // 1. 检查缓存是否过期，如果过期则安全地重新调度
+      if (!Config._baseinfo_cache || (now - Config._baseinfo_cache_time) > Config.BASEINFO_CACHE_TTL) {
+        // 🔒 利用原子 Promise 锁解决 Cache Stampede (惊群效应)
+        // 当数百个并发请求同时涌入时，他们会排队等待并复用同一个底层的系统数据抓取器
+        if (!Config._baseinfo_fetch_promise) {
+          Config._baseinfo_fetch_promise = systemInfo.getBasicInfo().then(data => {
+            Config._baseinfo_cache = data;
+            Config._baseinfo_cache_time = Math.floor(Date.now() / 1000);
+            Config._baseinfo_fetch_promise = null; // 释放锁
+            Logger.debug("🔄 [Cache] BaseInfo 缓存已过期，已重新调度系统资源进行更新。");
+            return data;
+          }).catch(err => {
+            Config._baseinfo_fetch_promise = null; // 遇错强制释放锁，防系统死锁
+            throw err;
+          });
+        }
+        await Config._baseinfo_fetch_promise;
+      } else {
+        Logger.debug("📦 [Cache] BaseInfo 命中有效缓存，直接输出。");
+      }
+
+      // ⚠️ 关键安全隔离步骤：采用 ES6 扩展运算符进行浅拷贝解耦副本
+      // 绝对不能直接修改全局 Config._baseinfo_cache 的属性，否则会导致敏感密钥永久泄露给后续的匿名请求
+      const info = { ...Config._baseinfo_cache };
       
-      // 🌟 新增：如果判定为匿名未认证访问，动态剔除核心安全密钥
+      // 2. 根据中间件打上的 req.is_authenticated 认证状态，动态决定是否向前端下发敏感密钥
       if (req.is_authenticated === false) {
         info.session_key = null;
         info.noise_key = null;
+      } else {
+        info.session_key = Config.SESSION_KEY;
+        info.noise_key = Config.NOISE_KEY;
       }
       
       res.json(info);
@@ -2109,9 +2148,30 @@ async function main(options = {}) {
   // 实时状态
   app.get('/api/status', async (req, res) => {
     try {
-      const status = await systemInfo.getRealtimeInfo();
-      // 🌟 无需额外处理密钥，中间件会自动判定未认证并输出不加密的明文
-      res.json(status);
+      const now = Math.floor(Date.now() / 1000);
+
+      // 1. 检查 30 秒防刷缓存是否失效
+      if (!Config._status_cache || (now - Config._status_cache_time) > Config.STATUS_CACHE_TTL) {
+        if (!Config._status_fetch_promise) {
+          Config._status_fetch_promise = systemInfo.getRealtimeInfo().then(data => {
+            Config._status_cache = data;
+            Config._status_cache_time = Math.floor(Date.now() / 1000);
+            Config._status_fetch_promise = null; // 释放锁
+            Logger.debug("🔄 [Cache] Status 实时监控缓存已过期，已重新生成度量快照。");
+            return data;
+          }).catch(err => {
+            Config._status_fetch_promise = null; // 释放锁
+            throw err;
+          });
+        }
+        await Config._status_fetch_promise;
+      } else {
+        Logger.debug("📦 [Cache] Status 命中监控缓存。");
+      }
+
+      // 同样克隆一份干净的副本丢给前端
+      const statusInfo = { ...Config._status_cache };
+      res.json(statusInfo);
     } catch (e) {
       res.status(500).json({ status: 'error', message: e.message });
     }
