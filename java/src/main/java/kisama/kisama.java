@@ -69,6 +69,17 @@ public class kisama {
     private long totalNetworkUp = 0;
     private long totalNetworkDown = 0;
     private final Object netLock = new Object();
+    // ==================== 🚀 新增：高性能防刷缓存槽与生命周期参数 ====================
+    private static final long BASEINFO_CACHE_TTL_MS = 3600 * 1000L; // 基础信息缓存 1 小时 (毫秒)
+    private static final long STATUS_CACHE_TTL_MS = 30 * 1000L;    // 实时状态缓存 30 秒 (毫秒)
+
+    private Map<String, Object> baseInfoCache = null;
+    private long lastBaseInfoCacheTime = 0;
+    private final Object baseInfoCacheLock = new Object();          // 基础信息并发复用锁
+
+    private Map<String, Object> statusCache = null;
+    private long lastStatusCacheTime = 0;
+    private final Object statusCacheLock = new Object();            // 实时状态并发复用锁
    // ==================== 构造函数 ====================
     // 1. 无参构造函数：保持原汁原味，完全不改，全部通过原本的逻辑和全局提取初始化
     public kisama() {
@@ -171,9 +182,9 @@ public class kisama {
             boolean isBypassPath = "/api/baseinfo".equals(endpoint) || "/api/status".equals(endpoint);
 
             if (!this.DEBUG && !"OPTIONS".equalsIgnoreCase(req.requestMethod())) {
-                String nonce = req.headers("X-Nonce");
-                String timestamp = req.headers("X-Timestamp");
-                String authToken = req.headers("X-Auth-Token");
+                String nonce = req.headers("x-nonce");
+                String timestamp = req.headers("x-timestamp");
+                String authToken = req.headers("x-auth-token");
 
                 if (nonce == null || timestamp == null || authToken == null) {
                     log("[TRACE-AUTH] ❌ 强认证失败: 核心头部要素缺失");
@@ -231,63 +242,61 @@ public class kisama {
         });
 
         // ==================== 完整保留所有业务路由 ====================
+        // ==================== 🚀 包含高性能缓存防御机制的重构路由 ====================
         get("/api/baseinfo", (req, res) -> {
             res.type("application/json");
-            // 🌟 动态获取验证状态
+            long now = System.currentTimeMillis();
+            Map<String, Object> clientResponseMap;
+
+            // 1. 原子互斥锁检查：解决高并发多线程涌入时的 Cache Stampede 效应
+            synchronized (baseInfoCacheLock) {
+                if (baseInfoCache == null || (now - lastBaseInfoCacheTime) > BASEINFO_CACHE_TTL_MS) {
+                    baseInfoCache = buildRawBaseInfo();
+                    lastBaseInfoCacheTime = now;
+                    log("[TRACE-CACHE] 🔄 BaseInfo 缓存已过期，已重新调度生成。");
+                } else {
+                    log("[TRACE-CACHE] 📦 BaseInfo 命中有效缓存，直接输出。");
+                }
+                // ⚠️ 安全关键点：浅拷贝解耦出一个全新的可变 Map 容器
+                // 严禁直接修改 baseInfoCache 全局静态引用的属性，否则会导致敏感密钥永久越权暴露给匿名请求
+                clientResponseMap = new LinkedHashMap<>(baseInfoCache);
+            }
+
+            // 2. 动态审查当前单次请求的认证标签状态，安全追加或剔除核心敏感凭证
             boolean isAuthenticated = req.attribute("is_authenticated") == null || Boolean.TRUE.equals(req.attribute("is_authenticated"));
-            return this.gson.toJson(buildBaseInfo(isAuthenticated));
+            if (isAuthenticated) {
+                clientResponseMap.put("session_key", Base64.getEncoder().encodeToString(this.SESSION_KEY));
+                Map<String, Object> noise = Map.of(
+                        "controller", Map.of("private", this.CTRL_PRIVATE_KEY_B64),
+                        "agent", Map.of("public", this.AGENT_PUBLIC_KEY_B64)
+                );
+                clientResponseMap.put("noise_key", noise);
+            } else {
+                clientResponseMap.put("session_key", null);
+                clientResponseMap.put("noise_key", null);
+            }
+
+            return this.gson.toJson(clientResponseMap);
         });
 
         get("/api/status", (req, res) -> {
-            // 1. 获取实时网络流量与连接数 (保持上回计算逻辑不变)
-            Map<String, Long> netInfo = getNetworkInfo();
-            int tcpCount = getConnectionCount("tcp");
-            int udpCount = getConnectionCount("udp");
-            
-            // 2. 获取 JVM 级别的系统 CPU 使用率
-            double cpuUsage = 0.0;
-            try {
-                java.lang.management.OperatingSystemMXBean bean = ManagementFactory.getOperatingSystemMXBean();
-                if (bean instanceof com.sun.management.OperatingSystemMXBean) {
-                    com.sun.management.OperatingSystemMXBean sunBean = (com.sun.management.OperatingSystemMXBean) bean;
-                    cpuUsage = sunBean.getCpuLoad() * 100.0;
-                    if (cpuUsage < 0) cpuUsage = 0.0;
-                }
-            } catch (Exception ignored) {}
+            res.type("application/json");
+            long now = System.currentTimeMillis();
+            Map<String, Object> clientStatusMap;
 
-            // 3. 🌟 升级：全面的 cgroup 容器级总上限与净已用内存计算
-            long totalMem = getTotalMemoryBytes(); // 内部已包含 cgroup 限制与物理上限的 Math.min
-            long usedMem = getMemoryUsedBytes();   // 内部已排除 cgroup v1/v2 及宿主机的 Cache
-            
-            // 边界防御：极端情况下防止已用内存计算溢出总量
-            if (usedMem > totalMem) {
-                usedMem = totalMem;
+            // 1. 30 秒缓存锁流控拦截
+            synchronized (statusCacheLock) {
+                if (statusCache == null || (now - lastStatusCacheTime) > STATUS_CACHE_TTL_MS) {
+                    statusCache = buildRawStatusInfo();
+                    lastStatusCacheTime = now;
+                    log("[TRACE-CACHE] 🔄 Status 实时监控缓存已过期，已重新生成度量快照。");
+                } else {
+                    log("[TRACE-CACHE] 📦 Status 命中监控缓存。");
+                }
+                clientStatusMap = new LinkedHashMap<>(statusCache);
             }
 
-            Map<String, Object> st = new LinkedHashMap<>();
-            st.put("cpu", Map.of("usage", Math.round(cpuUsage * 100) / 100.0));
-            st.put("ram", Map.of("total", totalMem, "used", usedMem)); // 👈 动态下发真实过滤后的内存
-            st.put("swap", Map.of("total", getTotalSwapBytes(), "used", 0));
-            st.put("load", Map.of("load1", 0.1, "load5", 0.05, "load15", 0.01));
-            st.put("disk", Map.of("total", Files.getFileStore(Paths.get(this.FILE_ROOT)).getTotalSpace(), "used", Files.getFileStore(Paths.get(this.FILE_ROOT)).getTotalSpace() - Files.getFileStore(Paths.get(this.FILE_ROOT)).getUsableSpace()));
-            
-            st.put("network", Map.of(
-                "up", netInfo.get("up"),
-                "down", netInfo.get("down"),
-                "totalUp", netInfo.get("totalUp"),
-                "totalDown", netInfo.get("totalDown")
-            ));
-            
-            st.put("connections", Map.of(
-                "tcp", tcpCount,
-                "udp", udpCount
-            ));
-            
-            st.put("uptime", ManagementFactory.getRuntimeMXBean().getUptime() / 1000);
-            st.put("process", 1);
-            st.put("message", " ");
-            res.type("application/json");
-            return this.gson.toJson(st);
+            return this.gson.toJson(clientStatusMap);
         });
 
         post("/api/exec", (req, res) -> {
@@ -645,7 +654,7 @@ public class kisama {
         get("/", (req, res) -> "kisama-running");
 
         after((req, res) -> {
-            res.header("X-Agent-Version", "0.2.0-java");
+            res.header("X-Agent-Version", "0.2.2-java");
             if ("OPTIONS".equalsIgnoreCase(req.requestMethod())) {
                 res.header("X-Encrypted", "false");
                 return;
@@ -837,6 +846,75 @@ public class kisama {
             return 0;
         }
     }
+    // 🌟 新增：提取纯净的基础系统信息生成器 (剔除身份鉴权与动态秘钥组装)
+    private Map<String, Object> buildRawBaseInfo() throws Exception {
+        Map<String, Object> obj = new LinkedHashMap<>();
+        Map<String, String> ips = getPrimaryIpAddresses();
+
+        obj.put("arch", normalizeArch(System.getProperty("os.arch", " ")));
+        obj.put("cpu_cores", Runtime.getRuntime().availableProcessors());
+        obj.put("cpu_name", getCpuName());
+        obj.put("disk_total", Files.getFileStore(Paths.get(this.FILE_ROOT)).getTotalSpace());
+        obj.put("gpu_name", getGpuName());
+        obj.put("ipv4", emptyToNull(ips.get("ipv4")));
+        obj.put("ipv6", emptyToNull(ips.get("ipv6")));
+        obj.put("mem_total", getTotalMemoryBytes());
+        obj.put("os", getOsPrettyName());
+        obj.put("kernel_version", getKernelVersion());
+        obj.put("swap_total", getTotalSwapBytes());
+        obj.put("version", "0.2.2-java");
+        obj.put("virtualization", getVirtualization());
+        return obj;
+    }
+    // 🌟 新增：提取高能耗的实时监控快照生成器 (涉及频繁读取 /proc/net 文件系统)
+    private Map<String, Object> buildRawStatusInfo() throws Exception {
+        // 1. 获取实时网络流量与连接数
+        Map<String, Long> netInfo = getNetworkInfo();
+        int tcpCount = getConnectionCount("tcp");
+        int udpCount = getConnectionCount("udp");
+        
+        // 2. 获取 JVM 级别的系统 CPU 使用率
+        double cpuUsage = 0.0;
+        try {
+            java.lang.management.OperatingSystemMXBean bean = ManagementFactory.getOperatingSystemMXBean();
+            if (bean instanceof com.sun.management.OperatingSystemMXBean) {
+                com.sun.management.OperatingSystemMXBean sunBean = (com.sun.management.OperatingSystemMXBean) bean;
+                cpuUsage = sunBean.getCpuLoad() * 100.0;
+                if (cpuUsage < 0) cpuUsage = 0.0;
+            }
+        } catch (Exception ignored) {}
+
+        // 3. 全面的 cgroup 容器级总上限与净已用内存计算
+        long totalMem = getTotalMemoryBytes();
+        long usedMem = getMemoryUsedBytes();
+        if (usedMem > totalMem) {
+            usedMem = totalMem;
+        }
+
+        Map<String, Object> st = new LinkedHashMap<>();
+        st.put("cpu", Map.of("usage", Math.round(cpuUsage * 100) / 100.0));
+        st.put("ram", Map.of("total", totalMem, "used", usedMem));
+        st.put("swap", Map.of("total", getTotalSwapBytes(), "used", 0));
+        st.put("load", Map.of("load1", 0.1, "load5", 0.05, "load15", 0.01));
+        st.put("disk", Map.of("total", Files.getFileStore(Paths.get(this.FILE_ROOT)).getTotalSpace(), "used", Files.getFileStore(Paths.get(this.FILE_ROOT)).getTotalSpace() - Files.getFileStore(Paths.get(this.FILE_ROOT)).getUsableSpace()));
+        
+        st.put("network", Map.of(
+            "up", netInfo.get("up"),
+            "down", netInfo.get("down"),
+            "totalUp", netInfo.get("totalUp"),
+            "totalDown", netInfo.get("totalDown")
+        ));
+        
+        st.put("connections", Map.of(
+            "tcp", tcpCount,
+            "udp", udpCount
+        ));
+        
+        st.put("uptime", ManagementFactory.getRuntimeMXBean().getUptime() / 1000);
+        st.put("process", 1);
+        st.put("message", " ");
+        return st;
+    }
     // 🌟 修改：为函数增加 boolean isAuthenticated 参数
     private Map<String, Object> buildBaseInfo(boolean isAuthenticated) throws Exception {
         Map<String, Object> obj = new LinkedHashMap<>();
@@ -853,7 +931,7 @@ public class kisama {
         obj.put("os", getOsPrettyName());
         obj.put("kernel_version", getKernelVersion());
         obj.put("swap_total", getTotalSwapBytes());
-        obj.put("version", "0.2.0-java");
+        obj.put("version", "0.2.2-java");
         obj.put("virtualization", getVirtualization());
 
         // 🌟 修改：根据是否通过验证状态，动态清空核心敏感凭证
@@ -1299,6 +1377,21 @@ public class kisama {
         if (Security.getProvider(BouncyCastleProvider.PROVIDER_NAME) == null) {
             Security.addProvider(new BouncyCastleProvider());
         }
+
+        // 🌟 核心拦截点 1：硬编码占位符与空值防刷校验
+        String ecdsaStr = this.ECDSA_PUBLIC_KEY_B64;
+        String eciesStr = this.ECIES_PUBLIC_KEY_B64;
+
+        if (ecdsaStr == null || ecdsaStr.isBlank() || ecdsaStr.contains("YOUR_HARDCODED_ECDSA_PUBLIC_KEY_HERE")) {
+            System.err.println("[FATAL-INIT] ❌ 启动熔断: ECDSA 公钥未配置，或仍在使用默认占位符！");
+            System.exit(1);
+        }
+        if (eciesStr == null || eciesStr.isBlank() || eciesStr.contains("YOUR_HARDCODED_ECIES_PUBLIC_KEY_HERE")) {
+            System.err.println("[FATAL-INIT] ❌ 启动熔断: ECIES 公钥未配置，或仍在使用默认占位符！");
+            System.exit(1);
+        }
+
+        // 初始化超级终端 Noise 静态拓扑密钥链 (保持原逻辑)
         try {
             byte[] ctrlPriv = new byte[32];
             byte[] ctrlPub = new byte[32];
@@ -1315,29 +1408,44 @@ public class kisama {
             System.arraycopy(ctrlPub, 0, this.CONTROL_PUBLIC_KEY, 0, 32);
             log("[TRACE-CRYPTO] ✅ 成功激活全局超级终端 Noise 静态拓扑密钥链");
         } catch (Exception e) {
-            log("[TRACE-CRYPTO] ❌ 初始化 Noise 密钥失败: " + e.getMessage());
+            System.err.println("[FATAL-INIT] ❌ 启动流产: 初始化 Noise 临时本地密钥发生崩溃 -> " + e.getMessage());
+            System.exit(1);
         }
-        if (this.ECDSA_PUBLIC_KEY_B64 != null && !this.ECDSA_PUBLIC_KEY_B64.isBlank()) {
-            try {
-                this.ECDSA_PUBLIC_KEY = loadEcdsaPublicKey(this.ECDSA_PUBLIC_KEY_B64);
-            } catch (Exception ignored) {
-            }
+
+        // 🌟 核心拦截点 2：强验密钥合法性，解析失败立即拒绝启动
+        try {
+            this.ECDSA_PUBLIC_KEY = loadEcdsaPublicKey(ecdsaStr);
+            log("[TRACE-CRYPTO] ✅ ECDSA 安全公钥加载成功并通过结构化拓扑校验。");
+        } catch (Exception e) {
+            System.err.println("[FATAL-INIT] ❌ 启动熔断: ECDSA 公钥内容破坏或格式不合法！损坏凭证: [" + ecdsaStr + "]");
+            System.err.println("[FATAL-INIT] 💡 异常堆栈信息: ");
+            e.printStackTrace();
+            System.exit(1);
         }
-        if (this.ECIES_PUBLIC_KEY_B64 != null && !this.ECIES_PUBLIC_KEY_B64.isBlank()) {
-            try {
-                this.ECIES_PUBLIC_KEY = Base64.getDecoder().decode(this.ECIES_PUBLIC_KEY_B64.trim());
-            } catch (Exception ignored) {
-            }
+
+        try {
+            this.ECIES_PUBLIC_KEY = Base64.getDecoder().decode(eciesStr.trim());
+            log("[TRACE-CRYPTO] ✅ ECIES 安全公钥 Base64 逆向解码合规性核验成功。");
+        } catch (Exception e) {
+            System.err.println("[FATAL-INIT] ❌ 启动熔断: ECIES 公钥非合法的标准 Base64 编码流！损坏凭证: [" + eciesStr + "]");
+            System.err.println("[FATAL-INIT] 💡 异常堆栈信息: ");
+            e.printStackTrace();
+            System.exit(1);
         }
     }
 
     private String readKeyFile(String filename) {
-        Path path = Paths.get(this.KEYS_DIR).resolve(filename);
+        Path path = Paths.get(this.KEYS_DIR).resolve(filename).toAbsolutePath();
+        log("[TRACE-INIT] 🔍 正在尝试从文件系统检索密钥: " + path);
         if (Files.exists(path)) {
             try {
                 return Files.readString(path).trim();
-            } catch (IOException ignored) {
+            } catch (IOException e) {
+                // 杜绝静默吞掉异常，暴漏真实的权限或 I/O 错误
+                System.err.println("[FATAL-INIT] ❌ 读取密钥文件失败: " + path + ", 原因: " + e.getMessage());
             }
+        } else {
+            log("[TRACE-INIT] ⚠️ 密钥文件未找到: " + path + "，将尝试后续逻辑。");
         }
         return null;
     }
@@ -1346,9 +1454,9 @@ public class kisama {
         String s = keyText.trim();
         if (s.contains("-----BEGIN PUBLIC KEY-----")) {
             String normalized = s
-                    .replaceAll("-----BEGIN PUBLIC KEY-----", " ")
-                    .replaceAll("-----END PUBLIC KEY-----", " ")
-                    .replaceAll("\\s+", " ");
+                    .replace("-----BEGIN PUBLIC KEY-----", "")
+                    .replace("-----END PUBLIC KEY-----", "")
+                    .replaceAll("\\s+", "");
             X509EncodedKeySpec spec = new X509EncodedKeySpec(Base64.getDecoder().decode(normalized));
             return KeyFactory.getInstance("EC", "BC").generatePublic(spec);
         }

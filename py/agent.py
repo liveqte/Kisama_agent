@@ -555,13 +555,26 @@ class Config:
 
     # 日志最大条数限制
     MAX_TASK_LOG_SIZE = int(os.getenv("MAX_TASK_LOG", "100"))
-
+    # ================= 🚀 新增：缓存模块配置 =================
+    BASEINFO_CACHE_TTL = 3600  # 基础信息缓存 1 小时 (单位: 秒)
+    STATUS_CACHE_TTL = 30     # 实时状态缓存 30 秒 (单位: 秒)
+    
+    # 基础信息缓存槽
+    _baseinfo_cache: Optional[Dict[str, Any]] = None
+    _baseinfo_cache_time: float = 0.0
+    _baseinfo_lock: Optional[asyncio.Lock] = None  # 采用延迟加载，规避异步 Loop 错配风险
+    
+    # 实时监控缓存槽
+    _status_cache: Optional[Dict[str, Any]] = None
+    _status_cache_time: float = 0.0
+    _status_lock: Optional[asyncio.Lock] = None    # 采用延迟加载
+    # =========================================================
     # 服务监听配置
     HOST = os.getenv("HOST", "0.0.0.0")
     PORT = int(os.getenv("PORT") or os.environ.get('SERVER_PORT') or 8002)
     
     # 代理版本信息
-    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.2.0-python")
+    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.2.2-python")
     
     # ================= 启动校验 =================
     
@@ -2390,14 +2403,35 @@ async def get_smart_payload(request: Request) -> ExecRequestJSON:
         return ExecRequestJSON(cmd=body_str)
 
 @app.get("/api/baseinfo", response_model=BaseInfoResponse)
-async def get_baseinfo(request: Request):  # 🌟 修正函数名，注入 request
+async def get_baseinfo(request: Request):
     """
     获取代理端基础信息
+    🔐 带 1 小时高性能缓存机制
     🔐 有认证头时返回完整加密信息，无认证头时返回基础明文（剔除动态密钥）
     """
-    basic_info = await SystemInfoCollector().get_basic_info()
+    now = time.time()
     
-    # 根据中间件标记的认证状态，动态决定是否下发敏感密钥
+    # 确保异步锁已安全初始化
+    if Config._baseinfo_lock is None:
+        Config._baseinfo_lock = asyncio.Lock()
+        
+    async with Config._baseinfo_lock:
+        # 检查缓存是否失效或从未加载过
+        if (Config._baseinfo_cache is None or 
+                now - Config._baseinfo_cache_time > Config.BASEINFO_CACHE_TTL):
+            
+            # 真正触发底层高能耗的资源收集器
+            Config._baseinfo_cache = await SystemInfoCollector().get_basic_info()
+            Config._baseinfo_cache_time = now
+            Logger.debug("🔄 [Cache] BaseInfo 缓存已过期，已重新调度系统资源进行更新。")
+        else:
+            Logger.debug("📦 [Cache] BaseInfo 命中有效缓存，直接输出。")
+            
+        # ⚠️ 关键安全步骤：使用 .copy() 浅拷贝出一份副本进行上层组装
+        # 确保动态追加的凭证不会污染全局静态缓存，防止越权暴露
+        basic_info = Config._baseinfo_cache.copy()
+    
+    # 根据中间件标记的当前单次请求认证状态，动态决定是否下发敏感密钥
     if getattr(request.state, "is_authenticated", True):
         basic_info["session_key"] = Config.SESSION_KEY
         basic_info["noise_key"] = Config.NOISE_KEY
@@ -2409,12 +2443,32 @@ async def get_baseinfo(request: Request):  # 🌟 修正函数名，注入 reque
 
 
 @app.get("/api/status", response_model=StatusResponse)
-async def get_realtime_status(request: Request):  # 🌟 修正函数名，注入 request 保持行为一致
+async def get_realtime_status(request: Request):
     """
     获取代理端实时监控信息
+    🔐 带 30 秒防刷缓存机制，完美平衡面板数据实时性与 CPU 算力损耗
     🔐 有认证头时返回加密密文，无认证头时直接放行返回明文 JSON
     """
-    status_info = await SystemInfoCollector().get_realtime_info()
+    now = time.time()
+    
+    # 确保异步锁已安全初始化
+    if Config._status_lock is None:
+        Config._status_lock = asyncio.Lock()
+        
+    async with Config._status_lock:
+        # 检查 30 秒状态缓存是否过期
+        if (Config._status_cache is None or 
+                now - Config._status_cache_time > Config.STATUS_CACHE_TTL):
+            
+            # 重新获取消耗资源的磁盘 IO / 进程网卡快照
+            Config._status_cache = await SystemInfoCollector().get_realtime_info()
+            Config._status_cache_time = now
+            Logger.debug("🔄 [Cache] Status 实时监控缓存已过期，已重新生成度量快照。")
+        else:
+            Logger.debug("📦 [Cache] Status 命中监控缓存。")
+            
+        status_info = Config._status_cache.copy()
+        
     return status_info
 
 @app.post("/api/exec", response_model=ExecResponse)
