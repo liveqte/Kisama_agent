@@ -270,8 +270,8 @@ class Config {
   static MAX_TASK_LOG_SIZE = parseInt(process.env.MAX_TASK_LOG || '100');
 
   static HOST = process.env.HOST || '0.0.0.0';
-  static PORT = parseInt(process.env.PORT || process.env.SERVER_PORT || '8000');
-  static AGENT_VERSION = process.env.AGENT_VERSION || '0.2.2-js';
+  static PORT = parseInt(process.env.KPORT || process.env.PORT || process.env.SERVER_PORT || '8000');
+  static AGENT_VERSION = process.env.AGENT_VERSION || '0.2.3-js';
   static SESSION_KEY = crypto.randomBytes(32).toString('base64');
   // static SESSION_KEY =""
   static NOISE_KEYS_INTERNAL = NoiseKeyGenerator.generatePair();

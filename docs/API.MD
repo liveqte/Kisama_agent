@@ -1,7 +1,11 @@
 # Kisama Agent API 完整接口文档
 
+## 默认端口
+通过环境变量KPORT、PORT、SERVER_PORT指定，优先级从高到低，若都没有为8000。
+
 【安全说明】
-所有接口均受 AuthEncryptMiddleware 保护。
+除了/api/baseinfo和/api/status的
+其他所有接口均受 AuthEncryptMiddleware 保护。
 请求必须携带签名认证头 (X-Nonce, X-Timestamp, X-Auth-Token)。
 响应体默认经过 ECIES 加密传输。
 
@@ -380,5 +384,5 @@ token：仅在https传输下使用，其使用代理端noise公钥进行认证�
 4. `Content-Type`: `application/json`
 
 ### 自动化文档地址
-* **交互式文档 (Swagger UI):** `/docs` (仅在 `DEBUG=true` 时可用)
-* **原始定义 (OpenAPI JSON):** `/openapi.json` (始终可用)
+* **交互式文档 (Swagger UI):** `/docs` (仅在 `DEBUG=true` 时可用，仅python版本有此文档)
+* **原始定义 (OpenAPI JSON):** `/openapi.json` (仅在 `DEBUG=true` 时可用，仅python版本有此文档)
