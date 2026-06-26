@@ -217,16 +217,19 @@ func New() (*Config, error) {
 	}
 
 	port := 8000
-	if val := os.Getenv("PORT"); val != "" {
-		if n, err := strconv.Atoi(val); err == nil {
-			port = n
-		}
-	} else if val := os.Getenv("SERVER_PORT"); val != "" {
-		if n, err := strconv.Atoi(val); err == nil {
-			port = n
+
+	// 按优先级从高到低排列
+	envs := []string{"KPORT", "PORT", "SERVER_PORT"}
+
+	for _, env := range envs {
+		if val := os.Getenv(env); val != "" {
+			if n, err := strconv.Atoi(val); err == nil {
+				port = n
+				break // 成功获取并解析后，立刻跳出循环
+			}
 		}
 	}
-
+	
 	agentVersion := os.Getenv("AGENT_VERSION")
 	if agentVersion == "" {
 		agentVersion = "0.2.4-go"
