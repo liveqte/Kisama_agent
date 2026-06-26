@@ -247,6 +247,7 @@ func ReadFileContent(c *gin.Context) {
 }
 
 // UploadFile uploads a file
+// UploadFile handles both single file uploads and chunked streaming uploads
 func UploadFile(c *gin.Context) {
 	cfg := config.Get()
 
@@ -256,7 +257,7 @@ func UploadFile(c *gin.Context) {
 		return
 	}
 
-	// Create directory if not exists
+	// Validate path security and boundaries
 	absDir := filepath.Join(cfg.FileRoot, req.Path)
 	if !strings.HasPrefix(absDir, cfg.FileRoot) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied"})
@@ -268,14 +269,14 @@ func UploadFile(c *gin.Context) {
 		return
 	}
 
-	// Decode base64 content
+	// Decode base64 content segment
 	content, err := base64.StdEncoding.DecodeString(req.Content)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid base64 content"})
 		return
 	}
 
-	// Check size limit
+	// Check size limit (For single file or a single chunk)
 	if int64(len(content)) > cfg.MaxUploadSize {
 		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "File too large"})
 		return
@@ -287,6 +288,81 @@ func UploadFile(c *gin.Context) {
 		return
 	}
 
+	// 💡 ✨【核心修复点】：自适应分块暂存与强顺序流重组引擎
+	// 提示：若您的 models.FileUploadRequest 结构体中将 TotalChunks 定义为了指针类型 (*int)，
+	// 请将此处的判断变更为: if req.TotalChunks != nil
+	// 💡 ✨ 自适应分块暂存与强顺序流重组引擎（已刚性对齐结构体大写 ChunkID）
+	if req.TotalChunks > 0 {
+		chunkIndex := req.ChunkID // 👈 🚨【精准修复点】：由 ChunkId 变更为 ChunkID
+		totalCount := req.TotalChunks
+
+		// 1. 创建隐藏的当前文件专属分块暂存目录：.upload_chunks/[filename]
+		chunkDir := filepath.Join(filepath.Dir(absPath), ".upload_chunks", filepath.Base(absPath))
+		if err := os.MkdirAll(chunkDir, 0755); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create chunk directory"})
+			return
+		}
+
+		// 2. 将当前接收到的分片直接落盘暂存
+		chunkFile := filepath.Join(chunkDir, fmt.Sprintf("chunk_%d", chunkIndex))
+		if err := ioutil.WriteFile(chunkFile, content, 0644); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to write chunk file"})
+			return
+		}
+
+		// 3. 读取暂存目录，计算目前已到位的分片数量
+		files, err := ioutil.ReadDir(chunkDir)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to read chunk directory"})
+			return
+		}
+
+		received := 0
+		for _, f := range files {
+			if !f.IsDir() && strings.HasPrefix(f.Name(), "chunk_") {
+				received++
+			}
+		}
+
+		// 4. 当已到齐的分片总数与预期总片数完全相等时，启动绝对强顺序流合并
+		if received == totalCount {
+			out, err := os.OpenFile(absPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to open target file for merging"})
+				return
+			}
+
+			for i := 0; i < totalCount; i++ {
+				partPath := filepath.Join(chunkDir, fmt.Sprintf("chunk_%d", i))
+				partContent, err := ioutil.ReadFile(partPath)
+				if err != nil {
+					out.Close()
+					c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Missing chunk %d", i)})
+					return
+				}
+				if _, err := out.Write(partContent); err != nil {
+					out.Close()
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to write merged content"})
+					return
+				}
+			}
+			out.Close()
+
+			// 5. 释放暂存区垃圾
+			os.RemoveAll(chunkDir)
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"status":   "ok",
+			"path":     filepath.Join(req.Path, req.Filename),
+			"received": received,
+			"total":    totalCount,
+			"chunked":  true,
+		})
+		return
+	}
+
+	// 🟢 降级兜底：非分块的传统小文件单包单次直传
 	if err := ioutil.WriteFile(absPath, content, 0644); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to write file"})
 		return

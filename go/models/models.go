@@ -227,7 +227,9 @@ type FileCatResponse struct {
 type FileUploadRequest struct {
 	Path     string `json:"path"`
 	Filename string `json:"filename"`
-	Content  string `json:"content"` // Base64 encoded
+	Content  string `json:"content"` 
+	ChunkID     int    `json:"chunk_id"`    
+	TotalChunks int    `json:"total_chunks"`
 }
 
 // FileDeleteRequest represents a file delete request
