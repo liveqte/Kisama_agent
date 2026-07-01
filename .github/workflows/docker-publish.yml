@@ -1,0 +1,61 @@
+name: Build and Push Multi-Arch Docker Image
+
+# 触发条件：当推送到 main 分支时，或手动触发时
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    # 赋予推送镜像到 GitHub Container Registry (ghcr.io) 所需的权限
+    permissions:
+      contents: read
+      packages: write 
+
+    steps:
+      # 1. 拉取代码
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. 设置 QEMU (解决跨架构构建时的 exec format error 问题)
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      # 3. 设置 Docker Buildx (支持多架构构建)
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 4. 登录到 GitHub Container Registry (ghcr.io)
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # (可选) 如果您需要在 CI 中编译 Go 代码生成 agent 二进制，请取消下面这段的注释
+      # - name: Build Go binaries
+      #   working-directory: ./go
+      #   run: |
+      #     # 安装 Go 环境 (如果 ubuntu-latest 没有自带合适版本)
+      #     # go build -o agent ./cmd/agent_amd64.go
+      #     # GOARCH=arm64 go build -o agent-linux-arm64 ./cmd/agent_arm64.go
+
+      # 5. 构建并推送多架构镜像
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          # 【关键】：将构建上下文切换到 go 目录
+          context: ./go
+          # 【关键】：指定 go 目录下的 Dockerfile
+          file: ./go/Dockerfile
+          # 指定构建的双架构
+          platforms: linux/amd64,linux/arm64
+          # 推送到镜像仓库
+          push: true
+          # 镜像标签 (使用 GitHub 仓库名自动拼接，例如 ghcr.io/yourname/yourrepo:latest)
+          tags: |
+            ghcr.io/${{ github.repository }}:latest
+            ghcr.io/${{ github.repository }}:${{ github.sha }}
