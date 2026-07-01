@@ -1,42 +1,64 @@
-# Build stage
-FROM golang:1.21-alpine AS builder
+# 使用轻量级的 Alpine 作为基础镜像
+FROM alpine:3.19
 
-WORKDIR /build
+# 启用 BuildKit 的架构参数
+ARG TARGETARCH
 
-# Install build dependencies
-RUN apk add --no-cache git
+# 定义 s6-overlay 版本
+ARG S6_OVERLAY_VERSION=3.1.6.2 
 
-# Copy go.mod and go.sum
-COPY go.mod go.sum* ./
+# 1. 安装必要的下载和解压工具 (不再需要 tini)
+RUN apk add --no-cache curl xz
 
-# Download dependencies
-RUN go mod download
+# 2. 下载并安装 s6-overlay (根据构建架构自动选择 x86_64 或 aarch64)
+RUN S6_ARCH=$(if [ "$TARGETARCH" = "amd64" ]; then echo "x86_64"; \
+               elif [ "$TARGETARCH" = "arm64" ]; then echo "aarch64"; \
+               else echo "$TARGETARCH"; fi) && \
+    curl -fsSL https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-noarch.tar.xz -o /tmp/s6-noarch.tar.xz && \
+    curl -fsSL https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-${S6_ARCH}.tar.xz -o /tmp/s6-arch.tar.xz && \
+    tar -C / -Jxpf /tmp/s6-noarch.tar.xz && \
+    tar -C / -Jxpf /tmp/s6-arch.tar.xz && \
+    rm -f /tmp/s6-*.tar.xz && \
+    apk del curl xz
 
-# Copy source code
-COPY . .
-
-# Build the binary
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -ldflags="-s -w" -o agent main.go
-
-# Runtime stage
-FROM alpine:latest
-
-RUN apk add --no-cache ca-certificates bash
-
+# 3. 复制 agent 二进制文件并根据架构重命名
 WORKDIR /app
+COPY agent agent-linux-arm64 /tmp/
 
-# Copy binary from builder
-COPY --from=builder /build/agent .
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+        mv /tmp/agent /app/agent; \
+    elif [ "$TARGETARCH" = "arm64" ]; then \
+        mv /tmp/agent-linux-arm64 /app/agent; \
+    else \
+        echo "Unsupported architecture: $TARGETARCH" && exit 1; \
+    fi && \
+    chmod +x /app/agent && \
+    rm -f /tmp/agent /tmp/agent-linux-arm64
 
-# Create keys directory
-RUN mkdir -p keys
+# 4. 配置 s6-rc 服务基础目录和类型
+RUN mkdir -p /etc/s6-overlay/s6-rc.d/myagent && \
+    printf 'longrun\n' > /etc/s6-overlay/s6-rc.d/myagent/type
 
-# Expose port
-EXPOSE 8000
+# 5. 使用 heredoc 编写 run 脚本 (独立 RUN 指令，避免续行符冲突)
+# 注意：EOF 必须顶格写，不能有空格
+RUN cat << 'EOF' > /etc/s6-overlay/s6-rc.d/myagent/run
+#!/bin/sh
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD wget --quiet --tries=1 --spider http://localhost:8000/health || exit 1
+# 【核心修复】：加载 Docker 注入的环境变量
+if [ -d /run/s6/container_environment ]; then
+    for envfile in /run/s6/container_environment/*; do
+        [ -f "$envfile" ] || continue
+        export "$(basename "$envfile")=$(cat "$envfile")"
+    done
+fi
 
-# Run the agent
-CMD ["./agent"]
+# 启动 agent 并将 stderr 重定向到 stdout
+exec /app/agent 2>&1
+EOF
+
+# 6. 设置脚本权限并注册到 s6 的 user bundle
+RUN chmod 755 /etc/s6-overlay/s6-rc.d/myagent/run && \
+    mkdir -p /etc/s6-overlay/s6-rc.d/user/contents.d && \
+    touch /etc/s6-overlay/s6-rc.d/user/contents.d/myagent
+
+ENTRYPOINT ["/init"]
