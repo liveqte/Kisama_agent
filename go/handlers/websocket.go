@@ -439,18 +439,23 @@ func (h *TerminalSessionHandler) processTerminalMessage(message []byte) {
 }
 
 func (h *TerminalSessionHandler) getAvailableShell() string {
+	// 🚀 1. 核心修复：优先寻找体验更佳的高级富文本 Shell
+	advancedShells := []string{"/bin/bash", "/bin/zsh", "/bin/ash"}
+	for _, sh := range advancedShells {
+		if _, err := os.Stat(sh); err == nil {
+			return sh // 只要有更高级的，直接采用
+		}
+	}
+
+	// 2. 如果没有高级 Shell，再退一步听从环境变量的安排
 	envShell := os.Getenv("SHELL")
 	if envShell != "" {
 		if _, err := os.Stat(envShell); err == nil {
 			return envShell
 		}
 	}
-	shells := []string{"/bin/bash", "/bin/zsh", "/bin/ash", "/bin/sh"}
-	for _, sh := range shells {
-		if _, err := os.Stat(sh); err == nil {
-			return sh
-		}
-	}
+
+	// 3. 最后的兜底
 	return "/bin/sh"
 }
 

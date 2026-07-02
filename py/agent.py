@@ -15,7 +15,7 @@ from typing import Union,List, Dict, Any, Optional
 from fastapi import FastAPI, Request, Response, HTTPException, status
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
-
+from urllib.parse import unquote
 # 加密相关
 from ecdsa import VerifyingKey, BadSignatureError, NIST256p
 from ecdsa.util import sigdecode_der, sigdecode_string
@@ -194,6 +194,13 @@ class FileUploadRequest(BaseModel):
     content: str = Field(..., description="文件内容的Base64编码", examples=["SGVsbG8gV29ybGQh"]) # "Hello World!"
     chunk_id: Optional[int] = Field(None, description="分块索引 (0-based)", examples=[0])
     total_chunks: Optional[int] = Field(None, description="总分块数", examples=[3])
+    
+class FileUploadRawResponse(SResponse):
+    """裸二进制流上传接口的标准化结构体返回体"""
+    path: Optional[str] = Field(None, description="文件在服务器端的保存路径")
+    chunk_id: Optional[int] = Field(None, description="当前上传的分片索引")
+    completed: bool = Field(..., description="指示该文件是否已全部传输并合并完成")
+    message: str = Field("", description="状态提示消息")
 
 class FileUploadResponse(SResponse):
     path: Optional[str] = None
@@ -574,7 +581,7 @@ class Config:
     PORT = int(os.getenv("KPORT") or os.getenv("PORT") or os.environ.get('SERVER_PORT') or 8000)
     
     # 代理版本信息
-    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.2.4-python")
+    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.3.0-python")
     
     # ================= 启动校验 =================
     
@@ -2152,13 +2159,14 @@ class TerminalSessionHandler:
 
     @staticmethod
     def get_available_shell():
+        for sh_name in ['bash', 'zsh', 'ash']:
+            sh_path = shutil.which(sh_name)
+            if sh_path: 
+                return sh_path
         env_shell = os.environ.get('SHELL')
         if env_shell and os.path.exists(env_shell) and os.access(env_shell, os.X_OK):
             return env_shell
-        for sh_name in ['bash', 'zsh', 'ash', 'sh']:
-            sh_path = shutil.which(sh_name)
-            if sh_path: return sh_path
-        return '/bin/sh'
+        return shutil.which('sh') or '/bin/sh'
 
     def set_pty_size(self, rows: int, cols: int):
         if self.master_fd is not None:
@@ -3001,7 +3009,66 @@ async def file_upload(
         total_chunks=body.total_chunks
     )
     return result
-
+# ============================================================================
+# 🚀 裸二进制流文件上传接口 (支持结构体返回，零体积膨胀)
+# ============================================================================
+@app.post("/api/fileraw", response_model=FileUploadRawResponse)
+async def file_upload_raw(request: Request):
+    headers = request.headers
+    
+    # 1. 从 HTTP Header 中提取元数据
+    file_path = unquote(headers.get("X-File-Path", ""))
+    filename = unquote(headers.get("X-File-Name", ""))
+    chunk_id_raw = headers.get("X-Chunk-Id")
+    total_chunks_raw = headers.get("X-Total-Chunks")
+    
+    if not file_path or not filename:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, 
+            detail="Missing required custom headers: X-File-Path and X-File-Name"
+        )
+        
+    chunk_id = int(chunk_id_raw) if chunk_id_raw is not None else None
+    total_chunks = int(total_chunks_raw) if total_chunks_raw is not None else None
+    
+    # 2. 读取 Body 中的裸二进制数据流
+    file_content = await request.body()
+    
+    # 3. 移交给底层核心驱动进行落盘/分块累加
+    fm = request.app.state.file_manager
+    result = fm.upload_file(
+        file_content=file_content,
+        target_path=file_path,
+        filename=filename,
+        chunk_id=chunk_id,
+        total_chunks=total_chunks
+    )
+    
+    # 4. 🚀 强类型无感返回：直接实例化结构体，FastAPI 自动将其转化为精简 JSON
+    if result.get("status") == "ok":
+        return FileUploadRawResponse(
+            status="ok",
+            path=result.get("path"),
+            chunk_id=chunk_id,
+            completed=True,
+            message="All chunks received. File merged successfully." if result.get("chunked") else "File uploaded successfully."
+        )
+        
+    elif result.get("status") == "pending":
+        import os
+        return FileUploadRawResponse(
+            status="ok",
+            path=os.path.join(file_path, filename),
+            chunk_id=chunk_id,
+            completed=False,
+            message=f"Chunk {chunk_id} uploaded. Waiting for remaining blocks."
+        )
+    
+    return FileUploadRawResponse(
+        status="error",
+        completed=False,
+        message=result.get("message", "Unknown upload error")
+    )
 
 # --- POST /api/file/download : 下载文件 ---
 @app.post("/api/file/download")

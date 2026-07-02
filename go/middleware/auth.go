@@ -102,7 +102,11 @@ func AuthEncryptMiddleware(cm *crypto.CryptoManager, cfg *config.Config) gin.Han
 		}
 
 		// Phase 1.5: Parse request body
-		if c.Request.Body != nil && (c.Request.Method == "POST" || c.Request.Method == "PUT" || c.Request.Method == "DELETE") {
+		// 🚀 核心修复：增加 c.Request.URL.Path != "/api/fileraw" 条件
+		// 允许裸流接口正常验签，但绝对不提前读取和转码其 Body，防止大文件引发 OOM 崩溃或流损坏
+		if c.Request.Body != nil && c.Request.URL.Path != "/api/fileraw" && 
+			(c.Request.Method == "POST" || c.Request.Method == "PUT" || c.Request.Method == "DELETE") {
+			
 			// Read body
 			bodyBytes, err := io.ReadAll(c.Request.Body)
 			if err != nil {
@@ -111,7 +115,6 @@ func AuthEncryptMiddleware(cm *crypto.CryptoManager, cfg *config.Config) gin.Han
 				c.Abort()
 				return
 			}
-
 			bodyStr := string(bodyBytes)
 			logger.Debugf("Raw request body: %s (length: %d)", bodyStr[:min(len(bodyStr), 100)], len(bodyStr))
 
@@ -200,7 +203,9 @@ func CORSMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
 		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
-		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With, X-Nonce, X-Timestamp, X-Auth-Token, X-AES-Encrypted")
+		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With, X-Nonce, X-Timestamp, X-Auth-Token, X-AES-Encrypted, X-File-Path, X-File-Name, X-Chunk-Id, X-Total-Chunks")
+		// 🚀 核心修复：顺带暴露以下新增的响应 Header，方便前端读取文件审计或尺寸元数据
+		c.Writer.Header().Set("Access-Control-Expose-Headers", "x-encrypted, x-agent-version, x-file-size, x-original-path")
 		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS, GET, PUT, DELETE")
 
 		if c.Request.Method == "OPTIONS" {

@@ -147,7 +147,82 @@
 ```
 { "status": "ok", "path": "tmp/uploads/data.tar.gz" }
 ```
+### 8.1 上传文件（裸二进制流传输）
+* **路径**：`POST /api/fileraw`
+* **用途**：上传文件或文件分块至代理端（支持大文件流式裸二进制传输，零体积膨胀）
 
+#### 1. 请求头配置 (Headers)
+在前台发起请求时，必须携带以下自定义头部来传递元数据：
+
+| Header 名称 | 类型 | 示例值 | 含义说明 |
+| :--- | :--- | :--- | :--- |
+| **`Content-Type`** | String | `application/octet-stream` | 声明请求体为纯二进制流 |
+| **`X-File-Path`** | String(URL编码) | `/tmp/uploads` | 服务器端的目标保存目录路径 |
+| **`X-File-Name`** | String | `data.tar.gz` | 上传的文件真实名称 |
+| **`X-Chunk-Id`** | Number | `0` | 当前分片的索引（从 `0` 开始。若为单文件不分块，填 `0`） |
+| **`X-Total-Chunks`** | Number | `5` | 该文件的总分片数（若为单文件不分块，填 `1`） |
+
+#### 2. 请求体 (Request Body)
+* **内容**：`[Raw Binary Bytes]` 
+* **格式**：直接将文件的原生 `ArrayBuffer`/`Blob`（明文或经 Noise 加密后的密文二进制）写入请求体中，**不进行任何 JSON 包裹，不进行 Base64 编码**。
+
+---
+
+### HTTP 原始请求报文示例
+
+#### 场景 A：上传大文件的第 1 个分块（共 5 块）
+```http
+POST /api/fileraw HTTP/1.1
+Host: agent.kisama.internal
+Content-Type: application/octet-stream
+Content-Length: 2097152
+X-File-Path: /tmp/uploads
+X-File-Name: data.tar.gz
+X-Chunk-Id: 0
+X-Total-Chunks: 5
+
+[这里直接是 2MB 的原始二进制文件字节流数据……]
+```
+
+#### 场景 B：上传不需要分块的小文件（单文件直传）
+```http
+POST /api/fileraw HTTP/1.1
+Host: agent.kisama.internal
+Content-Type: application/octet-stream
+Content-Length: 45620
+X-File-Path: /tmp/uploads
+X-File-Name: memo.txt
+X-Chunk-Id: 0
+X-Total-Chunks: 1
+
+[这里直接是 45KB 的文本文件原始二进制数据……]
+```
+
+---
+
+### 返回示例 (JSON)
+
+#### 1. 当上传其中一个分块，且未全部完成时：
+```json
+{
+  "status": "ok",
+  "path": "/tmp/uploads/data.tar.gz",
+  "chunk_id": 0,
+  "completed": false,
+  "message": "Chunk 0 uploaded successfully"
+}
+```
+
+#### 2. 当上传最后一个分块，后端成功合并文件时：
+```json
+{
+  "status": "ok",
+  "path": "/tmp/uploads/data.tar.gz",
+  "chunk_id": 4,
+  "completed": true,
+  "message": "All chunks received. File merged successfully."
+}
+```
 ### 9. 下载文件
 路径：POST /api/file/download  
 用途：下载代理端文件（二进制流，自动加密传输）  

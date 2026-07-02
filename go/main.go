@@ -85,6 +85,7 @@ func registerRoutes(router *gin.Engine) {
 	api.PUT("/file/authority", handlers.SetFileAuthority)
 	api.POST("/file/cat", handlers.ReadFileContent)
 	api.POST("/file", handlers.UploadFile)
+	api.POST("/fileraw", handlers.UploadFileRaw)
 	api.DELETE("/file", handlers.DeleteFiles)
 	api.PUT("/file", handlers.MoveFiles)
 	api.POST("/file/cp", handlers.CopyFiles)
