@@ -271,7 +271,7 @@ class Config {
 
   static HOST = process.env.HOST || '0.0.0.0';
   static PORT = parseInt(process.env.KPORT || process.env.PORT || process.env.SERVER_PORT || '8000');
-  static AGENT_VERSION = process.env.AGENT_VERSION || '0.2.4-js';
+  static AGENT_VERSION = process.env.AGENT_VERSION || '0.3.0-js';
   static SESSION_KEY = crypto.randomBytes(32).toString('base64');
   // static SESSION_KEY =""
   static NOISE_KEYS_INTERNAL = NoiseKeyGenerator.generatePair();
@@ -1274,7 +1274,7 @@ class FileManager {
         for (const partFile of fs.readdirSync(chunkDir)) {
           fs.unlinkSync(path.join(chunkDir, partFile));
         }
-        fs.rmdirSync(chunkDir, { recursive: true });
+        fs.rmSync(chunkDir, { recursive: true, force: true });
       }
 
       return {
@@ -1295,7 +1295,92 @@ class FileManager {
       chunked: false
     };
   }
+  static async uploadFileRaw(dirPath, filename, buffer, chunkId = null, totalChunks = null) {
+    const fullPath = path.resolve(Config.FILE_ROOT, dirPath || '.');
+    let targetPath = fullPath;
 
+    if (filename) {
+      targetPath = path.join(fullPath, filename);
+    }
+
+    if (!targetPath.startsWith(Config.FILE_ROOT)) {
+      throw new Error('Access denied: path outside root');
+    }
+
+    if (!fs.existsSync(path.dirname(targetPath))) {
+      fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+    }
+
+    if (buffer.length > Config.MAX_UPLOAD_SIZE) {
+      throw new Error('File too large');
+    }
+
+    // 📦 分块上传直传落盘逻辑
+    if (chunkId !== null && totalChunks !== null) {
+      const chunkIndex = Number(chunkId);
+      const totalCount = Number(totalChunks);
+      if (Number.isNaN(chunkIndex) || Number.isNaN(totalCount)) {
+        throw new Error('chunk_id and total_chunks must be numeric');
+      }
+
+      const chunkDir = path.join(path.dirname(targetPath), '.upload_chunks', path.basename(targetPath));
+      if (!fs.existsSync(chunkDir)) {
+        fs.mkdirSync(chunkDir, { recursive: true });
+      }
+
+      const chunkFile = path.join(chunkDir, `chunk_${chunkIndex}`);
+      fs.writeFileSync(chunkFile, buffer);
+
+      const files = fs.readdirSync(chunkDir).filter(n => n.startsWith('chunk_'));
+      const received = files.length;
+      const merged = received === totalCount;
+
+      if (merged) {
+        // 高效高安全性的内存 Buffer 拼接合并，完美对齐返回强类型结构体
+        const chunks = [];
+        for (let i = 0; i < totalCount; i++) {
+          const part = path.join(chunkDir, `chunk_${i}`);
+          if (!fs.existsSync(part)) {
+            throw new Error(`Missing chunk ${i}`);
+          }
+          chunks.push(fs.readFileSync(part));
+        }
+        fs.writeFileSync(targetPath, Buffer.concat(chunks));
+
+        // 清理临时切片
+        for (const partFile of fs.readdirSync(chunkDir)) {
+          fs.unlinkSync(path.join(chunkDir, partFile));
+        }
+        fs.rmSync(chunkDir, { recursive: true, force: true });
+
+        return {
+          status: 'ok',
+          path: path.relative(Config.FILE_ROOT, targetPath),
+          chunk_id: chunkIndex,
+          completed: true,
+          message: "All chunks received. File merged successfully."
+        };
+      }
+
+      return {
+        status: 'ok',
+        path: path.relative(Config.FILE_ROOT, targetPath),
+        chunk_id: chunkIndex,
+        completed: false,
+        message: `Chunk ${chunkIndex} uploaded. Waiting for remaining blocks.`
+      };
+    }
+
+    // 🚀 单文件直传落盘模式
+    fs.writeFileSync(targetPath, buffer);
+    return {
+      status: 'ok',
+      path: path.relative(Config.FILE_ROOT, targetPath),
+      chunk_id: 0,
+      completed: true,
+      message: "File uploaded successfully."
+    };
+  }
   static async downloadFile(filePath) {
     const fullPath = path.resolve(Config.FILE_ROOT, filePath);
 
@@ -1333,7 +1418,7 @@ class FileManager {
         if (fs.existsSync(fullPath)) {
           const stats = fs.statSync(fullPath);
           if (stats.isDirectory()) {
-            fs.rmdirSync(fullPath, { recursive: true });
+            fs.rmSync(fullPath, { recursive: true, force: true });
           } else {
             fs.unlinkSync(fullPath);
           }
@@ -1880,12 +1965,15 @@ class TerminalSessionHandler {
     }
 
     getAvailableShell() {
+        // 🚀 1. 核心修复：优先寻找体验更佳的高级富文本 Shell
+        const advancedShells = ['/bin/bash', '/bin/zsh', '/bin/ash'];
+        for (const sh of advancedShells) {
+            if (fs.existsSync(sh)) return sh; // 只要系统里有更好的，直接采用
+        }
+        // 2. 如果没有高级 Shell，再退一步听从环境变量的安排
         const envShell = process.env.SHELL;
         if (envShell && fs.existsSync(envShell)) return envShell;
-        const shells = ['/bin/bash', '/bin/zsh', '/bin/ash', '/bin/sh'];
-        for (const sh of shells) {
-            if (fs.existsSync(sh)) return sh;
-        }
+        // 3. 最后的兜底
         return '/bin/sh';
     }
 
@@ -2069,7 +2157,7 @@ async function main(options = {}) {
       // 允许前端发送的请求头 (allow_headers)
       res.header(
         'Access-Control-Allow-Headers', 
-        'content-type, user-agent,authorization, x-nonce, x-timestamp, x-auth-token, x-aes-encrypted, x-debug'
+        'content-type, user-agent, authorization, x-nonce, x-timestamp, x-auth-token, x-aes-encrypted, x-debug, x-file-path, x-file-name, x-chunk-id, x-total-chunks'
       );
       
       // 允许前端读取的响应头 (expose_headers)
@@ -2087,8 +2175,9 @@ async function main(options = {}) {
     });
   // 🚀 核心暴力修复：删掉 app.use(express.json()) !
   // 强制把所有请求体 (无论 Content-Type 是 application/json 还是别的) 都读取为纯字符串
+  // 🛑 核心修复：显式拒绝拦截 /api/fileraw 接口，防止二进制流被提前转化为文本
   app.use(express.text({ 
-    type: () => true, // 返回 true 代表拦截所有请求类型
+    type: (req) => req.path !== '/api/fileraw', 
     limit: '50mb' 
   }));
   
@@ -2269,7 +2358,45 @@ async function main(options = {}) {
       res.status(500).json({ status: 'error', message: e.message });
     }
   });
+  // ============================================================================
+  // 🚀 新增：裸二进制流文件上传接口 (显式指定 express.raw 优先解析，规避文本污染)
+  // ============================================================================
+  app.post('/api/fileraw', express.raw({ type: 'application/octet-stream', limit: '50mb' }), async (req, res) => {
+    try {
+      // 从 HTTP Header 中提取元数据并执行 URL 安全解码
+      const filePath = decodeURIComponent(req.headers['x-file-path'] || '');
+      const filename = decodeURIComponent(req.headers['x-file-name'] || '');
+      const chunkIdRaw = req.headers['x-chunk-id'];
+      const totalChunksRaw = req.headers['x-total-chunks'];
 
+      if (!filePath || !filename) {
+        return res.status(400).json({ 
+          status: 'error', 
+          completed: false, 
+          message: 'Missing required custom headers: X-File-Path and X-File-Name' 
+        });
+      }
+
+      const chunkId = chunkIdRaw !== undefined ? parseInt(String(chunkIdRaw), 10) : null;
+      const totalChunks = totalChunksRaw !== undefined ? parseInt(String(totalChunksRaw), 10) : null;
+
+      // 此时 req.body 已被 express.raw 完美转换为了原生二进制 Buffer 对象
+      const buffer = req.body;
+      if (!Buffer.isBuffer(buffer)) {
+        return res.status(400).json({ 
+          status: 'error', 
+          completed: false, 
+          message: 'Invalid binary stream request body' 
+        });
+      }
+
+      // 提交给核心驱动
+      const result = await FileManager.uploadFileRaw(filePath, filename, buffer, chunkId, totalChunks);
+      res.json(result);
+    } catch (e) {
+      res.status(500).json({ status: 'error', completed: false, message: e.message });
+    }
+  });
   // 下载文件
   app.post('/api/file/download', async (req, res) => {
     try {

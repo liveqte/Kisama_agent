@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"strconv"
+	"net/url"
 
 	"github.com/gin-gonic/gin"
 	"github.com/liveqte/kisama_agent/config"
@@ -562,4 +564,151 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	return ioutil.WriteFile(dst, content, 0644)
+}
+
+// ============================================================================
+// 🚀 新增：裸二进制流文件上传接口 (元数据走 Header，Body 为 100% 纯净裸流)
+// ============================================================================
+func UploadFileRaw(c *gin.Context) {
+	cfg := config.Get()
+
+	// 1. 从 HTTP Header 提取元数据并执行 URL 安全解码 (防其中包含中文)
+	encodedPath := c.GetHeader("X-File-Path")
+	encodedName := c.GetHeader("X-File-Name")
+	chunkIDStr := c.GetHeader("X-Chunk-Id")
+	totalChunksStr := c.GetHeader("X-Total-Chunks")
+
+	filePath, err := url.QueryUnescape(encodedPath)
+	if err != nil || filePath == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "completed": false, "message": "Invalid X-File-Path header"})
+		return
+	}
+	fileName, err := url.QueryUnescape(encodedName)
+	if err != nil || fileName == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "completed": false, "message": "Invalid X-File-Name header"})
+		return
+	}
+
+	chunkID, _ := strconv.Atoi(chunkIDStr)
+	totalChunks, _ := strconv.Atoi(totalChunksStr)
+
+	// 2. 严格的安全边界与路径遍历校验
+	absDir := filepath.Join(cfg.FileRoot, filePath)
+	if !strings.HasPrefix(absDir, cfg.FileRoot) {
+		c.JSON(http.StatusForbidden, gin.H{"status": "error", "completed": false, "message": "Access denied"})
+		return
+	}
+
+	if err := os.MkdirAll(absDir, 0755); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "completed": false, "message": "Failed to create directory"})
+		return
+	}
+
+	absPath := filepath.Join(absDir, fileName)
+	if !strings.HasPrefix(absPath, cfg.FileRoot) {
+		c.JSON(http.StatusForbidden, gin.H{"status": "error", "completed": false, "message": "Access denied"})
+		return
+	}
+
+	// 3. 直接在 Request Body 中读取 100% 原始二进制裸字节，免除 Base64 编解码开销
+	content, err := ioutil.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "completed": false, "message": "Failed to read binary stream"})
+		return
+	}
+
+	if int64(len(content)) > cfg.MaxUploadSize {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"status": "error", "completed": false, "message": "File too large"})
+		return
+	}
+
+	relPath := filepath.Join(filePath, fileName)
+
+	// 4. 自适应分块暂存与强顺序合并引擎
+	if totalChunks > 0 {
+		// 创建当前文件专属的隐藏暂存分片目录
+		chunkDir := filepath.Join(filepath.Dir(absPath), ".upload_chunks", filepath.Base(absPath))
+		if err := os.MkdirAll(chunkDir, 0755); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "completed": false, "message": "Failed to create chunk directory"})
+			return
+		}
+
+		// 分片落盘暂存
+		chunkFile := filepath.Join(chunkDir, fmt.Sprintf("chunk_%d", chunkID))
+		if err := ioutil.WriteFile(chunkFile, content, 0644); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "completed": false, "message": "Failed to write chunk"})
+			return
+		}
+
+		// 统计当前已到位的分片数
+		files, err := ioutil.ReadDir(chunkDir)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "completed": false, "message": "Failed to read chunk directory"})
+			return
+		}
+
+		received := 0
+		for _, f := range files {
+			if !f.IsDir() && strings.HasPrefix(f.Name(), "chunk_") {
+				received++
+			}
+		}
+
+		// 触发最终强顺序合并
+		if received == totalChunks {
+			out, err := os.OpenFile(absPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "completed": false, "message": "Failed to open target file"})
+				return
+			}
+			defer out.Close()
+
+			for i := 0; i < totalChunks; i++ {
+				partPath := filepath.Join(chunkDir, fmt.Sprintf("chunk_%d", i))
+				partContent, err := ioutil.ReadFile(partPath)
+				if err != nil {
+					c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "completed": false, "message": fmt.Sprintf("Missing chunk %d", i)})
+					return
+				}
+				if _, err := out.Write(partContent); err != nil {
+					c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "completed": false, "message": "Failed to merge chunk"})
+					return
+				}
+			}
+			os.RemoveAll(chunkDir) // 清理垃圾暂存区
+
+			c.JSON(http.StatusOK, gin.H{
+				"status":    "ok",
+				"path":      relPath,
+				"chunk_id":  chunkID,
+				"completed": true,
+				"message":   "All chunks received. File merged successfully.",
+			})
+			return
+		}
+
+		// 尚未集齐，返回挂起等待状态
+		c.JSON(http.StatusOK, gin.H{
+			"status":    "ok",
+			"path":      relPath,
+			"chunk_id":  chunkID,
+			"completed": false,
+			"message":   fmt.Sprintf("Chunk %d uploaded. Waiting for remaining blocks.", chunkID),
+		})
+		return
+	}
+
+	// 5. 降级兜底：非分块小文件单包直接落盘
+	if err := ioutil.WriteFile(absPath, content, 0644); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "completed": false, "message": "Failed to write file"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":    "ok",
+		"path":      relPath,
+		"chunk_id":  0,
+		"completed": true,
+		"message":   "File uploaded successfully.",
+	})
 }

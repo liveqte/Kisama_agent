@@ -14,6 +14,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.security.*;
 import java.security.spec.X509EncodedKeySpec;
@@ -401,7 +402,118 @@ public class kisama {
             res.type("application/json");
             return this.gson.toJson(Map.of("status", "ok", "path", Paths.get(path).resolve(filename).toString()));
         });
+        // ============================================================================
+        // 🚀 新增：裸二进制流文件上传接口 (支持大文件流式裸二进制传输与分块合并，零体积膨胀)
+        // ============================================================================
+        post("/api/fileraw", (req, res) -> {
+            res.type("application/json");
+            
+            // 1. 从 HTTP Header 中提取元数据并执行 URL 编码恢复 (确保支持中文和特殊路径)
+            String encodedPath = req.headers("X-File-Path");
+            String encodedName = req.headers("X-File-Name");
+            String chunkIdStr = req.headers("X-Chunk-Id");
+            String totalChunksStr = req.headers("X-Total-Chunks");
 
+            if (encodedPath == null || encodedName == null) {
+                res.status(400);
+                return this.gson.toJson(Map.of(
+                    "status", "error", 
+                    "completed", false, 
+                    "message", "Missing required custom headers: X-File-Path and X-File-Name"
+                ));
+            }
+
+            String filePath = java.net.URLDecoder.decode(encodedPath, StandardCharsets.UTF_8);
+            String fileName = java.net.URLDecoder.decode(encodedName, StandardCharsets.UTF_8);
+            
+            int chunkId = (chunkIdStr != null) ? Integer.parseInt(chunkIdStr) : 0;
+            int totalChunks = (totalChunksStr != null) ? Integer.parseInt(totalChunksStr) : 0;
+
+            // 2. 刚性安全边界校验：防止目录穿越与非法写出 (Path Traversal Protection)
+            Path rootPath = Paths.get(this.FILE_ROOT).toAbsolutePath().normalize();
+            Path dirPath = rootPath.resolve(filePath).toAbsolutePath().normalize();
+            if (!dirPath.startsWith(rootPath)) {
+                res.status(403);
+                return this.gson.toJson(Map.of("status", "error", "completed", false, "message", "Access denied"));
+            }
+            Files.createDirectories(dirPath);
+
+            Path targetPath = dirPath.resolve(fileName).toAbsolutePath().normalize();
+            if (!targetPath.startsWith(rootPath)) {
+                res.status(403);
+                return this.gson.toJson(Map.of("status", "error", "completed", false, "message", "Access denied"));
+            }
+
+            // 3. 100% 纯净读取 Body 缓冲区内的原生二进制裸流 (不经任何字符串解包)
+            byte[] content = req.bodyAsBytes();
+            if (content == null) {
+                content = new byte[0];
+            }
+
+            String relPath = Paths.get(filePath).resolve(fileName).toString();
+
+            // 4. 自适应分块暂存与绝对强顺序重组引擎
+            if (totalChunks > 0) {
+                // 建立当前文件专属的隐藏暂存分片目录：.upload_chunks/[filename]
+                Path chunkDir = dirPath.resolve(".upload_chunks").resolve(fileName);
+                Files.createDirectories(chunkDir);
+                
+                // 将当前分段写入暂存文件
+                Path chunkFile = chunkDir.resolve("chunk_" + chunkId);
+                Files.write(chunkFile, content);
+                
+                // 检索并统计当前已就位的分片数量
+                File[] chunkFiles = chunkDir.toFile().listFiles((dirFile, name) -> name.startsWith("chunk_"));
+                int received = (chunkFiles != null) ? chunkFiles.length : 0;
+                
+                // 触发终极流水线顺序合并
+                if (received == totalChunks) {
+                    try (OutputStream out = Files.newOutputStream(targetPath, 
+                            StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
+                        for (int i = 0; i < totalChunks; i++) {
+                            Path part = chunkDir.resolve("chunk_" + i);
+                            if (!Files.exists(part)) {
+                                throw new FileNotFoundException("Missing chunk block " + i);
+                            }
+                            Files.copy(part, out);
+                        }
+                    }
+                    
+                    // 彻底释放并清理暂存区碎屑
+                    Files.walk(chunkDir)
+                         .sorted(Comparator.reverseOrder())
+                         .map(Path::toFile)
+                         .forEach(File::delete);
+                    
+                    return this.gson.toJson(Map.of(
+                        "status", "ok",
+                        "path", relPath,
+                        "chunk_id", chunkId,
+                        "completed", true,
+                        "message", "All chunks received. File merged successfully."
+                    ));
+                }
+                
+                // 部分切片仍未到齐，保持挂起等待状态
+                return this.gson.toJson(Map.of(
+                    "status", "ok",
+                    "path", relPath,
+                    "chunk_id", chunkId,
+                    "completed", false,
+                    "message", "Chunk " + chunkId + " uploaded. Waiting for remaining blocks."
+                ));
+            } else {
+                // 5. 传统降级兜底：非分块小文件单包直接落盘
+                Files.write(targetPath, content);
+                return this.gson.toJson(Map.of(
+                    "status", "ok",
+                    "path", relPath,
+                    "chunk_id", 0,
+                    "completed", true,
+                    "message", "File uploaded successfully."
+                ));
+            }
+        });
         post("/api/file/download", (req, res) -> {
             Map<String, Object> body = req.attribute("json_body");
             String p = Objects.toString(body.getOrDefault("path", " "));
@@ -654,7 +766,7 @@ public class kisama {
         get("/", (req, res) -> "kisama-running");
 
         after((req, res) -> {
-            res.header("X-Agent-Version", "0.2.4-java");
+            res.header("X-Agent-Version", "0.3.0-java");
             if ("OPTIONS".equalsIgnoreCase(req.requestMethod())) {
                 res.header("X-Encrypted", "false");
                 return;
@@ -862,7 +974,7 @@ public class kisama {
         obj.put("os", getOsPrettyName());
         obj.put("kernel_version", getKernelVersion());
         obj.put("swap_total", getTotalSwapBytes());
-        obj.put("version", "0.2.4-java");
+        obj.put("version", "0.3.0-java");
         obj.put("virtualization", getVirtualization());
         return obj;
     }
@@ -931,7 +1043,7 @@ public class kisama {
         obj.put("os", getOsPrettyName());
         obj.put("kernel_version", getKernelVersion());
         obj.put("swap_total", getTotalSwapBytes());
-        obj.put("version", "0.2.4-java");
+        obj.put("version", "0.3.0-java");
         obj.put("virtualization", getVirtualization());
 
         // 🌟 修改：根据是否通过验证状态，动态清空核心敏感凭证
@@ -1659,7 +1771,29 @@ public class kisama {
                 this.noiseCipher = new NoiseSession(agent.AGENT_PRIVATE_KEY);
             }
         }
+        // 🚀 新增：依据优先级多维定位当前系统可用的最佳 Shell 进程
+        private String getAvailableShell() {
+            // 1. 核心修复：优先寻找体验更佳的高级富文本 Shell，具备执行权限才予以放行
+            String[] advancedShells = {"/bin/bash", "/bin/zsh", "/bin/ash"};
+            for (String sh : advancedShells) {
+                File f = new File(sh);
+                if (f.exists() && f.canExecute()) {
+                    return sh; // 只要系统里有更好的高级 Shell，直接采用
+                }
+            }
 
+            // 2. 如果没有高级 Shell，再退一步听从全局环境变量 SHELL 的强制安排
+            String envShell = System.getenv("SHELL");
+            if (envShell != null && !envShell.isBlank()) {
+                File f = new File(envShell.trim());
+                if (f.exists() && f.canExecute()) {
+                    return f.getAbsolutePath();
+                }
+            }
+
+            // 3. 最后的兜底平衡
+            return "/bin/sh";
+        }
         public void start() throws Exception {
             if (!useNoise) {
                 startProcess();
@@ -1676,11 +1810,12 @@ public class kisama {
 
             agent.log("[TRACE-WS] 🚀 正在使用 Pty4J 启动真正的原生伪终端...");
 
-            String[] shellCmd = new File("/bin/bash").exists() ? 
-                    new String[]{"/bin/bash"} : new String[]{"/bin/sh"};
+            // 🚀 核心替换：通过动态探测器替换原本硬编码的 /bin/bash 判定逻辑
+            String shell = getAvailableShell();
+            agent.log("[TRACE-WS] 🐚 优先级队列选定 Shell 路径: " + shell);
 
             this.ptyProcess = new PtyProcessBuilder()
-                    .setCommand(shellCmd)
+                    .setCommand(new String[]{shell}) // 注入动态计算出的富文本 Shell
                     .setEnvironment(env)
                     .setDirectory(agent.FILE_ROOT)
                     .start();
