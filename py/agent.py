@@ -8,6 +8,7 @@ import json
 import time
 import base64
 import hashlib
+import threading
 from datetime import datetime
 from typing import Union,List, Dict, Any, Optional
 
@@ -581,7 +582,7 @@ class Config:
     PORT = int(os.getenv("KPORT") or os.getenv("PORT") or os.environ.get('SERVER_PORT') or 8000)
     
     # 代理版本信息
-    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.3.0-python")
+    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.3.3-python")
     
     # ================= 启动校验 =================
     
@@ -3368,40 +3369,78 @@ async def http_exception_handler(request: Request, exc: HTTPException):
         content=json.loads(encrypted) if Config.DEBUG else {"_encrypted": encrypted},
         headers={"x-encrypted": "false" if Config.DEBUG else "true"}
     )
-
-
+    
 # ============================================================================
 # 🚀 程序入口
 # ============================================================================
-# ✅ 在 main() 函数中初始化并挂载
-def main():
-    """主入口"""
+class NoSignalsUvicornServer(uvicorn.Server):
+    """
+    自定义 Uvicorn 服务器类
+    🌟 核心技巧：重写信号安装函数。直接 pass 掉，阻止 Uvicorn 尝试在子线程
+    注册主线程专用的系统信号（解决 ValueError: set_wakeup_fd only works in main thread）
+    """
+    def install_signal_handlers(self) -> None:
+        pass
+
+def _start_uvicorn_server(app_obj, host, port, log_level):
+    """在子线程中运行的 Uvicorn 启动函数"""
+    # 🔄 确保子线程拥有独立的 asyncio 事件循环
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    # 🛠️ 实例化标准的配置类（移除了不属于它的 install_signals）
+    config = uvicorn.Config(
+        app=app_obj,           
+        host=host,
+        port=port,
+        reload=False,         # 🌟 后台线程中必须为 False
+        log_level=log_level,
+    )
     
+    # 🌟 使用重写了信号机制的自定义服务器启动
+    server = NoSignalsUvicornServer(config)
+    server.run()
+
+def main(blocking: bool = False):
+    """
+    主入口（已优化为非阻塞后台运行）
+    :param blocking: 是否阻塞主线程。外挂引入时传 False，独立运行时传 True。
+    """
+
     # 🔍 启动前校验
     Config.validate()
     init_crypto()
-    
-    # 🔄 确保 asyncio 事件循环存在（避免 get_event_loop() 的 DeprecationWarning）
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
-    script_name = os.path.splitext(os.path.basename(__file__))[0]
-    
-    if "kisama" in sys.modules:
-        app_import_string = "kisama.agent:app"
-    else:
-        app_import_string = "agent:app"
-    
-    Logger.debug(f" 使用重载模式启动: {app_import_string}")
-    
-    uvicorn.run(
-        app_import_string,
-        host=Config.HOST, 
-        port=Config.PORT, 
-        reload=Config.DEBUG,
-        log_level="debug" if Config.DEBUG else "info"
+
+    log_level = "debug" if Config.DEBUG else "info"
+
+    if Config.DEBUG:
+        Logger.warning(
+            "⚠️ 当前处于 DEBUG 模式，但由于采用了非阻塞后台挂载，已自动关闭热重载(Reload)功能。"
+        )
+
+    Logger.info(" 🚀 Kisama Agent 开始在后台守护线程中启动...")
+
+    # 🧵 创建并启动后台守护线程
+    agent_thread = threading.Thread(
+        target=_start_uvicorn_server,
+        args=(app, Config.HOST, Config.PORT, log_level),
+        daemon=True,  # 🌟 设置为守护线程
     )
+    agent_thread.start()
+
+    Logger.info(f" [-] 后台服务已成功挂载，正在监听端口: {Config.PORT}")
+
+    # 🌟 如果是独立运行，用死循环钉住主线程，不让进程退出
+    if blocking:
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            Logger.info("🛑 收到终止信号，Kisama Agent 守护进程已安全退出。")
+
+def cli():
+    """专供本地直接执行，以及 pyproject.toml 注册的命令行工具入口"""
+    main(blocking=True)
 
 if __name__ == "__main__":
-    # 全局文件管理器实例
-    main()
+    cli()

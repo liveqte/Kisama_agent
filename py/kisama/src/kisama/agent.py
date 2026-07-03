@@ -1,54 +1,39 @@
-#!/usr/bin/env python3
-# ============================================================================
-# 📦 依赖导入
-# ============================================================================
+import codecs
 import os
 import sys
 import json
 import time
 import base64
 import hashlib
+import threading
 from datetime import datetime
-from typing import Union,List, Dict, Any, Optional
-
-# FastAPI 相关
+from typing import Union, List, Dict, Any, Optional
 from fastapi import FastAPI, Request, Response, HTTPException, status
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from urllib.parse import unquote
-# 加密相关
 from ecdsa import VerifyingKey, BadSignatureError, NIST256p
 from ecdsa.util import sigdecode_der, sigdecode_string
 from ecies import encrypt as ecies_encrypt
 import binascii
-
-# 服务启动
 import uvicorn
-
-# 系统收集器相关
 import asyncio
 import platform
 import psutil
 import aiohttp
 import socket
-## 执行模块
 import subprocess
 import shlex
 from fastapi import BackgroundTasks
-## 任务模块
 from croniter import croniter
 from collections import deque
-## 路由生命周期
 from contextlib import asynccontextmanager
-## 数据类型
 from pydantic import BaseModel, Field, RootModel, ConfigDict
-from fastapi import Body,Depends,Query
-## AES有关库
+from fastapi import Body, Depends, Query
 from Crypto.Cipher import AES
 from Crypto.Random import get_random_bytes
-## noise和超级终端相关库
 from noise.connection import NoiseConnection, Keypair
-from fastapi import WebSocket , WebSocketDisconnect
+from fastapi import WebSocket, WebSocketDisconnect
 import shutil
 import struct
 import termios
@@ -56,73 +41,64 @@ import select
 import fcntl
 import signal
 import pty
-## 生成noise密钥相关
 from dataclasses import dataclass, asdict
 from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives import serialization
 from typing import Tuple
 
-# ============================================================================
-# 📦 Pydantic 响应模型定义 (用于生成文档示例和数据验证)
-# ============================================================================
 class SResponse(BaseModel):
-    """通用状态响应"""
-    status: str = Field("ok", examples=["ok", "error"])
+    codecs.decode('\\u901a\\u7528\\u72b6\\u6001\\u54cd\\u5e94', 'unicode_escape')
+    status: str = Field(codecs.decode('\\u006f\\u006b', 'unicode_escape'), examples=[codecs.decode('\\u006f\\u006b', 'unicode_escape'), codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape')])
 
 class CountResponse(SResponse):
-    """带计数的通用响应"""
+    codecs.decode('\\u5e26\\u8ba1\\u6570\\u7684\\u901a\\u7528\\u54cd\\u5e94', 'unicode_escape')
     count: int = Field(..., examples=[0])
 
 class BaseInfoResponse(BaseModel):
-    """代理基础信息响应模型"""
-    arch: str = Field(..., description="CPU架构", examples=["x86_64"])
-    cpu_cores: int = Field(..., description="CPU核心数", examples=[4])
-    cpu_name: str = Field(..., description="CPU型号", examples=["Intel(R) Xeon(R) CPU @ 2.20GHz"])
-    disk_total: int = Field(..., description="磁盘总容量(字节)", examples=[48360738816])
-    gpu_name: str = Field("", description="GPU型号", examples=["NVIDIA GeForce RTX 3090"])
-    ipv4: Optional[str] = Field(None, description="IPv4地址", examples=["192.168.1.100"])
-    ipv6: Optional[str] = Field(None, description="IPv6地址", examples=["2001:db8::1"])
-    mem_total: int = Field(..., description="内存总量(字节)", examples=[8589934592])
-    os: str = Field(..., description="操作系统名称", examples=["Ubuntu 22.04"])
-    kernel_version: str = Field(..., description="内核版本", examples=["5.15.0-76-generic"])
-    swap_total: int = Field(..., description="交换分区总量(字节)", examples=[0])
-    version: str = Field(..., description="代理版本", examples=["0.0.1"])
-    virtualization: str = Field(..., description="虚拟化环境", examples=["None"])
-    session_key: Optional[bytes] = Field(None, description="本次会话的动态 AES-256 密钥 (明文，由中间件负责加密)", examples=["k7Bv9...32位密钥字符串或Base64"] )
-    noise_key: Optional[Dict[str, Any]] = Field(
-        None, 
-        description="Noise 密钥配置，接收任意字典结构"
-    )
+    codecs.decode('\\u4ee3\\u7406\\u57fa\\u7840\\u4fe1\\u606f\\u54cd\\u5e94\\u6a21\\u578b', 'unicode_escape')
+    arch: str = Field(..., description=codecs.decode('\\u0043\\u0050\\u0055\\u67b6\\u6784', 'unicode_escape'), examples=[codecs.decode('\\u0078\\u0038\\u0036\\u005f\\u0036\\u0034', 'unicode_escape')])
+    cpu_cores: int = Field(..., description=codecs.decode('\\u0043\\u0050\\u0055\\u6838\\u5fc3\\u6570', 'unicode_escape'), examples=[4])
+    cpu_name: str = Field(..., description=codecs.decode('\\u0043\\u0050\\u0055\\u578b\\u53f7', 'unicode_escape'), examples=[codecs.decode('\\u0049\\u006e\\u0074\\u0065\\u006c\\u0028\\u0052\\u0029\\u0020\\u0058\\u0065\\u006f\\u006e\\u0028\\u0052\\u0029\\u0020\\u0043\\u0050\\u0055\\u0020\\u0040\\u0020\\u0032\\u002e\\u0032\\u0030\\u0047\\u0048\\u007a', 'unicode_escape')])
+    disk_total: int = Field(..., description=codecs.decode('\\u78c1\\u76d8\\u603b\\u5bb9\\u91cf\\u0028\\u5b57\\u8282\\u0029', 'unicode_escape'), examples=[48360738816])
+    gpu_name: str = Field(codecs.decode('', 'unicode_escape'), description=codecs.decode('\\u0047\\u0050\\u0055\\u578b\\u53f7', 'unicode_escape'), examples=[codecs.decode('\\u004e\\u0056\\u0049\\u0044\\u0049\\u0041\\u0020\\u0047\\u0065\\u0046\\u006f\\u0072\\u0063\\u0065\\u0020\\u0052\\u0054\\u0058\\u0020\\u0033\\u0030\\u0039\\u0030', 'unicode_escape')])
+    ipv4: Optional[str] = Field(None, description=codecs.decode('\\u0049\\u0050\\u0076\\u0034\\u5730\\u5740', 'unicode_escape'), examples=[codecs.decode('\\u0031\\u0039\\u0032\\u002e\\u0031\\u0036\\u0038\\u002e\\u0031\\u002e\\u0031\\u0030\\u0030', 'unicode_escape')])
+    ipv6: Optional[str] = Field(None, description=codecs.decode('\\u0049\\u0050\\u0076\\u0036\\u5730\\u5740', 'unicode_escape'), examples=[codecs.decode('\\u0032\\u0030\\u0030\\u0031\\u003a\\u0064\\u0062\\u0038\\u003a\\u003a\\u0031', 'unicode_escape')])
+    mem_total: int = Field(..., description=codecs.decode('\\u5185\\u5b58\\u603b\\u91cf\\u0028\\u5b57\\u8282\\u0029', 'unicode_escape'), examples=[8589934592])
+    os: str = Field(..., description=codecs.decode('\\u64cd\\u4f5c\\u7cfb\\u7edf\\u540d\\u79f0', 'unicode_escape'), examples=[codecs.decode('\\u0055\\u0062\\u0075\\u006e\\u0074\\u0075\\u0020\\u0032\\u0032\\u002e\\u0030\\u0034', 'unicode_escape')])
+    kernel_version: str = Field(..., description=codecs.decode('\\u5185\\u6838\\u7248\\u672c', 'unicode_escape'), examples=[codecs.decode('\\u0035\\u002e\\u0031\\u0035\\u002e\\u0030\\u002d\\u0037\\u0036\\u002d\\u0067\\u0065\\u006e\\u0065\\u0072\\u0069\\u0063', 'unicode_escape')])
+    swap_total: int = Field(..., description=codecs.decode('\\u4ea4\\u6362\\u5206\\u533a\\u603b\\u91cf\\u0028\\u5b57\\u8282\\u0029', 'unicode_escape'), examples=[0])
+    version: str = Field(..., description=codecs.decode('\\u4ee3\\u7406\\u7248\\u672c', 'unicode_escape'), examples=[codecs.decode('\\u0030\\u002e\\u0030\\u002e\\u0031', 'unicode_escape')])
+    virtualization: str = Field(..., description=codecs.decode('\\u865a\\u62df\\u5316\\u73af\\u5883', 'unicode_escape'), examples=[codecs.decode('\\u004e\\u006f\\u006e\\u0065', 'unicode_escape')])
+    session_key: Optional[bytes] = Field(None, description=codecs.decode('\\u672c\\u6b21\\u4f1a\\u8bdd\\u7684\\u52a8\\u6001\\u0020\\u0041\\u0045\\u0053\\u002d\\u0032\\u0035\\u0036\\u0020\\u5bc6\\u94a5\\u0020\\u0028\\u660e\\u6587\\uff0c\\u7531\\u4e2d\\u95f4\\u4ef6\\u8d1f\\u8d23\\u52a0\\u5bc6\\u0029', 'unicode_escape'), examples=[codecs.decode('\\u006b\\u0037\\u0042\\u0076\\u0039\\u002e\\u002e\\u002e\\u0033\\u0032\\u4f4d\\u5bc6\\u94a5\\u5b57\\u7b26\\u4e32\\u6216\\u0042\\u0061\\u0073\\u0065\\u0036\\u0034', 'unicode_escape')])
+    noise_key: Optional[Dict[str, Any]] = Field(None, description=codecs.decode('\\u004e\\u006f\\u0069\\u0073\\u0065\\u0020\\u5bc6\\u94a5\\u914d\\u7f6e\\uff0c\\u63a5\\u6536\\u4efb\\u610f\\u5b57\\u5178\\u7ed3\\u6784', 'unicode_escape'))
 
 class StatusResponse(BaseModel):
-    """实时监控信息响应模型"""
-    cpu: Dict[str, float] = Field(..., description="CPU使用率", examples=[{"usage": 12.5}])
-    ram: Dict[str, int] = Field(..., description="内存信息", examples=[{"total": 8589934592, "used": 4000000000}])
-    swap: Dict[str, int] = Field(..., description="交换分区信息", examples=[{"total": 0, "used": 0}])
-    load: Dict[str, float] = Field(..., description="系统负载", examples=[{"load1": 0.5, "load5": 0.4, "load15": 0.3}])
-    disk: Dict[str, int] = Field(..., description="磁盘信息", examples=[{"total": 48360738816, "used": 30000000000}])
-    network: Dict[str, int] = Field(..., description="网络统计", examples=[{"up": 1024, "down": 2048, "totalUp": 1000000, "totalDown": 2000000}])
-    connections: Dict[str, int] = Field(..., description="连接数", examples=[{"tcp": 20, "udp": 5}])
-    uptime: int = Field(..., description="运行时间(秒)", examples=[3600])
-    process: int = Field(..., description="进程数量", examples=[150])
-    message: str = Field("", description="附加消息", examples=[""])
-# --- 响应模型 ---
+    codecs.decode('\\u5b9e\\u65f6\\u76d1\\u63a7\\u4fe1\\u606f\\u54cd\\u5e94\\u6a21\\u578b', 'unicode_escape')
+    cpu: Dict[str, float] = Field(..., description=codecs.decode('\\u0043\\u0050\\u0055\\u4f7f\\u7528\\u7387', 'unicode_escape'), examples=[{codecs.decode('\\u0075\\u0073\\u0061\\u0067\\u0065', 'unicode_escape'): 12.5}])
+    ram: Dict[str, int] = Field(..., description=codecs.decode('\\u5185\\u5b58\\u4fe1\\u606f', 'unicode_escape'), examples=[{codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c', 'unicode_escape'): 8589934592, codecs.decode('\\u0075\\u0073\\u0065\\u0064', 'unicode_escape'): 4000000000}])
+    swap: Dict[str, int] = Field(..., description=codecs.decode('\\u4ea4\\u6362\\u5206\\u533a\\u4fe1\\u606f', 'unicode_escape'), examples=[{codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c', 'unicode_escape'): 0, codecs.decode('\\u0075\\u0073\\u0065\\u0064', 'unicode_escape'): 0}])
+    load: Dict[str, float] = Field(..., description=codecs.decode('\\u7cfb\\u7edf\\u8d1f\\u8f7d', 'unicode_escape'), examples=[{codecs.decode('\\u006c\\u006f\\u0061\\u0064\\u0031', 'unicode_escape'): 0.5, codecs.decode('\\u006c\\u006f\\u0061\\u0064\\u0035', 'unicode_escape'): 0.4, codecs.decode('\\u006c\\u006f\\u0061\\u0064\\u0031\\u0035', 'unicode_escape'): 0.3}])
+    disk: Dict[str, int] = Field(..., description=codecs.decode('\\u78c1\\u76d8\\u4fe1\\u606f', 'unicode_escape'), examples=[{codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c', 'unicode_escape'): 48360738816, codecs.decode('\\u0075\\u0073\\u0065\\u0064', 'unicode_escape'): 30000000000}])
+    network: Dict[str, int] = Field(..., description=codecs.decode('\\u7f51\\u7edc\\u7edf\\u8ba1', 'unicode_escape'), examples=[{codecs.decode('\\u0075\\u0070', 'unicode_escape'): 1024, codecs.decode('\\u0064\\u006f\\u0077\\u006e', 'unicode_escape'): 2048, codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c\\u0055\\u0070', 'unicode_escape'): 1000000, codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c\\u0044\\u006f\\u0077\\u006e', 'unicode_escape'): 2000000}])
+    connections: Dict[str, int] = Field(..., description=codecs.decode('\\u8fde\\u63a5\\u6570', 'unicode_escape'), examples=[{codecs.decode('\\u0074\\u0063\\u0070', 'unicode_escape'): 20, codecs.decode('\\u0075\\u0064\\u0070', 'unicode_escape'): 5}])
+    uptime: int = Field(..., description=codecs.decode('\\u8fd0\\u884c\\u65f6\\u95f4\\u0028\\u79d2\\u0029', 'unicode_escape'), examples=[3600])
+    process: int = Field(..., description=codecs.decode('\\u8fdb\\u7a0b\\u6570\\u91cf', 'unicode_escape'), examples=[150])
+    message: str = Field(codecs.decode('', 'unicode_escape'), description=codecs.decode('\\u9644\\u52a0\\u6d88\\u606f', 'unicode_escape'), examples=[codecs.decode('', 'unicode_escape')])
+
 class ExecResponse(BaseModel):
-    result: str = Field(..., description="命令输出(stdout+stderr)", examples=["total 4\ndrwxr-xr-x..."])
-    exitcode: int = Field(..., description="退出码 (0=成功, 124=超时, 127=未找到)", examples=[0])
-    timeout: bool = Field(..., description="是否因超时被终止", examples=[False])
-    cmd: str = Field(..., description="实际执行的命令", examples=["ls -la /tmp"])
+    result: str = Field(..., description=codecs.decode('\\u547d\\u4ee4\\u8f93\\u51fa\\u0028\\u0073\\u0074\\u0064\\u006f\\u0075\\u0074\\u002b\\u0073\\u0074\\u0064\\u0065\\u0072\\u0072\\u0029', 'unicode_escape'), examples=[codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c\\u0020\\u0034\\u000a\\u0064\\u0072\\u0077\\u0078\\u0072\\u002d\\u0078\\u0072\\u002d\\u0078\\u002e\\u002e\\u002e', 'unicode_escape')])
+    exitcode: int = Field(..., description=codecs.decode('\\u9000\\u51fa\\u7801\\u0020\\u0028\\u0030\\u003d\\u6210\\u529f\\u002c\\u0020\\u0031\\u0032\\u0034\\u003d\\u8d85\\u65f6\\u002c\\u0020\\u0031\\u0032\\u0037\\u003d\\u672a\\u627e\\u5230\\u0029', 'unicode_escape'), examples=[0])
+    timeout: bool = Field(..., description=codecs.decode('\\u662f\\u5426\\u56e0\\u8d85\\u65f6\\u88ab\\u7ec8\\u6b62', 'unicode_escape'), examples=[False])
+    cmd: str = Field(..., description=codecs.decode('\\u5b9e\\u9645\\u6267\\u884c\\u7684\\u547d\\u4ee4', 'unicode_escape'), examples=[codecs.decode('\\u006c\\u0073\\u0020\\u002d\\u006c\\u0061\\u0020\\u002f\\u0074\\u006d\\u0070', 'unicode_escape')])
 
-# --- 请求模型 (兼容 JSON 和 纯文本) ---
 class ExecRequestJSON(BaseModel):
-    cmd: str = Field(..., description="要执行的命令", examples=["ls -la /tmp", "python --version"])
-    cwd: Optional[str] = Field(None, description="工作目录", examples=["/tmp", "/var/log"])
-    env: Optional[Dict[str, str]] = Field(None, description="额外环境变量", examples=[{"PATH": "/usr/bin", "DEBUG": "true"}])
+    cmd: str = Field(..., description=codecs.decode('\\u8981\\u6267\\u884c\\u7684\\u547d\\u4ee4', 'unicode_escape'), examples=[codecs.decode('\\u006c\\u0073\\u0020\\u002d\\u006c\\u0061\\u0020\\u002f\\u0074\\u006d\\u0070', 'unicode_escape'), codecs.decode('\\u0070\\u0079\\u0074\\u0068\\u006f\\u006e\\u0020\\u002d\\u002d\\u0076\\u0065\\u0072\\u0073\\u0069\\u006f\\u006e', 'unicode_escape')])
+    cwd: Optional[str] = Field(None, description=codecs.decode('\\u5de5\\u4f5c\\u76ee\\u5f55', 'unicode_escape'), examples=[codecs.decode('\\u002f\\u0074\\u006d\\u0070', 'unicode_escape'), codecs.decode('\\u002f\\u0076\\u0061\\u0072\\u002f\\u006c\\u006f\\u0067', 'unicode_escape')])
+    env: Optional[Dict[str, str]] = Field(None, description=codecs.decode('\\u989d\\u5916\\u73af\\u5883\\u53d8\\u91cf', 'unicode_escape'), examples=[{codecs.decode('\\u0050\\u0041\\u0054\\u0048', 'unicode_escape'): codecs.decode('\\u002f\\u0075\\u0073\\u0072\\u002f\\u0062\\u0069\\u006e', 'unicode_escape'), codecs.decode('\\u0044\\u0045\\u0042\\u0055\\u0047', 'unicode_escape'): codecs.decode('\\u0074\\u0072\\u0075\\u0065', 'unicode_escape')}])
 
-# --- 文件列表 ---
 class FileListRequest(BaseModel):
-    path: str = Field(".", description="要列出的目录路径", examples=["/tmp", ".", "/var/log"])
-    recursive: bool = Field(False, description="是否递归列出子目录", examples=[True, False])
+    path: str = Field(codecs.decode('\\u002e', 'unicode_escape'), description=codecs.decode('\\u8981\\u5217\\u51fa\\u7684\\u76ee\\u5f55\\u8def\\u5f84', 'unicode_escape'), examples=[codecs.decode('\\u002f\\u0074\\u006d\\u0070', 'unicode_escape'), codecs.decode('\\u002e', 'unicode_escape'), codecs.decode('\\u002f\\u0076\\u0061\\u0072\\u002f\\u006c\\u006f\\u0067', 'unicode_escape')])
+    recursive: bool = Field(False, description=codecs.decode('\\u662f\\u5426\\u9012\\u5f52\\u5217\\u51fa\\u5b50\\u76ee\\u5f55', 'unicode_escape'), examples=[True, False])
 
 class FileInfo(BaseModel):
     name: str
@@ -137,9 +113,8 @@ class FileInfo(BaseModel):
 class FileListResponse(CountResponse):
     files: List[FileInfo]
 
-# --- 权限查询 ---
 class AuthorityQueryRequest(BaseModel):
-    paths: List[str] = Field(..., description="要查询权限的文件/目录路径列表", examples=[["/tmp/test.txt", "/var/log"]])
+    paths: List[str] = Field(..., description=codecs.decode('\\u8981\\u67e5\\u8be2\\u6743\\u9650\\u7684\\u6587\\u4ef6\\u002f\\u76ee\\u5f55\\u8def\\u5f84\\u5217\\u8868', 'unicode_escape'), examples=[[codecs.decode('\\u002f\\u0074\\u006d\\u0070\\u002f\\u0074\\u0065\\u0073\\u0074\\u002e\\u0074\\u0078\\u0074', 'unicode_escape'), codecs.decode('\\u002f\\u0076\\u0061\\u0072\\u002f\\u006c\\u006f\\u0067', 'unicode_escape')]])
 
 class AuthorityInfo(BaseModel):
     path: str
@@ -154,15 +129,9 @@ class AuthorityInfo(BaseModel):
 class AuthorityQueryResponse(SResponse):
     files: List[AuthorityInfo]
 
-# --- 权限设置 ---
 class AuthoritySetRequest(BaseModel):
-    # ✅ 修正：examples 必须是列表
-    permissions: Dict[str, str] = Field(
-        ..., 
-        description="路径到权限模式的映射", 
-        examples=[{"/tmp/test.txt": "644", "/opt/scripts": "755"}] # 👈 加上方括号
-    )
-    recursive: bool = Field(False, description="是否递归应用到子目录", examples=[True, False])
+    permissions: Dict[str, str] = Field(..., description=codecs.decode('\\u8def\\u5f84\\u5230\\u6743\\u9650\\u6a21\\u5f0f\\u7684\\u6620\\u5c04', 'unicode_escape'), examples=[{codecs.decode('\\u002f\\u0074\\u006d\\u0070\\u002f\\u0074\\u0065\\u0073\\u0074\\u002e\\u0074\\u0078\\u0074', 'unicode_escape'): codecs.decode('\\u0036\\u0034\\u0034', 'unicode_escape'), codecs.decode('\\u002f\\u006f\\u0070\\u0074\\u002f\\u0073\\u0063\\u0072\\u0069\\u0070\\u0074\\u0073', 'unicode_escape'): codecs.decode('\\u0037\\u0035\\u0035', 'unicode_escape')}])
+    recursive: bool = Field(False, description=codecs.decode('\\u662f\\u5426\\u9012\\u5f52\\u5e94\\u7528\\u5230\\u5b50\\u76ee\\u5f55', 'unicode_escape'), examples=[True, False])
 
 class AuthorityResult(BaseModel):
     path: str
@@ -176,9 +145,8 @@ class AuthoritySetResponse(SResponse):
     success: int
     results: List[AuthorityResult]
 
-# --- 查看文件内容 ---
 class FileCatRequest(BaseModel):
-    path: str = Field(..., description="要查看的文件路径", examples=["/tmp/config.json", "/var/log/syslog"])
+    path: str = Field(..., description=codecs.decode('\\u8981\\u67e5\\u770b\\u7684\\u6587\\u4ef6\\u8def\\u5f84', 'unicode_escape'), examples=[codecs.decode('\\u002f\\u0074\\u006d\\u0070\\u002f\\u0063\\u006f\\u006e\\u0066\\u0069\\u0067\\u002e\\u006a\\u0073\\u006f\\u006e', 'unicode_escape'), codecs.decode('\\u002f\\u0076\\u0061\\u0072\\u002f\\u006c\\u006f\\u0067\\u002f\\u0073\\u0079\\u0073\\u006c\\u006f\\u0067', 'unicode_escape')])
 
 class FileCatResponse(SResponse):
     path: str
@@ -187,20 +155,19 @@ class FileCatResponse(SResponse):
     is_binary: bool
     size: int
 
-# --- 上传文件 ---
 class FileUploadRequest(BaseModel):
-    path: str = Field(..., description="上传目标目录或文件路径", examples=["/tmp/uploads", "/tmp/newfile.txt"])
-    filename: Optional[str] = Field(None, description="文件名 (当path是目录时必填)", examples=["backup.tar.gz"])
-    content: str = Field(..., description="文件内容的Base64编码", examples=["SGVsbG8gV29ybGQh"]) # "Hello World!"
-    chunk_id: Optional[int] = Field(None, description="分块索引 (0-based)", examples=[0])
-    total_chunks: Optional[int] = Field(None, description="总分块数", examples=[3])
-    
+    path: str = Field(..., description=codecs.decode('\\u4e0a\\u4f20\\u76ee\\u6807\\u76ee\\u5f55\\u6216\\u6587\\u4ef6\\u8def\\u5f84', 'unicode_escape'), examples=[codecs.decode('\\u002f\\u0074\\u006d\\u0070\\u002f\\u0075\\u0070\\u006c\\u006f\\u0061\\u0064\\u0073', 'unicode_escape'), codecs.decode('\\u002f\\u0074\\u006d\\u0070\\u002f\\u006e\\u0065\\u0077\\u0066\\u0069\\u006c\\u0065\\u002e\\u0074\\u0078\\u0074', 'unicode_escape')])
+    filename: Optional[str] = Field(None, description=codecs.decode('\\u6587\\u4ef6\\u540d\\u0020\\u0028\\u5f53\\u0070\\u0061\\u0074\\u0068\\u662f\\u76ee\\u5f55\\u65f6\\u5fc5\\u586b\\u0029', 'unicode_escape'), examples=[codecs.decode('\\u0062\\u0061\\u0063\\u006b\\u0075\\u0070\\u002e\\u0074\\u0061\\u0072\\u002e\\u0067\\u007a', 'unicode_escape')])
+    content: str = Field(..., description=codecs.decode('\\u6587\\u4ef6\\u5185\\u5bb9\\u7684\\u0042\\u0061\\u0073\\u0065\\u0036\\u0034\\u7f16\\u7801', 'unicode_escape'), examples=[codecs.decode('\\u0053\\u0047\\u0056\\u0073\\u0062\\u0047\\u0038\\u0067\\u0056\\u0032\\u0039\\u0079\\u0062\\u0047\\u0051\\u0068', 'unicode_escape')])
+    chunk_id: Optional[int] = Field(None, description=codecs.decode('\\u5206\\u5757\\u7d22\\u5f15\\u0020\\u0028\\u0030\\u002d\\u0062\\u0061\\u0073\\u0065\\u0064\\u0029', 'unicode_escape'), examples=[0])
+    total_chunks: Optional[int] = Field(None, description=codecs.decode('\\u603b\\u5206\\u5757\\u6570', 'unicode_escape'), examples=[3])
+
 class FileUploadRawResponse(SResponse):
-    """裸二进制流上传接口的标准化结构体返回体"""
-    path: Optional[str] = Field(None, description="文件在服务器端的保存路径")
-    chunk_id: Optional[int] = Field(None, description="当前上传的分片索引")
-    completed: bool = Field(..., description="指示该文件是否已全部传输并合并完成")
-    message: str = Field("", description="状态提示消息")
+    codecs.decode('\\u88f8\\u4e8c\\u8fdb\\u5236\\u6d41\\u4e0a\\u4f20\\u63a5\\u53e3\\u7684\\u6807\\u51c6\\u5316\\u7ed3\\u6784\\u4f53\\u8fd4\\u56de\\u4f53', 'unicode_escape')
+    path: Optional[str] = Field(None, description=codecs.decode('\\u6587\\u4ef6\\u5728\\u670d\\u52a1\\u5668\\u7aef\\u7684\\u4fdd\\u5b58\\u8def\\u5f84', 'unicode_escape'))
+    chunk_id: Optional[int] = Field(None, description=codecs.decode('\\u5f53\\u524d\\u4e0a\\u4f20\\u7684\\u5206\\u7247\\u7d22\\u5f15', 'unicode_escape'))
+    completed: bool = Field(..., description=codecs.decode('\\u6307\\u793a\\u8be5\\u6587\\u4ef6\\u662f\\u5426\\u5df2\\u5168\\u90e8\\u4f20\\u8f93\\u5e76\\u5408\\u5e76\\u5b8c\\u6210', 'unicode_escape'))
+    message: str = Field(codecs.decode('', 'unicode_escape'), description=codecs.decode('\\u72b6\\u6001\\u63d0\\u793a\\u6d88\\u606f', 'unicode_escape'))
 
 class FileUploadResponse(SResponse):
     path: Optional[str] = None
@@ -208,15 +175,12 @@ class FileUploadResponse(SResponse):
     total: Optional[int] = None
     chunked: Optional[bool] = None
 
-# --- 下载文件 ---
 class FileDownloadRequest(BaseModel):
-    path: str = Field(..., description="要下载的文件路径", examples=["/tmp/backup.tar.gz"])
+    path: str = Field(..., description=codecs.decode('\\u8981\\u4e0b\\u8f7d\\u7684\\u6587\\u4ef6\\u8def\\u5f84', 'unicode_escape'), examples=[codecs.decode('\\u002f\\u0074\\u006d\\u0070\\u002f\\u0062\\u0061\\u0063\\u006b\\u0075\\u0070\\u002e\\u0074\\u0061\\u0072\\u002e\\u0067\\u007a', 'unicode_escape')])
 
-# --- 批量删除 ---
 class FileDeleteRequest(BaseModel):
-    paths: List[str] = Field(..., description="要删除的文件/目录路径列表", examples=[["/tmp/old.log", "/tmp/cache"]])
-    # 兼容旧格式的单一路径字段 (在逻辑中处理)
-    path: Optional[str] = Field(None, exclude=True) 
+    paths: List[str] = Field(..., description=codecs.decode('\\u8981\\u5220\\u9664\\u7684\\u6587\\u4ef6\\u002f\\u76ee\\u5f55\\u8def\\u5f84\\u5217\\u8868', 'unicode_escape'), examples=[[codecs.decode('\\u002f\\u0074\\u006d\\u0070\\u002f\\u006f\\u006c\\u0064\\u002e\\u006c\\u006f\\u0067', 'unicode_escape'), codecs.decode('\\u002f\\u0074\\u006d\\u0070\\u002f\\u0063\\u0061\\u0063\\u0068\\u0065', 'unicode_escape')]])
+    path: Optional[str] = Field(None, exclude=True)
     path2: Optional[str] = Field(None, exclude=True)
 
 class FileDeleteResult(BaseModel):
@@ -227,81 +191,61 @@ class FileDeleteResponse(BaseModel):
     status: str
     results: List[FileDeleteResult]
 
-# --- 批量移动 ---
 class FileMoveRequest(BaseModel):
-    # ✅ 修正：examples 必须是列表
-    move_map: Dict[str, str] = Field(
-        ..., 
-        description="源路径到目标路径的映射", 
-        examples=[{"/tmp/old.txt": "/archive/old.txt", "/tmp/logs": "/backup/logs"}] # 👈 加上方括号
-    )
-    # 兼容单对格式
+    move_map: Dict[str, str] = Field(..., description=codecs.decode('\\u6e90\\u8def\\u5f84\\u5230\\u76ee\\u6807\\u8def\\u5f84\\u7684\\u6620\\u5c04', 'unicode_escape'), examples=[{codecs.decode('\\u002f\\u0074\\u006d\\u0070\\u002f\\u006f\\u006c\\u0064\\u002e\\u0074\\u0078\\u0074', 'unicode_escape'): codecs.decode('\\u002f\\u0061\\u0072\\u0063\\u0068\\u0069\\u0076\\u0065\\u002f\\u006f\\u006c\\u0064\\u002e\\u0074\\u0078\\u0074', 'unicode_escape'), codecs.decode('\\u002f\\u0074\\u006d\\u0070\\u002f\\u006c\\u006f\\u0067\\u0073', 'unicode_escape'): codecs.decode('\\u002f\\u0062\\u0061\\u0063\\u006b\\u0075\\u0070\\u002f\\u006c\\u006f\\u0067\\u0073', 'unicode_escape')}])
     path: Optional[str] = Field(None, exclude=True)
     mvpath: Optional[str] = Field(None, exclude=True)
 
 class FileMoveResult(BaseModel):
-    from_field: str = Field(..., alias="from") # 使用 alias 兼容 Python 关键字 from
+    from_field: str = Field(..., alias=codecs.decode('\\u0066\\u0072\\u006f\\u006d', 'unicode_escape'))
     to: str
     status: str
-
     model_config = ConfigDict(populate_by_name=True)
 
 class FileMoveResponse(BaseModel):
     status: str
     total: int
     success: int
-    results: List[Dict[str, str]] # 或者使用 FileMoveResult
+    results: List[Dict[str, str]]
 
-# --- 新建目录 ---
 class FileMkdirRequest(BaseModel):
-    path: str = Field(..., description="要创建的新目录路径", examples=["/tmp/new/project/logs"])
+    path: str = Field(..., description=codecs.decode('\\u8981\\u521b\\u5efa\\u7684\\u65b0\\u76ee\\u5f55\\u8def\\u5f84', 'unicode_escape'), examples=[codecs.decode('\\u002f\\u0074\\u006d\\u0070\\u002f\\u006e\\u0065\\u0077\\u002f\\u0070\\u0072\\u006f\\u006a\\u0065\\u0063\\u0074\\u002f\\u006c\\u006f\\u0067\\u0073', 'unicode_escape')])
 
 class FileMkdirResponse(BaseModel):
     status: str
     path: str
 
 class OneTimeTaskGetResponse(BaseModel):
-    status: str = Field("ok", description="请求状态", examples=["ok"])
-    count: int = Field(..., description="待执行任务的数量", examples=[2])
-    tasks: List[str] = Field(
-        ..., 
-        description="待执行的任务命令列表", 
-        examples=[["echo 'init'", "/opt/scripts/setup.sh"]]
-    )
+    status: str = Field(codecs.decode('\\u006f\\u006b', 'unicode_escape'), description=codecs.decode('\\u8bf7\\u6c42\\u72b6\\u6001', 'unicode_escape'), examples=[codecs.decode('\\u006f\\u006b', 'unicode_escape')])
+    count: int = Field(..., description=codecs.decode('\\u5f85\\u6267\\u884c\\u4efb\\u52a1\\u7684\\u6570\\u91cf', 'unicode_escape'), examples=[2])
+    tasks: List[str] = Field(..., description=codecs.decode('\\u5f85\\u6267\\u884c\\u7684\\u4efb\\u52a1\\u547d\\u4ee4\\u5217\\u8868', 'unicode_escape'), examples=[[codecs.decode('\\u0065\\u0063\\u0068\\u006f\\u0020\\u0027\\u0069\\u006e\\u0069\\u0074\\u0027', 'unicode_escape'), codecs.decode('\\u002f\\u006f\\u0070\\u0074\\u002f\\u0073\\u0063\\u0072\\u0069\\u0070\\u0074\\u0073\\u002f\\u0073\\u0065\\u0074\\u0075\\u0070\\u002e\\u0073\\u0068', 'unicode_escape')]])
 
-# --- 请求模型：仅支持 ["cmd1", "cmd2"] ---
 class OneTimeTaskRequest(RootModel):
     root: List[str]
 
-# --- 响应模型 ---
 class OneTimeTaskResponse(CountResponse):
     tasks: List[str]
     executed: Optional[List[Any]] = None
 
-# --- 响应模型 (GET/POST 共用) ---
 class CronTasksResponse(CountResponse):
-    tasks: Dict[str, str] = Field(
-        ..., 
-        description="Cron表达式与命令的映射字典",
-        examples=[{"*/10 * * * *": "python /opt/scripts/health_check.py"}]
-    )
-# --- 日志条目基础模型 ---
+    tasks: Dict[str, str] = Field(..., description=codecs.decode('\\u0043\\u0072\\u006f\\u006e\\u8868\\u8fbe\\u5f0f\\u4e0e\\u547d\\u4ee4\\u7684\\u6620\\u5c04\\u5b57\\u5178', 'unicode_escape'), examples=[{codecs.decode('\\u002a\\u002f\\u0031\\u0030\\u0020\\u002a\\u0020\\u002a\\u0020\\u002a\\u0020\\u002a', 'unicode_escape'): codecs.decode('\\u0070\\u0079\\u0074\\u0068\\u006f\\u006e\\u0020\\u002f\\u006f\\u0070\\u0074\\u002f\\u0073\\u0063\\u0072\\u0069\\u0070\\u0074\\u0073\\u002f\\u0068\\u0065\\u0061\\u006c\\u0074\\u0068\\u005f\\u0063\\u0068\\u0065\\u0063\\u006b\\u002e\\u0070\\u0079', 'unicode_escape')}])
+
 class BaseLogEntry(BaseModel):
-    ts: str = Field(..., description="执行时间戳", examples=["2024-01-15T10:30:45Z"])
-    cmd: str = Field(..., description="执行的命令")
-    output: str = Field(..., description="命令输出内容")
-    exitcode: int = Field(..., description="退出码")
-    type: str = Field(..., description="日志类型")
-    formatted: Optional[str] = Field(None, description="格式化后的摘要")
+    ts: str = Field(..., description=codecs.decode('\\u6267\\u884c\\u65f6\\u95f4\\u6233', 'unicode_escape'), examples=[codecs.decode('\\u0032\\u0030\\u0032\\u0034\\u002d\\u0030\\u0031\\u002d\\u0031\\u0035\\u0054\\u0031\\u0030\\u003a\\u0033\\u0030\\u003a\\u0034\\u0035\\u005a', 'unicode_escape')])
+    cmd: str = Field(..., description=codecs.decode('\\u6267\\u884c\\u7684\\u547d\\u4ee4', 'unicode_escape'))
+    output: str = Field(..., description=codecs.decode('\\u547d\\u4ee4\\u8f93\\u51fa\\u5185\\u5bb9', 'unicode_escape'))
+    exitcode: int = Field(..., description=codecs.decode('\\u9000\\u51fa\\u7801', 'unicode_escape'))
+    type: str = Field(..., description=codecs.decode('\\u65e5\\u5fd7\\u7c7b\\u578b', 'unicode_escape'))
+    formatted: Optional[str] = Field(None, description=codecs.decode('\\u683c\\u5f0f\\u5316\\u540e\\u7684\\u6458\\u8981', 'unicode_escape'))
 
 class CronLogEntry(BaseLogEntry):
-    cron: str = Field(..., description="Cron 表达式", examples=["*/5 * * * *"])
+    cron: str = Field(..., description=codecs.decode('\\u0043\\u0072\\u006f\\u006e\\u0020\\u8868\\u8fbe\\u5f0f', 'unicode_escape'), examples=[codecs.decode('\\u002a\\u002f\\u0035\\u0020\\u002a\\u0020\\u002a\\u0020\\u002a\\u0020\\u002a', 'unicode_escape')])
 
 class TaskLogResponse(CountResponse):
-    logs: List[Any]  # 实际使用时会根据路由返回具体子类
+    logs: List[Any]
 
 class LogClearResponse(SResponse):
-    cleared: str = Field(..., description="被清空的日志类型", examples=["onetime", "cron"])
+    cleared: str = Field(..., description=codecs.decode('\\u88ab\\u6e05\\u7a7a\\u7684\\u65e5\\u5fd7\\u7c7b\\u578b', 'unicode_escape'), examples=[codecs.decode('\\u006f\\u006e\\u0065\\u0074\\u0069\\u006d\\u0065', 'unicode_escape'), codecs.decode('\\u0063\\u0072\\u006f\\u006e', 'unicode_escape')])
 
 class LogStats(BaseModel):
     total_logged: int
@@ -313,1183 +257,771 @@ class LogSummaryResponse(BaseModel):
     onetime: LogStats
     cron: LogStats
 
-# --- 子模型：启动任务状态 ---
 class OnetimeStatus(BaseModel):
-    pending: bool = Field(..., description="是否有待执行的任务", examples=[False])
-    count: int = Field(..., description="待执行任务数量", examples=[3])
+    pending: bool = Field(..., description=codecs.decode('\\u662f\\u5426\\u6709\\u5f85\\u6267\\u884c\\u7684\\u4efb\\u52a1', 'unicode_escape'), examples=[False])
+    count: int = Field(..., description=codecs.decode('\\u5f85\\u6267\\u884c\\u4efb\\u52a1\\u6570\\u91cf', 'unicode_escape'), examples=[3])
 
-# --- 子模型：定时任务状态 ---
 class CronStatus(BaseModel):
-    active: bool = Field(..., description="定时任务调度器是否处于活跃状态", examples=[True])
-    count: int = Field(..., description="当前配置的定时任务数量", examples=[2])
-    check_interval: int = Field(..., description="检查间隔(秒)", examples=[30])
+    active: bool = Field(..., description=codecs.decode('\\u5b9a\\u65f6\\u4efb\\u52a1\\u8c03\\u5ea6\\u5668\\u662f\\u5426\\u5904\\u4e8e\\u6d3b\\u8dc3\\u72b6\\u6001', 'unicode_escape'), examples=[True])
+    count: int = Field(..., description=codecs.decode('\\u5f53\\u524d\\u914d\\u7f6e\\u7684\\u5b9a\\u65f6\\u4efb\\u52a1\\u6570\\u91cf', 'unicode_escape'), examples=[2])
+    check_interval: int = Field(..., description=codecs.decode('\\u68c0\\u67e5\\u95f4\\u9694\\u0028\\u79d2\\u0029', 'unicode_escape'), examples=[30])
 
-# --- 主响应模型 ---
 class TaskStatusResponse(BaseModel):
     onetime: OnetimeStatus
     cron: CronStatus
 
 class OnetimeExecuteResponse(BaseModel):
-    status: str = Field("ok", examples=["ok"])
-    message: Optional[str] = Field(None, description="状态说明")
-    executed: int = Field(..., description="成功触发的任务数量", examples=[2])
-    results: List[Dict[str, Any]] = Field(
-        ..., 
-        description="每个任务的详细执行结果",
-        examples=[[{
-            "cmd": "echo 'hello'",
-            "exitcode": 0,
-            "stdout": "hello\n",
-            "stderr": ""
-        }]]
-    )
-##超级终端
-
-# ============================================================================
-# ⚙️ 全局配置辅助函数 (模块级，避免类定义时引用问题)
-# ============================================================================
+    status: str = Field(codecs.decode('\\u006f\\u006b', 'unicode_escape'), examples=[codecs.decode('\\u006f\\u006b', 'unicode_escape')])
+    message: Optional[str] = Field(None, description=codecs.decode('\\u72b6\\u6001\\u8bf4\\u660e', 'unicode_escape'))
+    executed: int = Field(..., description=codecs.decode('\\u6210\\u529f\\u89e6\\u53d1\\u7684\\u4efb\\u52a1\\u6570\\u91cf', 'unicode_escape'), examples=[2])
+    results: List[Dict[str, Any]] = Field(..., description=codecs.decode('\\u6bcf\\u4e2a\\u4efb\\u52a1\\u7684\\u8be6\\u7ec6\\u6267\\u884c\\u7ed3\\u679c', 'unicode_escape'), examples=[[{codecs.decode('\\u0063\\u006d\\u0064', 'unicode_escape'): codecs.decode('\\u0065\\u0063\\u0068\\u006f\\u0020\\u0027\\u0068\\u0065\\u006c\\u006c\\u006f\\u0027', 'unicode_escape'), codecs.decode('\\u0065\\u0078\\u0069\\u0074\\u0063\\u006f\\u0064\\u0065', 'unicode_escape'): 0, codecs.decode('\\u0073\\u0074\\u0064\\u006f\\u0075\\u0074', 'unicode_escape'): codecs.decode('\\u0068\\u0065\\u006c\\u006c\\u006f\\u000a', 'unicode_escape'), codecs.decode('\\u0073\\u0074\\u0064\\u0065\\u0072\\u0072', 'unicode_escape'): codecs.decode('', 'unicode_escape')}]])
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-
-def _get_config_value(key: str, default: str = "", file_path: str = None) -> str:
-    """
-    通用配置获取函数 (模块级)
-    优先级: 环境变量 > 本地文件 > 默认值
-    :param key: 环境变量名
-    :param default: 默认值
-    :param file_path: 备选文件路径 (相对于 _BASE_DIR)
-    :return: 配置值 (已 strip)
-    """
-    # 1. 优先读取环境变量
-    env_value = os.getenv(key)
-    if env_value is not None:
-        return env_value.strip()
-    
-    # 2. 尝试读取本地文件
+def _get_config_value(key: str, default: str=codecs.decode('', 'unicode_escape'), file_path: str=None) -> str:
+    O0_var_1 = os.getenv(key)
+    if O0_var_1 is not None:
+        return O0_var_1.strip()
     if file_path:
-        full_path = os.path.join(_BASE_DIR, file_path)
-        if os.path.exists(full_path):
+        O0_var_2 = os.path.join(_BASE_DIR, file_path)
+        if os.path.exists(O0_var_2):
             try:
-                with open(full_path, 'r', encoding='utf-8') as f:
-                    file_value = f.read().strip()
-                    if file_value:  # 非空才使用
-                        return file_value
+                with open(O0_var_2, codecs.decode('\\u0072', 'unicode_escape'), encoding=codecs.decode('\\u0075\\u0074\\u0066\\u002d\\u0038', 'unicode_escape')) as O0_var_3:
+                    O0_var_4 = O0_var_3.read().strip()
+                    if O0_var_4:
+                        return O0_var_4
             except Exception:
-                pass  # 文件读取失败则降级
-    
-    # 3. 返回默认值
-    return default.strip() if default else ""
+                pass
+    return default.strip() if default else codecs.decode('', 'unicode_escape')
 
-#===============================================
-# noise生成类和数据类
-#===============================================
 @dataclass
 class NoiseKeypair:
-    """Noise 协议密钥对数据类"""
+    codecs.decode('\\u004e\\u006f\\u0069\\u0073\\u0065\\u0020\\u534f\\u8bae\\u5bc6\\u94a5\\u5bf9\\u6570\\u636e\\u7c7b', 'unicode_escape')
     role: str
     private_b64: str
     public_b64: str
-    
+
     def to_dict(self) -> Dict[str, str]:
         return asdict(self)
-    
+
     @property
     def private_bytes(self) -> bytes:
-        """解码获取 32 字节原始私钥"""
         return base64.b64decode(self.private_b64)
-    
+
     @property
     def public_bytes(self) -> bytes:
-        """解码获取 32 字节原始公钥"""
         return base64.b64decode(self.public_b64)
 
 class NoiseKeyGenerator:
-    """
-    Noise Protocol X25519 密钥对生成器
-    
-    生成符合 noise-c / noiseprotocol 标准的 32 字节 Raw 格式密钥
-    """
-    
-    # 常量配置
-    KEY_SIZE = 32  # X25519 固定 32 字节
+    codecs.decode('\\u000a\\u0020\\u0020\\u0020\\u0020\\u004e\\u006f\\u0069\\u0073\\u0065\\u0020\\u0050\\u0072\\u006f\\u0074\\u006f\\u0063\\u006f\\u006c\\u0020\\u0058\\u0032\\u0035\\u0035\\u0031\\u0039\\u0020\\u5bc6\\u94a5\\u5bf9\\u751f\\u6210\\u5668\\u000a\\u0020\\u0020\\u0020\\u0020\\u000a\\u0020\\u0020\\u0020\\u0020\\u751f\\u6210\\u7b26\\u5408\\u0020\\u006e\\u006f\\u0069\\u0073\\u0065\\u002d\\u0063\\u0020\\u002f\\u0020\\u006e\\u006f\\u0069\\u0073\\u0065\\u0070\\u0072\\u006f\\u0074\\u006f\\u0063\\u006f\\u006c\\u0020\\u6807\\u51c6\\u7684\\u0020\\u0033\\u0032\\u0020\\u5b57\\u8282\\u0020\\u0052\\u0061\\u0077\\u0020\\u683c\\u5f0f\\u5bc6\\u94a5\\u000a\\u0020\\u0020\\u0020\\u0020', 'unicode_escape')
+    KEY_SIZE = 32
     ENCODING = serialization.Encoding.Raw
     PRIVATE_FORMAT = serialization.PrivateFormat.Raw
     PUBLIC_FORMAT = serialization.PublicFormat.Raw
-    
+
     @staticmethod
     def _generate_raw_keypair() -> Tuple[bytes, bytes]:
-        """内部方法：生成原始字节格式的 X25519 密钥对"""
-        priv_key = x25519.X25519PrivateKey.generate()
-        pub_key = priv_key.public_key()
-        
-        priv_bytes = priv_key.private_bytes(
-            encoding=NoiseKeyGenerator.ENCODING,
-            format=NoiseKeyGenerator.PRIVATE_FORMAT,
-            encryption_algorithm=serialization.NoEncryption()
-        )
-        pub_bytes = pub_key.public_bytes(
-            encoding=NoiseKeyGenerator.ENCODING,
-            format=NoiseKeyGenerator.PUBLIC_FORMAT
-        )
-        
-        assert len(priv_bytes) == NoiseKeyGenerator.KEY_SIZE
-        assert len(pub_bytes) == NoiseKeyGenerator.KEY_SIZE
-        
-        return priv_bytes, pub_bytes
-    
+        O0_var_5 = x25519.X25519PrivateKey.generate()
+        O0_var_6 = O0_var_5.public_key()
+        O0_var_7 = O0_var_5.private_bytes(encoding=NoiseKeyGenerator.ENCODING, format=NoiseKeyGenerator.PRIVATE_FORMAT, encryption_algorithm=serialization.NoEncryption())
+        O0_var_8 = O0_var_6.public_bytes(encoding=NoiseKeyGenerator.ENCODING, format=NoiseKeyGenerator.PUBLIC_FORMAT)
+        assert len(O0_var_7) == NoiseKeyGenerator.KEY_SIZE
+        assert len(O0_var_8) == NoiseKeyGenerator.KEY_SIZE
+        return (O0_var_7, O0_var_8)
+
     @classmethod
     def generate_single(cls, role_name: str) -> NoiseKeypair:
-        """
-        生成单个角色的密钥对
-        
-        Args:
-            role_name: 角色标识，如 "Controller", "Agent"
-            
-        Returns:
-            NoiseKeypair 数据类实例
-        """
-        priv_bytes, pub_bytes = cls._generate_raw_keypair()
-        
-        return NoiseKeypair(
-            role=role_name,
-            private_b64=base64.b64encode(priv_bytes).decode('utf-8'),
-            public_b64=base64.b64encode(pub_bytes).decode('utf-8')
-        )
-    
+        O0_var_9, O0_var_10 = cls._generate_raw_keypair()
+        return NoiseKeypair(role=role_name, private_b64=base64.b64encode(O0_var_9).decode(codecs.decode('\\u0075\\u0074\\u0066\\u002d\\u0038', 'unicode_escape')), public_b64=base64.b64encode(O0_var_10).decode(codecs.decode('\\u0075\\u0074\\u0066\\u002d\\u0038', 'unicode_escape')))
+
     @classmethod
-    def generate_pair(cls, 
-                      control_role: str = "Controller",
-                      agent_role: str = "Agent"
-                     ) -> Dict[str, NoiseKeypair]:
-        """
-        🔥 核心方法：一次性生成通信双方的密钥对
-        
-        Args:
-            control_role: 发起方角色名（默认: Controller/控制端）
-            agent_role: 响应方角色名（默认: Agent/代理端）
-            
-        Returns:
-            dict: {
-                'control': NoiseKeypair,  # 发起方密钥
-                'agent': NoiseKeypair,  # 响应方密钥
-            }
-        """
-        return {
-            'control': cls.generate_single(control_role),
-            'agent': cls.generate_single(agent_role)
-        }
-# ============================================================================
-# ⚙️ 全局配置类
-# ============================================================================
+    def generate_pair(cls, control_role: str=codecs.decode('\\u0043\\u006f\\u006e\\u0074\\u0072\\u006f\\u006c\\u006c\\u0065\\u0072', 'unicode_escape'), agent_role: str=codecs.decode('\\u0041\\u0067\\u0065\\u006e\\u0074', 'unicode_escape')) -> Dict[str, NoiseKeypair]:
+        return {codecs.decode('\\u0063\\u006f\\u006e\\u0074\\u0072\\u006f\\u006c', 'unicode_escape'): cls.generate_single(control_role), codecs.decode('\\u0061\\u0067\\u0065\\u006e\\u0074', 'unicode_escape'): cls.generate_single(agent_role)}
+
 class Config:
-    """
-    配置中心 - 支持多级配置源
-    优先级: 环境变量 > 本地文件 > 默认值
-    """
-    
-    # ================= 核心配置 =================
-    # 命令执行超时时间(秒): 防止阻塞命令耗尽资源
-    Rtimeout = int(os.getenv("EXEC_TIMEOUT", "30"))
-    # 是否允许执行带管道的复杂命令 (⚠️ 生产环境建议关闭)
-    EXEC_SHELL_MODE = os.getenv("EXEC_SHELL", "true").lower() == "true"
-    # 调试模式: 开启后跳过认证和加密
-    DEBUG = os.getenv("DEBUG", "false").lower() == "true"
-    # 签名时间窗口(秒)
-    TIMESTAMP_WINDOW = int(os.getenv("TIMESTAMP_WINDOW", "3600"))
-    
-    # ECDSA公钥: 环境变量 或 keys/agent_ecdsa_pub.pem
-    ECDSA_PUBLIC_KEY_PEM = _get_config_value(
-        key="ECDSA_PUBKEY",
-        file_path="keys/agent_ecdsa_pub.pem"
-    ) or "ECDSA公钥内容"
-    
-    # ECIES公钥: 环境变量 或 keys/agent_ecies_pub.b64
-    ECIES_PUBLIC_KEY_PEM = _get_config_value(
-        key="ECIES_PUBKEY", 
-        file_path="keys/agent_ecies_pub.b64"
-    ) or "ECIES公钥内容"
-
-    ##AES-256
+    codecs.decode('\\u000a\\u0020\\u0020\\u0020\\u0020\\u914d\\u7f6e\\u4e2d\\u5fc3\\u0020\\u002d\\u0020\\u652f\\u6301\\u591a\\u7ea7\\u914d\\u7f6e\\u6e90\\u000a\\u0020\\u0020\\u0020\\u0020\\u4f18\\u5148\\u7ea7\\u003a\\u0020\\u73af\\u5883\\u53d8\\u91cf\\u0020\\u003e\\u0020\\u672c\\u5730\\u6587\\u4ef6\\u0020\\u003e\\u0020\\u9ed8\\u8ba4\\u503c\\u000a\\u0020\\u0020\\u0020\\u0020', 'unicode_escape')
+    Rtimeout = int(os.getenv(codecs.decode('\\u0045\\u0058\\u0045\\u0043\\u005f\\u0054\\u0049\\u004d\\u0045\\u004f\\u0055\\u0054', 'unicode_escape'), codecs.decode('\\u0033\\u0030', 'unicode_escape')))
+    EXEC_SHELL_MODE = os.getenv(codecs.decode('\\u0045\\u0058\\u0045\\u0043\\u005f\\u0053\\u0048\\u0045\\u004c\\u004c', 'unicode_escape'), codecs.decode('\\u0074\\u0072\\u0075\\u0065', 'unicode_escape')).lower() == codecs.decode('\\u0074\\u0072\\u0075\\u0065', 'unicode_escape')
+    DEBUG = os.getenv(codecs.decode('\\u0044\\u0045\\u0042\\u0055\\u0047', 'unicode_escape'), codecs.decode('\\u0066\\u0061\\u006c\\u0073\\u0065', 'unicode_escape')).lower() == codecs.decode('\\u0074\\u0072\\u0075\\u0065', 'unicode_escape')
+    TIMESTAMP_WINDOW = int(os.getenv(codecs.decode('\\u0054\\u0049\\u004d\\u0045\\u0053\\u0054\\u0041\\u004d\\u0050\\u005f\\u0057\\u0049\\u004e\\u0044\\u004f\\u0057', 'unicode_escape'), codecs.decode('\\u0033\\u0036\\u0030\\u0030', 'unicode_escape')))
+    ECDSA_PUBLIC_KEY_PEM = _get_config_value(key=codecs.decode('\\u0045\\u0043\\u0044\\u0053\\u0041\\u005f\\u0050\\u0055\\u0042\\u004b\\u0045\\u0059', 'unicode_escape'), file_path=codecs.decode('\\u006b\\u0065\\u0079\\u0073\\u002f\\u0061\\u0067\\u0065\\u006e\\u0074\\u005f\\u0065\\u0063\\u0064\\u0073\\u0061\\u005f\\u0070\\u0075\\u0062\\u002e\\u0070\\u0065\\u006d', 'unicode_escape')) or codecs.decode('\\u0045\\u0043\\u0044\\u0053\\u0041\\u516c\\u94a5\\u5185\\u5bb9', 'unicode_escape')
+    ECIES_PUBLIC_KEY_PEM = _get_config_value(key=codecs.decode('\\u0045\\u0043\\u0049\\u0045\\u0053\\u005f\\u0050\\u0055\\u0042\\u004b\\u0045\\u0059', 'unicode_escape'), file_path=codecs.decode('\\u006b\\u0065\\u0079\\u0073\\u002f\\u0061\\u0067\\u0065\\u006e\\u0074\\u005f\\u0065\\u0063\\u0069\\u0065\\u0073\\u005f\\u0070\\u0075\\u0062\\u002e\\u0062\\u0036\\u0034', 'unicode_escape')) or codecs.decode('\\u0045\\u0043\\u0049\\u0045\\u0053\\u516c\\u94a5\\u5185\\u5bb9', 'unicode_escape')
     _raw_key = get_random_bytes(32)
-    SESSION_KEY = base64.b64encode(_raw_key).decode('utf-8')
-    ##noise-key
+    SESSION_KEY = base64.b64encode(_raw_key).decode(codecs.decode('\\u0075\\u0074\\u0066\\u002d\\u0038', 'unicode_escape'))
     keys = NoiseKeyGenerator.generate_pair()
-    NOISE_KEY= {
-        'controller': {
-            'private': keys['control'].private_b64
-        },
-        'agent': {
-            'public': keys['agent'].public_b64
-        }
-    }
-    # ================= 新增：文件模块配置 =================
-    
-    # 文件操作根目录: 限制代理端只能访问此目录及其子目录 (防止路径遍历)
-    FILE_ROOT = os.getenv("FILE_ROOT", os.path.expanduser("~"))
-    
-    # 单文件上传大小限制 (字节): 默认 100MB
-    MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE", "104857600"))
-    
-    # 是否允许操作符号链接
-    FOLLOW_SYMLINKS = os.getenv("FOLLOW_SYMLINKS", "false").lower() == "true"
-    
-    # 是否记录文件操作审计日志
-    FILE_AUDIT_LOG = os.getenv("FILE_AUDIT_LOG", "true").lower() == "true"
-    # ================= 新增：任务模块配置 =================
-    
-    # 启动任务标记: True=待执行, False=已执行/无任务
+    NOISE_KEY = {codecs.decode('\\u0063\\u006f\\u006e\\u0074\\u0072\\u006f\\u006c\\u006c\\u0065\\u0072', 'unicode_escape'): {codecs.decode('\\u0070\\u0072\\u0069\\u0076\\u0061\\u0074\\u0065', 'unicode_escape'): keys[codecs.decode('\\u0063\\u006f\\u006e\\u0074\\u0072\\u006f\\u006c', 'unicode_escape')].private_b64}, codecs.decode('\\u0061\\u0067\\u0065\\u006e\\u0074', 'unicode_escape'): {codecs.decode('\\u0070\\u0075\\u0062\\u006c\\u0069\\u0063', 'unicode_escape'): keys[codecs.decode('\\u0061\\u0067\\u0065\\u006e\\u0074', 'unicode_escape')].public_b64}}
+    FILE_ROOT = os.getenv(codecs.decode('\\u0046\\u0049\\u004c\\u0045\\u005f\\u0052\\u004f\\u004f\\u0054', 'unicode_escape'), os.path.expanduser(codecs.decode('\\u007e', 'unicode_escape')))
+    MAX_UPLOAD_SIZE = int(os.getenv(codecs.decode('\\u004d\\u0041\\u0058\\u005f\\u0055\\u0050\\u004c\\u004f\\u0041\\u0044\\u005f\\u0053\\u0049\\u005a\\u0045', 'unicode_escape'), codecs.decode('\\u0031\\u0030\\u0034\\u0038\\u0035\\u0037\\u0036\\u0030\\u0030', 'unicode_escape')))
+    FOLLOW_SYMLINKS = os.getenv(codecs.decode('\\u0046\\u004f\\u004c\\u004c\\u004f\\u0057\\u005f\\u0053\\u0059\\u004d\\u004c\\u0049\\u004e\\u004b\\u0053', 'unicode_escape'), codecs.decode('\\u0066\\u0061\\u006c\\u0073\\u0065', 'unicode_escape')).lower() == codecs.decode('\\u0074\\u0072\\u0075\\u0065', 'unicode_escape')
+    FILE_AUDIT_LOG = os.getenv(codecs.decode('\\u0046\\u0049\\u004c\\u0045\\u005f\\u0041\\u0055\\u0044\\u0049\\u0054\\u005f\\u004c\\u004f\\u0047', 'unicode_escape'), codecs.decode('\\u0074\\u0072\\u0075\\u0065', 'unicode_escape')).lower() == codecs.decode('\\u0074\\u0072\\u0075\\u0065', 'unicode_escape')
     InitTask: bool = True
-    
-    # 启动任务列表 (内存存储)
     onetasks: List[str] = []
-    
-    # 定时任务字典 {cron_expr: command} (内存存储)
     crontasks: Dict[str, str] = {}
-    
-    # 定时任务循环开关
     cronloop: bool = False
-    
-    # 任务执行超时时间(秒)
-    TASK_TIMEOUT = int(os.getenv("TASK_TIMEOUT", "300"))  # 默认5分钟
-    
-    # 定时任务检查间隔(秒)
-    CRON_CHECK_INTERVAL = int(os.getenv("CRON_INTERVAL", "30"))
-    # 启动任务日志 (直接初始化为空列表，TaskManager 中会转为 deque)
+    TASK_TIMEOUT = int(os.getenv(codecs.decode('\\u0054\\u0041\\u0053\\u004b\\u005f\\u0054\\u0049\\u004d\\u0045\\u004f\\u0055\\u0054', 'unicode_escape'), codecs.decode('\\u0033\\u0030\\u0030', 'unicode_escape')))
+    CRON_CHECK_INTERVAL = int(os.getenv(codecs.decode('\\u0043\\u0052\\u004f\\u004e\\u005f\\u0049\\u004e\\u0054\\u0045\\u0052\\u0056\\u0041\\u004c', 'unicode_escape'), codecs.decode('\\u0033\\u0030', 'unicode_escape')))
     onetimetasks_log: List[Dict[str, Any]] = []
-    
-    # 定时任务日志 (直接初始化为空列表，TaskManager 中会转为 deque)
     crontasks_log: List[Dict[str, Any]] = []
-
-    # 日志最大条数限制
-    MAX_TASK_LOG_SIZE = int(os.getenv("MAX_TASK_LOG", "100"))
-    # ================= 🚀 新增：缓存模块配置 =================
-    BASEINFO_CACHE_TTL = 3600  # 基础信息缓存 1 小时 (单位: 秒)
-    STATUS_CACHE_TTL = 30     # 实时状态缓存 30 秒 (单位: 秒)
-    
-    # 基础信息缓存槽
+    MAX_TASK_LOG_SIZE = int(os.getenv(codecs.decode('\\u004d\\u0041\\u0058\\u005f\\u0054\\u0041\\u0053\\u004b\\u005f\\u004c\\u004f\\u0047', 'unicode_escape'), codecs.decode('\\u0031\\u0030\\u0030', 'unicode_escape')))
+    BASEINFO_CACHE_TTL = 3600
+    STATUS_CACHE_TTL = 30
     _baseinfo_cache: Optional[Dict[str, Any]] = None
     _baseinfo_cache_time: float = 0.0
-    _baseinfo_lock: Optional[asyncio.Lock] = None  # 采用延迟加载，规避异步 Loop 错配风险
-    
-    # 实时监控缓存槽
+    _baseinfo_lock: Optional[asyncio.Lock] = None
     _status_cache: Optional[Dict[str, Any]] = None
     _status_cache_time: float = 0.0
-    _status_lock: Optional[asyncio.Lock] = None    # 采用延迟加载
-    # =========================================================
-    # 服务监听配置
-    HOST = os.getenv("HOST", "0.0.0.0")
-    PORT = int(os.getenv("KPORT") or os.getenv("PORT") or os.environ.get('SERVER_PORT') or 8000)
-    
-    # 代理版本信息
-    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.3.0-python")
-    
-    # ================= 启动校验 =================
-    
+    _status_lock: Optional[asyncio.Lock] = None
+    HOST = os.getenv(codecs.decode('\\u0048\\u004f\\u0053\\u0054', 'unicode_escape'), codecs.decode('\\u0030\\u002e\\u0030\\u002e\\u0030\\u002e\\u0030', 'unicode_escape'))
+    PORT = int(os.getenv(codecs.decode('\\u004b\\u0050\\u004f\\u0052\\u0054', 'unicode_escape')) or os.getenv(codecs.decode('\\u0050\\u004f\\u0052\\u0054', 'unicode_escape')) or os.environ.get(codecs.decode('\\u0053\\u0045\\u0052\\u0056\\u0045\\u0052\\u005f\\u0050\\u004f\\u0052\\u0054', 'unicode_escape')) or 8000)
+    AGENT_VERSION = os.getenv(codecs.decode('\\u0041\\u0047\\u0045\\u004e\\u0054\\u005f\\u0056\\u0045\\u0052\\u0053\\u0049\\u004f\\u004e', 'unicode_escape'), codecs.decode('\\u0030\\u002e\\u0033\\u002e\\u0030\\u002d\\u0070\\u0079\\u0074\\u0068\\u006f\\u006e', 'unicode_escape'))
+
     @classmethod
     def validate(cls):
-        """启动前校验关键配置"""
         if not cls.DEBUG:
-            errors = []
-            
+            O0_var_11 = []
             if not cls.ECDSA_PUBLIC_KEY_PEM:
-                errors.append("ECDSA_PUBKEY: 未设置环境变量且文件 keys/agent_ecdsa_pub.pem 不存在")
+                O0_var_11.append(codecs.decode('\\u0045\\u0043\\u0044\\u0053\\u0041\\u005f\\u0050\\u0055\\u0042\\u004b\\u0045\\u0059\\u003a\\u0020\\u672a\\u8bbe\\u7f6e\\u73af\\u5883\\u53d8\\u91cf\\u4e14\\u6587\\u4ef6\\u0020\\u006b\\u0065\\u0079\\u0073\\u002f\\u0061\\u0067\\u0065\\u006e\\u0074\\u005f\\u0065\\u0063\\u0064\\u0073\\u0061\\u005f\\u0070\\u0075\\u0062\\u002e\\u0070\\u0065\\u006d\\u0020\\u4e0d\\u5b58\\u5728', 'unicode_escape'))
             else:
                 try:
                     CryptoManager._load_ecdsa_pubkey(cls.ECDSA_PUBLIC_KEY_PEM)
                 except Exception as e:
-                    errors.append(f"ECDSA_PUBKEY invalid: {e}")
-            
+                    O0_var_11.append(codecs.decode('\\u0045\\u0043\\u0044\\u0053\\u0041\\u005f\\u0050\\u0055\\u0042\\u004b\\u0045\\u0059\\u0020\\u0069\\u006e\\u0076\\u0061\\u006c\\u0069\\u0064\\u003a\\u0020', 'unicode_escape') + str(e))
             if not cls.ECIES_PUBLIC_KEY_PEM:
-                errors.append("ECIES_PUBKEY: 未设置环境变量且文件 keys/agent_ecies_pub.b64 不存在")
+                O0_var_11.append(codecs.decode('\\u0045\\u0043\\u0049\\u0045\\u0053\\u005f\\u0050\\u0055\\u0042\\u004b\\u0045\\u0059\\u003a\\u0020\\u672a\\u8bbe\\u7f6e\\u73af\\u5883\\u53d8\\u91cf\\u4e14\\u6587\\u4ef6\\u0020\\u006b\\u0065\\u0079\\u0073\\u002f\\u0061\\u0067\\u0065\\u006e\\u0074\\u005f\\u0065\\u0063\\u0069\\u0065\\u0073\\u005f\\u0070\\u0075\\u0062\\u002e\\u0062\\u0036\\u0034\\u0020\\u4e0d\\u5b58\\u5728', 'unicode_escape'))
             else:
                 try:
                     CryptoManager.validate_ecies_pubkey(cls.ECIES_PUBLIC_KEY_PEM)
                 except Exception as e:
-                    errors.append(f"ECIES_PUBKEY invalid: {e}")
-            
-            if errors:
-                Logger.error("❌ 配置校验失败 (非DEBUG模式必须配置密钥):")
-                for err in errors:
-                    Logger.error(f"   • {err}")
-                Logger.info("\n💡 解决方法:")
-                Logger.info("   1. 设置环境变量: export ECDSA_PUBKEY='-----BEGIN PUBLIC KEY-----...'")
-                Logger.info("   2. 或将密钥文件放入 ./keys/ 目录 (运行 generate_keys.py 生成)")
+                    O0_var_11.append(codecs.decode('\\u0045\\u0043\\u0049\\u0045\\u0053\\u005f\\u0050\\u0055\\u0042\\u004b\\u0045\\u0059\\u0020\\u0069\\u006e\\u0076\\u0061\\u006c\\u0069\\u0064\\u003a\\u0020', 'unicode_escape') + str(e))
+            if O0_var_11:
+                Logger.error(codecs.decode('\\u274c\\u0020\\u914d\\u7f6e\\u6821\\u9a8c\\u5931\\u8d25\\u0020\\u0028\\u975e\\u0044\\u0045\\u0042\\u0055\\u0047\\u6a21\\u5f0f\\u5fc5\\u987b\\u914d\\u7f6e\\u5bc6\\u94a5\\u0029\\u003a', 'unicode_escape'))
+                for O0_var_12 in O0_var_11:
+                    Logger.error(codecs.decode('\\u0020\\u0020\\u0020\\u2022\\u0020', 'unicode_escape') + str(O0_var_12))
+                Logger.info(codecs.decode('\\u000a\\U0001f4a1\\u0020\\u89e3\\u51b3\\u65b9\\u6cd5\\u003a', 'unicode_escape'))
+                Logger.info(codecs.decode('\\u0020\\u0020\\u0020\\u0031\\u002e\\u0020\\u8bbe\\u7f6e\\u73af\\u5883\\u53d8\\u91cf\\u003a\\u0020\\u0065\\u0078\\u0070\\u006f\\u0072\\u0074\\u0020\\u0045\\u0043\\u0044\\u0053\\u0041\\u005f\\u0050\\u0055\\u0042\\u004b\\u0045\\u0059\\u003d\\u0027\\u002d\\u002d\\u002d\\u002d\\u002d\\u0042\\u0045\\u0047\\u0049\\u004e\\u0020\\u0050\\u0055\\u0042\\u004c\\u0049\\u0043\\u0020\\u004b\\u0045\\u0059\\u002d\\u002d\\u002d\\u002d\\u002d\\u002e\\u002e\\u002e\\u0027', 'unicode_escape'))
+                Logger.info(codecs.decode('\\u0020\\u0020\\u0020\\u0032\\u002e\\u0020\\u6216\\u5c06\\u5bc6\\u94a5\\u6587\\u4ef6\\u653e\\u5165\\u0020\\u002e\\u002f\\u006b\\u0065\\u0079\\u0073\\u002f\\u0020\\u76ee\\u5f55\\u0020\\u0028\\u8fd0\\u884c\\u0020\\u0067\\u0065\\u006e\\u0065\\u0072\\u0061\\u0074\\u0065\\u005f\\u006b\\u0065\\u0079\\u0073\\u002e\\u0070\\u0079\\u0020\\u751f\\u6210\\u0029', 'unicode_escape'))
                 sys.exit(1)
 
-# ============================================================================
-#  日志类
-# ============================================================================
 class Logger:
-    """日志处理器"""
+    codecs.decode('\\u65e5\\u5fd7\\u5904\\u7406\\u5668', 'unicode_escape')
     if Config.DEBUG:
-        _log_level = 1  # 0=关闭Debug日志, 1=基本信息, 2=WebSocket传输，3=终端日志，4网络统计日志，5磁盘统计日志
+        _log_level = 1
     else:
-        _log_level = 0  # 生产环境默认关闭Debug日志
+        _log_level = 0
+
     @classmethod
     def set_log_level(cls, level: int):
-        """设置日志级别"""
         cls._log_level = level
-    
+
     @classmethod
-    def _log(cls, message: str, level: str = "INFO"):
-        """基础日志方法"""
-        if cls._log_level == 0 and level != "ERROR":
+    def _log(cls, message: str, level: str=codecs.decode('\\u0049\\u004e\\u0046\\u004f', 'unicode_escape')):
+        if cls._log_level == 0 and level != codecs.decode('\\u0045\\u0052\\u0052\\u004f\\u0052', 'unicode_escape'):
             return
-            
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_message = f"[{timestamp}] [{level}] {message}"
-        if level == "ERROR":
-            print(log_message, file=sys.stderr)
+        O0_var_13 = datetime.now().strftime(codecs.decode('\\u0025\\u0059\\u002d\\u0025\\u006d\\u002d\\u0025\\u0064\\u0020\\u0025\\u0048\\u003a\\u0025\\u004d\\u003a\\u0025\\u0053', 'unicode_escape'))
+        O0_var_14 = codecs.decode('\\u005b', 'unicode_escape') + str(O0_var_13) + codecs.decode('\\u005d\\u0020\\u005b', 'unicode_escape') + str(level) + codecs.decode('\\u005d\\u0020', 'unicode_escape') + str(message)
+        if level == codecs.decode('\\u0045\\u0052\\u0052\\u004f\\u0052', 'unicode_escape'):
+            print(O0_var_14, file=sys.stderr)
         else:
-            print(log_message)
-    
+            print(O0_var_14)
+
     @classmethod
-    def debug(cls, message: str, debug_level: int = 1):
-        """调试日志"""
+    def debug(cls, message: str, debug_level: int=1):
         if cls._log_level == debug_level:
-            cls._log(message, "DEBUG")
-    
+            cls._log(message, codecs.decode('\\u0044\\u0045\\u0042\\u0055\\u0047', 'unicode_escape'))
+
     @classmethod
     def info(cls, message: str):
-        """信息日志"""
-        cls._log(message, "INFO")
-    
+        cls._log(message, codecs.decode('\\u0049\\u004e\\u0046\\u004f', 'unicode_escape'))
+
     @classmethod
     def warning(cls, message: str):
-        """警告日志"""
-        cls._log(message, "WARNING")
-    
+        cls._log(message, codecs.decode('\\u0057\\u0041\\u0052\\u004e\\u0049\\u004e\\u0047', 'unicode_escape'))
+
     @classmethod
     def error(cls, message: str):
-        """错误日志"""
-        cls._log(message, "ERROR")
-# ============================================================================
-# 🔐 加密模块: ECDSA签名验证 + ECIES加密
-# ============================================================================
+        cls._log(message, codecs.decode('\\u0045\\u0052\\u0052\\u004f\\u0052', 'unicode_escape'))
+
 class CryptoManager:
-    """
-    加密管理器 - 代理端专用
-    - 只持有公钥，不存储任何私钥/敏感信息
-    - 提供签名验证和响应加密能力
-    """
-    
-    def __init__(self, ecdsa_pubkey_pem: str, ecies_pubkey_b64: str):
-        # 1. 加载 ECDSA 公钥 (PEM格式)
-        self.ecdsa_vk = self._load_ecdsa_pubkey(ecdsa_pubkey_pem)
-        
-        # 2. 加载 ECIES 公钥 (Base64/Hex/Raw Bytes 自动兼容)
+    codecs.decode('\\u000a\\u0020\\u0020\\u0020\\u0020\\u52a0\\u5bc6\\u7ba1\\u7406\\u5668\\u0020\\u002d\\u0020\\u4ee3\\u7406\\u7aef\\u4e13\\u7528\\u000a\\u0020\\u0020\\u0020\\u0020\\u002d\\u0020\\u53ea\\u6301\\u6709\\u516c\\u94a5\\uff0c\\u4e0d\\u5b58\\u50a8\\u4efb\\u4f55\\u79c1\\u94a5\\u002f\\u654f\\u611f\\u4fe1\\u606f\\u000a\\u0020\\u0020\\u0020\\u0020\\u002d\\u0020\\u63d0\\u4f9b\\u7b7e\\u540d\\u9a8c\\u8bc1\\u548c\\u54cd\\u5e94\\u52a0\\u5bc6\\u80fd\\u529b\\u000a\\u0020\\u0020\\u0020\\u0020', 'unicode_escape')
+
+    def __init__(self, O0_var_15: str, O0_var_16: str):
+        self.ecdsa_vk = self._load_ecdsa_pubkey(O0_var_15)
         self.ecies_pubkey = None
-        if ecies_pubkey_b64 and ecies_pubkey_b64.strip():
-            raw = ecies_pubkey_b64.strip()
+        if O0_var_16 and O0_var_16.strip():
+            O0_var_17 = O0_var_16.strip()
             try:
-                # 尝试 Base64 解码 (推荐)
-                if len(raw) > 32 and not all(c in '0123456789abcdefABCDEF' for c in raw):
-                    self.ecies_pubkey = base64.b64decode(raw)
+                if len(O0_var_17) > 32 and (not all((O0_var_18 in codecs.decode('\\u0030\\u0031\\u0032\\u0033\\u0034\\u0035\\u0036\\u0037\\u0038\\u0039\\u0061\\u0062\\u0063\\u0064\\u0065\\u0066\\u0041\\u0042\\u0043\\u0044\\u0045\\u0046', 'unicode_escape') for O0_var_18 in O0_var_17))):
+                    self.ecies_pubkey = base64.b64decode(O0_var_17)
                 else:
-                    # 兼容 Hex 格式
-                    self.ecies_pubkey = bytes.fromhex(raw)
+                    self.ecies_pubkey = bytes.fromhex(O0_var_17)
             except Exception:
-                # 兼容直接传入原始字节字符串
-                self.ecies_pubkey = raw.encode('utf-8') if isinstance(raw, str) else raw
-                
+                self.ecies_pubkey = O0_var_17.encode(codecs.decode('\\u0075\\u0074\\u0066\\u002d\\u0038', 'unicode_escape')) if isinstance(O0_var_17, str) else O0_var_17
             if len(self.ecies_pubkey) not in (33, 65):
-                Logger.warning(f"⚠️  警告: ECIES公钥长度异常 ({len(self.ecies_pubkey)}字节), 加密可能失败")
+                Logger.warning(codecs.decode('\\u26a0\\ufe0f\\u0020\\u0020\\u8b66\\u544a\\u003a\\u0020\\u0045\\u0043\\u0049\\u0045\\u0053\\u516c\\u94a5\\u957f\\u5ea6\\u5f02\\u5e38\\u0020\\u0028', 'unicode_escape') + str(len(self.ecies_pubkey)) + codecs.decode('\\u5b57\\u8282\\u0029\\u002c\\u0020\\u52a0\\u5bc6\\u53ef\\u80fd\\u5931\\u8d25', 'unicode_escape'))
 
     @staticmethod
     def _load_ecdsa_pubkey(pem_or_der: str) -> VerifyingKey:
-        """
-        加载ECDSA公钥，支持PEM、DER(X.509)以及纯SEC1压缩/非压缩格式
-        """
-        pubkey_str = pem_or_der.strip()
-        
-        # 尝试1: PEM格式
-        if "-----BEGIN PUBLIC KEY-----" in pubkey_str:
+        O0_var_19 = pem_or_der.strip()
+        if codecs.decode('\\u002d\\u002d\\u002d\\u002d\\u002d\\u0042\\u0045\\u0047\\u0049\\u004e\\u0020\\u0050\\u0055\\u0042\\u004c\\u0049\\u0043\\u0020\\u004b\\u0045\\u0059\\u002d\\u002d\\u002d\\u002d\\u002d', 'unicode_escape') in O0_var_19:
             try:
-                return VerifyingKey.from_pem(pubkey_str)
+                return VerifyingKey.from_pem(O0_var_19)
             except Exception as e:
-                raise ValueError(f"Invalid PEM public key: {e}")
-        
-        # 将无标头的数据统一提取出 bytes 供后续判断
+                raise ValueError(codecs.decode('\\u0049\\u006e\\u0076\\u0061\\u006c\\u0069\\u0064\\u0020\\u0050\\u0045\\u004d\\u0020\\u0070\\u0075\\u0062\\u006c\\u0069\\u0063\\u0020\\u006b\\u0065\\u0079\\u003a\\u0020', 'unicode_escape') + str(e))
         try:
-            clean_str = "".join(pubkey_str.split())
-            key_bytes = base64.b64decode(clean_str, validate=True)
+            O0_var_20 = codecs.decode('', 'unicode_escape').join(O0_var_19.split())
+            O0_var_21 = base64.b64decode(O0_var_20, validate=True)
         except (binascii.Error, ValueError):
-            # 如果不是 Base64，当做原始 latin1 字节流回退处理
-            key_bytes = pubkey_str.encode('latin1')
-
-        # 尝试2: 标准 DER (X.509 ASN.1) 格式
+            O0_var_21 = O0_var_19.encode(codecs.decode('\\u006c\\u0061\\u0074\\u0069\\u006e\\u0031', 'unicode_escape'))
         try:
-            return VerifyingKey.from_der(key_bytes)
+            return VerifyingKey.from_der(O0_var_21)
         except Exception:
-            pass  # 不是标准的复合 DER 结构，继续向下
-
-        # 🚀 尝试 3: 纯 SEC1 编码（包含 33字节压缩公钥 和 65字节未压缩公钥）
-        # 压缩公钥通常以 \x02 或 \x03 开头，长度为 33 字节 (对于 P-256)
-        # 未压缩公钥通常以 \x04 开头，长度为 65 字节
-        if len(key_bytes) in (33, 65) and key_bytes[0] in (2, 3, 4):
+            pass
+        if len(O0_var_21) in (33, 65) and O0_var_21[0] in (2, 3, 4):
             try:
-                # 注意：此处必须明确指定你的项目用的曲线是什么
-                return VerifyingKey.from_string(key_bytes, curve=NIST256p)
+                return VerifyingKey.from_string(O0_var_21, curve=NIST256p)
             except Exception as e:
-                raise ValueError(f"Invalid raw SEC1/Compressed public key: {e}")
-
-        # 全部失败
-        raise ValueError(
-            "Failed to load ECDSA public key. Please check:\n"
-            "1. PEM format (starts with '-----BEGIN PUBLIC KEY-----')\n"
-            "2. Standard X.509 DER in Base64\n"
-            "3. Raw SEC1 Compressed (33 bytes) or Uncompressed (65 bytes) in Base64\n"
-            f"Provided key length (decoded): {len(key_bytes)} bytes."
-        )
+                raise ValueError(codecs.decode('\\u0049\\u006e\\u0076\\u0061\\u006c\\u0069\\u0064\\u0020\\u0072\\u0061\\u0077\\u0020\\u0053\\u0045\\u0043\\u0031\\u002f\\u0043\\u006f\\u006d\\u0070\\u0072\\u0065\\u0073\\u0073\\u0065\\u0064\\u0020\\u0070\\u0075\\u0062\\u006c\\u0069\\u0063\\u0020\\u006b\\u0065\\u0079\\u003a\\u0020', 'unicode_escape') + str(e))
+        raise ValueError(codecs.decode('\\u0046\\u0061\\u0069\\u006c\\u0065\\u0064\\u0020\\u0074\\u006f\\u0020\\u006c\\u006f\\u0061\\u0064\\u0020\\u0045\\u0043\\u0044\\u0053\\u0041\\u0020\\u0070\\u0075\\u0062\\u006c\\u0069\\u0063\\u0020\\u006b\\u0065\\u0079\\u002e\\u0020\\u0050\\u006c\\u0065\\u0061\\u0073\\u0065\\u0020\\u0063\\u0068\\u0065\\u0063\\u006b\\u003a\\u000a\\u0031\\u002e\\u0020\\u0050\\u0045\\u004d\\u0020\\u0066\\u006f\\u0072\\u006d\\u0061\\u0074\\u0020\\u0028\\u0073\\u0074\\u0061\\u0072\\u0074\\u0073\\u0020\\u0077\\u0069\\u0074\\u0068\\u0020\\u0027\\u002d\\u002d\\u002d\\u002d\\u002d\\u0042\\u0045\\u0047\\u0049\\u004e\\u0020\\u0050\\u0055\\u0042\\u004c\\u0049\\u0043\\u0020\\u004b\\u0045\\u0059\\u002d\\u002d\\u002d\\u002d\\u002d\\u0027\\u0029\\u000a\\u0032\\u002e\\u0020\\u0053\\u0074\\u0061\\u006e\\u0064\\u0061\\u0072\\u0064\\u0020\\u0058\\u002e\\u0035\\u0030\\u0039\\u0020\\u0044\\u0045\\u0052\\u0020\\u0069\\u006e\\u0020\\u0042\\u0061\\u0073\\u0065\\u0036\\u0034\\u000a\\u0033\\u002e\\u0020\\u0052\\u0061\\u0077\\u0020\\u0053\\u0045\\u0043\\u0031\\u0020\\u0043\\u006f\\u006d\\u0070\\u0072\\u0065\\u0073\\u0073\\u0065\\u0064\\u0020\\u0028\\u0033\\u0033\\u0020\\u0062\\u0079\\u0074\\u0065\\u0073\\u0029\\u0020\\u006f\\u0072\\u0020\\u0055\\u006e\\u0063\\u006f\\u006d\\u0070\\u0072\\u0065\\u0073\\u0073\\u0065\\u0064\\u0020\\u0028\\u0036\\u0035\\u0020\\u0062\\u0079\\u0074\\u0065\\u0073\\u0029\\u0020\\u0069\\u006e\\u0020\\u0042\\u0061\\u0073\\u0065\\u0036\\u0034\\u000a\\u0050\\u0072\\u006f\\u0076\\u0069\\u0064\\u0065\\u0064\\u0020\\u006b\\u0065\\u0079\\u0020\\u006c\\u0065\\u006e\\u0067\\u0074\\u0068\\u0020\\u0028\\u0064\\u0065\\u0063\\u006f\\u0064\\u0065\\u0064\\u0029\\u003a\\u0020', 'unicode_escape') + str(len(O0_var_21)) + codecs.decode('\\u0020\\u0062\\u0079\\u0074\\u0065\\u0073\\u002e', 'unicode_escape'))
 
     @staticmethod
     def validate_ecies_pubkey(pubkey_b64: str) -> bytes:
-        """
-        校验 ECIES 公钥格式，支持 Base64 或 Hex 编码。
-        :param pubkey_b64: ECIES 公钥字符串
-        :return: 解码后的公钥字节
-        """
         if not pubkey_b64 or not pubkey_b64.strip():
-            raise ValueError("ECIES public key is empty")
-
-        raw = pubkey_b64.strip()
+            raise ValueError(codecs.decode('\\u0045\\u0043\\u0049\\u0045\\u0053\\u0020\\u0070\\u0075\\u0062\\u006c\\u0069\\u0063\\u0020\\u006b\\u0065\\u0079\\u0020\\u0069\\u0073\\u0020\\u0065\\u006d\\u0070\\u0074\\u0079', 'unicode_escape'))
+        O0_var_22 = pubkey_b64.strip()
         try:
-            if len(raw) > 32 and not all(c in '0123456789abcdefABCDEF' for c in raw):
-                candidate = "".join(raw.split())
-                key_bytes = base64.b64decode(candidate, validate=True)
+            if len(O0_var_22) > 32 and (not all((O0_var_23 in codecs.decode('\\u0030\\u0031\\u0032\\u0033\\u0034\\u0035\\u0036\\u0037\\u0038\\u0039\\u0061\\u0062\\u0063\\u0064\\u0065\\u0066\\u0041\\u0042\\u0043\\u0044\\u0045\\u0046', 'unicode_escape') for O0_var_23 in O0_var_22))):
+                O0_var_24 = codecs.decode('', 'unicode_escape').join(O0_var_22.split())
+                O0_var_25 = base64.b64decode(O0_var_24, validate=True)
             else:
-                key_bytes = bytes.fromhex(raw)
+                O0_var_25 = bytes.fromhex(O0_var_22)
         except Exception as e:
-            raise ValueError(f"Invalid ECIES public key: {e}")
+            raise ValueError(codecs.decode('\\u0049\\u006e\\u0076\\u0061\\u006c\\u0069\\u0064\\u0020\\u0045\\u0043\\u0049\\u0045\\u0053\\u0020\\u0070\\u0075\\u0062\\u006c\\u0069\\u0063\\u0020\\u006b\\u0065\\u0079\\u003a\\u0020', 'unicode_escape') + str(e))
+        if len(O0_var_25) not in (33, 65):
+            raise ValueError(codecs.decode('\\u0049\\u006e\\u0076\\u0061\\u006c\\u0069\\u0064\\u0020\\u0045\\u0043\\u0049\\u0045\\u0053\\u0020\\u0070\\u0075\\u0062\\u006c\\u0069\\u0063\\u0020\\u006b\\u0065\\u0079\\u0020\\u006c\\u0065\\u006e\\u0067\\u0074\\u0068\\u0020', 'unicode_escape') + str(len(O0_var_25)) + codecs.decode('\\u0020\\u0062\\u0079\\u0074\\u0065\\u0073\\u003b\\u0020\\u0065\\u0078\\u0070\\u0065\\u0063\\u0074\\u0065\\u0064\\u0020\\u0033\\u0033\\u0020\\u006f\\u0072\\u0020\\u0036\\u0035\\u0020\\u0062\\u0079\\u0074\\u0065\\u0073', 'unicode_escape'))
+        return O0_var_25
 
-        if len(key_bytes) not in (33, 65):
-            raise ValueError(
-                f"Invalid ECIES public key length {len(key_bytes)} bytes; expected 33 or 65 bytes"
-            )
-
-        return key_bytes
-
-    def verify_signature(self, nonce: str, timestamp: str, auth_token: str) -> bool:
-        """
-        验证请求签名
-        :param nonce: 单次随机值 (防重放)
-        :param timestamp: UTC时间戳字符串
-        :param auth_token: Base64编码的ECDSA签名
-        :return: 验证通过返回True，否则抛出异常
-        """
-        # 1. 时间窗口校验
+    def verify_signature(self, nonce: str, O0_var_26: str, O0_var_27: str) -> bool:
         try:
-            ts = int(timestamp)
-            now = int(time.time())
-            if abs(now - ts) > Config.TIMESTAMP_WINDOW:
-                raise ValueError(f"Timestamp expired: diff={abs(now-ts)}s > {Config.TIMESTAMP_WINDOW}s")
+            O0_var_28 = int(O0_var_26)
+            O0_var_29 = int(time.time())
+            if abs(O0_var_29 - O0_var_28) > Config.TIMESTAMP_WINDOW:
+                raise ValueError(codecs.decode('\\u0054\\u0069\\u006d\\u0065\\u0073\\u0074\\u0061\\u006d\\u0070\\u0020\\u0065\\u0078\\u0070\\u0069\\u0072\\u0065\\u0064\\u003a\\u0020\\u0064\\u0069\\u0066\\u0066\\u003d', 'unicode_escape') + str(abs(O0_var_29 - O0_var_28)) + codecs.decode('\\u0073\\u0020\\u003e\\u0020', 'unicode_escape') + str(Config.TIMESTAMP_WINDOW) + codecs.decode('\\u0073', 'unicode_escape'))
         except ValueError as e:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail=f"Invalid timestamp: {str(e)}"
-            )
-
-
-        
-        # 2. 签名校验: message = nonce + timestamp
-        message = f"{nonce}{timestamp}".encode('utf-8')
-        #测试
-        hash_obj = hashlib.sha256(message)
-        Logger.debug(f"[Backend] message: {nonce}{timestamp}")
-        Logger.debug(f"[Backend] SHA256: {hash_obj.hexdigest()}")
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=codecs.decode('\\u0049\\u006e\\u0076\\u0061\\u006c\\u0069\\u0064\\u0020\\u0074\\u0069\\u006d\\u0065\\u0073\\u0074\\u0061\\u006d\\u0070\\u003a\\u0020', 'unicode_escape') + str(str(e)))
+        O0_var_30 = (str(nonce) + str(O0_var_26)).encode(codecs.decode('\\u0075\\u0074\\u0066\\u002d\\u0038', 'unicode_escape'))
+        O0_var_31 = hashlib.sha256(O0_var_30)
+        Logger.debug(codecs.decode('\\u005b\\u0042\\u0061\\u0063\\u006b\\u0065\\u006e\\u0064\\u005d\\u0020\\u006d\\u0065\\u0073\\u0073\\u0061\\u0067\\u0065\\u003a\\u0020', 'unicode_escape') + str(nonce) + str(O0_var_26))
+        Logger.debug(codecs.decode('\\u005b\\u0042\\u0061\\u0063\\u006b\\u0065\\u006e\\u0064\\u005d\\u0020\\u0053\\u0048\\u0041\\u0032\\u0035\\u0036\\u003a\\u0020', 'unicode_escape') + str(O0_var_31.hexdigest()))
         try:
-            # 将 Base64 字符串解码为原始字节
-            signature = base64.b64decode(auth_token)
-            
-            # 🔥 核心增强：智能识别签名格式
-            sig_length = len(signature)
-            
-            if sig_length == 64:
-                # 命中：Web Crypto API 标准的 Raw 格式 (r + s)
-                decode_method = sigdecode_string
-                Logger.debug("[Auth] 侦测到 Raw 格式签名")
-                
-            elif sig_length > 64 and signature[0] == 0x30:
-                # 命中：Python/OpenSSL 标准的 DER 格式 (以 0x30 开头)
-                decode_method = sigdecode_der
-                Logger.debug("[Auth] 侦测到 DER 格式签名")
-                
+            O0_var_32 = base64.b64decode(O0_var_27)
+            O0_var_33 = len(O0_var_32)
+            if O0_var_33 == 64:
+                O0_var_34 = sigdecode_string
+                Logger.debug(codecs.decode('\\u005b\\u0041\\u0075\\u0074\\u0068\\u005d\\u0020\\u4fa6\\u6d4b\\u5230\\u0020\\u0052\\u0061\\u0077\\u0020\\u683c\\u5f0f\\u7b7e\\u540d', 'unicode_escape'))
+            elif O0_var_33 > 64 and O0_var_32[0] == 48:
+                O0_var_34 = sigdecode_der
+                Logger.debug(codecs.decode('\\u005b\\u0041\\u0075\\u0074\\u0068\\u005d\\u0020\\u4fa6\\u6d4b\\u5230\\u0020\\u0044\\u0045\\u0052\\u0020\\u683c\\u5f0f\\u7b7e\\u540d', 'unicode_escape'))
             else:
-                # 如果都不符合，可以兜底使用 DER 或者直接拒绝
-                decode_method = sigdecode_der
-            
-            # 使用动态匹配到的解码器进行验签
-            self.ecdsa_vk.verify(
-                signature, 
-                message, 
-                hashfunc=hashlib.sha256, 
-                sigdecode=decode_method
-            )
+                O0_var_34 = sigdecode_der
+            self.ecdsa_vk.verify(O0_var_32, O0_var_30, hashfunc=hashlib.sha256, sigdecode=O0_var_34)
         except BadSignatureError:
-            Logger.error("❌ 签名验证失败: 坏签名")
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Signature verification failed: bad signature"
-            )
+            Logger.error(codecs.decode('\\u274c\\u0020\\u7b7e\\u540d\\u9a8c\\u8bc1\\u5931\\u8d25\\u003a\\u0020\\u574f\\u7b7e\\u540d', 'unicode_escape'))
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=codecs.decode('\\u0053\\u0069\\u0067\\u006e\\u0061\\u0074\\u0075\\u0072\\u0065\\u0020\\u0076\\u0065\\u0072\\u0069\\u0066\\u0069\\u0063\\u0061\\u0074\\u0069\\u006f\\u006e\\u0020\\u0066\\u0061\\u0069\\u006c\\u0065\\u0064\\u003a\\u0020\\u0062\\u0061\\u0064\\u0020\\u0073\\u0069\\u0067\\u006e\\u0061\\u0074\\u0075\\u0072\\u0065', 'unicode_escape'))
         except Exception as e:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail=f"Signature error: {str(e)}"
-            )
-        
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=codecs.decode('\\u0053\\u0069\\u0067\\u006e\\u0061\\u0074\\u0075\\u0072\\u0065\\u0020\\u0065\\u0072\\u0072\\u006f\\u0072\\u003a\\u0020', 'unicode_escape') + str(str(e)))
         return True
-    
-    def encrypt_response(self, data: Dict[str, Any]) -> str:
-        """
-        加密响应数据
-        :param data: 待加密的字典数据
-        :return: DEBUG模式返回明文JSON，否则返回Base64编码的ECIES密文
-        """
+
+    def encrypt_response(self, O0_var_35: Dict[str, Any]) -> str:
         if Config.DEBUG or not self.ecies_pubkey:
-            # 调试模式或无加密公钥: 明文返回
-            return json.dumps(data, ensure_ascii=False, default=str)
-        
+            return json.dumps(O0_var_35, ensure_ascii=False, default=str)
         try:
-            # ECIES加密: 自动协商临时AES密钥加密数据
-            plaintext = json.dumps(data, ensure_ascii=False, default=str).encode('utf-8')
-            ciphertext = ecies_encrypt(self.ecies_pubkey, plaintext)
-            return base64.b64encode(ciphertext).decode('ascii')
+            O0_var_36 = json.dumps(O0_var_35, ensure_ascii=False, default=str).encode(codecs.decode('\\u0075\\u0074\\u0066\\u002d\\u0038', 'unicode_escape'))
+            O0_var_37 = ecies_encrypt(self.ecies_pubkey, O0_var_36)
+            return base64.b64encode(O0_var_37).decode(codecs.decode('\\u0061\\u0073\\u0063\\u0069\\u0069', 'unicode_escape'))
         except Exception as e:
-            # 加密失败时返回错误标识(生产环境应记录日志)
-            error_data = {"_encrypt_error": str(e), "_raw": data if Config.DEBUG else None}
-            return json.dumps(error_data, ensure_ascii=False, default=str)
-    def decrypt_data(combined_payload: str, key: bytes):
-        """
-        使用 AES-256-GCM 解密
-        :param combined_payload: 加密函数返回的打包数据
-        :param key: 32字节密钥
-        :return: 解密后的明文字符串
-        """
+            O0_var_38 = {codecs.decode('\\u005f\\u0065\\u006e\\u0063\\u0072\\u0079\\u0070\\u0074\\u005f\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'): str(e), codecs.decode('\\u005f\\u0072\\u0061\\u0077', 'unicode_escape'): O0_var_35 if Config.DEBUG else None}
+            return json.dumps(O0_var_38, ensure_ascii=False, default=str)
+
+    def decrypt_data(O0_var_39: str, key: bytes):
         try:
-            # 1. 解码并提取参数
-            raw_data = json.loads(base64.b64decode(combined_payload).decode('utf-8'))
-            nonce = base64.b64decode(raw_data['nonce'])
-            tag = base64.b64decode(raw_data['tag'])
-            ciphertext = base64.b64decode(raw_data['ciphertext'])
-            
-            # 2. 创建解密器并验证
-            cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
-            
-            # 3. 解密同时校验完整性
-            # 如果密文或 tag 被篡改，这里会抛出 ValueError
-            plaintext = cipher.decrypt_and_verify(ciphertext, tag)
-            return plaintext.decode('utf-8')
-        
+            O0_var_40 = json.loads(base64.b64decode(O0_var_39).decode(codecs.decode('\\u0075\\u0074\\u0066\\u002d\\u0038', 'unicode_escape')))
+            O0_var_41 = base64.b64decode(O0_var_40[codecs.decode('\\u006e\\u006f\\u006e\\u0063\\u0065', 'unicode_escape')])
+            O0_var_42 = base64.b64decode(O0_var_40[codecs.decode('\\u0074\\u0061\\u0067', 'unicode_escape')])
+            O0_var_43 = base64.b64decode(O0_var_40[codecs.decode('\\u0063\\u0069\\u0070\\u0068\\u0065\\u0072\\u0074\\u0065\\u0078\\u0074', 'unicode_escape')])
+            O0_var_44 = AES.new(key, AES.MODE_GCM, nonce=O0_var_41)
+            O0_var_45 = O0_var_44.decrypt_and_verify(O0_var_43, O0_var_42)
+            return O0_var_45.decode(codecs.decode('\\u0075\\u0074\\u0066\\u002d\\u0038', 'unicode_escape'))
         except ValueError:
-            Logger.error("❌ 解密失败：数据可能被篡改或密钥错误")
+            Logger.error(codecs.decode('\\u274c\\u0020\\u89e3\\u5bc6\\u5931\\u8d25\\uff1a\\u6570\\u636e\\u53ef\\u80fd\\u88ab\\u7be1\\u6539\\u6216\\u5bc6\\u94a5\\u9519\\u8bef', 'unicode_escape'))
             return None
         except Exception as e:
-            Logger.error(f"❌ 异常: {e}")
+            Logger.error(codecs.decode('\\u274c\\u0020\\u5f02\\u5e38\\u003a\\u0020', 'unicode_escape') + str(e))
             return None
-
-
-# 全局加密管理器实例
 crypto = None
 
-
-def init_crypto():
-    """初始化全局加密管理器，确保密钥在验证后再加载。"""
+def O0_fn_1():
     global crypto
     if crypto is None:
         crypto = CryptoManager(Config.ECDSA_PUBLIC_KEY_PEM, Config.ECIES_PUBLIC_KEY_PEM)
     return crypto
 
-
-# ============================================================================
-# 🛡️ 认证中间件: 请求签名验证 + 响应加密
-# ============================================================================
 class AuthEncryptMiddleware(BaseHTTPMiddleware):
-    """
-    认证 + 加密中间件
-    1. 请求进入: 验证签名 -> 解密 Body (如果标记了 AES)
-    2. 响应返回: 加密 Response Body
-    """
-    
-    async def dispatch(self, request: Request, call_next):
-        headers = request.headers
-        path = request.url.path  # 获取当前请求路径
-        
-        # 🌟 新增：免密放行路由白名单
-        bypass_paths = ["/api/baseinfo", "/api/status"]
-        
-        # === 阶段 1: 请求认证 (DEBUG 模式跳过) ===
-        request.state.is_authenticated = True  # 默认初始化认证状态为 True
-        
-        if not Config.DEBUG and request.method not in ["OPTIONS", "HEAD"]:
-            nonce = headers.get("x-nonce")
-            timestamp = headers.get("x-timestamp") 
-            auth_token = headers.get("x-auth-token")
-            
-            # 检查是否缺失认证头
-            if not all([nonce, timestamp, auth_token]):
-                # 🌟 修改：如果在白名单内，允许放行但标记为未认证
-                if path in bypass_paths:
+    codecs.decode('\\u000a\\u0020\\u0020\\u0020\\u0020\\u8ba4\\u8bc1\\u0020\\u002b\\u0020\\u52a0\\u5bc6\\u4e2d\\u95f4\\u4ef6\\u000a\\u0020\\u0020\\u0020\\u0020\\u0031\\u002e\\u0020\\u8bf7\\u6c42\\u8fdb\\u5165\\u003a\\u0020\\u9a8c\\u8bc1\\u7b7e\\u540d\\u0020\\u002d\\u003e\\u0020\\u89e3\\u5bc6\\u0020\\u0042\\u006f\\u0064\\u0079\\u0020\\u0028\\u5982\\u679c\\u6807\\u8bb0\\u4e86\\u0020\\u0041\\u0045\\u0053\\u0029\\u000a\\u0020\\u0020\\u0020\\u0020\\u0032\\u002e\\u0020\\u54cd\\u5e94\\u8fd4\\u56de\\u003a\\u0020\\u52a0\\u5bc6\\u0020\\u0052\\u0065\\u0073\\u0070\\u006f\\u006e\\u0073\\u0065\\u0020\\u0042\\u006f\\u0064\\u0079\\u000a\\u0020\\u0020\\u0020\\u0020', 'unicode_escape')
+
+    async def dispatch(self, request: Request, O0_var_46):
+        O0_var_47 = request.headers
+        O0_var_48 = request.url.path
+        O0_var_49 = [codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0062\\u0061\\u0073\\u0065\\u0069\\u006e\\u0066\\u006f', 'unicode_escape'), codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape')]
+        request.state.is_authenticated = True
+        if not Config.DEBUG and request.method not in [codecs.decode('\\u004f\\u0050\\u0054\\u0049\\u004f\\u004e\\u0053', 'unicode_escape'), codecs.decode('\\u0048\\u0045\\u0041\\u0044', 'unicode_escape')]:
+            O0_var_50 = O0_var_47.get(codecs.decode('\\u0078\\u002d\\u006e\\u006f\\u006e\\u0063\\u0065', 'unicode_escape'))
+            O0_var_51 = O0_var_47.get(codecs.decode('\\u0078\\u002d\\u0074\\u0069\\u006d\\u0065\\u0073\\u0074\\u0061\\u006d\\u0070', 'unicode_escape'))
+            O0_var_52 = O0_var_47.get(codecs.decode('\\u0078\\u002d\\u0061\\u0075\\u0074\\u0068\\u002d\\u0074\\u006f\\u006b\\u0065\\u006e', 'unicode_escape'))
+            if not all([O0_var_50, O0_var_51, O0_var_52]):
+                if O0_var_48 in O0_var_49:
                     request.state.is_authenticated = False
                 else:
-                    return JSONResponse(
-                        status_code=status.HTTP_401_UNAUTHORIZED,
-                        content={"error": "Missing auth headers"}
-                    )
-            
-            # 如果认证头完整，且未被前面标记为伪认证，则执行签名校验
+                    return JSONResponse(status_code=status.HTTP_401_UNAUTHORIZED, content={codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'): codecs.decode('\\u004d\\u0069\\u0073\\u0073\\u0069\\u006e\\u0067\\u0020\\u0061\\u0075\\u0074\\u0068\\u0020\\u0068\\u0065\\u0061\\u0064\\u0065\\u0072\\u0073', 'unicode_escape')})
             if request.state.is_authenticated:
                 try:
-                    crypto.verify_signature(nonce, timestamp, auth_token)
+                    crypto.verify_signature(O0_var_50, O0_var_51, O0_var_52)
                 except Exception as e:
-                    # 🌟 修改：验签失败如果是白名单路由，同样放行并标记
-                    if path in bypass_paths:
+                    if O0_var_48 in O0_var_49:
                         request.state.is_authenticated = False
                     else:
-                        return JSONResponse(
-                            status_code=status.HTTP_401_UNAUTHORIZED,
-                            content={"error": f"Signature verification failed: {str(e)}"}
-                        )
-
-        # === 阶段 1.5: AES 请求体解密 (保持不变) ===
-        decrypted_body_bytes = None
-        if headers.get("x-aes-encrypted") == "true":
-            original_body = await request.body()
-            if original_body:
+                        return JSONResponse(status_code=status.HTTP_401_UNAUTHORIZED, content={codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'): codecs.decode('\\u0053\\u0069\\u0067\\u006e\\u0061\\u0074\\u0075\\u0072\\u0065\\u0020\\u0076\\u0065\\u0072\\u0069\\u0066\\u0069\\u0063\\u0061\\u0074\\u0069\\u006f\\u006e\\u0020\\u0066\\u0061\\u0069\\u006c\\u0065\\u0064\\u003a\\u0020', 'unicode_escape') + str(str(e))})
+        O0_var_53 = None
+        if O0_var_47.get(codecs.decode('\\u0078\\u002d\\u0061\\u0065\\u0073\\u002d\\u0065\\u006e\\u0063\\u0072\\u0079\\u0070\\u0074\\u0065\\u0064', 'unicode_escape')) == codecs.decode('\\u0074\\u0072\\u0075\\u0065', 'unicode_escape'):
+            O0_var_54 = await request.body()
+            if O0_var_54:
                 try:
-                    encrypted_str = original_body.decode('utf-8')
-                    decrypted_json_str = CryptoManager.decrypt_data(encrypted_str, Config._raw_key)
+                    O0_var_55 = O0_var_54.decode(codecs.decode('\\u0075\\u0074\\u0066\\u002d\\u0038', 'unicode_escape'))
+                    O0_var_56 = CryptoManager.decrypt_data(O0_var_55, Config._raw_key)
                     if Config.DEBUG:
-                        Logger.debug(f" [AES Decrypt] Success: {decrypted_json_str[:100]}...")
-                    json.loads(decrypted_json_str) 
-                    decrypted_body_bytes = decrypted_json_str.encode('utf-8')
-                    request._body = decrypted_body_bytes
+                        Logger.debug(codecs.decode('\\u0020\\u005b\\u0041\\u0045\\u0053\\u0020\\u0044\\u0065\\u0063\\u0072\\u0079\\u0070\\u0074\\u005d\\u0020\\u0053\\u0075\\u0063\\u0063\\u0065\\u0073\\u0073\\u003a\\u0020', 'unicode_escape') + str(O0_var_56[:100]) + codecs.decode('\\u002e\\u002e\\u002e', 'unicode_escape'))
+                    json.loads(O0_var_56)
+                    O0_var_53 = O0_var_56.encode(codecs.decode('\\u0075\\u0074\\u0066\\u002d\\u0038', 'unicode_escape'))
+                    request._body = O0_var_53
                 except Exception as e:
-                    Logger.error(f"💥 [AES Decrypt] Failed: {str(e)}")
-                    return JSONResponse(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        content={"error": f"AES Decrypt failed: {str(e)}"}
-                    )
-                    
-        original_receive = request.receive
-        has_returned_body = False
-        
+                    Logger.error(codecs.decode('\\U0001f4a5\\u0020\\u005b\\u0041\\u0045\\u0053\\u0020\\u0044\\u0065\\u0063\\u0072\\u0079\\u0070\\u0074\\u005d\\u0020\\u0046\\u0061\\u0069\\u006c\\u0065\\u0064\\u003a\\u0020', 'unicode_escape') + str(str(e)))
+                    return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content={codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'): codecs.decode('\\u0041\\u0045\\u0053\\u0020\\u0044\\u0065\\u0063\\u0072\\u0079\\u0070\\u0074\\u0020\\u0066\\u0061\\u0069\\u006c\\u0065\\u0064\\u003a\\u0020', 'unicode_escape') + str(str(e))})
+        O0_var_57 = request.receive
+        O0_var_58 = False
+
         async def wrapped_receive():
-            nonlocal has_returned_body
-            if decrypted_body_bytes is not None:
-                if not has_returned_body:
-                    has_returned_body = True
-                    return {"type": "http.request", "body": decrypted_body_bytes, "more_body": False}
+            nonlocal O0_var_58
+            if O0_var_53 is not None:
+                if not O0_var_58:
+                    O0_var_58 = True
+                    return {codecs.decode('\\u0074\\u0079\\u0070\\u0065', 'unicode_escape'): codecs.decode('\\u0068\\u0074\\u0074\\u0070\\u002e\\u0072\\u0065\\u0071\\u0075\\u0065\\u0073\\u0074', 'unicode_escape'), codecs.decode('\\u0062\\u006f\\u0064\\u0079', 'unicode_escape'): O0_var_53, codecs.decode('\\u006d\\u006f\\u0072\\u0065\\u005f\\u0062\\u006f\\u0064\\u0079', 'unicode_escape'): False}
                 else:
-                    return {"type": "http.request", "body": b"", "more_body": False}
+                    return {codecs.decode('\\u0074\\u0079\\u0070\\u0065', 'unicode_escape'): codecs.decode('\\u0068\\u0074\\u0074\\u0070\\u002e\\u0072\\u0065\\u0071\\u0075\\u0065\\u0073\\u0074', 'unicode_escape'), codecs.decode('\\u0062\\u006f\\u0064\\u0079', 'unicode_escape'): b'', codecs.decode('\\u006d\\u006f\\u0072\\u0065\\u005f\\u0062\\u006f\\u0064\\u0079', 'unicode_escape'): False}
             else:
-                return await original_receive()
-
+                return await O0_var_57()
         request._receive = wrapped_receive
-
-        # === 阶段 2: 处理业务逻辑 ===
         try:
-            response = await call_next(request)
+            response = await O0_var_46(request)
         except Exception as exc:
             raise exc
-
-        # === 阶段 3: 响应加密 ===
-        if response.headers.get("content-type", "").startswith("application/json"):
-            body_parts = []
-            async for chunk in response.body_iterator:
-                body_parts.append(chunk)
-            original_body = b"".join(body_parts)
-            
+        if response.headers.get(codecs.decode('\\u0063\\u006f\\u006e\\u0074\\u0065\\u006e\\u0074\\u002d\\u0074\\u0079\\u0070\\u0065', 'unicode_escape'), codecs.decode('', 'unicode_escape')).startswith(codecs.decode('\\u0061\\u0070\\u0070\\u006c\\u0069\\u0063\\u0061\\u0074\\u0069\\u006f\\u006e\\u002f\\u006a\\u0073\\u006f\\u006e', 'unicode_escape')):
+            O0_var_59 = []
+            async for O0_var_60 in response.body_iterator:
+                O0_var_59.append(O0_var_60)
+            O0_var_54 = b''.join(O0_var_59)
             try:
-                original_data = json.loads(original_body.decode('utf-8'))
-                
-                # 🌟 修改：只有在【已认证】状态下才执行加密；未认证请求直接返回明文
-                if getattr(request.state, "is_authenticated", True):
-                    encrypted_content = crypto.encrypt_response(original_data)
-                    encoded = encrypted_content.encode('utf-8')
+                O0_var_61 = json.loads(O0_var_54.decode(codecs.decode('\\u0075\\u0074\\u0066\\u002d\\u0038', 'unicode_escape')))
+                if getattr(request.state, codecs.decode('\\u0069\\u0073\\u005f\\u0061\\u0075\\u0074\\u0068\\u0065\\u006e\\u0074\\u0069\\u0063\\u0061\\u0074\\u0065\\u0064', 'unicode_escape'), True):
+                    O0_var_62 = crypto.encrypt_response(O0_var_61)
+                    O0_var_63 = O0_var_62.encode(codecs.decode('\\u0075\\u0074\\u0066\\u002d\\u0038', 'unicode_escape'))
                     if not Config.DEBUG:
-                        response.headers["x-encrypted"] = "true"
-                        response.headers["x-agent-version"] = Config.AGENT_VERSION
+                        response.headers[codecs.decode('\\u0078\\u002d\\u0065\\u006e\\u0063\\u0072\\u0079\\u0070\\u0074\\u0065\\u0064', 'unicode_escape')] = codecs.decode('\\u0074\\u0072\\u0075\\u0065', 'unicode_escape')
+                        response.headers[codecs.decode('\\u0078\\u002d\\u0061\\u0067\\u0065\\u006e\\u0074\\u002d\\u0076\\u0065\\u0072\\u0073\\u0069\\u006f\\u006e', 'unicode_escape')] = Config.AGENT_VERSION
                 else:
-                    # 未认证情况，直接透传明文
-                    encoded = original_body
-                    response.headers["x-encrypted"] = "false"
-                
-                response.body_iterator = self._async_iter([encoded])
-                response.headers["content-length"] = str(len(encoded))
-                
+                    O0_var_63 = O0_var_54
+                    response.headers[codecs.decode('\\u0078\\u002d\\u0065\\u006e\\u0063\\u0072\\u0079\\u0070\\u0074\\u0065\\u0064', 'unicode_escape')] = codecs.decode('\\u0066\\u0061\\u006c\\u0073\\u0065', 'unicode_escape')
+                response.body_iterator = self._async_iter([O0_var_63])
+                response.headers[codecs.decode('\\u0063\\u006f\\u006e\\u0074\\u0065\\u006e\\u0074\\u002d\\u006c\\u0065\\u006e\\u0067\\u0074\\u0068', 'unicode_escape')] = str(len(O0_var_63))
             except json.JSONDecodeError:
-                pass 
+                pass
         return response
-    
+
     @staticmethod
     async def _async_iter(items):
-        for item in items:
-            yield item
-# ============================================================================
-#  获取系统信息类
-# ============================================================================
+        for O0_var_64 in items:
+            yield O0_var_64
+
 class SystemInfoCollector:
-    """系统信息收集器 (已修复跨请求实例化生命周期导致的 0% 状态 Bug)"""
-    
-    # 🌟 核心修复：将增量统计状态提升为类变量，使跨请求创建的瞬时实例能持久共享历史上下文
+    codecs.decode('\\u7cfb\\u7edf\\u4fe1\\u606f\\u6536\\u96c6\\u5668\\u0020\\u0028\\u5df2\\u4fee\\u590d\\u8de8\\u8bf7\\u6c42\\u5b9e\\u4f8b\\u5316\\u751f\\u547d\\u5468\\u671f\\u5bfc\\u81f4\\u7684\\u0020\\u0030\\u0025\\u0020\\u72b6\\u6001\\u0020\\u0042\\u0075\\u0067\\u0029', 'unicode_escape')
     _last_cpu_times = None
-    _last_network_stats = {'rx': 0, 'tx': 0}
+    _last_network_stats = {codecs.decode('\\u0072\\u0078', 'unicode_escape'): 0, codecs.decode('\\u0074\\u0078', 'unicode_escape'): 0}
     _total_network_up = 0
     _total_network_down = 0
     _last_network_time = time.time()
     _cpu_init_lock = asyncio.Lock()
-    
+
     def __init__(self):
-        # 保持空的构造函数，完美兼容原路由层 SystemInfoCollector() 的瞬时调用方式
         pass
-    
+
     async def get_basic_info(self) -> Dict[str, Any]:
-        """获取基础系统信息"""
-        dist_info = self._get_linux_distribution()
-        
-        ipv4, ipv6 = await asyncio.gather(
-            self._get_public_ip_v4(),
-            self._get_public_ip_v6(),
-            return_exceptions=True
-        )
-        
-        ipv4 = ipv4 if not isinstance(ipv4, Exception) else None
-        ipv6 = ipv6 if not isinstance(ipv6, Exception) else None
-        
-        if isinstance(ipv4, Exception):
-            Logger.debug(f"获取 IPv4 失败: {ipv4}", 1)
-            ipv4 = None
-        if isinstance(ipv6, Exception):
-            Logger.debug(f"获取 IPv6 失败: {ipv6}", 1)
-            ipv6 = None
-        
-        os_name = f"{dist_info['name']} {dist_info['version']}" if dist_info['name'] != 'Unknown' else platform.system()
-        
-        info = {
-            "arch": platform.machine(),
-            "cpu_cores": psutil.cpu_count(),
-            "cpu_name": self._get_cpu_name(),
-            "disk_total": await self._get_disk_total(),
-            "gpu_name": "",  
-            "ipv4": ipv4,
-            "ipv6": ipv6,
-            "mem_total": self._get_container_mem_limit(),  
-            "os": os_name,
-            "kernel_version": platform.release(),
-            "swap_total": psutil.swap_memory().total,  
-            "version": Config.AGENT_VERSION,
-            "virtualization": self._get_virtualization()
-        }
-        
-        Logger.debug(f"基础信息数据: {json.dumps(info, indent=2)}", 1)
-        return info
-    
+        O0_var_65 = self._get_linux_distribution()
+        O0_var_66, O0_var_67 = await asyncio.gather(self._get_public_ip_v4(), self._get_public_ip_v6(), return_exceptions=True)
+        O0_var_66 = O0_var_66 if not isinstance(O0_var_66, Exception) else None
+        O0_var_67 = O0_var_67 if not isinstance(O0_var_67, Exception) else None
+        if isinstance(O0_var_66, Exception):
+            Logger.debug(codecs.decode('\\u83b7\\u53d6\\u0020\\u0049\\u0050\\u0076\\u0034\\u0020\\u5931\\u8d25\\u003a\\u0020', 'unicode_escape') + str(O0_var_66), 1)
+            O0_var_66 = None
+        if isinstance(O0_var_67, Exception):
+            Logger.debug(codecs.decode('\\u83b7\\u53d6\\u0020\\u0049\\u0050\\u0076\\u0036\\u0020\\u5931\\u8d25\\u003a\\u0020', 'unicode_escape') + str(O0_var_67), 1)
+            O0_var_67 = None
+        O0_var_68 = str(O0_var_65['name']) + codecs.decode('\\u0020', 'unicode_escape') + str(O0_var_65['version']) if O0_var_65[codecs.decode('\\u006e\\u0061\\u006d\\u0065', 'unicode_escape')] != codecs.decode('\\u0055\\u006e\\u006b\\u006e\\u006f\\u0077\\u006e', 'unicode_escape') else platform.system()
+        O0_var_69 = {codecs.decode('\\u0061\\u0072\\u0063\\u0068', 'unicode_escape'): platform.machine(), codecs.decode('\\u0063\\u0070\\u0075\\u005f\\u0063\\u006f\\u0072\\u0065\\u0073', 'unicode_escape'): psutil.cpu_count(), codecs.decode('\\u0063\\u0070\\u0075\\u005f\\u006e\\u0061\\u006d\\u0065', 'unicode_escape'): self._get_cpu_name(), codecs.decode('\\u0064\\u0069\\u0073\\u006b\\u005f\\u0074\\u006f\\u0074\\u0061\\u006c', 'unicode_escape'): await self._get_disk_total(), codecs.decode('\\u0067\\u0070\\u0075\\u005f\\u006e\\u0061\\u006d\\u0065', 'unicode_escape'): codecs.decode('', 'unicode_escape'), codecs.decode('\\u0069\\u0070\\u0076\\u0034', 'unicode_escape'): O0_var_66, codecs.decode('\\u0069\\u0070\\u0076\\u0036', 'unicode_escape'): O0_var_67, codecs.decode('\\u006d\\u0065\\u006d\\u005f\\u0074\\u006f\\u0074\\u0061\\u006c', 'unicode_escape'): self._get_container_mem_limit(), codecs.decode('\\u006f\\u0073', 'unicode_escape'): O0_var_68, codecs.decode('\\u006b\\u0065\\u0072\\u006e\\u0065\\u006c\\u005f\\u0076\\u0065\\u0072\\u0073\\u0069\\u006f\\u006e', 'unicode_escape'): platform.release(), codecs.decode('\\u0073\\u0077\\u0061\\u0070\\u005f\\u0074\\u006f\\u0074\\u0061\\u006c', 'unicode_escape'): psutil.swap_memory().total, codecs.decode('\\u0076\\u0065\\u0072\\u0073\\u0069\\u006f\\u006e', 'unicode_escape'): Config.AGENT_VERSION, codecs.decode('\\u0076\\u0069\\u0072\\u0074\\u0075\\u0061\\u006c\\u0069\\u007a\\u0061\\u0074\\u0069\\u006f\\u006e', 'unicode_escape'): self._get_virtualization()}
+        Logger.debug(codecs.decode('\\u57fa\\u7840\\u4fe1\\u606f\\u6570\\u636e\\u003a\\u0020', 'unicode_escape') + str(json.dumps(O0_var_69, indent=2)), 1)
+        return O0_var_69
+
     async def get_realtime_info(self) -> Dict[str, Any]:
-        """获取实时监控信息"""
-        cpu_usage = await self._get_cpu_usage()
-        network_stats = await self._get_network_stats()
-        memory_info = await self._get_memory_info()
-        disk_info = await self._get_disk_info()
-        try: 
-            process_count = len(psutil.pids()) 
-        except Exception as e: 
-            process_count = 0
-            Logger.debug(f"获取进程数失败：{e}", 1)
-        info = {
-            "cpu": {
-                "usage": cpu_usage
-            },
-            "ram": {
-                "total": memory_info["ram_total"],    
-                "used": memory_info["ram_used"]       
-            },
-            "swap": {
-                "total": memory_info["swap_total"],   
-                "used": memory_info["swap_used"]      
-            },
-            "load": {
-                "load1": round(psutil.getloadavg()[0] if hasattr(psutil, 'getloadavg') and psutil.getloadavg() else 0, 2),
-                "load5": round(psutil.getloadavg()[1] if hasattr(psutil, 'getloadavg') and psutil.getloadavg() else 0, 2),
-                "load15": round(psutil.getloadavg()[2] if hasattr(psutil, 'getloadavg') and psutil.getloadavg() else 0, 2)
-            },
-            "disk": {
-                "total": disk_info["total"],          
-                "used": disk_info["used"]             
-            },
-            "network": {
-                "up": network_stats["up"],
-                "down": network_stats["down"],
-                "totalUp": network_stats["total_up"],
-                "totalDown": network_stats["total_down"]
-            },
-            "connections": {
-                "tcp": await self._get_tcp_connections(),
-                "udp": await self._get_udp_connections()
-            },
-            "uptime": int(time.time() - psutil.boot_time()),
-            "process": process_count,
-            "message": ""
-        }
-        
-        Logger.debug(f"实时监控数据: {json.dumps(info, indent=2)}", 2)
-        return info
-    
-    def _get_cpu_name(self) -> str:
-        """获取 CPU 名称"""
+        O0_var_70 = await self._get_cpu_usage()
+        O0_var_71 = await self._get_network_stats()
+        O0_var_72 = await self._get_memory_info()
+        O0_var_73 = await self._get_disk_info()
         try:
-            if platform.system() == "Windows":
-                import winreg
-                key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\CentralProcessor\0")
-                cpu_name = winreg.QueryValueEx(key, "ProcessorNameString")[0]
-                winreg.CloseKey(key)
-                return cpu_name.strip()
-            else:
-                with open('/proc/cpuinfo', 'r') as f:
-                    for line in f:
-                        if line.strip().startswith('model name'):
-                            return line.split(':')[1].strip()
+            O0_var_74 = len(psutil.pids())
         except Exception as e:
-            Logger.debug(f"获取CPU名称失败: {e}", 1)
-        return "Unknown CPU"
-    
-    async def _get_cpu_usage(self) -> float:
-        """🌟 升级：获取 CPU 使用率 (通过手动计算 cpu_times 差值，百分百规避缓存失效与生命周期问题)"""
+            O0_var_74 = 0
+            Logger.debug(codecs.decode('\\u83b7\\u53d6\\u8fdb\\u7a0b\\u6570\\u5931\\u8d25\\uff1a', 'unicode_escape') + str(e), 1)
+        O0_var_75 = {codecs.decode('\\u0063\\u0070\\u0075', 'unicode_escape'): {codecs.decode('\\u0075\\u0073\\u0061\\u0067\\u0065', 'unicode_escape'): O0_var_70}, codecs.decode('\\u0072\\u0061\\u006d', 'unicode_escape'): {codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c', 'unicode_escape'): O0_var_72[codecs.decode('\\u0072\\u0061\\u006d\\u005f\\u0074\\u006f\\u0074\\u0061\\u006c', 'unicode_escape')], codecs.decode('\\u0075\\u0073\\u0065\\u0064', 'unicode_escape'): O0_var_72[codecs.decode('\\u0072\\u0061\\u006d\\u005f\\u0075\\u0073\\u0065\\u0064', 'unicode_escape')]}, codecs.decode('\\u0073\\u0077\\u0061\\u0070', 'unicode_escape'): {codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c', 'unicode_escape'): O0_var_72[codecs.decode('\\u0073\\u0077\\u0061\\u0070\\u005f\\u0074\\u006f\\u0074\\u0061\\u006c', 'unicode_escape')], codecs.decode('\\u0075\\u0073\\u0065\\u0064', 'unicode_escape'): O0_var_72[codecs.decode('\\u0073\\u0077\\u0061\\u0070\\u005f\\u0075\\u0073\\u0065\\u0064', 'unicode_escape')]}, codecs.decode('\\u006c\\u006f\\u0061\\u0064', 'unicode_escape'): {codecs.decode('\\u006c\\u006f\\u0061\\u0064\\u0031', 'unicode_escape'): round(psutil.getloadavg()[0] if hasattr(psutil, codecs.decode('\\u0067\\u0065\\u0074\\u006c\\u006f\\u0061\\u0064\\u0061\\u0076\\u0067', 'unicode_escape')) and psutil.getloadavg() else 0, 2), codecs.decode('\\u006c\\u006f\\u0061\\u0064\\u0035', 'unicode_escape'): round(psutil.getloadavg()[1] if hasattr(psutil, codecs.decode('\\u0067\\u0065\\u0074\\u006c\\u006f\\u0061\\u0064\\u0061\\u0076\\u0067', 'unicode_escape')) and psutil.getloadavg() else 0, 2), codecs.decode('\\u006c\\u006f\\u0061\\u0064\\u0031\\u0035', 'unicode_escape'): round(psutil.getloadavg()[2] if hasattr(psutil, codecs.decode('\\u0067\\u0065\\u0074\\u006c\\u006f\\u0061\\u0064\\u0061\\u0076\\u0067', 'unicode_escape')) and psutil.getloadavg() else 0, 2)}, codecs.decode('\\u0064\\u0069\\u0073\\u006b', 'unicode_escape'): {codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c', 'unicode_escape'): O0_var_73[codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c', 'unicode_escape')], codecs.decode('\\u0075\\u0073\\u0065\\u0064', 'unicode_escape'): O0_var_73[codecs.decode('\\u0075\\u0073\\u0065\\u0064', 'unicode_escape')]}, codecs.decode('\\u006e\\u0065\\u0074\\u0077\\u006f\\u0072\\u006b', 'unicode_escape'): {codecs.decode('\\u0075\\u0070', 'unicode_escape'): O0_var_71[codecs.decode('\\u0075\\u0070', 'unicode_escape')], codecs.decode('\\u0064\\u006f\\u0077\\u006e', 'unicode_escape'): O0_var_71[codecs.decode('\\u0064\\u006f\\u0077\\u006e', 'unicode_escape')], codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c\\u0055\\u0070', 'unicode_escape'): O0_var_71[codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c\\u005f\\u0075\\u0070', 'unicode_escape')], codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c\\u0044\\u006f\\u0077\\u006e', 'unicode_escape'): O0_var_71[codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c\\u005f\\u0064\\u006f\\u0077\\u006e', 'unicode_escape')]}, codecs.decode('\\u0063\\u006f\\u006e\\u006e\\u0065\\u0063\\u0074\\u0069\\u006f\\u006e\\u0073', 'unicode_escape'): {codecs.decode('\\u0074\\u0063\\u0070', 'unicode_escape'): await self._get_tcp_connections(), codecs.decode('\\u0075\\u0064\\u0070', 'unicode_escape'): await self._get_udp_connections()}, codecs.decode('\\u0075\\u0070\\u0074\\u0069\\u006d\\u0065', 'unicode_escape'): int(time.time() - psutil.boot_time()), codecs.decode('\\u0070\\u0072\\u006f\\u0063\\u0065\\u0073\\u0073', 'unicode_escape'): O0_var_74, codecs.decode('\\u006d\\u0065\\u0073\\u0073\\u0061\\u0067\\u0065', 'unicode_escape'): codecs.decode('', 'unicode_escape')}
+        Logger.debug(codecs.decode('\\u5b9e\\u65f6\\u76d1\\u63a7\\u6570\\u636e\\u003a\\u0020', 'unicode_escape') + str(json.dumps(O0_var_75, indent=2)), 2)
+        return O0_var_75
+
+    def _get_cpu_name(self) -> str:
         try:
-            current_times = psutil.cpu_times()
-            
+            if platform.system() == codecs.decode('\\u0057\\u0069\\u006e\\u0064\\u006f\\u0077\\u0073', 'unicode_escape'):
+                import winreg
+                O0_var_76 = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, codecs.decode('\\u0048\\u0041\\u0052\\u0044\\u0057\\u0041\\u0052\\u0045\\u005c\\u0044\\u0045\\u0053\\u0043\\u0052\\u0049\\u0050\\u0054\\u0049\\u004f\\u004e\\u005c\\u0053\\u0079\\u0073\\u0074\\u0065\\u006d\\u005c\\u0043\\u0065\\u006e\\u0074\\u0072\\u0061\\u006c\\u0050\\u0072\\u006f\\u0063\\u0065\\u0073\\u0073\\u006f\\u0072\\u005c\\u0030', 'unicode_escape'))
+                O0_var_77 = winreg.QueryValueEx(O0_var_76, codecs.decode('\\u0050\\u0072\\u006f\\u0063\\u0065\\u0073\\u0073\\u006f\\u0072\\u004e\\u0061\\u006d\\u0065\\u0053\\u0074\\u0072\\u0069\\u006e\\u0067', 'unicode_escape'))[0]
+                winreg.CloseKey(O0_var_76)
+                return O0_var_77.strip()
+            else:
+                with open(codecs.decode('\\u002f\\u0070\\u0072\\u006f\\u0063\\u002f\\u0063\\u0070\\u0075\\u0069\\u006e\\u0066\\u006f', 'unicode_escape'), codecs.decode('\\u0072', 'unicode_escape')) as O0_var_78:
+                    for O0_var_79 in O0_var_78:
+                        if O0_var_79.strip().startswith(codecs.decode('\\u006d\\u006f\\u0064\\u0065\\u006c\\u0020\\u006e\\u0061\\u006d\\u0065', 'unicode_escape')):
+                            return O0_var_79.split(codecs.decode('\\u003a', 'unicode_escape'))[1].strip()
+        except Exception as e:
+            Logger.debug(codecs.decode('\\u83b7\\u53d6\\u0043\\u0050\\u0055\\u540d\\u79f0\\u5931\\u8d25\\u003a\\u0020', 'unicode_escape') + str(e), 1)
+        return codecs.decode('\\u0055\\u006e\\u006b\\u006e\\u006f\\u0077\\u006e\\u0020\\u0043\\u0050\\u0055', 'unicode_escape')
+
+    async def _get_cpu_usage(self) -> float:
+        try:
+            O0_var_80 = psutil.cpu_times()
             async with SystemInfoCollector._cpu_init_lock:
                 if SystemInfoCollector._last_cpu_times is None:
-                    # 第一次冷启动：建立初始快照基准
-                    SystemInfoCollector._last_cpu_times = current_times
-                    # 微阻塞 0.1 秒提供初次请求的有效值，防止控制端面板第一次加载刷出 0
+                    SystemInfoCollector._last_cpu_times = O0_var_80
                     await asyncio.sleep(0.1)
-                    current_times = psutil.cpu_times()
-                
-                last_times = SystemInfoCollector._last_cpu_times
-                SystemInfoCollector._last_cpu_times = current_times
-            
-            # 计算系统总时间差 (所有 CPU 状态时间片求和)
-            delta_total = sum(current_times) - sum(last_times)
-            # 计算纯空闲时间差
-            delta_idle = current_times.idle - last_times.idle
-            
-            if delta_total <= 0:
+                    O0_var_80 = psutil.cpu_times()
+                O0_var_81 = SystemInfoCollector._last_cpu_times
+                SystemInfoCollector._last_cpu_times = O0_var_80
+            O0_var_82 = sum(O0_var_80) - sum(O0_var_81)
+            O0_var_83 = O0_var_80.idle - O0_var_81.idle
+            if O0_var_82 <= 0:
                 return 0.0
-                
-            # CPU 使用率 = (总运行时间 - 空闲时间) / 总运行时间 * 100
-            usage = ((delta_total - delta_idle) / delta_total) * 100
-            return round(max(0.0, min(100.0, usage)), 2)
+            O0_var_84 = (O0_var_82 - O0_var_83) / O0_var_82 * 100
+            return round(max(0.0, min(100.0, O0_var_84)), 2)
         except Exception as e:
-            Logger.debug(f"获取CPU使用率失败: {e}", 2)
+            Logger.debug(codecs.decode('\\u83b7\\u53d6\\u0043\\u0050\\u0055\\u4f7f\\u7528\\u7387\\u5931\\u8d25\\u003a\\u0020', 'unicode_escape') + str(e), 2)
             return 0.0
-    
+
     def _get_container_mem_limit(self) -> int:
-        """获取容器内存限制（字节），兼容 cgroup v1/v2，无限制时回退 psutil"""
         try:
-            if os.path.exists("/sys/fs/cgroup/memory.max"):
-                with open("/sys/fs/cgroup/memory.max", "r") as f:
-                    val = f.read().strip()
-                    if val != "max": return int(val)
-        except (OSError, ValueError): pass
+            if os.path.exists(codecs.decode('\\u002f\\u0073\\u0079\\u0073\\u002f\\u0066\\u0073\\u002f\\u0063\\u0067\\u0072\\u006f\\u0075\\u0070\\u002f\\u006d\\u0065\\u006d\\u006f\\u0072\\u0079\\u002e\\u006d\\u0061\\u0078', 'unicode_escape')):
+                with open(codecs.decode('\\u002f\\u0073\\u0079\\u0073\\u002f\\u0066\\u0073\\u002f\\u0063\\u0067\\u0072\\u006f\\u0075\\u0070\\u002f\\u006d\\u0065\\u006d\\u006f\\u0072\\u0079\\u002e\\u006d\\u0061\\u0078', 'unicode_escape'), codecs.decode('\\u0072', 'unicode_escape')) as O0_var_85:
+                    O0_var_86 = O0_var_85.read().strip()
+                    if O0_var_86 != codecs.decode('\\u006d\\u0061\\u0078', 'unicode_escape'):
+                        return int(O0_var_86)
+        except (OSError, ValueError):
+            pass
         try:
-            if os.path.exists("/sys/fs/cgroup/memory/memory.limit_in_bytes"):
-                with open("/sys/fs/cgroup/memory/memory.limit_in_bytes", "r") as f:
-                    val = int(f.read().strip())
-                    if val < 9223372036854771712: return val
-        except (OSError, ValueError): pass
+            if os.path.exists(codecs.decode('\\u002f\\u0073\\u0079\\u0073\\u002f\\u0066\\u0073\\u002f\\u0063\\u0067\\u0072\\u006f\\u0075\\u0070\\u002f\\u006d\\u0065\\u006d\\u006f\\u0072\\u0079\\u002f\\u006d\\u0065\\u006d\\u006f\\u0072\\u0079\\u002e\\u006c\\u0069\\u006d\\u0069\\u0074\\u005f\\u0069\\u006e\\u005f\\u0062\\u0079\\u0074\\u0065\\u0073', 'unicode_escape')):
+                with open(codecs.decode('\\u002f\\u0073\\u0079\\u0073\\u002f\\u0066\\u0073\\u002f\\u0063\\u0067\\u0072\\u006f\\u0075\\u0070\\u002f\\u006d\\u0065\\u006d\\u006f\\u0072\\u0079\\u002f\\u006d\\u0065\\u006d\\u006f\\u0072\\u0079\\u002e\\u006c\\u0069\\u006d\\u0069\\u0074\\u005f\\u0069\\u006e\\u005f\\u0062\\u0079\\u0074\\u0065\\u0073', 'unicode_escape'), codecs.decode('\\u0072', 'unicode_escape')) as O0_var_85:
+                    O0_var_86 = int(O0_var_85.read().strip())
+                    if O0_var_86 < 9223372036854771712:
+                        return O0_var_86
+        except (OSError, ValueError):
+            pass
         return psutil.virtual_memory().total
 
     def _get_container_mem_usage(self) -> int:
-        """获取容器当前内存使用量（字节），严格排除 Cache 缓存"""
-        if os.path.exists("/sys/fs/cgroup/memory.current") and os.path.exists("/sys/fs/cgroup/memory.stat"):
+        if os.path.exists(codecs.decode('\\u002f\\u0073\\u0079\\u0073\\u002f\\u0066\\u0073\\u002f\\u0063\\u0067\\u0072\\u006f\\u0075\\u0070\\u002f\\u006d\\u0065\\u006d\\u006f\\u0072\\u0079\\u002e\\u0063\\u0075\\u0072\\u0072\\u0065\\u006e\\u0074', 'unicode_escape')) and os.path.exists(codecs.decode('\\u002f\\u0073\\u0079\\u0073\\u002f\\u0066\\u0073\\u002f\\u0063\\u0067\\u0072\\u006f\\u0075\\u0070\\u002f\\u006d\\u0065\\u006d\\u006f\\u0072\\u0079\\u002e\\u0073\\u0074\\u0061\\u0074', 'unicode_escape')):
             try:
-                with open("/sys/fs/cgroup/memory.current", "r") as f:
-                    current_raw = int(f.read().strip())
-                file_cache = 0
-                with open("/sys/fs/cgroup/memory.stat", "r") as f:
-                    for line in f:
-                        parts = line.strip().split()
-                        if len(parts) == 2 and parts[0] == "file":
-                            file_cache = int(parts[1])
+                with open(codecs.decode('\\u002f\\u0073\\u0079\\u0073\\u002f\\u0066\\u0073\\u002f\\u0063\\u0067\\u0072\\u006f\\u0075\\u0070\\u002f\\u006d\\u0065\\u006d\\u006f\\u0072\\u0079\\u002e\\u0063\\u0075\\u0072\\u0072\\u0065\\u006e\\u0074', 'unicode_escape'), codecs.decode('\\u0072', 'unicode_escape')) as O0_var_87:
+                    O0_var_88 = int(O0_var_87.read().strip())
+                O0_var_89 = 0
+                with open(codecs.decode('\\u002f\\u0073\\u0079\\u0073\\u002f\\u0066\\u0073\\u002f\\u0063\\u0067\\u0072\\u006f\\u0075\\u0070\\u002f\\u006d\\u0065\\u006d\\u006f\\u0072\\u0079\\u002e\\u0073\\u0074\\u0061\\u0074', 'unicode_escape'), codecs.decode('\\u0072', 'unicode_escape')) as O0_var_87:
+                    for O0_var_90 in O0_var_87:
+                        O0_var_91 = O0_var_90.strip().split()
+                        if len(O0_var_91) == 2 and O0_var_91[0] == codecs.decode('\\u0066\\u0069\\u006c\\u0065', 'unicode_escape'):
+                            O0_var_89 = int(O0_var_91[1])
                             break
-                return max(0, current_raw - file_cache)
-            except (OSError, ValueError): pass
-        if os.path.exists("/sys/fs/cgroup/memory/memory.usage_in_bytes") and os.path.exists("/sys/fs/cgroup/memory/memory.stat"):
+                return max(0, O0_var_88 - O0_var_89)
+            except (OSError, ValueError):
+                pass
+        if os.path.exists(codecs.decode('\\u002f\\u0073\\u0079\\u0073\\u002f\\u0066\\u0073\\u002f\\u0063\\u0067\\u0072\\u006f\\u0075\\u0070\\u002f\\u006d\\u0065\\u006d\\u006f\\u0072\\u0079\\u002f\\u006d\\u0065\\u006d\\u006f\\u0072\\u0079\\u002e\\u0075\\u0073\\u0061\\u0067\\u0065\\u005f\\u0069\\u006e\\u005f\\u0062\\u0079\\u0074\\u0065\\u0073', 'unicode_escape')) and os.path.exists(codecs.decode('\\u002f\\u0073\\u0079\\u0073\\u002f\\u0066\\u0073\\u002f\\u0063\\u0067\\u0072\\u006f\\u0075\\u0070\\u002f\\u006d\\u0065\\u006d\\u006f\\u0072\\u0079\\u002f\\u006d\\u0065\\u006d\\u006f\\u0072\\u0079\\u002e\\u0073\\u0074\\u0061\\u0074', 'unicode_escape')):
             try:
-                with open("/sys/fs/cgroup/memory/memory.usage_in_bytes", "r") as f:
-                    current_raw = int(f.read().strip())
-                cache = 0
-                with open("/sys/fs/cgroup/memory/memory.stat", "r") as f:
-                    for line in f:
-                        parts = line.strip().split()
-                        if len(parts) == 2 and parts[0] == "cache":
-                            cache = int(parts[1])
+                with open(codecs.decode('\\u002f\\u0073\\u0079\\u0073\\u002f\\u0066\\u0073\\u002f\\u0063\\u0067\\u0072\\u006f\\u0075\\u0070\\u002f\\u006d\\u0065\\u006d\\u006f\\u0072\\u0079\\u002f\\u006d\\u0065\\u006d\\u006f\\u0072\\u0079\\u002e\\u0075\\u0073\\u0061\\u0067\\u0065\\u005f\\u0069\\u006e\\u005f\\u0062\\u0079\\u0074\\u0065\\u0073', 'unicode_escape'), codecs.decode('\\u0072', 'unicode_escape')) as O0_var_87:
+                    O0_var_88 = int(O0_var_87.read().strip())
+                O0_var_92 = 0
+                with open(codecs.decode('\\u002f\\u0073\\u0079\\u0073\\u002f\\u0066\\u0073\\u002f\\u0063\\u0067\\u0072\\u006f\\u0075\\u0070\\u002f\\u006d\\u0065\\u006d\\u006f\\u0072\\u0079\\u002f\\u006d\\u0065\\u006d\\u006f\\u0072\\u0079\\u002e\\u0073\\u0074\\u0061\\u0074', 'unicode_escape'), codecs.decode('\\u0072', 'unicode_escape')) as O0_var_87:
+                    for O0_var_90 in O0_var_87:
+                        O0_var_91 = O0_var_90.strip().split()
+                        if len(O0_var_91) == 2 and O0_var_91[0] == codecs.decode('\\u0063\\u0061\\u0063\\u0068\\u0065', 'unicode_escape'):
+                            O0_var_92 = int(O0_var_91[1])
                             break
-                return max(0, current_raw - cache)
-            except (OSError, ValueError): pass
+                return max(0, O0_var_88 - O0_var_92)
+            except (OSError, ValueError):
+                pass
         return psutil.virtual_memory().used
 
     async def _get_memory_info(self) -> Dict[str, int]:
-        """获取内存信息（字节单位）"""
         try:
-            ram_total = self._get_container_mem_limit()
-            ram_used = self._get_container_mem_usage()
-            swap = psutil.swap_memory()
-            return {
-                "ram_total": ram_total,
-                "ram_used": ram_used,
-                "swap_total": swap.total,
-                "swap_used": swap.used
-            }
+            O0_var_93 = self._get_container_mem_limit()
+            O0_var_94 = self._get_container_mem_usage()
+            O0_var_95 = psutil.swap_memory()
+            return {codecs.decode('\\u0072\\u0061\\u006d\\u005f\\u0074\\u006f\\u0074\\u0061\\u006c', 'unicode_escape'): O0_var_93, codecs.decode('\\u0072\\u0061\\u006d\\u005f\\u0075\\u0073\\u0065\\u0064', 'unicode_escape'): O0_var_94, codecs.decode('\\u0073\\u0077\\u0061\\u0070\\u005f\\u0074\\u006f\\u0074\\u0061\\u006c', 'unicode_escape'): O0_var_95.total, codecs.decode('\\u0073\\u0077\\u0061\\u0070\\u005f\\u0075\\u0073\\u0065\\u0064', 'unicode_escape'): O0_var_95.used}
         except Exception as e:
-            Logger.debug(f"获取内存信息失败: {e}", 2)
-            return {"ram_total": 0, "ram_used": 0, "swap_total": 0, "swap_used": 0}
-    
-    def _get_physical_disk_device(self, device_path: str) -> Optional[str]:
-        if platform.system() != "Linux":
-            return device_path
+            Logger.debug(codecs.decode('\\u83b7\\u53d6\\u5185\\u5b58\\u4fe1\\u606f\\u5931\\u8d25\\u003a\\u0020', 'unicode_escape') + str(e), 2)
+            return {codecs.decode('\\u0072\\u0061\\u006d\\u005f\\u0074\\u006f\\u0074\\u0061\\u006c', 'unicode_escape'): 0, codecs.decode('\\u0072\\u0061\\u006d\\u005f\\u0075\\u0073\\u0065\\u0064', 'unicode_escape'): 0, codecs.decode('\\u0073\\u0077\\u0061\\u0070\\u005f\\u0074\\u006f\\u0074\\u0061\\u006c', 'unicode_escape'): 0, codecs.decode('\\u0073\\u0077\\u0061\\u0070\\u005f\\u0075\\u0073\\u0065\\u0064', 'unicode_escape'): 0}
+
+    def _get_physical_disk_device(self, O0_var_96: str) -> Optional[str]:
+        if platform.system() != codecs.decode('\\u004c\\u0069\\u006e\\u0075\\u0078', 'unicode_escape'):
+            return O0_var_96
         import re
-        dev_name = device_path.replace("/dev/", "")
-        if not dev_name: return None
-        if re.match(r'^[a-zA-Z0-9\.\-_]+:', dev_name) or dev_name.startswith('//'):
-            return device_path
-        DEVICE_PATTERNS = [
-            r'^(md[0-9]+)$',
-            r'^(sd[a-z]+)\d*$',
-            r'^(vd[a-z]+)\d*$',
-            r'^(xvd[a-z]+)\d*$',
-            r'^(mmcblk\d+)p?\d*$',
-            r'^(nvme\d+n\d+)p?\d*$',
-        ]
-        for pattern in DEVICE_PATTERNS:
-            m = re.match(pattern, dev_name)
-            if m: return f"/dev/{m.group(1)}"
-        if not re.search(r'\d', dev_name): return device_path
-        sys_block_path = f"/sys/block/{dev_name}"
-        if os.path.exists(sys_block_path):
-            real_parent = os.path.realpath(os.path.dirname(sys_block_path))
-            real_path = os.path.realpath(sys_block_path)
-            if not os.path.isdir(real_path):
-                real_grandparent = os.path.dirname(real_parent)
-                if real_grandparent.endswith('/sys/block'):
-                    physical_name = os.path.basename(real_parent)
-                    if self._is_physical_disk(f"/dev/{physical_name}"):
-                        return f"/dev/{physical_name}"
+        O0_var_97 = O0_var_96.replace(codecs.decode('\\u002f\\u0064\\u0065\\u0076\\u002f', 'unicode_escape'), codecs.decode('', 'unicode_escape'))
+        if not O0_var_97:
+            return None
+        if re.match(codecs.decode('\\u005e\\u005b\\u0061\\u002d\\u007a\\u0041\\u002d\\u005a\\u0030\\u002d\\u0039\\u005c\\u002e\\u005c\\u002d\\u005f\\u005d\\u002b\\u003a', 'unicode_escape'), O0_var_97) or O0_var_97.startswith(codecs.decode('\\u002f\\u002f', 'unicode_escape')):
+            return O0_var_96
+        O0_var_98 = [codecs.decode('\\u005e\\u0028\\u006d\\u0064\\u005b\\u0030\\u002d\\u0039\\u005d\\u002b\\u0029\\u0024', 'unicode_escape'), codecs.decode('\\u005e\\u0028\\u0073\\u0064\\u005b\\u0061\\u002d\\u007a\\u005d\\u002b\\u0029\\u005c\\u0064\\u002a\\u0024', 'unicode_escape'), codecs.decode('\\u005e\\u0028\\u0076\\u0064\\u005b\\u0061\\u002d\\u007a\\u005d\\u002b\\u0029\\u005c\\u0064\\u002a\\u0024', 'unicode_escape'), codecs.decode('\\u005e\\u0028\\u0078\\u0076\\u0064\\u005b\\u0061\\u002d\\u007a\\u005d\\u002b\\u0029\\u005c\\u0064\\u002a\\u0024', 'unicode_escape'), codecs.decode('\\u005e\\u0028\\u006d\\u006d\\u0063\\u0062\\u006c\\u006b\\u005c\\u0064\\u002b\\u0029\\u0070\\u003f\\u005c\\u0064\\u002a\\u0024', 'unicode_escape'), codecs.decode('\\u005e\\u0028\\u006e\\u0076\\u006d\\u0065\\u005c\\u0064\\u002b\\u006e\\u005c\\u0064\\u002b\\u0029\\u0070\\u003f\\u005c\\u0064\\u002a\\u0024', 'unicode_escape')]
+        for O0_var_99 in O0_var_98:
+            O0_var_100 = re.match(O0_var_99, O0_var_97)
+            if O0_var_100:
+                return codecs.decode('\\u002f\\u0064\\u0065\\u0076\\u002f', 'unicode_escape') + str(O0_var_100.group(1))
+        if not re.search(codecs.decode('\\u005c\\u0064', 'unicode_escape'), O0_var_97):
+            return O0_var_96
+        O0_var_101 = codecs.decode('\\u002f\\u0073\\u0079\\u0073\\u002f\\u0062\\u006c\\u006f\\u0063\\u006b\\u002f', 'unicode_escape') + str(O0_var_97)
+        if os.path.exists(O0_var_101):
+            O0_var_102 = os.path.realpath(os.path.dirname(O0_var_101))
+            O0_var_103 = os.path.realpath(O0_var_101)
+            if not os.path.isdir(O0_var_103):
+                O0_var_104 = os.path.dirname(O0_var_102)
+                if O0_var_104.endswith(codecs.decode('\\u002f\\u0073\\u0079\\u0073\\u002f\\u0062\\u006c\\u006f\\u0063\\u006b', 'unicode_escape')):
+                    O0_var_105 = os.path.basename(O0_var_102)
+                    if self._is_physical_disk(codecs.decode('\\u002f\\u0064\\u0065\\u0076\\u002f', 'unicode_escape') + str(O0_var_105)):
+                        return codecs.decode('\\u002f\\u0064\\u0065\\u0076\\u002f', 'unicode_escape') + str(O0_var_105)
         return None
 
     def _get_container_disk_info(self) -> Dict[str, int]:
         try:
-            usage = psutil.disk_usage('/')
-            return {"total": int(usage.total), "used": int(usage.used)}
+            O0_var_106 = psutil.disk_usage(codecs.decode('\\u002f', 'unicode_escape'))
+            return {codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c', 'unicode_escape'): int(O0_var_106.total), codecs.decode('\\u0075\\u0073\\u0065\\u0064', 'unicode_escape'): int(O0_var_106.used)}
         except Exception as e:
-            Logger.debug(f"[容器模式] 获取磁盘信息失败: {e}", 5)
-            return {"total": 0, "used": 0}
-    
+            Logger.debug(codecs.decode('\\u005b\\u5bb9\\u5668\\u6a21\\u5f0f\\u005d\\u0020\\u83b7\\u53d6\\u78c1\\u76d8\\u4fe1\\u606f\\u5931\\u8d25\\u003a\\u0020', 'unicode_escape') + str(e), 5)
+            return {codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c', 'unicode_escape'): 0, codecs.decode('\\u0075\\u0073\\u0065\\u0064', 'unicode_escape'): 0}
+
     async def _get_host_disk_info(self) -> Dict[str, int]:
         try:
-            total_bytes = 0
-            used_bytes = 0
-            seen_physical_devices = set()
-            partitions = psutil.disk_partitions(all=True)
-            for partition in partitions:
-                device = partition.device
-                mountpoint = partition.mountpoint
-                fstype = partition.fstype
-                if fstype in {'tmpfs', 'devtmpfs', 'overlay', 'squashfs', 'proc', 'sysfs', 'debugfs', 'configfs', 'cgroup', 'cgroup2', 'pstore', 'bpf', 'tracefs', 'securityfs', 'efivarfs'}:
+            O0_var_107 = 0
+            O0_var_108 = 0
+            O0_var_109 = set()
+            O0_var_110 = psutil.disk_partitions(all=True)
+            for O0_var_111 in O0_var_110:
+                O0_var_112 = O0_var_111.device
+                O0_var_113 = O0_var_111.mountpoint
+                O0_var_114 = O0_var_111.fstype
+                if O0_var_114 in {codecs.decode('\\u0074\\u006d\\u0070\\u0066\\u0073', 'unicode_escape'), codecs.decode('\\u0064\\u0065\\u0076\\u0074\\u006d\\u0070\\u0066\\u0073', 'unicode_escape'), codecs.decode('\\u006f\\u0076\\u0065\\u0072\\u006c\\u0061\\u0079', 'unicode_escape'), codecs.decode('\\u0073\\u0071\\u0075\\u0061\\u0073\\u0068\\u0066\\u0073', 'unicode_escape'), codecs.decode('\\u0070\\u0072\\u006f\\u0063', 'unicode_escape'), codecs.decode('\\u0073\\u0079\\u0073\\u0066\\u0073', 'unicode_escape'), codecs.decode('\\u0064\\u0065\\u0062\\u0075\\u0067\\u0066\\u0073', 'unicode_escape'), codecs.decode('\\u0063\\u006f\\u006e\\u0066\\u0069\\u0067\\u0066\\u0073', 'unicode_escape'), codecs.decode('\\u0063\\u0067\\u0072\\u006f\\u0075\\u0070', 'unicode_escape'), codecs.decode('\\u0063\\u0067\\u0072\\u006f\\u0075\\u0070\\u0032', 'unicode_escape'), codecs.decode('\\u0070\\u0073\\u0074\\u006f\\u0072\\u0065', 'unicode_escape'), codecs.decode('\\u0062\\u0070\\u0066', 'unicode_escape'), codecs.decode('\\u0074\\u0072\\u0061\\u0063\\u0065\\u0066\\u0073', 'unicode_escape'), codecs.decode('\\u0073\\u0065\\u0063\\u0075\\u0072\\u0069\\u0074\\u0079\\u0066\\u0073', 'unicode_escape'), codecs.decode('\\u0065\\u0066\\u0069\\u0076\\u0061\\u0072\\u0066\\u0073', 'unicode_escape')}:
                     continue
-                physical_device = self._get_physical_disk_device(device)
-                if not physical_device or physical_device in seen_physical_devices:
+                O0_var_115 = self._get_physical_disk_device(O0_var_112)
+                if not O0_var_115 or O0_var_115 in O0_var_109:
                     continue
-                if not self._is_physical_disk(physical_device):
+                if not self._is_physical_disk(O0_var_115):
                     continue
                 try:
-                    usage = psutil.disk_usage(mountpoint)
-                    total_bytes += usage.total
-                    used_bytes += usage.used
-                    seen_physical_devices.add(physical_device)
+                    O0_var_116 = psutil.disk_usage(O0_var_113)
+                    O0_var_107 += O0_var_116.total
+                    O0_var_108 += O0_var_116.used
+                    O0_var_109.add(O0_var_115)
                 except (PermissionError, OSError):
                     continue
-            return {"total": total_bytes, "used": used_bytes}
+            return {codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c', 'unicode_escape'): O0_var_107, codecs.decode('\\u0075\\u0073\\u0065\\u0064', 'unicode_escape'): O0_var_108}
         except Exception as e:
-            Logger.debug(f"获取磁盘信息失败: {e}", 5)
-            return {"total": 0, "used": 0}
+            Logger.debug(codecs.decode('\\u83b7\\u53d6\\u78c1\\u76d8\\u4fe1\\u606f\\u5931\\u8d25\\u003a\\u0020', 'unicode_escape') + str(e), 5)
+            return {codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c', 'unicode_escape'): 0, codecs.decode('\\u0075\\u0073\\u0065\\u0064', 'unicode_escape'): 0}
 
     async def _get_disk_info(self) -> Dict[str, int]:
-        if self._get_virtualization() in ['Docker', 'Lxc', 'Podman']:
+        if self._get_virtualization() in [codecs.decode('\\u0044\\u006f\\u0063\\u006b\\u0065\\u0072', 'unicode_escape'), codecs.decode('\\u004c\\u0078\\u0063', 'unicode_escape'), codecs.decode('\\u0050\\u006f\\u0064\\u006d\\u0061\\u006e', 'unicode_escape')]:
             return self._get_container_disk_info()
         return await self._get_host_disk_info()
 
     async def _get_disk_total(self) -> int:
-        disk_info = await self._get_disk_info()
-        return disk_info["total"]
-    
-    def _is_physical_disk(self, device: str) -> bool:
-        if platform.system() == "Windows":
-            return any(device.lower().startswith(drive) for drive in ['c:', 'd:', 'e:', 'f:', 'g:', 'h:'])
+        O0_var_117 = await self._get_disk_info()
+        return O0_var_117[codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c', 'unicode_escape')]
+
+    def _is_physical_disk(self, O0_var_118: str) -> bool:
+        if platform.system() == codecs.decode('\\u0057\\u0069\\u006e\\u0064\\u006f\\u0077\\u0073', 'unicode_escape'):
+            return any((O0_var_118.lower().startswith(O0_var_119) for O0_var_119 in [codecs.decode('\\u0063\\u003a', 'unicode_escape'), codecs.decode('\\u0064\\u003a', 'unicode_escape'), codecs.decode('\\u0065\\u003a', 'unicode_escape'), codecs.decode('\\u0066\\u003a', 'unicode_escape'), codecs.decode('\\u0067\\u003a', 'unicode_escape'), codecs.decode('\\u0068\\u003a', 'unicode_escape')]))
         import re
-        if re.match(r'^[a-zA-Z0-9\.\-_]+:', device) or device.startswith('//'):
+        if re.match(codecs.decode('\\u005e\\u005b\\u0061\\u002d\\u007a\\u0041\\u002d\\u005a\\u0030\\u002d\\u0039\\u005c\\u002e\\u005c\\u002d\\u005f\\u005d\\u002b\\u003a', 'unicode_escape'), O0_var_118) or O0_var_118.startswith(codecs.decode('\\u002f\\u002f', 'unicode_escape')):
             return True
-        physical_patterns = [
-            r'^/dev/sd[a-z]+$', r'^/dev/vd[a-z]+$', r'^/dev/xvd[a-z]+$',
-            r'^/dev/nvme[0-9]+n[0-9]+$', r'^/dev/mmcblk[0-9]+$',
-            r'^/dev/md[0-9]+$', r'^zroot/.*$',
-        ]
-        return any(re.match(pattern, device) for pattern in physical_patterns)
-    
+        O0_var_120 = [codecs.decode('\\u005e\\u002f\\u0064\\u0065\\u0076\\u002f\\u0073\\u0064\\u005b\\u0061\\u002d\\u007a\\u005d\\u002b\\u0024', 'unicode_escape'), codecs.decode('\\u005e\\u002f\\u0064\\u0065\\u0076\\u002f\\u0076\\u0064\\u005b\\u0061\\u002d\\u007a\\u005d\\u002b\\u0024', 'unicode_escape'), codecs.decode('\\u005e\\u002f\\u0064\\u0065\\u0076\\u002f\\u0078\\u0076\\u0064\\u005b\\u0061\\u002d\\u007a\\u005d\\u002b\\u0024', 'unicode_escape'), codecs.decode('\\u005e\\u002f\\u0064\\u0065\\u0076\\u002f\\u006e\\u0076\\u006d\\u0065\\u005b\\u0030\\u002d\\u0039\\u005d\\u002b\\u006e\\u005b\\u0030\\u002d\\u0039\\u005d\\u002b\\u0024', 'unicode_escape'), codecs.decode('\\u005e\\u002f\\u0064\\u0065\\u0076\\u002f\\u006d\\u006d\\u0063\\u0062\\u006c\\u006b\\u005b\\u0030\\u002d\\u0039\\u005d\\u002b\\u0024', 'unicode_escape'), codecs.decode('\\u005e\\u002f\\u0064\\u0065\\u0076\\u002f\\u006d\\u0064\\u005b\\u0030\\u002d\\u0039\\u005d\\u002b\\u0024', 'unicode_escape'), codecs.decode('\\u005e\\u007a\\u0072\\u006f\\u006f\\u0074\\u002f\\u002e\\u002a\\u0024', 'unicode_escape')]
+        return any((re.match(O0_var_121, O0_var_118) for O0_var_121 in O0_var_120))
+
     async def _get_network_stats(self) -> Dict[str, int]:
-        """🌟 升级：按网卡获取网络统计（通过类变量维持上一秒的状态快照）"""
         try:
-            net_io = psutil.net_io_counters(pernic=True)
-            current_time = time.time()
-            
-            total_current_rx = 0
-            total_current_tx = 0
-            exclude_patterns = ['lo', 'docker', 'veth', 'br-', 'tun', 'virbr']
-            
-            for interface, stats in net_io.items():
-                if any(pattern in interface for pattern in exclude_patterns):
+            O0_var_122 = psutil.net_io_counters(pernic=True)
+            O0_var_123 = time.time()
+            O0_var_124 = 0
+            O0_var_125 = 0
+            O0_var_126 = [codecs.decode('\\u006c\\u006f', 'unicode_escape'), codecs.decode('\\u0064\\u006f\\u0063\\u006b\\u0065\\u0072', 'unicode_escape'), codecs.decode('\\u0076\\u0065\\u0074\\u0068', 'unicode_escape'), codecs.decode('\\u0062\\u0072\\u002d', 'unicode_escape'), codecs.decode('\\u0074\\u0075\\u006e', 'unicode_escape'), codecs.decode('\\u0076\\u0069\\u0072\\u0062\\u0072', 'unicode_escape')]
+            for O0_var_127, O0_var_128 in O0_var_122.items():
+                if any((O0_var_129 in O0_var_127 for O0_var_129 in O0_var_126)):
                     continue
-                total_current_rx += stats.bytes_recv
-                total_current_tx += stats.bytes_sent
-            
-            # 第一轮请求初始化
-            if SystemInfoCollector._last_network_stats['rx'] == 0:
-                SystemInfoCollector._total_network_down = total_current_rx
-                SystemInfoCollector._total_network_up = total_current_tx
-                SystemInfoCollector._last_network_stats = {'rx': total_current_rx, 'tx': total_current_tx}
-                SystemInfoCollector._last_network_time = current_time
-                return {
-                    "up": 0, "down": 0,
-                    "total_up": SystemInfoCollector._total_network_up,
-                    "total_down": SystemInfoCollector._total_network_down
-                }
-            
-            # 跨请求计算瞬时速率
-            time_diff = current_time - SystemInfoCollector._last_network_time
-            up_speed = 0
-            down_speed = 0
-            if time_diff > 0:
-                down_speed = (total_current_rx - SystemInfoCollector._last_network_stats['rx']) / time_diff
-                up_speed = (total_current_tx - SystemInfoCollector._last_network_stats['tx']) / time_diff
-                down_speed = max(0, down_speed)
-                up_speed = max(0, up_speed)
-                
-                SystemInfoCollector._total_network_down = total_current_rx
-                SystemInfoCollector._total_network_up = total_current_tx
-            
-            SystemInfoCollector._last_network_stats = {'rx': total_current_rx, 'tx': total_current_tx}
-            SystemInfoCollector._last_network_time = current_time
-            
-            return {
-                "up": int(up_speed),
-                "down": int(down_speed),
-                "total_up": SystemInfoCollector._total_network_up,
-                "total_down": SystemInfoCollector._total_network_down
-            }
+                O0_var_124 += O0_var_128.bytes_recv
+                O0_var_125 += O0_var_128.bytes_sent
+            if SystemInfoCollector._last_network_stats[codecs.decode('\\u0072\\u0078', 'unicode_escape')] == 0:
+                SystemInfoCollector._total_network_down = O0_var_124
+                SystemInfoCollector._total_network_up = O0_var_125
+                SystemInfoCollector._last_network_stats = {codecs.decode('\\u0072\\u0078', 'unicode_escape'): O0_var_124, codecs.decode('\\u0074\\u0078', 'unicode_escape'): O0_var_125}
+                SystemInfoCollector._last_network_time = O0_var_123
+                return {codecs.decode('\\u0075\\u0070', 'unicode_escape'): 0, codecs.decode('\\u0064\\u006f\\u0077\\u006e', 'unicode_escape'): 0, codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c\\u005f\\u0075\\u0070', 'unicode_escape'): SystemInfoCollector._total_network_up, codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c\\u005f\\u0064\\u006f\\u0077\\u006e', 'unicode_escape'): SystemInfoCollector._total_network_down}
+            O0_var_130 = O0_var_123 - SystemInfoCollector._last_network_time
+            O0_var_131 = 0
+            O0_var_132 = 0
+            if O0_var_130 > 0:
+                O0_var_132 = (O0_var_124 - SystemInfoCollector._last_network_stats[codecs.decode('\\u0072\\u0078', 'unicode_escape')]) / O0_var_130
+                O0_var_131 = (O0_var_125 - SystemInfoCollector._last_network_stats[codecs.decode('\\u0074\\u0078', 'unicode_escape')]) / O0_var_130
+                O0_var_132 = max(0, O0_var_132)
+                O0_var_131 = max(0, O0_var_131)
+                SystemInfoCollector._total_network_down = O0_var_124
+                SystemInfoCollector._total_network_up = O0_var_125
+            SystemInfoCollector._last_network_stats = {codecs.decode('\\u0072\\u0078', 'unicode_escape'): O0_var_124, codecs.decode('\\u0074\\u0078', 'unicode_escape'): O0_var_125}
+            SystemInfoCollector._last_network_time = O0_var_123
+            return {codecs.decode('\\u0075\\u0070', 'unicode_escape'): int(O0_var_131), codecs.decode('\\u0064\\u006f\\u0077\\u006e', 'unicode_escape'): int(O0_var_132), codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c\\u005f\\u0075\\u0070', 'unicode_escape'): SystemInfoCollector._total_network_up, codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c\\u005f\\u0064\\u006f\\u0077\\u006e', 'unicode_escape'): SystemInfoCollector._total_network_down}
         except Exception as e:
-            Logger.debug(f"psutil 按网卡统计失败: {e}", 4)
-            return {"up": 0, "down": 0, "total_up": 0, "total_down": 0}
-    
+            Logger.debug(codecs.decode('\\u0070\\u0073\\u0075\\u0074\\u0069\\u006c\\u0020\\u6309\\u7f51\\u5361\\u7edf\\u8ba1\\u5931\\u8d25\\u003a\\u0020', 'unicode_escape') + str(e), 4)
+            return {codecs.decode('\\u0075\\u0070', 'unicode_escape'): 0, codecs.decode('\\u0064\\u006f\\u0077\\u006e', 'unicode_escape'): 0, codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c\\u005f\\u0075\\u0070', 'unicode_escape'): 0, codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c\\u005f\\u0064\\u006f\\u0077\\u006e', 'unicode_escape'): 0}
+
     async def _get_tcp_connections(self) -> int:
         try:
-            if platform.system() == "Windows":
-                result = subprocess.run(['netstat', '-n', '-p', 'tcp'], capture_output=True, text=True, timeout=5)
-                return len([line for line in result.stdout.split('\n') if 'ESTABLISHED' in line])
-            connections = psutil.net_connections(kind='tcp')
-            return len([conn for conn in connections if conn.status == 'ESTABLISHED'])
+            if platform.system() == codecs.decode('\\u0057\\u0069\\u006e\\u0064\\u006f\\u0077\\u0073', 'unicode_escape'):
+                O0_var_133 = subprocess.run([codecs.decode('\\u006e\\u0065\\u0074\\u0073\\u0074\\u0061\\u0074', 'unicode_escape'), codecs.decode('\\u002d\\u006e', 'unicode_escape'), codecs.decode('\\u002d\\u0070', 'unicode_escape'), codecs.decode('\\u0074\\u0063\\u0070', 'unicode_escape')], capture_output=True, text=True, timeout=5)
+                return len([O0_var_134 for O0_var_134 in O0_var_133.stdout.split(codecs.decode('\\u000a', 'unicode_escape')) if codecs.decode('\\u0045\\u0053\\u0054\\u0041\\u0042\\u004c\\u0049\\u0053\\u0048\\u0045\\u0044', 'unicode_escape') in O0_var_134])
+            O0_var_135 = psutil.net_connections(kind=codecs.decode('\\u0074\\u0063\\u0070', 'unicode_escape'))
+            return len([O0_var_136 for O0_var_136 in O0_var_135 if O0_var_136.status == codecs.decode('\\u0045\\u0053\\u0054\\u0041\\u0042\\u004c\\u0049\\u0053\\u0048\\u0045\\u0044', 'unicode_escape')])
         except Exception as e:
-            Logger.debug(f"获取TCP连接数失败: {e}", 2)
+            Logger.debug(codecs.decode('\\u83b7\\u53d6\\u0054\\u0043\\u0050\\u8fde\\u63a5\\u6570\\u5931\\u8d25\\u003a\\u0020', 'unicode_escape') + str(e), 2)
             return 0
-    
+
     async def _get_udp_connections(self) -> int:
         try:
-            if platform.system() == "Windows":
-                result = subprocess.run(['netstat', '-n', '-p', 'udp'], capture_output=True, text=True, timeout=5)
-                return len([line for line in result.stdout.split('\n') if 'UDP' in line and line.strip()])
-            return len(psutil.net_connections(kind='udp'))
+            if platform.system() == codecs.decode('\\u0057\\u0069\\u006e\\u0064\\u006f\\u0077\\u0073', 'unicode_escape'):
+                O0_var_137 = subprocess.run([codecs.decode('\\u006e\\u0065\\u0074\\u0073\\u0074\\u0061\\u0074', 'unicode_escape'), codecs.decode('\\u002d\\u006e', 'unicode_escape'), codecs.decode('\\u002d\\u0070', 'unicode_escape'), codecs.decode('\\u0075\\u0064\\u0070', 'unicode_escape')], capture_output=True, text=True, timeout=5)
+                return len([O0_var_138 for O0_var_138 in O0_var_137.stdout.split(codecs.decode('\\u000a', 'unicode_escape')) if codecs.decode('\\u0055\\u0044\\u0050', 'unicode_escape') in O0_var_138 and O0_var_138.strip()])
+            return len(psutil.net_connections(kind=codecs.decode('\\u0075\\u0064\\u0070', 'unicode_escape')))
         except Exception as e:
-            Logger.debug(f"获取UDP连接数失败: {e}", 2)
+            Logger.debug(codecs.decode('\\u83b7\\u53d6\\u0055\\u0044\\u0050\\u8fde\\u63a5\\u6570\\u5931\\u8d25\\u003a\\u0020', 'unicode_escape') + str(e), 2)
             return 0
-    
+
     def _get_linux_distribution(self) -> Dict[str, str]:
         try:
-            if platform.system() == "Linux" and os.path.exists('/etc/os-release'):
-                with open('/etc/os-release', 'r') as f: content = f.read()
-                name, version = 'Unknown', 'Unknown'
-                for line in content.split('\n'):
-                    if line.startswith('ID='): name = line.replace('ID=', '').replace('"', '').strip()
-                    elif line.startswith('VERSION_ID='): version = line.replace('VERSION_ID=', '').replace('"', '').strip()
-                return {'name': name, 'version': version}
-        except Exception: pass
-        return {'name': 'Unknown', 'version': 'Unknown'}
-    
+            if platform.system() == codecs.decode('\\u004c\\u0069\\u006e\\u0075\\u0078', 'unicode_escape') and os.path.exists(codecs.decode('\\u002f\\u0065\\u0074\\u0063\\u002f\\u006f\\u0073\\u002d\\u0072\\u0065\\u006c\\u0065\\u0061\\u0073\\u0065', 'unicode_escape')):
+                with open(codecs.decode('\\u002f\\u0065\\u0074\\u0063\\u002f\\u006f\\u0073\\u002d\\u0072\\u0065\\u006c\\u0065\\u0061\\u0073\\u0065', 'unicode_escape'), codecs.decode('\\u0072', 'unicode_escape')) as O0_var_139:
+                    O0_var_140 = O0_var_139.read()
+                O0_var_141, O0_var_142 = (codecs.decode('\\u0055\\u006e\\u006b\\u006e\\u006f\\u0077\\u006e', 'unicode_escape'), codecs.decode('\\u0055\\u006e\\u006b\\u006e\\u006f\\u0077\\u006e', 'unicode_escape'))
+                for O0_var_143 in O0_var_140.split(codecs.decode('\\u000a', 'unicode_escape')):
+                    if O0_var_143.startswith(codecs.decode('\\u0049\\u0044\\u003d', 'unicode_escape')):
+                        O0_var_141 = O0_var_143.replace(codecs.decode('\\u0049\\u0044\\u003d', 'unicode_escape'), codecs.decode('', 'unicode_escape')).replace(codecs.decode('\\u0022', 'unicode_escape'), codecs.decode('', 'unicode_escape')).strip()
+                    elif O0_var_143.startswith(codecs.decode('\\u0056\\u0045\\u0052\\u0053\\u0049\\u004f\\u004e\\u005f\\u0049\\u0044\\u003d', 'unicode_escape')):
+                        O0_var_142 = O0_var_143.replace(codecs.decode('\\u0056\\u0045\\u0052\\u0053\\u0049\\u004f\\u004e\\u005f\\u0049\\u0044\\u003d', 'unicode_escape'), codecs.decode('', 'unicode_escape')).replace(codecs.decode('\\u0022', 'unicode_escape'), codecs.decode('', 'unicode_escape')).strip()
+                return {codecs.decode('\\u006e\\u0061\\u006d\\u0065', 'unicode_escape'): O0_var_141, codecs.decode('\\u0076\\u0065\\u0072\\u0073\\u0069\\u006f\\u006e', 'unicode_escape'): O0_var_142}
+        except Exception:
+            pass
+        return {codecs.decode('\\u006e\\u0061\\u006d\\u0065', 'unicode_escape'): codecs.decode('\\u0055\\u006e\\u006b\\u006e\\u006f\\u0077\\u006e', 'unicode_escape'), codecs.decode('\\u0076\\u0065\\u0072\\u0073\\u0069\\u006f\\u006e', 'unicode_escape'): codecs.decode('\\u0055\\u006e\\u006b\\u006e\\u006f\\u0077\\u006e', 'unicode_escape')}
+
     def _get_virtualization(self) -> str:
         try:
-            if platform.system() == "Linux":
-                if os.path.exists('//.dockerenv'): return 'Docker'
-                if os.path.exists('/run/.containerenv'): return 'Podman'
-                if os.path.exists('/proc/1/cgroup'):
-                    with open('/proc/proc/1/cgroup', 'r', encoding='utf-8', errors='ignore') as f:
-                        content = f.read().lower()
-                        if 'docker' in content or 'containerd' in content: return 'Docker'
-                        elif 'kubepods' in content: return 'Kubernetes'
-                        elif 'lxc' in content: return 'LXC'
-                if os.path.exists('/proc/self/mountinfo'):
-                    with open('/proc/self/mountinfo', 'r', encoding='utf-8', errors='ignore') as f:
-                        content = f.read()
-                        if '/docker/containers/' in content or 'workdir=/var/lib/docker' in content: return 'Docker'
-                        elif '/pods/' in content or 'kubelet' in content: return 'Kubernetes'
-                if os.path.exists('/proc/1/environ'):
-                    with open('/proc/1/environ', 'r', encoding='utf-8', errors='ignore') as f:
-                        if 'container=lxc' in f.read(): return 'LXC'
-                if os.path.exists('/proc/cpuinfo'):
-                    with open('/proc/cpuinfo', 'r', encoding='utf-8', errors='ignore') as f:
-                        content = f.read()
-                        if 'QEMU' in content or 'KVM' in content: return 'QEMU'
+            if platform.system() == codecs.decode('\\u004c\\u0069\\u006e\\u0075\\u0078', 'unicode_escape'):
+                if os.path.exists(codecs.decode('\\u002f\\u002f\\u002e\\u0064\\u006f\\u0063\\u006b\\u0065\\u0072\\u0065\\u006e\\u0076', 'unicode_escape')):
+                    return codecs.decode('\\u0044\\u006f\\u0063\\u006b\\u0065\\u0072', 'unicode_escape')
+                if os.path.exists(codecs.decode('\\u002f\\u0072\\u0075\\u006e\\u002f\\u002e\\u0063\\u006f\\u006e\\u0074\\u0061\\u0069\\u006e\\u0065\\u0072\\u0065\\u006e\\u0076', 'unicode_escape')):
+                    return codecs.decode('\\u0050\\u006f\\u0064\\u006d\\u0061\\u006e', 'unicode_escape')
+                if os.path.exists(codecs.decode('\\u002f\\u0070\\u0072\\u006f\\u0063\\u002f\\u0031\\u002f\\u0063\\u0067\\u0072\\u006f\\u0075\\u0070', 'unicode_escape')):
+                    with open(codecs.decode('\\u002f\\u0070\\u0072\\u006f\\u0063\\u002f\\u0070\\u0072\\u006f\\u0063\\u002f\\u0031\\u002f\\u0063\\u0067\\u0072\\u006f\\u0075\\u0070', 'unicode_escape'), codecs.decode('\\u0072', 'unicode_escape'), encoding=codecs.decode('\\u0075\\u0074\\u0066\\u002d\\u0038', 'unicode_escape'), errors=codecs.decode('\\u0069\\u0067\\u006e\\u006f\\u0072\\u0065', 'unicode_escape')) as O0_var_144:
+                        O0_var_145 = O0_var_144.read().lower()
+                        if codecs.decode('\\u0064\\u006f\\u0063\\u006b\\u0065\\u0072', 'unicode_escape') in O0_var_145 or codecs.decode('\\u0063\\u006f\\u006e\\u0074\\u0061\\u0069\\u006e\\u0065\\u0072\\u0064', 'unicode_escape') in O0_var_145:
+                            return codecs.decode('\\u0044\\u006f\\u0063\\u006b\\u0065\\u0072', 'unicode_escape')
+                        elif codecs.decode('\\u006b\\u0075\\u0062\\u0065\\u0070\\u006f\\u0064\\u0073', 'unicode_escape') in O0_var_145:
+                            return codecs.decode('\\u004b\\u0075\\u0062\\u0065\\u0072\\u006e\\u0065\\u0074\\u0065\\u0073', 'unicode_escape')
+                        elif codecs.decode('\\u006c\\u0078\\u0063', 'unicode_escape') in O0_var_145:
+                            return codecs.decode('\\u004c\\u0058\\u0043', 'unicode_escape')
+                if os.path.exists(codecs.decode('\\u002f\\u0070\\u0072\\u006f\\u0063\\u002f\\u0073\\u0065\\u006c\\u0066\\u002f\\u006d\\u006f\\u0075\\u006e\\u0074\\u0069\\u006e\\u0066\\u006f', 'unicode_escape')):
+                    with open(codecs.decode('\\u002f\\u0070\\u0072\\u006f\\u0063\\u002f\\u0073\\u0065\\u006c\\u0066\\u002f\\u006d\\u006f\\u0075\\u006e\\u0074\\u0069\\u006e\\u0066\\u006f', 'unicode_escape'), codecs.decode('\\u0072', 'unicode_escape'), encoding=codecs.decode('\\u0075\\u0074\\u0066\\u002d\\u0038', 'unicode_escape'), errors=codecs.decode('\\u0069\\u0067\\u006e\\u006f\\u0072\\u0065', 'unicode_escape')) as O0_var_144:
+                        O0_var_145 = O0_var_144.read()
+                        if codecs.decode('\\u002f\\u0064\\u006f\\u0063\\u006b\\u0065\\u0072\\u002f\\u0063\\u006f\\u006e\\u0074\\u0061\\u0069\\u006e\\u0065\\u0072\\u0073\\u002f', 'unicode_escape') in O0_var_145 or codecs.decode('\\u0077\\u006f\\u0072\\u006b\\u0064\\u0069\\u0072\\u003d\\u002f\\u0076\\u0061\\u0072\\u002f\\u006c\\u0069\\u0062\\u002f\\u0064\\u006f\\u0063\\u006b\\u0065\\u0072', 'unicode_escape') in O0_var_145:
+                            return codecs.decode('\\u0044\\u006f\\u0063\\u006b\\u0065\\u0072', 'unicode_escape')
+                        elif codecs.decode('\\u002f\\u0070\\u006f\\u0064\\u0073\\u002f', 'unicode_escape') in O0_var_145 or codecs.decode('\\u006b\\u0075\\u0062\\u0065\\u006c\\u0065\\u0074', 'unicode_escape') in O0_var_145:
+                            return codecs.decode('\\u004b\\u0075\\u0062\\u0065\\u0072\\u006e\\u0065\\u0074\\u0065\\u0073', 'unicode_escape')
+                if os.path.exists(codecs.decode('\\u002f\\u0070\\u0072\\u006f\\u0063\\u002f\\u0031\\u002f\\u0065\\u006e\\u0076\\u0069\\u0072\\u006f\\u006e', 'unicode_escape')):
+                    with open(codecs.decode('\\u002f\\u0070\\u0072\\u006f\\u0063\\u002f\\u0031\\u002f\\u0065\\u006e\\u0076\\u0069\\u0072\\u006f\\u006e', 'unicode_escape'), codecs.decode('\\u0072', 'unicode_escape'), encoding=codecs.decode('\\u0075\\u0074\\u0066\\u002d\\u0038', 'unicode_escape'), errors=codecs.decode('\\u0069\\u0067\\u006e\\u006f\\u0072\\u0065', 'unicode_escape')) as O0_var_144:
+                        if codecs.decode('\\u0063\\u006f\\u006e\\u0074\\u0061\\u0069\\u006e\\u0065\\u0072\\u003d\\u006c\\u0078\\u0063', 'unicode_escape') in O0_var_144.read():
+                            return codecs.decode('\\u004c\\u0058\\u0043', 'unicode_escape')
+                if os.path.exists(codecs.decode('\\u002f\\u0070\\u0072\\u006f\\u0063\\u002f\\u0063\\u0070\\u0075\\u0069\\u006e\\u0066\\u006f', 'unicode_escape')):
+                    with open(codecs.decode('\\u002f\\u0070\\u0072\\u006f\\u0063\\u002f\\u0063\\u0070\\u0075\\u0069\\u006e\\u0066\\u006f', 'unicode_escape'), codecs.decode('\\u0072', 'unicode_escape'), encoding=codecs.decode('\\u0075\\u0074\\u0066\\u002d\\u0038', 'unicode_escape'), errors=codecs.decode('\\u0069\\u0067\\u006e\\u006f\\u0072\\u0065', 'unicode_escape')) as O0_var_144:
+                        O0_var_145 = O0_var_144.read()
+                        if codecs.decode('\\u0051\\u0045\\u004d\\u0055', 'unicode_escape') in O0_var_145 or codecs.decode('\\u004b\\u0056\\u004d', 'unicode_escape') in O0_var_145:
+                            return codecs.decode('\\u0051\\u0045\\u004d\\u0055', 'unicode_escape')
         except Exception as e:
-            Logger.error(f"❌ 获取虚拟化信息失败: {e}")
-        return 'None'
-    
-    async def _get_public_ip_v4(self) -> Optional[str]:
-        services = ['https://api.ipify.org', 'https://icanhazip.com', 'https://checkip.amazonaws.com', 'https://ifconfig.me/ip']
-        for service in services:
-            try:
-                ip = await self._fetch_ip(service)
-                if ip and self._is_valid_ipv4(ip): return ip
-            except Exception: continue
-        return None
-    
-    async def _get_public_ip_v6(self) -> Optional[str]:
-        services = ['https://api6.ipify.org', 'https://icanhazip.com']
-        for service in services:
-            try:
-                ip = await self._fetch_ip(service)
-                if ip and self._is_valid_ipv6(ip): return ip
-            except Exception: continue
-        return None
-    
-    async def _fetch_ip(self, url: str) -> str:
-        timeout = aiohttp.ClientTimeout(total=5)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, headers={'user-agent': Config.AGENT_VERSION}) as response:
-                if response.status == 200: return (await response.text()).strip()
-                raise Exception(f"HTTP {response.status}")
-    
-    def _is_valid_ipv4(self, ip: str) -> bool:
-        try:
-            socket.inet_pton(socket.AF_INET, ip)
-            return True
-        except socket.error: return False
-    
-    def _is_valid_ipv6(self, ip: str) -> bool:
-        try:
-            socket.inet_pton(socket.AF_INET6, ip)
-            return True
-        except socket.error: return False
-# ============================================================================
-# 📁 文件模块: FileManager 类 (面向对象封装)
-# ============================================================================
+            Logger.error(codecs.decode('\\u274c\\u0020\\u83b7\\u53d6\\u865a\\u62df\\u5316\\u4fe1\\u606f\\u5931\\u8d25\\u003a\\u0020', 'unicode_escape') + str(e))
+        return codecs.decode('\\u004e\\u006f\\u006e\\u0065', 'unicode_escape')
 
+    async def _get_public_ip_v4(self) -> Optional[str]:
+        O0_var_146 = [codecs.decode('\\u0068\\u0074\\u0074\\u0070\\u0073\\u003a\\u002f\\u002f\\u0061\\u0070\\u0069\\u002e\\u0069\\u0070\\u0069\\u0066\\u0079\\u002e\\u006f\\u0072\\u0067', 'unicode_escape'), codecs.decode('\\u0068\\u0074\\u0074\\u0070\\u0073\\u003a\\u002f\\u002f\\u0069\\u0063\\u0061\\u006e\\u0068\\u0061\\u007a\\u0069\\u0070\\u002e\\u0063\\u006f\\u006d', 'unicode_escape'), codecs.decode('\\u0068\\u0074\\u0074\\u0070\\u0073\\u003a\\u002f\\u002f\\u0063\\u0068\\u0065\\u0063\\u006b\\u0069\\u0070\\u002e\\u0061\\u006d\\u0061\\u007a\\u006f\\u006e\\u0061\\u0077\\u0073\\u002e\\u0063\\u006f\\u006d', 'unicode_escape'), codecs.decode('\\u0068\\u0074\\u0074\\u0070\\u0073\\u003a\\u002f\\u002f\\u0069\\u0066\\u0063\\u006f\\u006e\\u0066\\u0069\\u0067\\u002e\\u006d\\u0065\\u002f\\u0069\\u0070', 'unicode_escape')]
+        for O0_var_147 in O0_var_146:
+            try:
+                O0_var_148 = await self._fetch_ip(O0_var_147)
+                if O0_var_148 and self._is_valid_ipv4(O0_var_148):
+                    return O0_var_148
+            except Exception:
+                continue
+        return None
+
+    async def _get_public_ip_v6(self) -> Optional[str]:
+        O0_var_149 = [codecs.decode('\\u0068\\u0074\\u0074\\u0070\\u0073\\u003a\\u002f\\u002f\\u0061\\u0070\\u0069\\u0036\\u002e\\u0069\\u0070\\u0069\\u0066\\u0079\\u002e\\u006f\\u0072\\u0067', 'unicode_escape'), codecs.decode('\\u0068\\u0074\\u0074\\u0070\\u0073\\u003a\\u002f\\u002f\\u0069\\u0063\\u0061\\u006e\\u0068\\u0061\\u007a\\u0069\\u0070\\u002e\\u0063\\u006f\\u006d', 'unicode_escape')]
+        for O0_var_150 in O0_var_149:
+            try:
+                O0_var_151 = await self._fetch_ip(O0_var_150)
+                if O0_var_151 and self._is_valid_ipv6(O0_var_151):
+                    return O0_var_151
+            except Exception:
+                continue
+        return None
+
+    async def _fetch_ip(self, O0_var_152: str) -> str:
+        O0_var_153 = aiohttp.ClientTimeout(total=5)
+        async with aiohttp.ClientSession(timeout=O0_var_153) as O0_var_154:
+            async with O0_var_154.get(O0_var_152, headers={codecs.decode('\\u0075\\u0073\\u0065\\u0072\\u002d\\u0061\\u0067\\u0065\\u006e\\u0074', 'unicode_escape'): Config.AGENT_VERSION}) as response:
+                if response.status == 200:
+                    return (await response.text()).strip()
+                raise Exception(codecs.decode('\\u0048\\u0054\\u0054\\u0050\\u0020', 'unicode_escape') + str(response.status))
+
+    def _is_valid_ipv4(self, O0_var_155: str) -> bool:
+        try:
+            socket.inet_pton(socket.AF_INET, O0_var_155)
+            return True
+        except socket.error:
+            return False
+
+    def _is_valid_ipv6(self, O0_var_156: str) -> bool:
+        try:
+            socket.inet_pton(socket.AF_INET6, O0_var_156)
+            return True
+        except socket.error:
+            return False
 import shutil
 import stat
 import hashlib
@@ -1502,580 +1034,357 @@ from typing import List, Dict, Optional, Union
 from fastapi import HTTPException, status, UploadFile
 from croniter import croniter
 
-
 class FileManager:
-    """
-    文件管理器 - 封装所有文件/目录操作
-    安全特性: 路径校验、权限检查、审计日志、分块上传
-    """
-    
-    def __init__(self, root: str, max_upload: int = 104857600, 
-                 chunk_size: int = 20971520, audit: bool = True):
-        """
-        :param root: 文件操作根目录 (限制访问范围)
-        :param max_upload: 单文件上传大小限制 (字节)
-        :param chunk_size: 分块上传阈值 (默认 20MB)
-        :param audit: 是否启用审计日志
-        """
-        self.root = Path(root).resolve()
+    codecs.decode('\\u000a\\u0020\\u0020\\u0020\\u0020\\u6587\\u4ef6\\u7ba1\\u7406\\u5668\\u0020\\u002d\\u0020\\u5c01\\u88c5\\u6240\\u6709\\u6587\\u4ef6\\u002f\\u76ee\\u5f55\\u64cd\\u4f5c\\u000a\\u0020\\u0020\\u0020\\u0020\\u5b89\\u5168\\u7279\\u6027\\u003a\\u0020\\u8def\\u5f84\\u6821\\u9a8c\\u3001\\u6743\\u9650\\u68c0\\u67e5\\u3001\\u5ba1\\u8ba1\\u65e5\\u5fd7\\u3001\\u5206\\u5757\\u4e0a\\u4f20\\u000a\\u0020\\u0020\\u0020\\u0020', 'unicode_escape')
+
+    def __init__(self, root: str, max_upload: int=104857600, chunk_size: int=20971520, audit: bool=True):
+        self.O0_fn_31 = Path(root).resolve()
         self.max_upload = max_upload
-        self.chunk_size = chunk_size  # 20MB 阈值
+        self.chunk_size = chunk_size
         self.audit = audit
-        self.chunk_dir = self.root / ".proxy_chunks"  # 临时分块目录
+        self.chunk_dir = self.O0_fn_31 / codecs.decode('\\u002e\\u0070\\u0072\\u006f\\u0078\\u0079\\u005f\\u0063\\u0068\\u0075\\u006e\\u006b\\u0073', 'unicode_escape')
         self.chunk_dir.mkdir(exist_ok=True)
-    
-    # ================= 内部工具方法 =================
-    
-    def _audit(self, action: str, path: str, result: str, meta: dict = None):
-        """审计日志"""
+
+    def _audit(self, O0_var_157: str, path: str, O0_var_158: str, O0_var_159: dict=None):
         if self.audit:
-            entry = {
-                "ts": datetime.utcnow().isoformat(),
-                "action": action,
-                "path": path,
-                "result": result,
-                **(meta or {})
-            }
-            if os.getenv("DEBUG", "false").lower() == "true":
-                Logger.debug(f"📝 [AUDIT] {json.dumps(entry, ensure_ascii=False)}")
-    
-    def _safe_path(self, user_path: str) -> Path:
-        """路径安全校验 + 标准化 (防路径遍历)"""
-        user_path = (user_path or ".").strip()
-        target = Path(user_path)
-        
-        # 转为绝对路径
-        if not target.is_absolute():
-            target = self.root / target
-        target = target.resolve()
-        
-        # 安全检查: 必须在 root 内
+            O0_var_160 = {codecs.decode('\\u0074\\u0073', 'unicode_escape'): datetime.utcnow().isoformat(), codecs.decode('\\u0061\\u0063\\u0074\\u0069\\u006f\\u006e', 'unicode_escape'): O0_var_157, codecs.decode('\\u0070\\u0061\\u0074\\u0068', 'unicode_escape'): path, codecs.decode('\\u0072\\u0065\\u0073\\u0075\\u006c\\u0074', 'unicode_escape'): O0_var_158, **(O0_var_159 or {})}
+            if os.getenv(codecs.decode('\\u0044\\u0045\\u0042\\u0055\\u0047', 'unicode_escape'), codecs.decode('\\u0066\\u0061\\u006c\\u0073\\u0065', 'unicode_escape')).lower() == codecs.decode('\\u0074\\u0072\\u0075\\u0065', 'unicode_escape'):
+                Logger.debug(codecs.decode('\\U0001f4dd\\u0020\\u005b\\u0041\\u0055\\u0044\\u0049\\u0054\\u005d\\u0020', 'unicode_escape') + str(json.dumps(O0_var_160, ensure_ascii=False)))
+
+    def _safe_path(self, O0_var_161: str) -> Path:
+        O0_var_161 = (O0_var_161 or codecs.decode('\\u002e', 'unicode_escape')).strip()
+        O0_var_162 = Path(O0_var_161)
+        if not O0_var_162.is_absolute():
+            O0_var_162 = self.O0_fn_31 / O0_var_162
+        O0_var_162 = O0_var_162.resolve()
         try:
-            target.relative_to(self.root)
+            O0_var_162.relative_to(self.O0_fn_31)
         except ValueError:
-            raise HTTPException(
-                status_code=403,
-                detail=f"Access denied: '{user_path}' outside root '{self.root}'"
-            )
-        return target
-    
+            raise HTTPException(status_code=403, detail=codecs.decode('\\u0041\\u0063\\u0063\\u0065\\u0073\\u0073\\u0020\\u0064\\u0065\\u006e\\u0069\\u0065\\u0064\\u003a\\u0020\\u0027', 'unicode_escape') + str(O0_var_161) + codecs.decode('\\u0027\\u0020\\u006f\\u0075\\u0074\\u0073\\u0069\\u0064\\u0065\\u0020\\u0072\\u006f\\u006f\\u0074\\u0020\\u0027', 'unicode_escape') + str(self.O0_fn_31) + codecs.decode('\\u0027', 'unicode_escape'))
+        return O0_var_162
+
     def _format_info(self, path: Path) -> dict:
-        """格式化文件信息"""
         try:
-            st = path.lstat() if path.is_symlink() else path.stat()
-            return {
-                "name": path.name,
-                "path": str(path.relative_to(self.root)),
-                "type": "directory" if path.is_dir() else "symlink" if path.is_symlink() else "file",
-                "size": st.st_size,
-                "mtime": datetime.fromtimestamp(st.st_mtime).isoformat(),
-                "mode": stat.filemode(st.st_mode),
-                "mode_octal": oct(stat.S_IMODE(st.st_mode)),
-                "owner": f"{st.st_uid}:{st.st_gid}"
-            }
+            O0_var_163 = path.lstat() if path.is_symlink() else path.stat()
+            return {codecs.decode('\\u006e\\u0061\\u006d\\u0065', 'unicode_escape'): path.name, codecs.decode('\\u0070\\u0061\\u0074\\u0068', 'unicode_escape'): str(path.relative_to(self.O0_fn_31)), codecs.decode('\\u0074\\u0079\\u0070\\u0065', 'unicode_escape'): codecs.decode('\\u0064\\u0069\\u0072\\u0065\\u0063\\u0074\\u006f\\u0072\\u0079', 'unicode_escape') if path.is_dir() else codecs.decode('\\u0073\\u0079\\u006d\\u006c\\u0069\\u006e\\u006b', 'unicode_escape') if path.is_symlink() else codecs.decode('\\u0066\\u0069\\u006c\\u0065', 'unicode_escape'), codecs.decode('\\u0073\\u0069\\u007a\\u0065', 'unicode_escape'): O0_var_163.st_size, codecs.decode('\\u006d\\u0074\\u0069\\u006d\\u0065', 'unicode_escape'): datetime.fromtimestamp(O0_var_163.st_mtime).isoformat(), codecs.decode('\\u006d\\u006f\\u0064\\u0065', 'unicode_escape'): stat.filemode(O0_var_163.st_mode), codecs.decode('\\u006d\\u006f\\u0064\\u0065\\u005f\\u006f\\u0063\\u0074\\u0061\\u006c', 'unicode_escape'): oct(stat.S_IMODE(O0_var_163.st_mode)), codecs.decode('\\u006f\\u0077\\u006e\\u0065\\u0072', 'unicode_escape'): str(O0_var_163.st_uid) + codecs.decode('\\u003a', 'unicode_escape') + str(O0_var_163.st_gid)}
         except Exception as e:
-            return {"name": path.name, "path": str(path), "error": str(e)}
-    
-    # ================= 核心功能方法 =================
-    
-    def list_files(self, base_path: str, recursive: bool = False) -> dict:
-        """列出文件/目录"""
-        target = self._safe_path(base_path)
-        if not target.exists():
-            raise HTTPException(404, f"Not found: {base_path}")
-        if not target.is_dir():
-            raise HTTPException(400, f"Not a directory: {base_path}")
-        
-        files = []
+            return {codecs.decode('\\u006e\\u0061\\u006d\\u0065', 'unicode_escape'): path.name, codecs.decode('\\u0070\\u0061\\u0074\\u0068', 'unicode_escape'): str(path), codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'): str(e)}
+
+    def list_files(self, base_path: str, recursive: bool=False) -> dict:
+        O0_var_164 = self._safe_path(base_path)
+        if not O0_var_164.exists():
+            raise HTTPException(404, codecs.decode('\\u004e\\u006f\\u0074\\u0020\\u0066\\u006f\\u0075\\u006e\\u0064\\u003a\\u0020', 'unicode_escape') + str(base_path))
+        if not O0_var_164.is_dir():
+            raise HTTPException(400, codecs.decode('\\u004e\\u006f\\u0074\\u0020\\u0061\\u0020\\u0064\\u0069\\u0072\\u0065\\u0063\\u0074\\u006f\\u0072\\u0079\\u003a\\u0020', 'unicode_escape') + str(base_path))
+        O0_var_165 = []
         try:
-            items = target.rglob("*") if recursive else target.iterdir()
-            for item in items:
-                if not recursive and item.parent != target:
+            O0_var_166 = O0_var_164.rglob(codecs.decode('\\u002a', 'unicode_escape')) if recursive else O0_var_164.iterdir()
+            for O0_var_167 in O0_var_166:
+                if not recursive and O0_var_167.parent != O0_var_164:
                     continue
-                files.append(self._format_info(item))
+                O0_var_165.append(self._format_info(O0_var_167))
         except PermissionError:
-            raise HTTPException(403, f"Permission denied: {base_path}")
-        
-        files.sort(key=lambda x: (x.get("type") != "directory", x.get("name", "").lower()))
-        self._audit("list", base_path, "ok", {"count": len(files)})
-        return {"status": "ok", "count": len(files), "files": files}
-    
-    def get_authority(self, paths: List[str]) -> dict:
-        """批量查询文件权限"""
-        results = []
-        for p in paths:
+            raise HTTPException(403, codecs.decode('\\u0050\\u0065\\u0072\\u006d\\u0069\\u0073\\u0073\\u0069\\u006f\\u006e\\u0020\\u0064\\u0065\\u006e\\u0069\\u0065\\u0064\\u003a\\u0020', 'unicode_escape') + str(base_path))
+        O0_var_165.sort(key=lambda x: (x.get(codecs.decode('\\u0074\\u0079\\u0070\\u0065', 'unicode_escape')) != codecs.decode('\\u0064\\u0069\\u0072\\u0065\\u0063\\u0074\\u006f\\u0072\\u0079', 'unicode_escape'), x.get(codecs.decode('\\u006e\\u0061\\u006d\\u0065', 'unicode_escape'), codecs.decode('', 'unicode_escape')).lower()))
+        self._audit(codecs.decode('\\u006c\\u0069\\u0073\\u0074', 'unicode_escape'), base_path, codecs.decode('\\u006f\\u006b', 'unicode_escape'), {codecs.decode('\\u0063\\u006f\\u0075\\u006e\\u0074', 'unicode_escape'): len(O0_var_165)})
+        return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape'), codecs.decode('\\u0063\\u006f\\u0075\\u006e\\u0074', 'unicode_escape'): len(O0_var_165), codecs.decode('\\u0066\\u0069\\u006c\\u0065\\u0073', 'unicode_escape'): O0_var_165}
+
+    def get_authority(self, O0_var_168: List[str]) -> dict:
+        O0_var_169 = []
+        for O0_var_170 in O0_var_168:
             try:
-                target = self._safe_path(p)
-                if not target.exists():
-                    results.append({"path": p, "error": "Not found"})
+                O0_var_171 = self._safe_path(O0_var_170)
+                if not O0_var_171.exists():
+                    O0_var_169.append({codecs.decode('\\u0070\\u0061\\u0074\\u0068', 'unicode_escape'): O0_var_170, codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'): codecs.decode('\\u004e\\u006f\\u0074\\u0020\\u0066\\u006f\\u0075\\u006e\\u0064', 'unicode_escape')})
                     continue
-                info = self._format_info(target)
-                results.append({
-                    "path": info["path"],
-                    "name": info["name"],
-                    "mode": info.get("mode"),
-                    "mode_octal": info.get("mode_octal"),
-                    "type": info.get("type"),
-                    "readable": os.access(target, os.R_OK),
-                    "writable": os.access(target, os.W_OK),
-                    "executable": os.access(target, os.X_OK)
-                })
+                O0_var_172 = self._format_info(O0_var_171)
+                O0_var_169.append({codecs.decode('\\u0070\\u0061\\u0074\\u0068', 'unicode_escape'): O0_var_172[codecs.decode('\\u0070\\u0061\\u0074\\u0068', 'unicode_escape')], codecs.decode('\\u006e\\u0061\\u006d\\u0065', 'unicode_escape'): O0_var_172[codecs.decode('\\u006e\\u0061\\u006d\\u0065', 'unicode_escape')], codecs.decode('\\u006d\\u006f\\u0064\\u0065', 'unicode_escape'): O0_var_172.get(codecs.decode('\\u006d\\u006f\\u0064\\u0065', 'unicode_escape')), codecs.decode('\\u006d\\u006f\\u0064\\u0065\\u005f\\u006f\\u0063\\u0074\\u0061\\u006c', 'unicode_escape'): O0_var_172.get(codecs.decode('\\u006d\\u006f\\u0064\\u0065\\u005f\\u006f\\u0063\\u0074\\u0061\\u006c', 'unicode_escape')), codecs.decode('\\u0074\\u0079\\u0070\\u0065', 'unicode_escape'): O0_var_172.get(codecs.decode('\\u0074\\u0079\\u0070\\u0065', 'unicode_escape')), codecs.decode('\\u0072\\u0065\\u0061\\u0064\\u0061\\u0062\\u006c\\u0065', 'unicode_escape'): os.access(O0_var_171, os.R_OK), codecs.decode('\\u0077\\u0072\\u0069\\u0074\\u0061\\u0062\\u006c\\u0065', 'unicode_escape'): os.access(O0_var_171, os.W_OK), codecs.decode('\\u0065\\u0078\\u0065\\u0063\\u0075\\u0074\\u0061\\u0062\\u006c\\u0065', 'unicode_escape'): os.access(O0_var_171, os.X_OK)})
             except HTTPException as e:
-                results.append({"path": p, "error": str(e.detail)})
+                O0_var_169.append({codecs.decode('\\u0070\\u0061\\u0074\\u0068', 'unicode_escape'): O0_var_170, codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'): str(e.detail)})
             except Exception as e:
-                results.append({"path": p, "error": str(e)})
-        
-        self._audit("authority", str(paths), "ok", {"queried": len(paths)})
-        return {"status": "ok", "files": results}
-    
-    def cat_file(self, file_path: str, max_size: int = 1048576) -> dict:
-        """查看文件文本内容 (限制大小防大文件)"""
-        target = self._safe_path(file_path)
-        if not target.exists():
-            raise HTTPException(404, f"Not found: {file_path}")
-        if not target.is_file():
-            raise HTTPException(400, f"Not a file: {file_path}")
-        if target.stat().st_size > max_size:
-            raise HTTPException(413, f"File too large for cat (>1MB): {file_path}")
-        
+                O0_var_169.append({codecs.decode('\\u0070\\u0061\\u0074\\u0068', 'unicode_escape'): O0_var_170, codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'): str(e)})
+        self._audit(codecs.decode('\\u0061\\u0075\\u0074\\u0068\\u006f\\u0072\\u0069\\u0074\\u0079', 'unicode_escape'), str(O0_var_168), codecs.decode('\\u006f\\u006b', 'unicode_escape'), {codecs.decode('\\u0071\\u0075\\u0065\\u0072\\u0069\\u0065\\u0064', 'unicode_escape'): len(O0_var_168)})
+        return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape'), codecs.decode('\\u0066\\u0069\\u006c\\u0065\\u0073', 'unicode_escape'): O0_var_169}
+
+    def cat_file(self, file_path: str, O0_var_173: int=1048576) -> dict:
+        O0_var_174 = self._safe_path(file_path)
+        if not O0_var_174.exists():
+            raise HTTPException(404, codecs.decode('\\u004e\\u006f\\u0074\\u0020\\u0066\\u006f\\u0075\\u006e\\u0064\\u003a\\u0020', 'unicode_escape') + str(file_path))
+        if not O0_var_174.is_file():
+            raise HTTPException(400, codecs.decode('\\u004e\\u006f\\u0074\\u0020\\u0061\\u0020\\u0066\\u0069\\u006c\\u0065\\u003a\\u0020', 'unicode_escape') + str(file_path))
+        if O0_var_174.stat().st_size > O0_var_173:
+            raise HTTPException(413, codecs.decode('\\u0046\\u0069\\u006c\\u0065\\u0020\\u0074\\u006f\\u006f\\u0020\\u006c\\u0061\\u0072\\u0067\\u0065\\u0020\\u0066\\u006f\\u0072\\u0020\\u0063\\u0061\\u0074\\u0020\\u0028\\u003e\\u0031\\u004d\\u0042\\u0029\\u003a\\u0020', 'unicode_escape') + str(file_path))
         try:
-            # 尝试 UTF-8 解码，失败则返回 Base64
-            content = target.read_text(encoding='utf-8', errors='replace')
-            encoding = "utf-8"
-            is_binary = False
+            O0_var_175 = O0_var_174.read_text(encoding=codecs.decode('\\u0075\\u0074\\u0066\\u002d\\u0038', 'unicode_escape'), errors=codecs.decode('\\u0072\\u0065\\u0070\\u006c\\u0061\\u0063\\u0065', 'unicode_escape'))
+            O0_var_176 = codecs.decode('\\u0075\\u0074\\u0066\\u002d\\u0038', 'unicode_escape')
+            O0_var_177 = False
         except:
-            content = base64.b64encode(target.read_bytes()).decode()
-            encoding = "base64"
-            is_binary = True
-        
-        self._audit("cat", file_path, "ok", {"size": target.stat().st_size, "encoding": encoding})
-        return {
-            "status": "ok",
-            "path": str(target.relative_to(self.root)),
-            "content": content,
-            "encoding": encoding,
-            "is_binary": is_binary,
-            "size": target.stat().st_size
-        }
-    
-    def upload_file(self, file_content: bytes, target_path: str, 
-                filename: str = None, chunk_id: int = None,
-                total_chunks: int = None) -> dict:
-        """
-        上传文件 (支持分块)
-        :param chunk_id: 分块索引 (0~N-1), None 表示完整上传
-        :param total_chunks: 总分块数
-        """
-        target = self._safe_path(target_path)
-        if target.is_dir():
+            O0_var_175 = base64.b64encode(O0_var_174.read_bytes()).decode()
+            O0_var_176 = codecs.decode('\\u0062\\u0061\\u0073\\u0065\\u0036\\u0034', 'unicode_escape')
+            O0_var_177 = True
+        self._audit(codecs.decode('\\u0063\\u0061\\u0074', 'unicode_escape'), file_path, codecs.decode('\\u006f\\u006b', 'unicode_escape'), {codecs.decode('\\u0073\\u0069\\u007a\\u0065', 'unicode_escape'): O0_var_174.stat().st_size, codecs.decode('\\u0065\\u006e\\u0063\\u006f\\u0064\\u0069\\u006e\\u0067', 'unicode_escape'): O0_var_176})
+        return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape'), codecs.decode('\\u0070\\u0061\\u0074\\u0068', 'unicode_escape'): str(O0_var_174.relative_to(self.O0_fn_31)), codecs.decode('\\u0063\\u006f\\u006e\\u0074\\u0065\\u006e\\u0074', 'unicode_escape'): O0_var_175, codecs.decode('\\u0065\\u006e\\u0063\\u006f\\u0064\\u0069\\u006e\\u0067', 'unicode_escape'): O0_var_176, codecs.decode('\\u0069\\u0073\\u005f\\u0062\\u0069\\u006e\\u0061\\u0072\\u0079', 'unicode_escape'): O0_var_177, codecs.decode('\\u0073\\u0069\\u007a\\u0065', 'unicode_escape'): O0_var_174.stat().st_size}
+
+    def upload_file(self, file_content: bytes, target_path: str, filename: str=None, chunk_id: int=None, total_chunks: int=None) -> dict:
+        O0_var_178 = self._safe_path(target_path)
+        if O0_var_178.is_dir():
             if not filename:
-                raise HTTPException(400, "filename required for directory upload")
-            target = target / filename
-        
-        # 完整上传模式的大小检查
+                raise HTTPException(400, codecs.decode('\\u0066\\u0069\\u006c\\u0065\\u006e\\u0061\\u006d\\u0065\\u0020\\u0072\\u0065\\u0071\\u0075\\u0069\\u0072\\u0065\\u0064\\u0020\\u0066\\u006f\\u0072\\u0020\\u0064\\u0069\\u0072\\u0065\\u0063\\u0074\\u006f\\u0072\\u0079\\u0020\\u0075\\u0070\\u006c\\u006f\\u0061\\u0064', 'unicode_escape'))
+            O0_var_178 = O0_var_178 / filename
         if len(file_content) > self.max_upload and chunk_id is None:
-            raise HTTPException(413, f"File too large: use chunked upload")
-        
+            raise HTTPException(413, codecs.decode('\\u0046\\u0069\\u006c\\u0065\\u0020\\u0074\\u006f\\u006f\\u0020\\u006c\\u0061\\u0072\\u0067\\u0065\\u003a\\u0020\\u0075\\u0073\\u0065\\u0020\\u0063\\u0068\\u0075\\u006e\\u006b\\u0065\\u0064\\u0020\\u0075\\u0070\\u006c\\u006f\\u0061\\u0064', 'unicode_escape'))
         try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            
+            O0_var_178.parent.mkdir(parents=True, exist_ok=True)
             if chunk_id is not None and total_chunks is not None:
-                # 【优化1】将路径扁平化并哈希，防止子目录导致的 FileNotFoundError
-                safe_prefix = hashlib.md5(target.as_posix().encode()).hexdigest()
-                
-                # 确保临时分块目录存在
+                O0_var_179 = hashlib.md5(O0_var_178.as_posix().encode()).hexdigest()
                 self.chunk_dir.mkdir(parents=True, exist_ok=True)
-                chunk_file = self.chunk_dir / f"{safe_prefix}.chunk.{chunk_id}"
-                
-                with open(chunk_file, 'wb') as f:
-                    f.write(file_content)
-                
-                # 检查是否所有分块已到达
-                received = list(self.chunk_dir.glob(f"{safe_prefix}.chunk.*"))
-                if len(received) == total_chunks:
-                    # 【优化2】防并发冲突：通过创建锁文件来确保只有一个请求能执行合并
-                    lock_file = self.chunk_dir / f"{safe_prefix}.lock"
+                O0_var_180 = self.chunk_dir / (str(O0_var_179) + codecs.decode('\\u002e\\u0063\\u0068\\u0075\\u006e\\u006b\\u002e', 'unicode_escape') + str(chunk_id))
+                with open(O0_var_180, codecs.decode('\\u0077\\u0062', 'unicode_escape')) as O0_var_181:
+                    O0_var_181.write(file_content)
+                O0_var_182 = list(self.chunk_dir.glob(str(O0_var_179) + codecs.decode('\\u002e\\u0063\\u0068\\u0075\\u006e\\u006b\\u002e\\u002a', 'unicode_escape')))
+                if len(O0_var_182) == total_chunks:
+                    O0_var_183 = self.chunk_dir / (str(O0_var_179) + codecs.decode('\\u002e\\u006c\\u006f\\u0063\\u006b', 'unicode_escape'))
                     try:
-                        # 尝试独占创建锁文件 (如果文件已存在会抛出 FileExistsError)
-                        with open(lock_file, 'x'):
+                        with open(O0_var_183, codecs.decode('\\u0078', 'unicode_escape')):
                             pass
                     except FileExistsError:
-                        # 锁已存在，说明其他线程正在合并，当前线程直接返回 pending
-                        return {"status": "pending", "received": len(received), "total": total_chunks, "msg": "merging in progress"}
-
+                        return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0070\\u0065\\u006e\\u0064\\u0069\\u006e\\u0067', 'unicode_escape'), codecs.decode('\\u0072\\u0065\\u0063\\u0065\\u0069\\u0076\\u0065\\u0064', 'unicode_escape'): len(O0_var_182), codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c', 'unicode_escape'): total_chunks, codecs.decode('\\u006d\\u0073\\u0067', 'unicode_escape'): codecs.decode('\\u006d\\u0065\\u0072\\u0067\\u0069\\u006e\\u0067\\u0020\\u0069\\u006e\\u0020\\u0070\\u0072\\u006f\\u0067\\u0072\\u0065\\u0073\\u0073', 'unicode_escape')}
                     try:
-                        # 开始安全合并
-                        with open(target, 'wb') as outf:
-                            for i in range(total_chunks):
-                                cf = self.chunk_dir / f"{safe_prefix}.chunk.{i}"
-                                with open(cf, 'rb') as inf:
-                                    outf.write(inf.read())
-                                cf.unlink()  # 清理临时分块
-                                
-                        self._audit("upload_chunked", str(target), "merged", 
-                                   {"chunks": total_chunks, "size": target.stat().st_size})
-                        return {"status": "ok", "path": str(target.relative_to(self.root)), "chunked": True}
+                        with open(O0_var_178, codecs.decode('\\u0077\\u0062', 'unicode_escape')) as O0_var_184:
+                            for O0_var_185 in range(total_chunks):
+                                O0_var_186 = self.chunk_dir / (str(O0_var_179) + codecs.decode('\\u002e\\u0063\\u0068\\u0075\\u006e\\u006b\\u002e', 'unicode_escape') + str(O0_var_185))
+                                with open(O0_var_186, codecs.decode('\\u0072\\u0062', 'unicode_escape')) as O0_var_187:
+                                    O0_var_184.write(O0_var_187.read())
+                                O0_var_186.unlink()
+                        self._audit(codecs.decode('\\u0075\\u0070\\u006c\\u006f\\u0061\\u0064\\u005f\\u0063\\u0068\\u0075\\u006e\\u006b\\u0065\\u0064', 'unicode_escape'), str(O0_var_178), codecs.decode('\\u006d\\u0065\\u0072\\u0067\\u0065\\u0064', 'unicode_escape'), {codecs.decode('\\u0063\\u0068\\u0075\\u006e\\u006b\\u0073', 'unicode_escape'): total_chunks, codecs.decode('\\u0073\\u0069\\u007a\\u0065', 'unicode_escape'): O0_var_178.stat().st_size})
+                        return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape'), codecs.decode('\\u0070\\u0061\\u0074\\u0068', 'unicode_escape'): str(O0_var_178.relative_to(self.O0_fn_31)), codecs.decode('\\u0063\\u0068\\u0075\\u006e\\u006b\\u0065\\u0064', 'unicode_escape'): True}
                     finally:
-                        # 确保合并完成后清理锁文件
-                        if lock_file.exists():
-                            lock_file.unlink()
+                        if O0_var_183.exists():
+                            O0_var_183.unlink()
                 else:
-                    return {"status": "pending", "received": len(received), "total": total_chunks}
-                    
+                    return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0070\\u0065\\u006e\\u0064\\u0069\\u006e\\u0067', 'unicode_escape'), codecs.decode('\\u0072\\u0065\\u0063\\u0065\\u0069\\u0076\\u0065\\u0064', 'unicode_escape'): len(O0_var_182), codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c', 'unicode_escape'): total_chunks}
             else:
-                # 完整上传模式
-                with open(target, 'wb') as f:
-                    f.write(file_content)
-                self._audit("upload", str(target), "ok", {"size": len(file_content)})
-                return {"status": "ok", "path": str(target.relative_to(self.root))}
-                
+                with open(O0_var_178, codecs.decode('\\u0077\\u0062', 'unicode_escape')) as O0_var_181:
+                    O0_var_181.write(file_content)
+                self._audit(codecs.decode('\\u0075\\u0070\\u006c\\u006f\\u0061\\u0064', 'unicode_escape'), str(O0_var_178), codecs.decode('\\u006f\\u006b', 'unicode_escape'), {codecs.decode('\\u0073\\u0069\\u007a\\u0065', 'unicode_escape'): len(file_content)})
+                return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape'), codecs.decode('\\u0070\\u0061\\u0074\\u0068', 'unicode_escape'): str(O0_var_178.relative_to(self.O0_fn_31))}
         except PermissionError:
-            raise HTTPException(403, "Permission denied")
+            raise HTTPException(403, codecs.decode('\\u0050\\u0065\\u0072\\u006d\\u0069\\u0073\\u0073\\u0069\\u006f\\u006e\\u0020\\u0064\\u0065\\u006e\\u0069\\u0065\\u0064', 'unicode_escape'))
         except Exception as e:
-            raise HTTPException(500, f"Upload failed: {e}")
-    
+            raise HTTPException(500, codecs.decode('\\u0055\\u0070\\u006c\\u006f\\u0061\\u0064\\u0020\\u0066\\u0061\\u0069\\u006c\\u0065\\u0064\\u003a\\u0020', 'unicode_escape') + str(e))
+
     def download_file(self, file_path: str) -> tuple:
-        """准备下载: 返回 (Path, MIME类型, 大小)"""
-        target = self._safe_path(file_path)
-        if not target.exists():
-            raise HTTPException(404, f"Not found: {file_path}")
-        if not target.is_file():
-            raise HTTPException(400, f"Not a file: {file_path}")
-        
-        mime, _ = mimetypes.guess_type(str(target))
-        self._audit("download", str(target), "ok", {"size": target.stat().st_size})
-        return target, mime or "application/octet-stream", target.stat().st_size
-    
-    def delete_paths(self, paths: List[str]) -> dict:
-        """批量删除文件/目录"""
-        results = []
-        for p in paths:
-            try:
-                target = self._safe_path(p)
-                if not target.exists():
-                    results.append({"path": p, "status": "not_found"})
-                    continue
-                if target.is_dir():
-                    shutil.rmtree(target)
-                else:
-                    target.unlink()
-                results.append({"path": p, "status": "deleted"})
-                self._audit("delete", p, "ok")
-            except HTTPException as e:
-                results.append({"path": p, "status": "error", "error": str(e.detail)})
-            except Exception as e:
-                results.append({"path": p, "status": "error", "error": str(e)})
-        
-        return {"status": "ok", "results": results}
-    
-    # 在 FileManager 类中添加:
+        O0_var_188 = self._safe_path(file_path)
+        if not O0_var_188.exists():
+            raise HTTPException(404, codecs.decode('\\u004e\\u006f\\u0074\\u0020\\u0066\\u006f\\u0075\\u006e\\u0064\\u003a\\u0020', 'unicode_escape') + str(file_path))
+        if not O0_var_188.is_file():
+            raise HTTPException(400, codecs.decode('\\u004e\\u006f\\u0074\\u0020\\u0061\\u0020\\u0066\\u0069\\u006c\\u0065\\u003a\\u0020', 'unicode_escape') + str(file_path))
+        O0_var_189, O0_var_190 = mimetypes.guess_type(str(O0_var_188))
+        self._audit(codecs.decode('\\u0064\\u006f\\u0077\\u006e\\u006c\\u006f\\u0061\\u0064', 'unicode_escape'), str(O0_var_188), codecs.decode('\\u006f\\u006b', 'unicode_escape'), {codecs.decode('\\u0073\\u0069\\u007a\\u0065', 'unicode_escape'): O0_var_188.stat().st_size})
+        return (O0_var_188, O0_var_189 or codecs.decode('\\u0061\\u0070\\u0070\\u006c\\u0069\\u0063\\u0061\\u0074\\u0069\\u006f\\u006e\\u002f\\u006f\\u0063\\u0074\\u0065\\u0074\\u002d\\u0073\\u0074\\u0072\\u0065\\u0061\\u006d', 'unicode_escape'), O0_var_188.stat().st_size)
 
-    def move_paths(self, move_map: Dict[str, str]) -> dict:
-        """
-        批量移动/重命名文件/目录
-        :param move_map: {"src_path1": "dst_path1", "src_path2": "dst_path2", ...}
-        :return: {"status": "ok", "results": [{"from": "...", "to": "...", "status": "ok/error"}]}
-        """
-        results = []
-        
-        for src, dst in move_map.items():
+    def delete_paths(self, O0_var_191: List[str]) -> dict:
+        O0_var_192 = []
+        for O0_var_193 in O0_var_191:
             try:
-                src_path = self._safe_path(src)
-                dst_path = self._safe_path(dst)
-                
-                if not src_path.exists():
-                    results.append({"from": src, "to": dst, "status": "error", "error": "Source not found"})
+                O0_var_194 = self._safe_path(O0_var_193)
+                if not O0_var_194.exists():
+                    O0_var_192.append({codecs.decode('\\u0070\\u0061\\u0074\\u0068', 'unicode_escape'): O0_var_193, codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006e\\u006f\\u0074\\u005f\\u0066\\u006f\\u0075\\u006e\\u0064', 'unicode_escape')})
                     continue
-                if dst_path.exists():
-                    results.append({"from": src, "to": dst, "status": "error", "error": "Destination exists"})
-                    continue
-                
-                # 确保目标父目录存在
-                dst_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(src_path), str(dst_path))
-                
-                results.append({
-                    "from": str(src_path.relative_to(self.root)),
-                    "to": str(dst_path.relative_to(self.root)),
-                    "status": "ok"
-                })
-                self._audit("move_batch", f"{src} -> {dst}", "ok")
-                
-            except HTTPException as e:
-                results.append({"from": src, "to": dst, "status": "error", "error": str(e.detail)})
-            except Exception as e:
-                results.append({"from": src, "to": dst, "status": "error", "error": str(e)})
-        
-        success_count = sum(1 for r in results if r["status"] == "ok")
-        self._audit("move_batch", str(list(move_map.keys())), "completed", 
-                   {"total": len(move_map), "success": success_count})
-        
-        return {
-            "status": "ok" if success_count > 0 else "failed",
-            "total": len(move_map),
-            "success": success_count,
-            "results": results
-        }
-    # 在 FileManager 类中添加:
-    def copy_paths(self, copy_map: Dict[str, str]) -> dict:
-        """
-        批量复制文件/目录
-        :param copy_map: {"src_path1": "dst_path1", "src_path2": "dst_path2", ...}
-        :return: {"status": "ok", "results": [{"from": "...", "to": "...", "status": "ok/error"}]}
-        """
-        results = []
-        
-        for src, dst in copy_map.items():
-            try:
-                src_path = self._safe_path(src)
-                dst_path = self._safe_path(dst)
-                
-                if not src_path.exists():
-                    results.append({"from": src, "to": dst, "status": "error", "error": "Source not found"})
-                    continue
-                
-                # 如果目标是目录，则复制到该目录下 (保持原文件名)
-                if dst_path.is_dir():
-                    dst_path = dst_path / src_path.name
-                
-                # 目标已存在则跳过 (与 move_paths 保持一致的保守策略)
-                if dst_path.exists():
-                    results.append({"from": src, "to": dst, "status": "error", "error": "Destination exists"})
-                    continue
-                
-                # 确保目标父目录存在
-                dst_path.parent.mkdir(parents=True, exist_ok=True)
-                
-                # 执行复制: 文件用 copy2 (保留元数据), 目录用 copytree
-                if src_path.is_file():
-                    shutil.copy2(str(src_path), str(dst_path))
+                if O0_var_194.is_dir():
+                    shutil.rmtree(O0_var_194)
                 else:
-                    shutil.copytree(str(src_path), str(dst_path))
-                
-                results.append({
-                    "from": str(src_path.relative_to(self.root)),
-                    "to": str(dst_path.relative_to(self.root)),
-                    "status": "ok"
-                })
-                self._audit("copy_batch", f"{src} -> {dst}", "ok")
-                
+                    O0_var_194.unlink()
+                O0_var_192.append({codecs.decode('\\u0070\\u0061\\u0074\\u0068', 'unicode_escape'): O0_var_193, codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0064\\u0065\\u006c\\u0065\\u0074\\u0065\\u0064', 'unicode_escape')})
+                self._audit(codecs.decode('\\u0064\\u0065\\u006c\\u0065\\u0074\\u0065', 'unicode_escape'), O0_var_193, codecs.decode('\\u006f\\u006b', 'unicode_escape'))
             except HTTPException as e:
-                results.append({"from": src, "to": dst, "status": "error", "error": str(e.detail)})
+                O0_var_192.append({codecs.decode('\\u0070\\u0061\\u0074\\u0068', 'unicode_escape'): O0_var_193, codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'), codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'): str(e.detail)})
             except Exception as e:
-                results.append({"from": src, "to": dst, "status": "error", "error": str(e)})
-        
-        success_count = sum(1 for r in results if r["status"] == "ok")
-        self._audit("copy_batch", str(list(copy_map.keys())), "completed", 
-                   {"total": len(copy_map), "success": success_count})
-        
-        return {
-            "status": "ok" if success_count > 0 else "failed",
-            "total": len(copy_map),
-            "success": success_count,
-            "results": results
-        }
+                O0_var_192.append({codecs.decode('\\u0070\\u0061\\u0074\\u0068', 'unicode_escape'): O0_var_193, codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'), codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'): str(e)})
+        return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape'), codecs.decode('\\u0072\\u0065\\u0073\\u0075\\u006c\\u0074\\u0073', 'unicode_escape'): O0_var_192}
 
-    def _parse_mode(self, mode_str: str) -> int:
-        """
-        解析权限模式字符串为 octal int
-        支持: "755", "0755", "rwxr-xr-x", "u+x", "a-w"
-        """
-        mode_str = mode_str.strip()
-        
-        # 1. 纯数字模式 (八进制)
-        if mode_str.isdigit() or (mode_str.startswith('0') and mode_str[1:].isdigit()):
-            return int(mode_str, 8)
-        
-        # 2. 符号模式 (rwxr-xr-x)
-        if len(mode_str) == 9 and all(c in 'rwxStT-' for c in mode_str):
-            mode = 0
-            perm_map = {'r': 4, 'w': 2, 'x': 1, 'S': 0, 's': 1, 'T': 0, 't': 1, '-': 0}
-            for i, c in enumerate(mode_str):
-                if c in perm_map:
-                    shift = 2 - (i % 3)
-                    mode |= perm_map[c] << (6 - i // 3 * 3 + shift)
-            return mode
-        
-        # 3. 符号操作模式 (u+x, g-w, o=r, a+rwx)
-        if any(op in mode_str for op in ['=', '+', '-']) and any(who in mode_str for who in ['u', 'g', 'o', 'a']):
-            # 简化实现: 先获取当前权限，再应用操作
-            # 生产环境建议使用 `stat` 模块完整解析
-            raise ValueError(f"Symbolic mode '{mode_str}' not fully supported yet, use octal like '755'")
-        
-        raise ValueError(f"Invalid mode format: '{mode_str}'. Use '755', '0644', or 'rwxr-xr-x'")
-
-    def set_authority(self, perm_map: Dict[str, str], recursive: bool = False) -> dict:
-        """
-        批量设置文件/目录权限
-        :param perm_map: {"path1": "755", "path2": "644", ...}
-        :param recursive: 是否递归应用到子目录
-        :return: {"status": "ok", "results": [{"path": "...", "mode": "755", "status": "ok/error"}]}
-        """
-        results = []
-        
-        for path, mode_str in perm_map.items():
+    def move_paths(self, O0_var_195: Dict[str, str]) -> dict:
+        O0_var_196 = []
+        for O0_var_197, O0_var_198 in O0_var_195.items():
             try:
-                target = self._safe_path(path)
-                if not target.exists():
-                    results.append({"path": path, "status": "error", "error": "Not found"})
+                O0_var_199 = self._safe_path(O0_var_197)
+                O0_var_200 = self._safe_path(O0_var_198)
+                if not O0_var_199.exists():
+                    O0_var_196.append({codecs.decode('\\u0066\\u0072\\u006f\\u006d', 'unicode_escape'): O0_var_197, codecs.decode('\\u0074\\u006f', 'unicode_escape'): O0_var_198, codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'), codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'): codecs.decode('\\u0053\\u006f\\u0075\\u0072\\u0063\\u0065\\u0020\\u006e\\u006f\\u0074\\u0020\\u0066\\u006f\\u0075\\u006e\\u0064', 'unicode_escape')})
                     continue
-                
-                # 解析权限模式
-                mode = self._parse_mode(mode_str)
-                
-                # 设置权限
-                if recursive and target.is_dir():
-                    for root, dirs, files in os.walk(target):
-                        os.chmod(root, mode)
-                        for d in dirs:
-                            os.chmod(os.path.join(root, d), mode)
-                        for f in files:
-                            os.chmod(os.path.join(root, f), mode)
-                else:
-                    os.chmod(target, mode)
-                
-                # 获取设置后的实际权限
-                new_mode = stat.filemode(target.stat().st_mode)
-                results.append({
-                    "path": str(target.relative_to(self.root)),
-                    "requested": mode_str,
-                    "applied": new_mode,
-                    "mode_octal": oct(stat.S_IMODE(target.stat().st_mode)),
-                    "status": "ok"
-                })
-                self._audit("chmod", path, "ok", {"mode": mode_str, "recursive": recursive})
-                
+                if O0_var_200.exists():
+                    O0_var_196.append({codecs.decode('\\u0066\\u0072\\u006f\\u006d', 'unicode_escape'): O0_var_197, codecs.decode('\\u0074\\u006f', 'unicode_escape'): O0_var_198, codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'), codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'): codecs.decode('\\u0044\\u0065\\u0073\\u0074\\u0069\\u006e\\u0061\\u0074\\u0069\\u006f\\u006e\\u0020\\u0065\\u0078\\u0069\\u0073\\u0074\\u0073', 'unicode_escape')})
+                    continue
+                O0_var_200.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(O0_var_199), str(O0_var_200))
+                O0_var_196.append({codecs.decode('\\u0066\\u0072\\u006f\\u006d', 'unicode_escape'): str(O0_var_199.relative_to(self.O0_fn_31)), codecs.decode('\\u0074\\u006f', 'unicode_escape'): str(O0_var_200.relative_to(self.O0_fn_31)), codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape')})
+                self._audit(codecs.decode('\\u006d\\u006f\\u0076\\u0065\\u005f\\u0062\\u0061\\u0074\\u0063\\u0068', 'unicode_escape'), str(O0_var_197) + codecs.decode('\\u0020\\u002d\\u003e\\u0020', 'unicode_escape') + str(O0_var_198), codecs.decode('\\u006f\\u006b', 'unicode_escape'))
             except HTTPException as e:
-                results.append({"path": path, "status": "error", "error": str(e.detail)})
+                O0_var_196.append({codecs.decode('\\u0066\\u0072\\u006f\\u006d', 'unicode_escape'): O0_var_197, codecs.decode('\\u0074\\u006f', 'unicode_escape'): O0_var_198, codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'), codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'): str(e.detail)})
+            except Exception as e:
+                O0_var_196.append({codecs.decode('\\u0066\\u0072\\u006f\\u006d', 'unicode_escape'): O0_var_197, codecs.decode('\\u0074\\u006f', 'unicode_escape'): O0_var_198, codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'), codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'): str(e)})
+        O0_var_201 = sum((1 for O0_var_202 in O0_var_196 if O0_var_202[codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape')] == codecs.decode('\\u006f\\u006b', 'unicode_escape')))
+        self._audit(codecs.decode('\\u006d\\u006f\\u0076\\u0065\\u005f\\u0062\\u0061\\u0074\\u0063\\u0068', 'unicode_escape'), str(list(O0_var_195.keys())), codecs.decode('\\u0063\\u006f\\u006d\\u0070\\u006c\\u0065\\u0074\\u0065\\u0064', 'unicode_escape'), {codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c', 'unicode_escape'): len(O0_var_195), codecs.decode('\\u0073\\u0075\\u0063\\u0063\\u0065\\u0073\\u0073', 'unicode_escape'): O0_var_201})
+        return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape') if O0_var_201 > 0 else codecs.decode('\\u0066\\u0061\\u0069\\u006c\\u0065\\u0064', 'unicode_escape'), codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c', 'unicode_escape'): len(O0_var_195), codecs.decode('\\u0073\\u0075\\u0063\\u0063\\u0065\\u0073\\u0073', 'unicode_escape'): O0_var_201, codecs.decode('\\u0072\\u0065\\u0073\\u0075\\u006c\\u0074\\u0073', 'unicode_escape'): O0_var_196}
+
+    def copy_paths(self, O0_var_203: Dict[str, str]) -> dict:
+        O0_var_204 = []
+        for O0_var_205, O0_var_206 in O0_var_203.items():
+            try:
+                O0_var_207 = self._safe_path(O0_var_205)
+                O0_var_208 = self._safe_path(O0_var_206)
+                if not O0_var_207.exists():
+                    O0_var_204.append({codecs.decode('\\u0066\\u0072\\u006f\\u006d', 'unicode_escape'): O0_var_205, codecs.decode('\\u0074\\u006f', 'unicode_escape'): O0_var_206, codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'), codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'): codecs.decode('\\u0053\\u006f\\u0075\\u0072\\u0063\\u0065\\u0020\\u006e\\u006f\\u0074\\u0020\\u0066\\u006f\\u0075\\u006e\\u0064', 'unicode_escape')})
+                    continue
+                if O0_var_208.is_dir():
+                    O0_var_208 = O0_var_208 / O0_var_207.name
+                if O0_var_208.exists():
+                    O0_var_204.append({codecs.decode('\\u0066\\u0072\\u006f\\u006d', 'unicode_escape'): O0_var_205, codecs.decode('\\u0074\\u006f', 'unicode_escape'): O0_var_206, codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'), codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'): codecs.decode('\\u0044\\u0065\\u0073\\u0074\\u0069\\u006e\\u0061\\u0074\\u0069\\u006f\\u006e\\u0020\\u0065\\u0078\\u0069\\u0073\\u0074\\u0073', 'unicode_escape')})
+                    continue
+                O0_var_208.parent.mkdir(parents=True, exist_ok=True)
+                if O0_var_207.is_file():
+                    shutil.copy2(str(O0_var_207), str(O0_var_208))
+                else:
+                    shutil.copytree(str(O0_var_207), str(O0_var_208))
+                O0_var_204.append({codecs.decode('\\u0066\\u0072\\u006f\\u006d', 'unicode_escape'): str(O0_var_207.relative_to(self.O0_fn_31)), codecs.decode('\\u0074\\u006f', 'unicode_escape'): str(O0_var_208.relative_to(self.O0_fn_31)), codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape')})
+                self._audit(codecs.decode('\\u0063\\u006f\\u0070\\u0079\\u005f\\u0062\\u0061\\u0074\\u0063\\u0068', 'unicode_escape'), str(O0_var_205) + codecs.decode('\\u0020\\u002d\\u003e\\u0020', 'unicode_escape') + str(O0_var_206), codecs.decode('\\u006f\\u006b', 'unicode_escape'))
+            except HTTPException as e:
+                O0_var_204.append({codecs.decode('\\u0066\\u0072\\u006f\\u006d', 'unicode_escape'): O0_var_205, codecs.decode('\\u0074\\u006f', 'unicode_escape'): O0_var_206, codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'), codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'): str(e.detail)})
+            except Exception as e:
+                O0_var_204.append({codecs.decode('\\u0066\\u0072\\u006f\\u006d', 'unicode_escape'): O0_var_205, codecs.decode('\\u0074\\u006f', 'unicode_escape'): O0_var_206, codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'), codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'): str(e)})
+        O0_var_209 = sum((1 for O0_var_210 in O0_var_204 if O0_var_210[codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape')] == codecs.decode('\\u006f\\u006b', 'unicode_escape')))
+        self._audit(codecs.decode('\\u0063\\u006f\\u0070\\u0079\\u005f\\u0062\\u0061\\u0074\\u0063\\u0068', 'unicode_escape'), str(list(O0_var_203.keys())), codecs.decode('\\u0063\\u006f\\u006d\\u0070\\u006c\\u0065\\u0074\\u0065\\u0064', 'unicode_escape'), {codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c', 'unicode_escape'): len(O0_var_203), codecs.decode('\\u0073\\u0075\\u0063\\u0063\\u0065\\u0073\\u0073', 'unicode_escape'): O0_var_209})
+        return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape') if O0_var_209 > 0 else codecs.decode('\\u0066\\u0061\\u0069\\u006c\\u0065\\u0064', 'unicode_escape'), codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c', 'unicode_escape'): len(O0_var_203), codecs.decode('\\u0073\\u0075\\u0063\\u0063\\u0065\\u0073\\u0073', 'unicode_escape'): O0_var_209, codecs.decode('\\u0072\\u0065\\u0073\\u0075\\u006c\\u0074\\u0073', 'unicode_escape'): O0_var_204}
+
+    def _parse_mode(self, O0_var_211: str) -> int:
+        O0_var_211 = O0_var_211.strip()
+        if O0_var_211.isdigit() or (O0_var_211.startswith(codecs.decode('\\u0030', 'unicode_escape')) and O0_var_211[1:].isdigit()):
+            return int(O0_var_211, 8)
+        if len(O0_var_211) == 9 and all((O0_var_212 in codecs.decode('\\u0072\\u0077\\u0078\\u0053\\u0074\\u0054\\u002d', 'unicode_escape') for O0_var_212 in O0_var_211)):
+            O0_var_213 = 0
+            O0_var_214 = {codecs.decode('\\u0072', 'unicode_escape'): 4, codecs.decode('\\u0077', 'unicode_escape'): 2, codecs.decode('\\u0078', 'unicode_escape'): 1, codecs.decode('\\u0053', 'unicode_escape'): 0, codecs.decode('\\u0073', 'unicode_escape'): 1, codecs.decode('\\u0054', 'unicode_escape'): 0, codecs.decode('\\u0074', 'unicode_escape'): 1, codecs.decode('\\u002d', 'unicode_escape'): 0}
+            for O0_var_215, O0_var_216 in enumerate(O0_var_211):
+                if O0_var_216 in O0_var_214:
+                    O0_var_217 = 2 - O0_var_215 % 3
+                    O0_var_213 |= O0_var_214[O0_var_216] << 6 - O0_var_215 // 3 * 3 + O0_var_217
+            return O0_var_213
+        if any((O0_var_218 in O0_var_211 for O0_var_218 in [codecs.decode('\\u003d', 'unicode_escape'), codecs.decode('\\u002b', 'unicode_escape'), codecs.decode('\\u002d', 'unicode_escape')])) and any((O0_var_219 in O0_var_211 for O0_var_219 in [codecs.decode('\\u0075', 'unicode_escape'), codecs.decode('\\u0067', 'unicode_escape'), codecs.decode('\\u006f', 'unicode_escape'), codecs.decode('\\u0061', 'unicode_escape')])):
+            raise ValueError(codecs.decode('\\u0053\\u0079\\u006d\\u0062\\u006f\\u006c\\u0069\\u0063\\u0020\\u006d\\u006f\\u0064\\u0065\\u0020\\u0027', 'unicode_escape') + str(O0_var_211) + codecs.decode('\\u0027\\u0020\\u006e\\u006f\\u0074\\u0020\\u0066\\u0075\\u006c\\u006c\\u0079\\u0020\\u0073\\u0075\\u0070\\u0070\\u006f\\u0072\\u0074\\u0065\\u0064\\u0020\\u0079\\u0065\\u0074\\u002c\\u0020\\u0075\\u0073\\u0065\\u0020\\u006f\\u0063\\u0074\\u0061\\u006c\\u0020\\u006c\\u0069\\u006b\\u0065\\u0020\\u0027\\u0037\\u0035\\u0035\\u0027', 'unicode_escape'))
+        raise ValueError(codecs.decode('\\u0049\\u006e\\u0076\\u0061\\u006c\\u0069\\u0064\\u0020\\u006d\\u006f\\u0064\\u0065\\u0020\\u0066\\u006f\\u0072\\u006d\\u0061\\u0074\\u003a\\u0020\\u0027', 'unicode_escape') + str(O0_var_211) + codecs.decode('\\u0027\\u002e\\u0020\\u0055\\u0073\\u0065\\u0020\\u0027\\u0037\\u0035\\u0035\\u0027\\u002c\\u0020\\u0027\\u0030\\u0036\\u0034\\u0034\\u0027\\u002c\\u0020\\u006f\\u0072\\u0020\\u0027\\u0072\\u0077\\u0078\\u0072\\u002d\\u0078\\u0072\\u002d\\u0078\\u0027', 'unicode_escape'))
+
+    def set_authority(self, O0_var_220: Dict[str, str], recursive: bool=False) -> dict:
+        O0_var_221 = []
+        for O0_var_222, O0_var_223 in O0_var_220.items():
+            try:
+                O0_var_224 = self._safe_path(O0_var_222)
+                if not O0_var_224.exists():
+                    O0_var_221.append({codecs.decode('\\u0070\\u0061\\u0074\\u0068', 'unicode_escape'): O0_var_222, codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'), codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'): codecs.decode('\\u004e\\u006f\\u0074\\u0020\\u0066\\u006f\\u0075\\u006e\\u0064', 'unicode_escape')})
+                    continue
+                O0_var_225 = self._parse_mode(O0_var_223)
+                if recursive and O0_var_224.is_dir():
+                    for O0_var_226, O0_var_227, O0_var_228 in os.walk(O0_var_224):
+                        os.chmod(O0_var_226, O0_var_225)
+                        for O0_var_229 in O0_var_227:
+                            os.chmod(os.path.join(O0_var_226, O0_var_229), O0_var_225)
+                        for O0_var_230 in O0_var_228:
+                            os.chmod(os.path.join(O0_var_226, O0_var_230), O0_var_225)
+                else:
+                    os.chmod(O0_var_224, O0_var_225)
+                O0_var_231 = stat.filemode(O0_var_224.stat().st_mode)
+                O0_var_221.append({codecs.decode('\\u0070\\u0061\\u0074\\u0068', 'unicode_escape'): str(O0_var_224.relative_to(self.O0_fn_31)), codecs.decode('\\u0072\\u0065\\u0071\\u0075\\u0065\\u0073\\u0074\\u0065\\u0064', 'unicode_escape'): O0_var_223, codecs.decode('\\u0061\\u0070\\u0070\\u006c\\u0069\\u0065\\u0064', 'unicode_escape'): O0_var_231, codecs.decode('\\u006d\\u006f\\u0064\\u0065\\u005f\\u006f\\u0063\\u0074\\u0061\\u006c', 'unicode_escape'): oct(stat.S_IMODE(O0_var_224.stat().st_mode)), codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape')})
+                self._audit(codecs.decode('\\u0063\\u0068\\u006d\\u006f\\u0064', 'unicode_escape'), O0_var_222, codecs.decode('\\u006f\\u006b', 'unicode_escape'), {codecs.decode('\\u006d\\u006f\\u0064\\u0065', 'unicode_escape'): O0_var_223, codecs.decode('\\u0072\\u0065\\u0063\\u0075\\u0072\\u0073\\u0069\\u0076\\u0065', 'unicode_escape'): recursive})
+            except HTTPException as e:
+                O0_var_221.append({codecs.decode('\\u0070\\u0061\\u0074\\u0068', 'unicode_escape'): O0_var_222, codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'), codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'): str(e.detail)})
             except ValueError as e:
-                results.append({"path": path, "status": "error", "error": str(e)})
+                O0_var_221.append({codecs.decode('\\u0070\\u0061\\u0074\\u0068', 'unicode_escape'): O0_var_222, codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'), codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'): str(e)})
             except PermissionError:
-                results.append({"path": path, "status": "error", "error": "Permission denied"})
+                O0_var_221.append({codecs.decode('\\u0070\\u0061\\u0074\\u0068', 'unicode_escape'): O0_var_222, codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'), codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'): codecs.decode('\\u0050\\u0065\\u0072\\u006d\\u0069\\u0073\\u0073\\u0069\\u006f\\u006e\\u0020\\u0064\\u0065\\u006e\\u0069\\u0065\\u0064', 'unicode_escape')})
             except Exception as e:
-                results.append({"path": path, "status": "error", "error": f"{type(e).__name__}: {e}"})
-        
-        success_count = sum(1 for r in results if r["status"] == "ok")
-        return {
-            "status": "ok" if success_count > 0 else "failed",
-            "total": len(perm_map),
-            "success": success_count,
-            "results": results
-        }
-    def create_directory(self, dir_path: str) -> dict:
-        """新建目录"""
-        target = self._safe_path(dir_path)
-        if target.exists():
-            raise HTTPException(409, f"Exists: {dir_path}")
-        
+                O0_var_221.append({codecs.decode('\\u0070\\u0061\\u0074\\u0068', 'unicode_escape'): O0_var_222, codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'), codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'): str(type(e).__name__) + codecs.decode('\\u003a\\u0020', 'unicode_escape') + str(e)})
+        O0_var_232 = sum((1 for O0_var_233 in O0_var_221 if O0_var_233[codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape')] == codecs.decode('\\u006f\\u006b', 'unicode_escape')))
+        return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape') if O0_var_232 > 0 else codecs.decode('\\u0066\\u0061\\u0069\\u006c\\u0065\\u0064', 'unicode_escape'), codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c', 'unicode_escape'): len(O0_var_220), codecs.decode('\\u0073\\u0075\\u0063\\u0063\\u0065\\u0073\\u0073', 'unicode_escape'): O0_var_232, codecs.decode('\\u0072\\u0065\\u0073\\u0075\\u006c\\u0074\\u0073', 'unicode_escape'): O0_var_221}
+
+    def create_directory(self, O0_var_234: str) -> dict:
+        O0_var_235 = self._safe_path(O0_var_234)
+        if O0_var_235.exists():
+            raise HTTPException(409, codecs.decode('\\u0045\\u0078\\u0069\\u0073\\u0074\\u0073\\u003a\\u0020', 'unicode_escape') + str(O0_var_234))
         try:
-            target.mkdir(parents=True)
-            self._audit("mkdir", str(target), "ok")
-            return {"status": "ok", "path": str(target.relative_to(self.root))}
+            O0_var_235.mkdir(parents=True)
+            self._audit(codecs.decode('\\u006d\\u006b\\u0064\\u0069\\u0072', 'unicode_escape'), str(O0_var_235), codecs.decode('\\u006f\\u006b', 'unicode_escape'))
+            return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape'), codecs.decode('\\u0070\\u0061\\u0074\\u0068', 'unicode_escape'): str(O0_var_235.relative_to(self.O0_fn_31))}
         except Exception as e:
-            raise HTTPException(500, f"Mkdir failed: {e}")
-# ==================== 1. 解耦的 Noise 加密封装类 ====================
+            raise HTTPException(500, codecs.decode('\\u004d\\u006b\\u0064\\u0069\\u0072\\u0020\\u0066\\u0061\\u0069\\u006c\\u0065\\u0064\\u003a\\u0020', 'unicode_escape') + str(e))
+
 class NoiseSessionWrapper:
-    """
-    Noise Protocol 封装类 (黑盒状态机)
-    业务层无需关心底层的握手细节，直接调用对应方法即可。
-    """
-    def __init__(self, is_initiator: bool, local_priv_b64: str, expected_remote_pub_b64: str = None):
-        # 使用你指定的 XX 模式
-        self.noise = NoiseConnection.from_name(b"Noise_XX_25519_ChaChaPoly_BLAKE2s")
-        
-        # 服务端是被动响应方 (Responder)，客户端是主动发起方 (Initiator)
+    codecs.decode('\\u000a\\u0020\\u0020\\u0020\\u0020\\u004e\\u006f\\u0069\\u0073\\u0065\\u0020\\u0050\\u0072\\u006f\\u0074\\u006f\\u0063\\u006f\\u006c\\u0020\\u5c01\\u88c5\\u7c7b\\u0020\\u0028\\u9ed1\\u76d2\\u72b6\\u6001\\u673a\\u0029\\u000a\\u0020\\u0020\\u0020\\u0020\\u4e1a\\u52a1\\u5c42\\u65e0\\u9700\\u5173\\u5fc3\\u5e95\\u5c42\\u7684\\u63e1\\u624b\\u7ec6\\u8282\\uff0c\\u76f4\\u63a5\\u8c03\\u7528\\u5bf9\\u5e94\\u65b9\\u6cd5\\u5373\\u53ef\\u3002\\u000a\\u0020\\u0020\\u0020\\u0020', 'unicode_escape')
+
+    def __init__(self, is_initiator: bool, local_priv_b64: str, expected_remote_pub_b64: str=None):
+        self.noise = NoiseConnection.from_name(b'Noise_XX_25519_ChaChaPoly_BLAKE2s')
         if is_initiator:
             self.noise.set_as_initiator()
         else:
             self.noise.set_as_responder()
-
-        # 配置本地私钥 (32 bytes Raw)
         if local_priv_b64:
-            priv_bytes = base64.b64decode(local_priv_b64)
-            self.noise.set_keypair_from_private_bytes(Keypair.STATIC, priv_bytes)
-
+            O0_var_236 = base64.b64decode(local_priv_b64)
+            self.noise.set_keypair_from_private_bytes(Keypair.STATIC, O0_var_236)
         if expected_remote_pub_b64:
-            pub_bytes = base64.b64decode(expected_remote_pub_b64)
-            # This tells the library: "I expect the remote party to have this static key"
-            # It will automatically fail the handshake if it doesn't match.
-            self.noise.set_keypair_from_public_bytes(Keypair.REMOTE_STATIC, pub_bytes)
-        
-        # 可选：设置序言，防止跨协议重放攻击
-        self.noise.set_prologue(b"kisama_terminal_v1")
+            O0_var_237 = base64.b64decode(expected_remote_pub_b64)
+            self.noise.set_keypair_from_public_bytes(Keypair.REMOTE_STATIC, O0_var_237)
+        self.noise.set_prologue(b'kisama_terminal_v1')
         self.noise.start_handshake()
 
     @property
     def is_established(self) -> bool:
         return self.noise.handshake_finished
 
-    def process_handshake(self, payload: bytes) -> bytes:
-        """
-        处理握手包。
-        传入收到的 payload，返回需要发送给对方的回包。
-        如果返回空 bytes (b'')，说明不需要回包。
-        """
-        if payload:
-            self.noise.read_message(payload)
-            
+    def process_handshake(self, O0_var_238: bytes) -> bytes:
+        if O0_var_238:
+            self.noise.read_message(O0_var_238)
         if not self.noise.handshake_finished:
-            # 必须写出回包
             return self.noise.write_message(b'')
         else:
-            # 握手完成，验证客户端身份 (XX 模式下，客户端会在最后一步发来它的公钥)
             return b''
 
-    def encrypt(self, plaintext: bytes) -> bytes:
+    def encrypt(self, O0_var_239: bytes) -> bytes:
         if not self.is_established:
-            raise RuntimeError("握手未完成，无法加密数据")
-        return self.noise.encrypt(plaintext)
+            raise RuntimeError(codecs.decode('\\u63e1\\u624b\\u672a\\u5b8c\\u6210\\uff0c\\u65e0\\u6cd5\\u52a0\\u5bc6\\u6570\\u636e', 'unicode_escape'))
+        return self.noise.encrypt(O0_var_239)
 
-    def decrypt(self, ciphertext: bytes) -> bytes:
+    def decrypt(self, O0_var_240: bytes) -> bytes:
         if not self.is_established:
-            raise RuntimeError("握手未完成，无法解密数据")
-        return self.noise.decrypt(ciphertext)
+            raise RuntimeError(codecs.decode('\\u63e1\\u624b\\u672a\\u5b8c\\u6210\\uff0c\\u65e0\\u6cd5\\u89e3\\u5bc6\\u6570\\u636e', 'unicode_escape'))
+        return self.noise.decrypt(O0_var_240)
 
-
-# ==================== 2. 终端会话处理器 ====================
 class TerminalSessionHandler:
+
     def __init__(self):
         self.process = None
         self.master_fd = None
         self.slave_fd = None
         self.websocket: WebSocket = None
         self.request_id: str = None
-        
-        # 实例化 Noise 管道 (⚠️ 替换为你用脚本生成的真实密钥)
-        # self.AGENT_PRIVATE_KEY = self._read_key_file("noise_keys/agent_private.key")
-        # self.CONTROL_PUBLIC_KEY = self._read_key_file("noise_keys/control_public.key")
-        self.AGENT_PRIVATE_KEY=Config.keys['agent'].private_b64
+        self.AGENT_PRIVATE_KEY = Config.keys[codecs.decode('\\u0061\\u0067\\u0065\\u006e\\u0074', 'unicode_escape')].private_b64
         Logger.debug(self.AGENT_PRIVATE_KEY)
-        self.CONTROL_PUBLIC_KEY=Config.keys['control'].public_b64
+        self.CONTROL_PUBLIC_KEY = Config.keys[codecs.decode('\\u0063\\u006f\\u006e\\u0074\\u0072\\u006f\\u006c', 'unicode_escape')].public_b64
         Logger.debug(self.CONTROL_PUBLIC_KEY)
-        self.cipher = NoiseSessionWrapper(
-            is_initiator=False,  # 服务端是 Responder
-            local_priv_b64=self.AGENT_PRIVATE_KEY,
-            expected_remote_pub_b64=self.CONTROL_PUBLIC_KEY
-        )
+        self.cipher = NoiseSessionWrapper(is_initiator=False, local_priv_b64=self.AGENT_PRIVATE_KEY, expected_remote_pub_b64=self.CONTROL_PUBLIC_KEY)
 
-    def _read_key_file(self, filepath: str) -> str:
+    def _read_key_file(self, O0_var_241: str) -> str:
         try:
-            if os.path.exists(filepath):
-                with open(filepath, 'r') as f:
-                    # 读取内容并去除首尾空白字符(如换行符)
-                    return f.read().strip()
+            if os.path.exists(O0_var_241):
+                with open(O0_var_241, codecs.decode('\\u0072', 'unicode_escape')) as O0_var_242:
+                    return O0_var_242.read().strip()
             return None
         except Exception as e:
-            Logger.error(f"读取密钥文件 {filepath} 失败: {e}")
+            Logger.error(codecs.decode('\\u8bfb\\u53d6\\u5bc6\\u94a5\\u6587\\u4ef6\\u0020', 'unicode_escape') + str(O0_var_241) + codecs.decode('\\u0020\\u5931\\u8d25\\u003a\\u0020', 'unicode_escape') + str(e))
             return None
 
     async def cleanup(self):
-        """彻底清理终端资源"""
         if self.request_id:
-            Logger.info(f"[{self.request_id}] 执行终端资源清理...")
-        
+            Logger.info(codecs.decode('\\u005b', 'unicode_escape') + str(self.request_id) + codecs.decode('\\u005d\\u0020\\u6267\\u884c\\u7ec8\\u7aef\\u8d44\\u6e90\\u6e05\\u7406\\u002e\\u002e\\u002e', 'unicode_escape'))
         if self.process:
             try:
-                if hasattr(os, 'killpg'):
+                if hasattr(os, codecs.decode('\\u006b\\u0069\\u006c\\u006c\\u0070\\u0067', 'unicode_escape')):
                     os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
                 else:
                     self.process.terminate()
@@ -2086,16 +1395,14 @@ class TerminalSessionHandler:
             except Exception:
                 pass
             self.process = None
-
-        for fd_name in ['master_fd', 'slave_fd']:
-            fd = getattr(self, fd_name)
-            if fd is not None:
+        for O0_var_243 in [codecs.decode('\\u006d\\u0061\\u0073\\u0074\\u0065\\u0072\\u005f\\u0066\\u0064', 'unicode_escape'), codecs.decode('\\u0073\\u006c\\u0061\\u0076\\u0065\\u005f\\u0066\\u0064', 'unicode_escape')]:
+            O0_var_244 = getattr(self, O0_var_243)
+            if O0_var_244 is not None:
                 try:
-                    os.close(fd)
+                    os.close(O0_var_244)
                 except Exception:
                     pass
-                setattr(self, fd_name, None)
-        
+                setattr(self, O0_var_243, None)
         if self.websocket:
             try:
                 await self.websocket.close(code=1000)
@@ -2104,94 +1411,77 @@ class TerminalSessionHandler:
             finally:
                 self.websocket = None
 
-    async def _do_noise_handshake(self, websocket: WebSocket, log):
-        """执行 Noise_XX 的严格 3 步握手"""
-        log("🤝 开始 Noise 加密握手...")
-        
+    async def _do_noise_handshake(self, O0_var_245: WebSocket, O0_var_246):
+        O0_var_246(codecs.decode('\\U0001f91d\\u0020\\u5f00\\u59cb\\u0020\\u004e\\u006f\\u0069\\u0073\\u0065\\u0020\\u52a0\\u5bc6\\u63e1\\u624b\\u002e\\u002e\\u002e', 'unicode_escape'))
         try:
-            # 1. 接收客户端的第一个握手包 (-> e)
-            msg1 = await websocket.receive_bytes()
-            
-            # 2. 🔥 修复：消费 msg1，并直接获取生成的服务端握手回包 msg2
-            msg2 = self.cipher.process_handshake(msg1)
-            await websocket.send_bytes(msg2)
-            
-            # 3. 接收客户端的最后一个握手包 (-> s, se)
-            msg3 = await websocket.receive_bytes()
-            self.cipher.process_handshake(msg3)
-            
-            log("✅ Noise 握手完成，端到端加密通道已建立！")
+            O0_var_247 = await O0_var_245.receive_bytes()
+            O0_var_248 = self.cipher.process_handshake(O0_var_247)
+            await O0_var_245.send_bytes(O0_var_248)
+            O0_var_249 = await O0_var_245.receive_bytes()
+            self.cipher.process_handshake(O0_var_249)
+            O0_var_246(codecs.decode('\\u2705\\u0020\\u004e\\u006f\\u0069\\u0073\\u0065\\u0020\\u63e1\\u624b\\u5b8c\\u6210\\uff0c\\u7aef\\u5230\\u7aef\\u52a0\\u5bc6\\u901a\\u9053\\u5df2\\u5efa\\u7acb\\uff01', 'unicode_escape'))
         except PermissionError as e:
-            log(f"🚨 拒绝访问: {e}")
+            O0_var_246(codecs.decode('\\U0001f6a8\\u0020\\u62d2\\u7edd\\u8bbf\\u95ee\\u003a\\u0020', 'unicode_escape') + str(e))
             raise
         except Exception as e:
-            log(f"💥 握手失败: {e}")
-            raise RuntimeError("加密握手失败")
+            O0_var_246(codecs.decode('\\U0001f4a5\\u0020\\u63e1\\u624b\\u5931\\u8d25\\u003a\\u0020', 'unicode_escape') + str(e))
+            raise RuntimeError(codecs.decode('\\u52a0\\u5bc6\\u63e1\\u624b\\u5931\\u8d25', 'unicode_escape'))
 
-    async def start_session(self, websocket: WebSocket, request_id: str, use_noise: bool = True):
-        self.websocket = websocket
-        self.request_id = request_id
-        self.use_noise = use_noise
-        log = lambda msg: Logger.info(f"[终端会话 {request_id}] {msg}")
-        
-        log("终端会话已建立，等待接受连接...")
-        
+    async def start_session(self, O0_var_250: WebSocket, O0_var_251: str, O0_var_252: bool=True):
+        self.websocket = O0_var_250
+        self.request_id = O0_var_251
+        self.use_noise = O0_var_252
+        O0_var_253 = lambda msg: Logger.info(codecs.decode('\\u005b\\u7ec8\\u7aef\\u4f1a\\u8bdd\\u0020', 'unicode_escape') + str(O0_var_251) + codecs.decode('\\u005d\\u0020', 'unicode_escape') + str(msg))
+        O0_var_253(codecs.decode('\\u7ec8\\u7aef\\u4f1a\\u8bdd\\u5df2\\u5efa\\u7acb\\uff0c\\u7b49\\u5f85\\u63a5\\u53d7\\u8fde\\u63a5\\u002e\\u002e\\u002e', 'unicode_escape'))
         try:
-            await websocket.accept()
-            log("✅ WebSocket 连接已接受")
-            
-            # 🔥 分流：如果是 Noise 模式，才强制要求密码学握手
+            await O0_var_250.accept()
+            O0_var_253(codecs.decode('\\u2705\\u0020\\u0057\\u0065\\u0062\\u0053\\u006f\\u0063\\u006b\\u0065\\u0074\\u0020\\u8fde\\u63a5\\u5df2\\u63a5\\u53d7', 'unicode_escape'))
             if self.use_noise:
-                await self._do_noise_handshake(websocket, log)
+                await self._do_noise_handshake(O0_var_250, O0_var_253)
             else:
-                log("⚡ 走 HTTPS 明文降级通道，跳过 Noise 握手。")
-            # 握手成功后，正常拉起 PTY
-            await self._run_terminal(websocket, request_id, log)
-            
+                O0_var_253(codecs.decode('\\u26a1\\u0020\\u8d70\\u0020\\u0048\\u0054\\u0054\\u0050\\u0053\\u0020\\u660e\\u6587\\u964d\\u7ea7\\u901a\\u9053\\uff0c\\u8df3\\u8fc7\\u0020\\u004e\\u006f\\u0069\\u0073\\u0065\\u0020\\u63e1\\u624b\\u3002', 'unicode_escape'))
+            await self._run_terminal(O0_var_250, O0_var_251, O0_var_253)
         except WebSocketDisconnect:
-            log("🔌 客户端主动断开连接")
+            O0_var_253(codecs.decode('\\U0001f50c\\u0020\\u5ba2\\u6237\\u7aef\\u4e3b\\u52a8\\u65ad\\u5f00\\u8fde\\u63a5', 'unicode_escape'))
         except Exception as e:
-            log(f"❌ 终端会话异常: {type(e).__name__} - {e}")
+            O0_var_253(codecs.decode('\\u274c\\u0020\\u7ec8\\u7aef\\u4f1a\\u8bdd\\u5f02\\u5e38\\u003a\\u0020', 'unicode_escape') + str(type(e).__name__) + codecs.decode('\\u0020\\u002d\\u0020', 'unicode_escape') + str(e))
         finally:
-            await self.cleanup() 
-            log(f"✅ 资源清理完毕: {request_id}")
+            await self.cleanup()
+            O0_var_253(codecs.decode('\\u2705\\u0020\\u8d44\\u6e90\\u6e05\\u7406\\u5b8c\\u6bd5\\u003a\\u0020', 'unicode_escape') + str(O0_var_251))
 
     @staticmethod
     def get_available_shell():
-        for sh_name in ['bash', 'zsh', 'ash']:
-            sh_path = shutil.which(sh_name)
-            if sh_path: 
-                return sh_path
-        env_shell = os.environ.get('SHELL')
-        if env_shell and os.path.exists(env_shell) and os.access(env_shell, os.X_OK):
-            return env_shell
-        return shutil.which('sh') or '/bin/sh'
+        for O0_var_254 in [codecs.decode('\\u0062\\u0061\\u0073\\u0068', 'unicode_escape'), codecs.decode('\\u007a\\u0073\\u0068', 'unicode_escape'), codecs.decode('\\u0061\\u0073\\u0068', 'unicode_escape')]:
+            O0_var_255 = shutil.which(O0_var_254)
+            if O0_var_255:
+                return O0_var_255
+        O0_var_256 = os.environ.get(codecs.decode('\\u0053\\u0048\\u0045\\u004c\\u004c', 'unicode_escape'))
+        if O0_var_256 and os.path.exists(O0_var_256) and os.access(O0_var_256, os.X_OK):
+            return O0_var_256
+        return shutil.which(codecs.decode('\\u0073\\u0068', 'unicode_escape')) or codecs.decode('\\u002f\\u0062\\u0069\\u006e\\u002f\\u0073\\u0068', 'unicode_escape')
 
-    def set_pty_size(self, rows: int, cols: int):
+    def set_pty_size(self, O0_var_257: int, O0_var_258: int):
         if self.master_fd is not None:
             try:
-                winsz = struct.pack("HHHH", rows, cols, 0, 0)
-                fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, winsz)
+                O0_var_259 = struct.pack(codecs.decode('\\u0048\\u0048\\u0048\\u0048', 'unicode_escape'), O0_var_257, O0_var_258, 0, 0)
+                fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, O0_var_259)
             except Exception as e:
-                Logger.warning(f"设置 PTY 尺寸失败: {e}")
+                Logger.warning(codecs.decode('\\u8bbe\\u7f6e\\u0020\\u0050\\u0054\\u0059\\u0020\\u5c3a\\u5bf8\\u5931\\u8d25\\u003a\\u0020', 'unicode_escape') + str(e))
 
-    async def _run_terminal(self, websocket: WebSocket, request_id: str, log):
+    async def _run_terminal(self, O0_var_260: WebSocket, O0_var_261: str, O0_var_262):
         self.master_fd = None
         self.slave_fd = None
-        
         try:
-            env = os.environ.copy()
-            env.pop('PROMPT_COMMAND', None)
-            env.setdefault('TERM', 'xterm-256color')
-            if 'LANG' not in env:
-                env['LANG'] = 'C.UTF-8'
-
+            O0_var_263 = os.environ.copy()
+            O0_var_263.pop(codecs.decode('\\u0050\\u0052\\u004f\\u004d\\u0050\\u0054\\u005f\\u0043\\u004f\\u004d\\u004d\\u0041\\u004e\\u0044', 'unicode_escape'), None)
+            O0_var_263.setdefault(codecs.decode('\\u0054\\u0045\\u0052\\u004d', 'unicode_escape'), codecs.decode('\\u0078\\u0074\\u0065\\u0072\\u006d\\u002d\\u0032\\u0035\\u0036\\u0063\\u006f\\u006c\\u006f\\u0072', 'unicode_escape'))
+            if codecs.decode('\\u004c\\u0041\\u004e\\u0047', 'unicode_escape') not in O0_var_263:
+                O0_var_263[codecs.decode('\\u004c\\u0041\\u004e\\u0047', 'unicode_escape')] = codecs.decode('\\u0043\\u002e\\u0055\\u0054\\u0046\\u002d\\u0038', 'unicode_escape')
             self.master_fd, self.slave_fd = pty.openpty()
             self.set_pty_size(24, 80)
+            O0_var_264 = self.get_available_shell()
+            O0_var_262(codecs.decode('\\U0001f41a\\u0020\\u4f7f\\u7528\\u0020\\u0053\\u0068\\u0065\\u006c\\u006c\\u0020\\u8def\\u5f84\\u003a\\u0020', 'unicode_escape') + str(O0_var_264))
 
-            shell = self.get_available_shell()
-            log(f"🐚 使用 Shell 路径: {shell}")
-            
             def pty_preexec():
                 import termios, fcntl
                 os.setsid()
@@ -2199,1209 +1489,621 @@ class TerminalSessionHandler:
                     fcntl.ioctl(0, termios.TIOCSCTTY, 0)
                 except Exception:
                     pass
-
-            self.process = await asyncio.create_subprocess_exec(
-                shell, stdin=self.slave_fd, stdout=self.slave_fd, stderr=self.slave_fd,
-                env=env, preexec_fn=pty_preexec
-            )
-            log(f"🚀 终端进程已启动 (PID: {self.process.pid})")
-
+            self.process = await asyncio.create_subprocess_exec(O0_var_264, stdin=self.slave_fd, stdout=self.slave_fd, stderr=self.slave_fd, env=O0_var_263, preexec_fn=pty_preexec)
+            O0_var_262(codecs.decode('\\U0001f680\\u0020\\u7ec8\\u7aef\\u8fdb\\u7a0b\\u5df2\\u542f\\u52a8\\u0020\\u0028\\u0050\\u0049\\u0044\\u003a\\u0020', 'unicode_escape') + str(self.process.pid) + codecs.decode('\\u0029', 'unicode_escape'))
             if self.slave_fd is not None:
                 os.close(self.slave_fd)
                 self.slave_fd = None
-
-            fl = fcntl.fcntl(self.master_fd, fcntl.F_GETFL)
-            fcntl.fcntl(self.master_fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
-
-            tasks = [
-                asyncio.create_task(self._handle_pty_output(websocket, self.master_fd, log)),
-                asyncio.create_task(self._handle_websocket_input(websocket, self.master_fd, log)),
-                asyncio.create_task(self._monitor_process(self.process, log)),
-            ]
-            
-            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            for t in pending:
-                t.cancel()
+            O0_var_265 = fcntl.fcntl(self.master_fd, fcntl.F_GETFL)
+            fcntl.fcntl(self.master_fd, fcntl.F_SETFL, O0_var_265 | os.O_NONBLOCK)
+            O0_var_266 = [asyncio.create_task(self._handle_pty_output(O0_var_260, self.master_fd, O0_var_262)), asyncio.create_task(self._handle_websocket_input(O0_var_260, self.master_fd, O0_var_262)), asyncio.create_task(self._monitor_process(self.process, O0_var_262))]
+            O0_var_267, O0_var_268 = await asyncio.wait(O0_var_266, return_when=asyncio.FIRST_COMPLETED)
+            for O0_var_269 in O0_var_268:
+                O0_var_269.cancel()
             try:
-                await websocket.close(code=1000, reason="Terminal exited normally")
+                await O0_var_260.close(code=1000, reason=codecs.decode('\\u0054\\u0065\\u0072\\u006d\\u0069\\u006e\\u0061\\u006c\\u0020\\u0065\\u0078\\u0069\\u0074\\u0065\\u0064\\u0020\\u006e\\u006f\\u0072\\u006d\\u0061\\u006c\\u006c\\u0079', 'unicode_escape'))
             except Exception:
                 pass
-
         except Exception as e:
-            log(f"💥 启动终端失败: {type(e).__name__} - {str(e)}")
+            O0_var_262(codecs.decode('\\U0001f4a5\\u0020\\u542f\\u52a8\\u7ec8\\u7aef\\u5931\\u8d25\\u003a\\u0020', 'unicode_escape') + str(type(e).__name__) + codecs.decode('\\u0020\\u002d\\u0020', 'unicode_escape') + str(str(e)))
             await self.cleanup()
             raise
-    
-    async def _handle_pty_output(self, websocket: WebSocket, master: int, log):
+
+    async def _handle_pty_output(self, O0_var_270: WebSocket, O0_var_271: int, O0_var_272):
         try:
             while True:
-                if master is None: break
-                rlist, _, _ = select.select([master], [], [], 0.1)
-                if master in rlist:
+                if O0_var_271 is None:
+                    break
+                O0_var_273, O0_var_274, O0_var_274 = select.select([O0_var_271], [], [], 0.1)
+                if O0_var_271 in O0_var_273:
                     try:
-                        data = os.read(master, 8192)
-                        if not data: break
-                        
-                        # 🔥 发送前：使用 Noise 管道加密终端输出
+                        O0_var_275 = os.read(O0_var_271, 8192)
+                        if not O0_var_275:
+                            break
                         if self.use_noise:
-                            encrypted_data = self.cipher.encrypt(data)
-                            await websocket.send_bytes(encrypted_data)
+                            O0_var_276 = self.cipher.encrypt(O0_var_275)
+                            await O0_var_270.send_bytes(O0_var_276)
                         else:
-                            await websocket.send_bytes(data)
-                        
+                            await O0_var_270.send_bytes(O0_var_275)
                     except BlockingIOError:
                         await asyncio.sleep(0.01)
                     except OSError as e:
-                        if e.errno == 5: break
+                        if e.errno == 5:
+                            break
                         raise
                 else:
                     await asyncio.sleep(0.01)
         except (OSError, WebSocketDisconnect, ConnectionResetError):
             pass
-    
-    async def _handle_websocket_input(self, websocket: WebSocket, master: int, log):
+
+    async def _handle_websocket_input(self, O0_var_277: WebSocket, O0_var_278: int, O0_var_279):
         try:
-            # 🔥 必须使用 iter_bytes，因为密文是纯二进制数据
-            async for payload in websocket.iter_bytes():
-                if master is None: break
-                
-                # 🔥 接收后：使用 Noise 管道解密
+            async for O0_var_280 in O0_var_277.iter_bytes():
+                if O0_var_278 is None:
+                    break
                 if self.use_noise:
                     try:
-                        decrypted = self.cipher.decrypt(payload)
+                        O0_var_281 = self.cipher.decrypt(O0_var_280)
                     except Exception as e:
-                        log(f"⚠️ 解密失败，收到非法包: {e}")
+                        O0_var_279(codecs.decode('\\u26a0\\ufe0f\\u0020\\u89e3\\u5bc6\\u5931\\u8d25\\uff0c\\u6536\\u5230\\u975e\\u6cd5\\u5305\\u003a\\u0020', 'unicode_escape') + str(e))
                         break
                 else:
-                    # HTTPS 降级模式，收到的直接就是明文二进制
-                    decrypted = payload
-
-                # 尝试解析是否是前端发来的 JSON 控制指令
+                    O0_var_281 = O0_var_280
                 try:
-                    text_msg = decrypted.decode('utf-8')
-                    if text_msg.strip().startswith('{'):
-                        data = json.loads(text_msg)
-                        msg_type = data.get('type')
-                        
-                        if msg_type == 'heartbeat':
-                            # 回复心跳也要按模式区分
-                            reply = json.dumps({"type": "heartbeat"}).encode()
+                    O0_var_282 = O0_var_281.decode(codecs.decode('\\u0075\\u0074\\u0066\\u002d\\u0038', 'unicode_escape'))
+                    if O0_var_282.strip().startswith(codecs.decode('\\u007b', 'unicode_escape')):
+                        O0_var_283 = json.loads(O0_var_282)
+                        O0_var_284 = O0_var_283.get(codecs.decode('\\u0074\\u0079\\u0070\\u0065', 'unicode_escape'))
+                        if O0_var_284 == codecs.decode('\\u0068\\u0065\\u0061\\u0072\\u0074\\u0062\\u0065\\u0061\\u0074', 'unicode_escape'):
+                            O0_var_285 = json.dumps({codecs.decode('\\u0074\\u0079\\u0070\\u0065', 'unicode_escape'): codecs.decode('\\u0068\\u0065\\u0061\\u0072\\u0074\\u0062\\u0065\\u0061\\u0074', 'unicode_escape')}).encode()
                             if self.use_noise:
-                                await websocket.send_bytes(self.cipher.encrypt(reply))
+                                await O0_var_277.send_bytes(self.cipher.encrypt(O0_var_285))
                             else:
-                                await websocket.send_bytes(reply)
+                                await O0_var_277.send_bytes(O0_var_285)
                             continue
-                            
-                        if msg_type == 'resize':
-                            rows, cols = data.get('rows', 24), data.get('cols', 80)
-                            self.set_pty_size(rows, cols)
+                        if O0_var_284 == codecs.decode('\\u0072\\u0065\\u0073\\u0069\\u007a\\u0065', 'unicode_escape'):
+                            O0_var_286, O0_var_287 = (O0_var_283.get(codecs.decode('\\u0072\\u006f\\u0077\\u0073', 'unicode_escape'), 24), O0_var_283.get(codecs.decode('\\u0063\\u006f\\u006c\\u0073', 'unicode_escape'), 80))
+                            self.set_pty_size(O0_var_286, O0_var_287)
                             continue
-                        if msg_type == 'input' and 'data' in data:
-                            input_data = data['data']
-                            if data.get('encoding') == 'base64':
-                                input_bytes = base64.b64decode(input_data)
+                        if O0_var_284 == codecs.decode('\\u0069\\u006e\\u0070\\u0075\\u0074', 'unicode_escape') and codecs.decode('\\u0064\\u0061\\u0074\\u0061', 'unicode_escape') in O0_var_283:
+                            O0_var_288 = O0_var_283[codecs.decode('\\u0064\\u0061\\u0074\\u0061', 'unicode_escape')]
+                            if O0_var_283.get(codecs.decode('\\u0065\\u006e\\u0063\\u006f\\u0064\\u0069\\u006e\\u0067', 'unicode_escape')) == codecs.decode('\\u0062\\u0061\\u0073\\u0065\\u0036\\u0034', 'unicode_escape'):
+                                O0_var_289 = base64.b64decode(O0_var_288)
                             else:
-                                input_bytes = input_data.encode('utf-8')
-                            os.write(master, input_bytes)
+                                O0_var_289 = O0_var_288.encode(codecs.decode('\\u0075\\u0074\\u0066\\u002d\\u0038', 'unicode_escape'))
+                            os.write(O0_var_278, O0_var_289)
                             continue
                 except (UnicodeDecodeError, json.JSONDecodeError):
-                    pass # 解析 JSON 失败，说明是普通的键盘敲击输入
-                
-                # 默认当作普通键盘输入写入 PTY
-                os.write(master, decrypted)
-                
+                    pass
+                os.write(O0_var_278, O0_var_281)
         except WebSocketDisconnect:
-            log("🔌 客户端断开，停止接收输入")
+            O0_var_279(codecs.decode('\\U0001f50c\\u0020\\u5ba2\\u6237\\u7aef\\u65ad\\u5f00\\uff0c\\u505c\\u6b62\\u63a5\\u6536\\u8f93\\u5165', 'unicode_escape'))
         except OSError:
             pass
 
-    async def _monitor_process(self, process, log):
+    async def _monitor_process(self, O0_var_290, O0_var_291):
         try:
-            await process.wait()
+            await O0_var_290.wait()
         except Exception:
             pass
 
-# ============================================================================
-# 🔄 应用生命周期管理 (lifespan)
-# ============================================================================
-
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    """
-    应用启动/关闭时的生命周期管理
-    ✅ 确保管理器在路由处理前初始化并挂载到 app.state
-    """
-    # 🚀 启动时: 校验配置并初始化加密管理器
-    Logger.debug("🔧 初始化管理器...")
+async def O0_fn_2(app: FastAPI):
+    Logger.debug(codecs.decode('\\U0001f527\\u0020\\u521d\\u59cb\\u5316\\u7ba1\\u7406\\u5668\\u002e\\u002e\\u002e', 'unicode_escape'))
     Config.validate()
-    init_crypto()
-    
-    app.state.file_manager = FileManager(
-        root=Config.FILE_ROOT,
-        max_upload=Config.MAX_UPLOAD_SIZE,
-        chunk_size=int(os.getenv("CHUNK_THRESHOLD", "20971520")),
-        audit=Config.FILE_AUDIT_LOG
-    )
-    
-    app.state.task_manager = TaskManager(
-        timeout=Config.TASK_TIMEOUT,
-        check_interval=Config.CRON_CHECK_INTERVAL
-    )
-    
+    O0_fn_1()
+    app.state.file_manager = FileManager(root=Config.FILE_ROOT, max_upload=Config.MAX_UPLOAD_SIZE, chunk_size=int(os.getenv(codecs.decode('\\u0043\\u0048\\u0055\\u004e\\u004b\\u005f\\u0054\\u0048\\u0052\\u0045\\u0053\\u0048\\u004f\\u004c\\u0044', 'unicode_escape'), codecs.decode('\\u0032\\u0030\\u0039\\u0037\\u0031\\u0035\\u0032\\u0030', 'unicode_escape'))), audit=Config.FILE_AUDIT_LOG)
+    app.state.task_manager = TaskManager(timeout=Config.TASK_TIMEOUT, check_interval=Config.CRON_CHECK_INTERVAL)
     if Config.DEBUG:
-        Logger.debug(f"✅ 管理器已挂载到 app.state")
-        Logger.debug(f"   • file_manager: {app.state.file_manager}")
-        Logger.debug(f"   • task_manager: {app.state.task_manager}")
-    
-    
-    yield  # 🔑 关键: 应用在此处运行
-    
-    # 🛑 关闭时: 清理资源 (可选)
+        Logger.debug(codecs.decode('\\u2705\\u0020\\u7ba1\\u7406\\u5668\\u5df2\\u6302\\u8f7d\\u5230\\u0020\\u0061\\u0070\\u0070\\u002e\\u0073\\u0074\\u0061\\u0074\\u0065', 'unicode_escape'))
+        Logger.debug(codecs.decode('\\u0020\\u0020\\u0020\\u2022\\u0020\\u0066\\u0069\\u006c\\u0065\\u005f\\u006d\\u0061\\u006e\\u0061\\u0067\\u0065\\u0072\\u003a\\u0020', 'unicode_escape') + str(app.state.file_manager))
+        Logger.debug(codecs.decode('\\u0020\\u0020\\u0020\\u2022\\u0020\\u0074\\u0061\\u0073\\u006b\\u005f\\u006d\\u0061\\u006e\\u0061\\u0067\\u0065\\u0072\\u003a\\u0020', 'unicode_escape') + str(app.state.task_manager))
+    yield
     if Config.DEBUG:
-        Logger.debug("🛑 应用关闭，清理资源...")
-    
-    # 示例: 停止定时任务循环
-    if hasattr(app.state, 'task_manager'):
+        Logger.debug(codecs.decode('\\U0001f6d1\\u0020\\u5e94\\u7528\\u5173\\u95ed\\uff0c\\u6e05\\u7406\\u8d44\\u6e90\\u002e\\u002e\\u002e', 'unicode_escape'))
+    if hasattr(app.state, codecs.decode('\\u0074\\u0061\\u0073\\u006b\\u005f\\u006d\\u0061\\u006e\\u0061\\u0067\\u0065\\u0072', 'unicode_escape')):
         try:
             app.state.task_manager.stop_cron_loop()
         except:
-            pass  # 忽略清理错误
-# ============================================================================
-# 📊 业务路由: 状态接口等
-# ============================================================================
-app = FastAPI(
-    title="Proxy Agent API",
-    description="单文件部署版 - 支持签名认证与响应加密",
-    version=Config.AGENT_VERSION,
-    docs_url="/docs" if Config.DEBUG else None,
-    redoc_url=None,
-    lifespan=lifespan  # 🔧 添加这行!
-)
+            pass
+app = FastAPI(title=codecs.decode('\\u0050\\u0072\\u006f\\u0078\\u0079\\u0020\\u0041\\u0067\\u0065\\u006e\\u0074\\u0020\\u0041\\u0050\\u0049', 'unicode_escape'), description=codecs.decode('\\u5355\\u6587\\u4ef6\\u90e8\\u7f72\\u7248\\u0020\\u002d\\u0020\\u652f\\u6301\\u7b7e\\u540d\\u8ba4\\u8bc1\\u4e0e\\u54cd\\u5e94\\u52a0\\u5bc6', 'unicode_escape'), version=Config.AGENT_VERSION, docs_url=codecs.decode('\\u002f\\u0064\\u006f\\u0063\\u0073', 'unicode_escape') if Config.DEBUG else None, redoc_url=None, lifespan=O0_fn_2)
 from fastapi.middleware.cors import CORSMiddleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],   # 或指定 ["X-Nonce", "X-Timestamp", ...]
-    expose_headers=["x-encrypted"], 
-)
-# 注册中间件
+app.add_middleware(CORSMiddleware, allow_origins=[codecs.decode('\\u002a', 'unicode_escape')], allow_methods=[codecs.decode('\\u002a', 'unicode_escape')], allow_headers=[codecs.decode('\\u002a', 'unicode_escape')], expose_headers=[codecs.decode('\\u0078\\u002d\\u0065\\u006e\\u0063\\u0072\\u0079\\u0070\\u0074\\u0065\\u0064', 'unicode_escape')])
 app.add_middleware(AuthEncryptMiddleware)
 
-async def get_smart_payload(request: Request) -> ExecRequestJSON:
-    """
-    智能解析依赖项：
-    1. 获取 Body
-    2. 尝试转为 ExecRequestJSON 对象
-    3. 如果失败，将全文包装进 ExecRequestJSON(cmd=body)
-    """
-    body_bytes = await request.body()
-    body_str = body_bytes.decode('utf-8').strip()
-    
-    if not body_str:
-        raise HTTPException(status_code=400, detail="Empty request body")
-
+async def O0_fn_3(request: Request) -> ExecRequestJSON:
+    O0_var_292 = await request.body()
+    O0_var_293 = O0_var_292.decode(codecs.decode('\\u0075\\u0074\\u0066\\u002d\\u0038', 'unicode_escape')).strip()
+    if not O0_var_293:
+        raise HTTPException(status_code=400, detail=codecs.decode('\\u0045\\u006d\\u0070\\u0074\\u0079\\u0020\\u0072\\u0065\\u0071\\u0075\\u0065\\u0073\\u0074\\u0020\\u0062\\u006f\\u0064\\u0079', 'unicode_escape'))
     try:
-        # 尝试作为 JSON 解析
-        return ExecRequestJSON.model_validate_json(body_str)
+        return ExecRequestJSON.model_validate_json(O0_var_293)
     except Exception:
-        # 解析失败，说明是纯文本，手动构造模型返回
-        # 这样下游业务逻辑永远拿到的都是 ExecRequestJSON 对象
-        return ExecRequestJSON(cmd=body_str)
+        return ExecRequestJSON(cmd=O0_var_293)
 
-@app.get("/api/baseinfo", response_model=BaseInfoResponse)
-async def get_baseinfo(request: Request):
-    """
-    获取代理端基础信息
-    🔐 带 1 小时高性能缓存机制
-    🔐 有认证头时返回完整加密信息，无认证头时返回基础明文（剔除动态密钥）
-    """
-    now = time.time()
-    
-    # 确保异步锁已安全初始化
+@app.get(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0062\\u0061\\u0073\\u0065\\u0069\\u006e\\u0066\\u006f', 'unicode_escape'), response_model=BaseInfoResponse)
+async def O0_fn_4(request: Request):
+    O0_var_294 = time.time()
     if Config._baseinfo_lock is None:
         Config._baseinfo_lock = asyncio.Lock()
-        
     async with Config._baseinfo_lock:
-        # 检查缓存是否失效或从未加载过
-        if (Config._baseinfo_cache is None or 
-                now - Config._baseinfo_cache_time > Config.BASEINFO_CACHE_TTL):
-            
-            # 真正触发底层高能耗的资源收集器
+        if Config._baseinfo_cache is None or O0_var_294 - Config._baseinfo_cache_time > Config.BASEINFO_CACHE_TTL:
             Config._baseinfo_cache = await SystemInfoCollector().get_basic_info()
-            Config._baseinfo_cache_time = now
-            Logger.debug("🔄 [Cache] BaseInfo 缓存已过期，已重新调度系统资源进行更新。")
+            Config._baseinfo_cache_time = O0_var_294
+            Logger.debug(codecs.decode('\\U0001f504\\u0020\\u005b\\u0043\\u0061\\u0063\\u0068\\u0065\\u005d\\u0020\\u0042\\u0061\\u0073\\u0065\\u0049\\u006e\\u0066\\u006f\\u0020\\u7f13\\u5b58\\u5df2\\u8fc7\\u671f\\uff0c\\u5df2\\u91cd\\u65b0\\u8c03\\u5ea6\\u7cfb\\u7edf\\u8d44\\u6e90\\u8fdb\\u884c\\u66f4\\u65b0\\u3002', 'unicode_escape'))
         else:
-            Logger.debug("📦 [Cache] BaseInfo 命中有效缓存，直接输出。")
-            
-        # ⚠️ 关键安全步骤：使用 .copy() 浅拷贝出一份副本进行上层组装
-        # 确保动态追加的凭证不会污染全局静态缓存，防止越权暴露
-        basic_info = Config._baseinfo_cache.copy()
-    
-    # 根据中间件标记的当前单次请求认证状态，动态决定是否下发敏感密钥
-    if getattr(request.state, "is_authenticated", True):
-        basic_info["session_key"] = Config.SESSION_KEY
-        basic_info["noise_key"] = Config.NOISE_KEY
+            Logger.debug(codecs.decode('\\U0001f4e6\\u0020\\u005b\\u0043\\u0061\\u0063\\u0068\\u0065\\u005d\\u0020\\u0042\\u0061\\u0073\\u0065\\u0049\\u006e\\u0066\\u006f\\u0020\\u547d\\u4e2d\\u6709\\u6548\\u7f13\\u5b58\\uff0c\\u76f4\\u63a5\\u8f93\\u51fa\\u3002', 'unicode_escape'))
+        O0_var_295 = Config._baseinfo_cache.copy()
+    if getattr(request.state, codecs.decode('\\u0069\\u0073\\u005f\\u0061\\u0075\\u0074\\u0068\\u0065\\u006e\\u0074\\u0069\\u0063\\u0061\\u0074\\u0065\\u0064', 'unicode_escape'), True):
+        O0_var_295[codecs.decode('\\u0073\\u0065\\u0073\\u0073\\u0069\\u006f\\u006e\\u005f\\u006b\\u0065\\u0079', 'unicode_escape')] = Config.SESSION_KEY
+        O0_var_295[codecs.decode('\\u006e\\u006f\\u0069\\u0073\\u0065\\u005f\\u006b\\u0065\\u0079', 'unicode_escape')] = Config.NOISE_KEY
     else:
-        basic_info["session_key"] = None
-        basic_info["noise_key"] = None
-        
-    return basic_info
+        O0_var_295[codecs.decode('\\u0073\\u0065\\u0073\\u0073\\u0069\\u006f\\u006e\\u005f\\u006b\\u0065\\u0079', 'unicode_escape')] = None
+        O0_var_295[codecs.decode('\\u006e\\u006f\\u0069\\u0073\\u0065\\u005f\\u006b\\u0065\\u0079', 'unicode_escape')] = None
+    return O0_var_295
 
-
-@app.get("/api/status", response_model=StatusResponse)
-async def get_realtime_status(request: Request):
-    """
-    获取代理端实时监控信息
-    🔐 带 30 秒防刷缓存机制，完美平衡面板数据实时性与 CPU 算力损耗
-    🔐 有认证头时返回加密密文，无认证头时直接放行返回明文 JSON
-    """
-    now = time.time()
-    
-    # 确保异步锁已安全初始化
+@app.get(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'), response_model=StatusResponse)
+async def O0_fn_5(request: Request):
+    O0_var_296 = time.time()
     if Config._status_lock is None:
         Config._status_lock = asyncio.Lock()
-        
     async with Config._status_lock:
-        # 检查 30 秒状态缓存是否过期
-        if (Config._status_cache is None or 
-                now - Config._status_cache_time > Config.STATUS_CACHE_TTL):
-            
-            # 重新获取消耗资源的磁盘 IO / 进程网卡快照
+        if Config._status_cache is None or O0_var_296 - Config._status_cache_time > Config.STATUS_CACHE_TTL:
             Config._status_cache = await SystemInfoCollector().get_realtime_info()
-            Config._status_cache_time = now
-            Logger.debug("🔄 [Cache] Status 实时监控缓存已过期，已重新生成度量快照。")
+            Config._status_cache_time = O0_var_296
+            Logger.debug(codecs.decode('\\U0001f504\\u0020\\u005b\\u0043\\u0061\\u0063\\u0068\\u0065\\u005d\\u0020\\u0053\\u0074\\u0061\\u0074\\u0075\\u0073\\u0020\\u5b9e\\u65f6\\u76d1\\u63a7\\u7f13\\u5b58\\u5df2\\u8fc7\\u671f\\uff0c\\u5df2\\u91cd\\u65b0\\u751f\\u6210\\u5ea6\\u91cf\\u5feb\\u7167\\u3002', 'unicode_escape'))
         else:
-            Logger.debug("📦 [Cache] Status 命中监控缓存。")
-            
-        status_info = Config._status_cache.copy()
-        
-    return status_info
+            Logger.debug(codecs.decode('\\U0001f4e6\\u0020\\u005b\\u0043\\u0061\\u0063\\u0068\\u0065\\u005d\\u0020\\u0053\\u0074\\u0061\\u0074\\u0075\\u0073\\u0020\\u547d\\u4e2d\\u76d1\\u63a7\\u7f13\\u5b58\\u3002', 'unicode_escape'))
+        O0_var_297 = Config._status_cache.copy()
+    return O0_var_297
 
-@app.post("/api/exec", response_model=ExecResponse)
-async def exec_command(
-    payload: ExecRequestJSON = Depends(get_smart_payload)  # 👈 核心：自动转换
-):
-    """
-    执行系统命令接口
-    现在的 payload 永远是 ExecRequestJSON 对象，无论客户端发的是 JSON 还是纯文本
-    """
-    # 直接使用，不再需要判断和解析
-    cmd = payload.cmd
-    cwd = payload.cwd
-    env_override = payload.env
-
-    # 3. 准备执行参数
-    timeout = Config.Rtimeout
-    use_shell = Config.EXEC_SHELL_MODE
-    
-    exec_kwargs = {
-        "shell": use_shell,
-        "stdout": subprocess.PIPE,
-        "stderr": subprocess.STDOUT,
-        "stdin": subprocess.DEVNULL,
-        "timeout": timeout,
-        "text": True,
-        "errors": "replace",
-        "cwd": cwd,
-    }
-
-    # 处理环境变量合并
-    if env_override:
-        exec_kwargs["env"] = {**os.environ, **env_override}
-
-    # 4. 执行并利用 ExecResponse 自动序列化返回
+@app.post(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0065\\u0078\\u0065\\u0063', 'unicode_escape'), response_model=ExecResponse)
+async def O0_fn_6(payload: ExecRequestJSON=Depends(O0_fn_3)):
+    O0_var_298 = payload.cmd
+    O0_var_299 = payload.cwd
+    O0_var_300 = payload.env
+    O0_var_301 = Config.Rtimeout
+    O0_var_302 = Config.EXEC_SHELL_MODE
+    O0_var_303 = {codecs.decode('\\u0073\\u0068\\u0065\\u006c\\u006c', 'unicode_escape'): O0_var_302, codecs.decode('\\u0073\\u0074\\u0064\\u006f\\u0075\\u0074', 'unicode_escape'): subprocess.PIPE, codecs.decode('\\u0073\\u0074\\u0064\\u0065\\u0072\\u0072', 'unicode_escape'): subprocess.STDOUT, codecs.decode('\\u0073\\u0074\\u0064\\u0069\\u006e', 'unicode_escape'): subprocess.DEVNULL, codecs.decode('\\u0074\\u0069\\u006d\\u0065\\u006f\\u0075\\u0074', 'unicode_escape'): O0_var_301, codecs.decode('\\u0074\\u0065\\u0078\\u0074', 'unicode_escape'): True, codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072\\u0073', 'unicode_escape'): codecs.decode('\\u0072\\u0065\\u0070\\u006c\\u0061\\u0063\\u0065', 'unicode_escape'), codecs.decode('\\u0063\\u0077\\u0064', 'unicode_escape'): O0_var_299}
+    if O0_var_300:
+        O0_var_303[codecs.decode('\\u0065\\u006e\\u0076', 'unicode_escape')] = {**os.environ, **O0_var_300}
     try:
-        res = subprocess.run(cmd, **exec_kwargs)
-        return {
-            "result": res.stdout,
-            "exitcode": res.returncode,
-            "timeout": False,
-            "cmd": cmd
-        }
+        O0_var_304 = subprocess.run(O0_var_298, **O0_var_303)
+        return {codecs.decode('\\u0072\\u0065\\u0073\\u0075\\u006c\\u0074', 'unicode_escape'): O0_var_304.stdout, codecs.decode('\\u0065\\u0078\\u0069\\u0074\\u0063\\u006f\\u0064\\u0065', 'unicode_escape'): O0_var_304.returncode, codecs.decode('\\u0074\\u0069\\u006d\\u0065\\u006f\\u0075\\u0074', 'unicode_escape'): False, codecs.decode('\\u0063\\u006d\\u0064', 'unicode_escape'): O0_var_298}
     except subprocess.TimeoutExpired as e:
-        return {
-            "result": f"[TIMEOUT]\n{e.output or ''}",
-            "exitcode": 124,
-            "timeout": True,
-            "cmd": cmd
-        }
+        return {codecs.decode('\\u0072\\u0065\\u0073\\u0075\\u006c\\u0074', 'unicode_escape'): codecs.decode('\\u005b\\u0054\\u0049\\u004d\\u0045\\u004f\\u0055\\u0054\\u005d\\u000a', 'unicode_escape') + str(e.output or ''), codecs.decode('\\u0065\\u0078\\u0069\\u0074\\u0063\\u006f\\u0064\\u0065', 'unicode_escape'): 124, codecs.decode('\\u0074\\u0069\\u006d\\u0065\\u006f\\u0075\\u0074', 'unicode_escape'): True, codecs.decode('\\u0063\\u006d\\u0064', 'unicode_escape'): O0_var_298}
     except Exception as e:
-        return {
-            "result": f"[ERROR] {str(e)}",
-            "exitcode": -1,
-            "timeout": False,
-            "cmd": cmd
-        }
+        return {codecs.decode('\\u0072\\u0065\\u0073\\u0075\\u006c\\u0074', 'unicode_escape'): codecs.decode('\\u005b\\u0045\\u0052\\u0052\\u004f\\u0052\\u005d\\u0020', 'unicode_escape') + str(str(e)), codecs.decode('\\u0065\\u0078\\u0069\\u0074\\u0063\\u006f\\u0064\\u0065', 'unicode_escape'): -1, codecs.decode('\\u0074\\u0069\\u006d\\u0065\\u006f\\u0075\\u0074', 'unicode_escape'): False, codecs.decode('\\u0063\\u006d\\u0064', 'unicode_escape'): O0_var_298}
+
 class TaskManager:
-    """
-    任务管理器 - 纯内存存储，动态执行
-    - 启动任务: 一次性执行，执行后自动清除
-    - 定时任务: Crontab 表达式调度，后台循环检查
-    """
-    
-    def __init__(self, timeout: int = 300, check_interval: int = 30, 
-                 max_log_size: int = None):
+    codecs.decode('\\u000a\\u0020\\u0020\\u0020\\u0020\\u4efb\\u52a1\\u7ba1\\u7406\\u5668\\u0020\\u002d\\u0020\\u7eaf\\u5185\\u5b58\\u5b58\\u50a8\\uff0c\\u52a8\\u6001\\u6267\\u884c\\u000a\\u0020\\u0020\\u0020\\u0020\\u002d\\u0020\\u542f\\u52a8\\u4efb\\u52a1\\u003a\\u0020\\u4e00\\u6b21\\u6027\\u6267\\u884c\\uff0c\\u6267\\u884c\\u540e\\u81ea\\u52a8\\u6e05\\u9664\\u000a\\u0020\\u0020\\u0020\\u0020\\u002d\\u0020\\u5b9a\\u65f6\\u4efb\\u52a1\\u003a\\u0020\\u0043\\u0072\\u006f\\u006e\\u0074\\u0061\\u0062\\u0020\\u8868\\u8fbe\\u5f0f\\u8c03\\u5ea6\\uff0c\\u540e\\u53f0\\u5faa\\u73af\\u68c0\\u67e5\\u000a\\u0020\\u0020\\u0020\\u0020', 'unicode_escape')
+
+    def __init__(self, timeout: int=300, check_interval: int=30, O0_var_305: int=None):
         self.timeout = timeout
         self.check_interval = check_interval
-        self.max_log_size = max_log_size or Config.MAX_TASK_LOG_SIZE
-        
-        # 初始化日志缓冲 (使用 deque 自动淘汰)
+        self.max_log_size = O0_var_305 or Config.MAX_TASK_LOG_SIZE
         Config.onetimetasks_log = deque(Config.onetimetasks_log, maxlen=self.max_log_size)
         Config.crontasks_log = deque(Config.crontasks_log, maxlen=self.max_log_size)
-        
         self._cron_task: Optional[asyncio.Task] = None
         self._running = False
         self._executed_crons: set = set()
-    
-    # ================= 启动任务 (One-time) =================
-    
-    def set_onetime_tasks(self, tasks: List[str]) -> dict:
-        """设置启动任务列表"""
-        Config.onetasks = tasks if tasks else []
-        return {"status": "ok", "count": len(Config.onetasks), "tasks": Config.onetasks}
-    
+
+    def set_onetime_tasks(self, O0_var_306: List[str]) -> dict:
+        Config.onetasks = O0_var_306 if O0_var_306 else []
+        return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape'), codecs.decode('\\u0063\\u006f\\u0075\\u006e\\u0074', 'unicode_escape'): len(Config.onetasks), codecs.decode('\\u0074\\u0061\\u0073\\u006b\\u0073', 'unicode_escape'): Config.onetasks}
+
     def get_onetime_tasks(self) -> dict:
-        """获取启动任务列表"""
-        return {"status": "ok", "count": len(Config.onetasks), "tasks": Config.onetasks}
-    
-        # ================= 启动任务 (带日志) =================
-    
+        return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape'), codecs.decode('\\u0063\\u006f\\u0075\\u006e\\u0074', 'unicode_escape'): len(Config.onetasks), codecs.decode('\\u0074\\u0061\\u0073\\u006b\\u0073', 'unicode_escape'): Config.onetasks}
+
     def run_onetime_tasks(self) -> List[dict]:
-        """执行启动任务并记录日志"""
         if not Config.InitTask or not Config.onetasks:
             return []
-        
-        results = []
-        tasks_to_run = Config.onetasks.copy()
-        for i, cmd in enumerate(tasks_to_run):
-            start_time = datetime.utcnow()
+        O0_var_307 = []
+        O0_var_308 = Config.onetasks.copy()
+        for O0_var_309, O0_var_310 in enumerate(O0_var_308):
+            O0_var_311 = datetime.utcnow()
             try:
                 if Config.DEBUG:
-                    Logger.debug(f"🚀 [OneTime-{i+1}] Executing: {cmd[:100]}...")
-                
-                result = subprocess.run(
-                    cmd, shell=True,
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    stdin=subprocess.DEVNULL,
-                    timeout=self.timeout, text=True, errors="replace"
-                )
-                
-                output = result.stdout[:2000]  # 限制输出长度防日志爆炸
-                exitcode = result.returncode
-                
-                # 📝 记录日志
-                log_entry = self._format_log_entry(cmd, output, exitcode, "onetime")
-                Config.onetimetasks_log = self._append_task_log(
-                    Config.onetimetasks_log, log_entry, self.max_log_size
-                )
-                
-                results.append({
-                    "index": i, "cmd": cmd[:200], "exitcode": exitcode,
-                    "output": output[:500], "status": "ok"
-                })
-                
+                    Logger.debug(codecs.decode('\\U0001f680\\u0020\\u005b\\u004f\\u006e\\u0065\\u0054\\u0069\\u006d\\u0065\\u002d', 'unicode_escape') + str(O0_var_309 + 1) + codecs.decode('\\u005d\\u0020\\u0045\\u0078\\u0065\\u0063\\u0075\\u0074\\u0069\\u006e\\u0067\\u003a\\u0020', 'unicode_escape') + str(O0_var_310[:100]) + codecs.decode('\\u002e\\u002e\\u002e', 'unicode_escape'))
+                O0_var_312 = subprocess.run(O0_var_310, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, timeout=self.timeout, text=True, errors=codecs.decode('\\u0072\\u0065\\u0070\\u006c\\u0061\\u0063\\u0065', 'unicode_escape'))
+                O0_var_313 = O0_var_312.stdout[:2000]
+                O0_var_314 = O0_var_312.returncode
+                O0_var_315 = self._format_log_entry(O0_var_310, O0_var_313, O0_var_314, codecs.decode('\\u006f\\u006e\\u0065\\u0074\\u0069\\u006d\\u0065', 'unicode_escape'))
+                Config.onetimetasks_log = self._append_task_log(Config.onetimetasks_log, O0_var_315, self.max_log_size)
+                O0_var_307.append({codecs.decode('\\u0069\\u006e\\u0064\\u0065\\u0078', 'unicode_escape'): O0_var_309, codecs.decode('\\u0063\\u006d\\u0064', 'unicode_escape'): O0_var_310[:200], codecs.decode('\\u0065\\u0078\\u0069\\u0074\\u0063\\u006f\\u0064\\u0065', 'unicode_escape'): O0_var_314, codecs.decode('\\u006f\\u0075\\u0074\\u0070\\u0075\\u0074', 'unicode_escape'): O0_var_313[:500], codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape')})
             except subprocess.TimeoutExpired as e:
-                output = f"[TIMEOUT] {e.output[:500] if e.output else ''}"
-                exitcode = 124
-                
-                log_entry =  self._format_log_entry(cmd, output, exitcode, "onetime")
-                Config.onetimetasks_log = self._append_task_log(
-                    Config.onetimetasks_log, log_entry, self.max_log_size
-                )
-                
-                results.append({
-                    "index": i, "cmd": cmd[:200], "exitcode": exitcode,
-                    "output": output[:500], "status": "timeout"
-                })
+                O0_var_313 = codecs.decode('\\u005b\\u0054\\u0049\\u004d\\u0045\\u004f\\u0055\\u0054\\u005d\\u0020', 'unicode_escape') + str(e.output[:500] if e.output else '')
+                O0_var_314 = 124
+                O0_var_315 = self._format_log_entry(O0_var_310, O0_var_313, O0_var_314, codecs.decode('\\u006f\\u006e\\u0065\\u0074\\u0069\\u006d\\u0065', 'unicode_escape'))
+                Config.onetimetasks_log = self._append_task_log(Config.onetimetasks_log, O0_var_315, self.max_log_size)
+                O0_var_307.append({codecs.decode('\\u0069\\u006e\\u0064\\u0065\\u0078', 'unicode_escape'): O0_var_309, codecs.decode('\\u0063\\u006d\\u0064', 'unicode_escape'): O0_var_310[:200], codecs.decode('\\u0065\\u0078\\u0069\\u0074\\u0063\\u006f\\u0064\\u0065', 'unicode_escape'): O0_var_314, codecs.decode('\\u006f\\u0075\\u0074\\u0070\\u0075\\u0074', 'unicode_escape'): O0_var_313[:500], codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0074\\u0069\\u006d\\u0065\\u006f\\u0075\\u0074', 'unicode_escape')})
             except Exception as e:
-                output = f"[ERROR] {type(e).__name__}: {str(e)}"
-                exitcode = -1
-                
-                log_entry =  self._format_log_entry(cmd, output, exitcode, "onetime")
-                Config.onetimetasks_log = self._append_task_log(
-                    Config.onetimetasks_log, log_entry, self.max_log_size
-                )
-                
-                results.append({
-                    "index": i, "cmd": cmd[:200], "exitcode": exitcode,
-                    "output": output, "status": "error"
-                })
-        
-        # ✅ 执行完成后清除任务
+                O0_var_313 = codecs.decode('\\u005b\\u0045\\u0052\\u0052\\u004f\\u0052\\u005d\\u0020', 'unicode_escape') + str(type(e).__name__) + codecs.decode('\\u003a\\u0020', 'unicode_escape') + str(str(e))
+                O0_var_314 = -1
+                O0_var_315 = self._format_log_entry(O0_var_310, O0_var_313, O0_var_314, codecs.decode('\\u006f\\u006e\\u0065\\u0074\\u0069\\u006d\\u0065', 'unicode_escape'))
+                Config.onetimetasks_log = self._append_task_log(Config.onetimetasks_log, O0_var_315, self.max_log_size)
+                O0_var_307.append({codecs.decode('\\u0069\\u006e\\u0064\\u0065\\u0078', 'unicode_escape'): O0_var_309, codecs.decode('\\u0063\\u006d\\u0064', 'unicode_escape'): O0_var_310[:200], codecs.decode('\\u0065\\u0078\\u0069\\u0074\\u0063\\u006f\\u0064\\u0065', 'unicode_escape'): O0_var_314, codecs.decode('\\u006f\\u0075\\u0074\\u0070\\u0075\\u0074', 'unicode_escape'): O0_var_313, codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape')})
         Config.InitTask = False
-        
         if Config.DEBUG:
-            Logger.debug(f"✅ [OneTime] Completed {len(results)} tasks, logged to onetimetasks_log")
-        
-        return results
-    
-    # ================= 定时任务 (带日志) =================
-    
+            Logger.debug(codecs.decode('\\u2705\\u0020\\u005b\\u004f\\u006e\\u0065\\u0054\\u0069\\u006d\\u0065\\u005d\\u0020\\u0043\\u006f\\u006d\\u0070\\u006c\\u0065\\u0074\\u0065\\u0064\\u0020', 'unicode_escape') + str(len(O0_var_307)) + codecs.decode('\\u0020\\u0074\\u0061\\u0073\\u006b\\u0073\\u002c\\u0020\\u006c\\u006f\\u0067\\u0067\\u0065\\u0064\\u0020\\u0074\\u006f\\u0020\\u006f\\u006e\\u0065\\u0074\\u0069\\u006d\\u0065\\u0074\\u0061\\u0073\\u006b\\u0073\\u005f\\u006c\\u006f\\u0067', 'unicode_escape'))
+        return O0_var_307
+
     async def _check_and_run_cron(self):
-        """检查并执行到期的定时任务 (修复逻辑并保留日志)"""
         if not Config.crontasks:
             return
-        
-        # 统一使用本地时间进行调度匹配 (与系统 cron 习惯一致)
-        now = datetime.now()
-        
-        for cron_expr, cmd in Config.crontasks.items():
+        O0_var_316 = datetime.now()
+        for O0_var_317, O0_var_318 in Config.crontasks.items():
             try:
-                # 1. 计算【刚才/当前】最近的一个计划运行时间点
-                # 比如现在 12:00:05，cron 表达式是每分钟，那么 prev_run 就是 12:00:00
-                cron = croniter(cron_expr, now)
-                prev_run = cron.get_prev(datetime)
-                
-                # 2. 计算当前时间距离“计划时间”过去了多久
-                time_passed = (now - prev_run).total_seconds()
-                
-                # 3. 触发判定窗口：
-                # 如果距离计划时间在 (检查间隔 + 宽限期) 之内，说明现在该跑
-                # 宽限期设为 5-10s 确保在 30s 检查一次的情况下不会漏掉
-                if 0 <= time_passed <= (self.check_interval + 5):
-                    
-                    # 4. 防重复执行：hash 必须包含【计划运行的时间戳】
-                    # 这样在 12:00:05 和 12:00:35 两次检查时，算出的 ID 是一样的，确保只跑一次
-                    time_slug = prev_run.strftime('%Y%m%d%H%M')
-                    task_id = f"{cron_expr}:{cmd}:{time_slug}"
-                    task_hash = hashlib.md5(task_id.encode()).hexdigest()[:10]
-                    
-                    if task_hash in self._executed_crons:
+                O0_var_319 = croniter(O0_var_317, O0_var_316)
+                O0_var_320 = O0_var_319.get_prev(datetime)
+                O0_var_321 = (O0_var_316 - O0_var_320).total_seconds()
+                if 0 <= O0_var_321 <= self.check_interval + 5:
+                    O0_var_322 = O0_var_320.strftime(codecs.decode('\\u0025\\u0059\\u0025\\u006d\\u0025\\u0064\\u0025\\u0048\\u0025\\u004d', 'unicode_escape'))
+                    O0_var_323 = str(O0_var_317) + codecs.decode('\\u003a', 'unicode_escape') + str(O0_var_318) + codecs.decode('\\u003a', 'unicode_escape') + str(O0_var_322)
+                    O0_var_324 = hashlib.md5(O0_var_323.encode()).hexdigest()[:10]
+                    if O0_var_324 in self._executed_crons:
                         continue
-                    
                     if Config.DEBUG:
-                        Logger.info(f"⏰ [Cron] Triggered: {cron_expr} → {cmd[:50]}... (Lag: {time_passed:.2f}s)")
-                    
-                    # 5. 执行异步子进程
-                    proc = await asyncio.create_subprocess_shell(
-                        cmd,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.STDOUT,
-                        stdin=asyncio.subprocess.DEVNULL
-                    )
-                    
+                        Logger.info(codecs.decode('\\u23f0\\u0020\\u005b\\u0043\\u0072\\u006f\\u006e\\u005d\\u0020\\u0054\\u0072\\u0069\\u0067\\u0067\\u0065\\u0072\\u0065\\u0064\\u003a\\u0020', 'unicode_escape') + str(O0_var_317) + codecs.decode('\\u0020\\u2192\\u0020', 'unicode_escape') + str(O0_var_318[:50]) + codecs.decode('\\u002e\\u002e\\u002e\\u0020\\u0028\\u004c\\u0061\\u0067\\u003a\\u0020', 'unicode_escape') + format(O0_var_321, codecs.decode('\\u002e\\u0032\\u0066', 'unicode_escape')) + codecs.decode('\\u0073\\u0029', 'unicode_escape'))
+                    O0_var_325 = await asyncio.create_subprocess_shell(O0_var_318, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, stdin=asyncio.subprocess.DEVNULL)
                     try:
-                        # 等待执行结果
-                        stdout, _ = await asyncio.wait_for(
-                            proc.communicate(), timeout=self.timeout
-                        )
-                        output = stdout.decode('utf-8', errors='replace')[:2000]
-                        exitcode = proc.returncode
+                        O0_var_326, O0_var_327 = await asyncio.wait_for(O0_var_325.communicate(), timeout=self.timeout)
+                        O0_var_328 = O0_var_326.decode(codecs.decode('\\u0075\\u0074\\u0066\\u002d\\u0038', 'unicode_escape'), errors=codecs.decode('\\u0072\\u0065\\u0070\\u006c\\u0061\\u0063\\u0065', 'unicode_escape'))[:2000]
+                        O0_var_329 = O0_var_325.returncode
                     except asyncio.TimeoutError:
                         try:
-                            proc.kill()
+                            O0_var_325.kill()
                         except:
                             pass
-                        output = "[TIMEOUT]"
-                        exitcode = 124
+                        O0_var_328 = codecs.decode('\\u005b\\u0054\\u0049\\u004d\\u0045\\u004f\\u0055\\u0054\\u005d', 'unicode_escape')
+                        O0_var_329 = 124
                     except Exception as inner_e:
-                        output = f"[RUNTIME_ERROR] {str(inner_e)}"
-                        exitcode = -1
-                    
-                    # 6. 📝 记录日志 (调用你原有的格式化方法)
-                    log_entry = self._format_log_entry(cmd, output, exitcode, "cron", cron_expr)
-                    Config.crontasks_log = self._append_task_log(
-                        Config.crontasks_log, log_entry, self.max_log_size
-                    )
-                    
-                    # 7. 标记已执行，并设置定时清理（防止集合无限增大）
-                    self._executed_crons.add(task_hash)
-                    # 2分钟后丢弃该 hash，足够跳过当前的触发窗口
-                    asyncio.get_event_loop().call_later(
-                        120, self._executed_crons.discard, task_hash
-                    )
-                    
+                        O0_var_328 = codecs.decode('\\u005b\\u0052\\u0055\\u004e\\u0054\\u0049\\u004d\\u0045\\u005f\\u0045\\u0052\\u0052\\u004f\\u0052\\u005d\\u0020', 'unicode_escape') + str(str(inner_e))
+                        O0_var_329 = -1
+                    O0_var_330 = self._format_log_entry(O0_var_318, O0_var_328, O0_var_329, codecs.decode('\\u0063\\u0072\\u006f\\u006e', 'unicode_escape'), O0_var_317)
+                    Config.crontasks_log = self._append_task_log(Config.crontasks_log, O0_var_330, self.max_log_size)
+                    self._executed_crons.add(O0_var_324)
+                    asyncio.get_event_loop().call_later(120, self._executed_crons.discard, O0_var_324)
             except Exception as e:
                 if Config.DEBUG:
-                    Logger.error(f"❌ [Cron] Scheduler Error for '{cron_expr}': {e}")
-                # 记录调度异常到日志
-                output = f"[SCHEDULER_ERROR] {type(e).__name__}: {str(e)}"
-                log_entry = self._format_log_entry(cmd, output, -1, "cron", cron_expr)
-                Config.crontasks_log = self._append_task_log(
-                    Config.crontasks_log, log_entry, self.max_log_size
-                )
-      # ================= 日志获取方法 =================
-    
-    def get_onetime_log(self, limit: int = None) -> list:
-        """获取启动任务日志 (最近 limit 条)"""
-        logs = list(Config.onetimetasks_log)
-        if limit and limit > 0:
-            return logs[-limit:]  # 返回最新的 limit 条
-        return logs
-    
-    def get_cron_log(self, limit: int = None) -> list:
-        """获取定时任务日志 (最近 limit 条)"""
-        logs = list(Config.crontasks_log)
-        if limit and limit > 0:
-            return logs[-limit:]
-        return logs
-    
-    def clear_logs(self, log_type: str = "all"):
-        """清空日志 (可选接口)"""
-        if log_type in ["onetime", "all"]:
+                    Logger.error(codecs.decode('\\u274c\\u0020\\u005b\\u0043\\u0072\\u006f\\u006e\\u005d\\u0020\\u0053\\u0063\\u0068\\u0065\\u0064\\u0075\\u006c\\u0065\\u0072\\u0020\\u0045\\u0072\\u0072\\u006f\\u0072\\u0020\\u0066\\u006f\\u0072\\u0020\\u0027', 'unicode_escape') + str(O0_var_317) + codecs.decode('\\u0027\\u003a\\u0020', 'unicode_escape') + str(e))
+                O0_var_328 = codecs.decode('\\u005b\\u0053\\u0043\\u0048\\u0045\\u0044\\u0055\\u004c\\u0045\\u0052\\u005f\\u0045\\u0052\\u0052\\u004f\\u0052\\u005d\\u0020', 'unicode_escape') + str(type(e).__name__) + codecs.decode('\\u003a\\u0020', 'unicode_escape') + str(str(e))
+                O0_var_330 = self._format_log_entry(O0_var_318, O0_var_328, -1, codecs.decode('\\u0063\\u0072\\u006f\\u006e', 'unicode_escape'), O0_var_317)
+                Config.crontasks_log = self._append_task_log(Config.crontasks_log, O0_var_330, self.max_log_size)
+
+    def get_onetime_log(self, O0_var_331: int=None) -> list:
+        O0_var_332 = list(Config.onetimetasks_log)
+        if O0_var_331 and O0_var_331 > 0:
+            return O0_var_332[-O0_var_331:]
+        return O0_var_332
+
+    def get_cron_log(self, O0_var_333: int=None) -> list:
+        O0_var_334 = list(Config.crontasks_log)
+        if O0_var_333 and O0_var_333 > 0:
+            return O0_var_334[-O0_var_333:]
+        return O0_var_334
+
+    def clear_logs(self, O0_var_335: str=codecs.decode('\\u0061\\u006c\\u006c', 'unicode_escape')):
+        if O0_var_335 in [codecs.decode('\\u006f\\u006e\\u0065\\u0074\\u0069\\u006d\\u0065', 'unicode_escape'), codecs.decode('\\u0061\\u006c\\u006c', 'unicode_escape')]:
             Config.onetimetasks_log.clear()
-        if log_type in ["cron", "all"]:
+        if O0_var_335 in [codecs.decode('\\u0063\\u0072\\u006f\\u006e', 'unicode_escape'), codecs.decode('\\u0061\\u006c\\u006c', 'unicode_escape')]:
             Config.crontasks_log.clear()
-        return {"status": "ok", "cleared": log_type}
-    def set_cron_tasks(self, tasks: Dict[str, str]) -> dict:
-        """
-        设置定时任务 {cron_expr: command}
-        :param tasks: 如 {"*/5 * * * *": "echo hello", "0 2 * * *": "backup.sh"}
-        """
-        # 验证 cron 表达式
-        invalid = []
-        for cron_expr in tasks.keys():
+        return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape'), codecs.decode('\\u0063\\u006c\\u0065\\u0061\\u0072\\u0065\\u0064', 'unicode_escape'): O0_var_335}
+
+    def set_cron_tasks(self, O0_var_336: Dict[str, str]) -> dict:
+        O0_var_337 = []
+        for O0_var_338 in O0_var_336.keys():
             try:
-                croniter(cron_expr, datetime.now())
+                croniter(O0_var_338, datetime.now())
             except Exception:
-                invalid.append(cron_expr)
-        
-        if invalid:
-            return {
-                "status": "error",
-                "message": f"Invalid cron expressions: {invalid}",
-                "valid_count": len(tasks) - len(invalid)
-            }
-        
-        Config.crontasks = tasks if tasks else {}
-        
-        # 控制循环开关: 有任务则启动，无任务则停止
-        if Config.crontasks and not Config.cronloop:
+                O0_var_337.append(O0_var_338)
+        if O0_var_337:
+            return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'), codecs.decode('\\u006d\\u0065\\u0073\\u0073\\u0061\\u0067\\u0065', 'unicode_escape'): codecs.decode('\\u0049\\u006e\\u0076\\u0061\\u006c\\u0069\\u0064\\u0020\\u0063\\u0072\\u006f\\u006e\\u0020\\u0065\\u0078\\u0070\\u0072\\u0065\\u0073\\u0073\\u0069\\u006f\\u006e\\u0073\\u003a\\u0020', 'unicode_escape') + str(O0_var_337), codecs.decode('\\u0076\\u0061\\u006c\\u0069\\u0064\\u005f\\u0063\\u006f\\u0075\\u006e\\u0074', 'unicode_escape'): len(O0_var_336) - len(O0_var_337)}
+        Config.crontasks = O0_var_336 if O0_var_336 else {}
+        if Config.crontasks and (not Config.cronloop):
             self.start_cron_loop()
         elif not Config.crontasks and Config.cronloop:
             self.stop_cron_loop()
-        
-        return {"status": "ok", "count": len(Config.crontasks), "tasks": Config.crontasks}
+        return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape'), codecs.decode('\\u0063\\u006f\\u0075\\u006e\\u0074', 'unicode_escape'): len(Config.crontasks), codecs.decode('\\u0074\\u0061\\u0073\\u006b\\u0073', 'unicode_escape'): Config.crontasks}
 
     def get_cron_tasks(self) -> dict:
-        """获取定时任务列表"""
-        return {"status": "ok", "count": len(Config.crontasks), "tasks": Config.crontasks}
-    
+        return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape'), codecs.decode('\\u0063\\u006f\\u0075\\u006e\\u0074', 'unicode_escape'): len(Config.crontasks), codecs.decode('\\u0074\\u0061\\u0073\\u006b\\u0073', 'unicode_escape'): Config.crontasks}
+
     def start_cron_loop(self):
-        """启动定时任务后台循环"""
         if Config.cronloop and self._running:
-            return {"status": "ok", "message": "Cron loop already running"}
-        
+            return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape'), codecs.decode('\\u006d\\u0065\\u0073\\u0073\\u0061\\u0067\\u0065', 'unicode_escape'): codecs.decode('\\u0043\\u0072\\u006f\\u006e\\u0020\\u006c\\u006f\\u006f\\u0070\\u0020\\u0061\\u006c\\u0072\\u0065\\u0061\\u0064\\u0079\\u0020\\u0072\\u0075\\u006e\\u006e\\u0069\\u006e\\u0067', 'unicode_escape')}
         Config.cronloop = True
         self._running = True
         self._executed_crons.clear()
-        
-        # 在 asyncio 事件循环中启动后台任务
         try:
-            loop = asyncio.get_event_loop()
-            self._cron_task = loop.create_task(self._cron_loop_worker())
+            O0_var_339 = asyncio.get_event_loop()
+            self._cron_task = O0_var_339.create_task(self._cron_loop_worker())
             if Config.DEBUG:
-                Logger.info(f"🔄 [Cron] Loop started, interval={self.check_interval}s")
+                Logger.info(codecs.decode('\\U0001f504\\u0020\\u005b\\u0043\\u0072\\u006f\\u006e\\u005d\\u0020\\u004c\\u006f\\u006f\\u0070\\u0020\\u0073\\u0074\\u0061\\u0072\\u0074\\u0065\\u0064\\u002c\\u0020\\u0069\\u006e\\u0074\\u0065\\u0072\\u0076\\u0061\\u006c\\u003d', 'unicode_escape') + str(self.check_interval) + codecs.decode('\\u0073', 'unicode_escape'))
         except RuntimeError:
-            # 无事件循环时 (如同步调用), 创建新线程运行
             import threading
-            thread = threading.Thread(target=self._run_cron_sync, daemon=True)
-            thread.start()
+            O0_var_340 = threading.Thread(target=self._run_cron_sync, daemon=True)
+            O0_var_340.start()
             if Config.DEBUG:
-                Logger.info(f"🔄 [Cron] Loop started in thread, interval={self.check_interval}s")
-        
-        return {"status": "ok", "message": "Cron loop started"}
-    
+                Logger.info(codecs.decode('\\U0001f504\\u0020\\u005b\\u0043\\u0072\\u006f\\u006e\\u005d\\u0020\\u004c\\u006f\\u006f\\u0070\\u0020\\u0073\\u0074\\u0061\\u0072\\u0074\\u0065\\u0064\\u0020\\u0069\\u006e\\u0020\\u0074\\u0068\\u0072\\u0065\\u0061\\u0064\\u002c\\u0020\\u0069\\u006e\\u0074\\u0065\\u0072\\u0076\\u0061\\u006c\\u003d', 'unicode_escape') + str(self.check_interval) + codecs.decode('\\u0073', 'unicode_escape'))
+        return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape'), codecs.decode('\\u006d\\u0065\\u0073\\u0073\\u0061\\u0067\\u0065', 'unicode_escape'): codecs.decode('\\u0043\\u0072\\u006f\\u006e\\u0020\\u006c\\u006f\\u006f\\u0070\\u0020\\u0073\\u0074\\u0061\\u0072\\u0074\\u0065\\u0064', 'unicode_escape')}
+
     def stop_cron_loop(self):
-        """停止定时任务后台循环"""
         Config.cronloop = False
         self._running = False
         if self._cron_task:
             self._cron_task.cancel()
             self._cron_task = None
         if Config.DEBUG:
-            Logger.info(f"🛑 [Cron] Loop stopped")
-        return {"status": "ok", "message": "Cron loop stopped"}
-    
+            Logger.info(codecs.decode('\\U0001f6d1\\u0020\\u005b\\u0043\\u0072\\u006f\\u006e\\u005d\\u0020\\u004c\\u006f\\u006f\\u0070\\u0020\\u0073\\u0074\\u006f\\u0070\\u0070\\u0065\\u0064', 'unicode_escape'))
+        return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape'), codecs.decode('\\u006d\\u0065\\u0073\\u0073\\u0061\\u0067\\u0065', 'unicode_escape'): codecs.decode('\\u0043\\u0072\\u006f\\u006e\\u0020\\u006c\\u006f\\u006f\\u0070\\u0020\\u0073\\u0074\\u006f\\u0070\\u0070\\u0065\\u0064', 'unicode_escape')}
+
     async def _cron_loop_worker(self):
-        """异步后台循环: 定期检查并执行到期的定时任务"""
         while self._running and Config.cronloop:
             try:
                 await self._check_and_run_cron()
             except Exception as e:
                 if Config.DEBUG:
-                    Logger.error(f"❌ [Cron] Loop error: {e}")
+                    Logger.error(codecs.decode('\\u274c\\u0020\\u005b\\u0043\\u0072\\u006f\\u006e\\u005d\\u0020\\u004c\\u006f\\u006f\\u0070\\u0020\\u0065\\u0072\\u0072\\u006f\\u0072\\u003a\\u0020', 'unicode_escape') + str(e))
             await asyncio.sleep(self.check_interval)
-    
+
     def _run_cron_sync(self):
-        """同步模式下的循环 (无 asyncio 时备用)"""
         import time
         while self._running and Config.cronloop:
             try:
-                # 同步执行检查 (简化版, 不阻塞主线程太久)
                 asyncio.run(self._check_and_run_cron())
             except:
                 pass
             time.sleep(self.check_interval)
 
     @staticmethod
-    def _append_task_log(log_list: deque, entry: dict, max_size: int = None):
-        """
-        添加任务日志到环形缓冲
-        :param log_list: deque 实例 (用于自动淘汰)
-        :param entry: 日志条目 dict
-        :param max_size: 最大条数 (默认用 Config.MAX_TASK_LOG_SIZE)
-        """
+    def _append_task_log(log_list: deque, entry: dict, max_size: int=None):
         if max_size is None:
             max_size = Config.MAX_TASK_LOG_SIZE
-        
-        # 确保是 deque (支持 maxlen 自动淘汰)
         if not isinstance(log_list, deque):
-            # 转换现有列表为 deque
             log_list = deque(log_list, maxlen=max_size)
-        
         log_list.append(entry)
         return log_list
+
     @staticmethod
-    def _format_log_entry(cmd: str, output: str, exitcode: int, 
-                        task_type: str, cron_expr: str = None) -> dict:
-        """
-        格式化日志条目
-        :return: 标准日志 dict
-        """
-        return {
-            "ts": datetime.utcnow().isoformat() + "Z",  # UTC 时间
-            "cmd": cmd,
-            "output": output,
-            "exitcode": exitcode,
-            "type": task_type,  # "onetime" or "cron"
-            "cron": cron_expr,   # 仅定时任务有
-            # 可读格式: "2024-01-15T10:30:45Z ---- echo hello ---- exitcode=0\nhello"
-            "formatted": f"{datetime.utcnow().isoformat()}Z ---- {cmd} ---- exitcode={exitcode}\n{output.strip()}"
-        }
-    # ================= 工具方法 =================
-    
+    def _format_log_entry(cmd: str, output: str, exitcode: int, task_type: str, cron_expr: str=None) -> dict:
+        return {codecs.decode('\\u0074\\u0073', 'unicode_escape'): datetime.utcnow().isoformat() + codecs.decode('\\u005a', 'unicode_escape'), codecs.decode('\\u0063\\u006d\\u0064', 'unicode_escape'): cmd, codecs.decode('\\u006f\\u0075\\u0074\\u0070\\u0075\\u0074', 'unicode_escape'): output, codecs.decode('\\u0065\\u0078\\u0069\\u0074\\u0063\\u006f\\u0064\\u0065', 'unicode_escape'): exitcode, codecs.decode('\\u0074\\u0079\\u0070\\u0065', 'unicode_escape'): task_type, codecs.decode('\\u0063\\u0072\\u006f\\u006e', 'unicode_escape'): cron_expr, codecs.decode('\\u0066\\u006f\\u0072\\u006d\\u0061\\u0074\\u0074\\u0065\\u0064', 'unicode_escape'): str(datetime.utcnow().isoformat()) + codecs.decode('\\u005a\\u0020\\u002d\\u002d\\u002d\\u002d\\u0020', 'unicode_escape') + str(cmd) + codecs.decode('\\u0020\\u002d\\u002d\\u002d\\u002d\\u0020\\u0065\\u0078\\u0069\\u0074\\u0063\\u006f\\u0064\\u0065\\u003d', 'unicode_escape') + str(exitcode) + codecs.decode('\\u000a', 'unicode_escape') + str(output.strip())}
+
     def get_status(self) -> dict:
-        """获取任务模块状态"""
-        return {
-            "onetime": {
-                "pending": Config.InitTask and len(Config.onetasks) > 0,
-                "count": len(Config.onetasks)
-            },
-            "cron": {
-                "active": Config.cronloop,
-                "count": len(Config.crontasks),
-                "check_interval": self.check_interval
-            }
-        }
-    
-# ============================================================================
-# 📁 文件模块: RESTful 路由 (重构版)
-# ============================================================================
-# --- POST /api/file/list : 列出文件 ---
-@app.post("/api/file/list", response_model=FileListResponse)
-async def file_list(
-    request: Request,
-    body: FileListRequest = Body(...) # 👈 注入模型
-):
-    fm = request.app.state.file_manager
-    result = fm.list_files(
-        base_path=body.path,
-        recursive=body.recursive
-    )
-    return result
+        return {codecs.decode('\\u006f\\u006e\\u0065\\u0074\\u0069\\u006d\\u0065', 'unicode_escape'): {codecs.decode('\\u0070\\u0065\\u006e\\u0064\\u0069\\u006e\\u0067', 'unicode_escape'): Config.InitTask and len(Config.onetasks) > 0, codecs.decode('\\u0063\\u006f\\u0075\\u006e\\u0074', 'unicode_escape'): len(Config.onetasks)}, codecs.decode('\\u0063\\u0072\\u006f\\u006e', 'unicode_escape'): {codecs.decode('\\u0061\\u0063\\u0074\\u0069\\u0076\\u0065', 'unicode_escape'): Config.cronloop, codecs.decode('\\u0063\\u006f\\u0075\\u006e\\u0074', 'unicode_escape'): len(Config.crontasks), codecs.decode('\\u0063\\u0068\\u0065\\u0063\\u006b\\u005f\\u0069\\u006e\\u0074\\u0065\\u0072\\u0076\\u0061\\u006c', 'unicode_escape'): self.check_interval}}
 
+@app.post(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0066\\u0069\\u006c\\u0065\\u002f\\u006c\\u0069\\u0073\\u0074', 'unicode_escape'), response_model=FileListResponse)
+async def O0_fn_7(request: Request, body: FileListRequest=Body(...)):
+    O0_var_341 = request.app.state.file_manager
+    O0_var_342 = O0_var_341.list_files(base_path=body.path, recursive=body.recursive)
+    return O0_var_342
 
-# --- POST /api/file/authority : 批量查询权限 ---
-@app.post("/api/file/authority", response_model=AuthorityQueryResponse)
-async def file_authority(
-    request: Request,
-    body: AuthorityQueryRequest = Body(...)
-):
+@app.post(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0066\\u0069\\u006c\\u0065\\u002f\\u0061\\u0075\\u0074\\u0068\\u006f\\u0072\\u0069\\u0074\\u0079', 'unicode_escape'), response_model=AuthorityQueryResponse)
+async def O0_fn_8(request: Request, body: AuthorityQueryRequest=Body(...)):
     if not body.paths:
-        return JSONResponse(status_code=400, content={ "status:":"error","files": []})
-    
-    fm = request.app.state.file_manager
-    result = fm.get_authority(body.paths)
-    return result
+        return JSONResponse(status_code=400, content={codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073\\u003a', 'unicode_escape'): codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'), codecs.decode('\\u0066\\u0069\\u006c\\u0065\\u0073', 'unicode_escape'): []})
+    O0_var_343 = request.app.state.file_manager
+    O0_var_344 = O0_var_343.get_authority(body.paths)
+    return O0_var_344
 
+@app.put(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0066\\u0069\\u006c\\u0065\\u002f\\u0061\\u0075\\u0074\\u0068\\u006f\\u0072\\u0069\\u0074\\u0079', 'unicode_escape'), response_model=AuthoritySetResponse)
+async def O0_fn_9(request: Request, body: AuthoritySetRequest=Body(...)):
+    O0_var_345 = body.permissions
+    O0_var_346 = body.recursive
+    if not O0_var_345:
+        return JSONResponse(status_code=400, content={codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'), codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c', 'unicode_escape'): 0, codecs.decode('\\u0073\\u0075\\u0063\\u0063\\u0065\\u0073\\u0073', 'unicode_escape'): 0, codecs.decode('\\u0072\\u0065\\u0073\\u0075\\u006c\\u0074\\u0073', 'unicode_escape'): []})
+    O0_var_347 = request.app.state.file_manager
+    O0_var_348 = O0_var_347.set_authority(O0_var_345, O0_var_346)
+    return O0_var_348
 
-# --- PUT /api/file/authority : 批量设置权限 ---
-@app.put("/api/file/authority", response_model=AuthoritySetResponse)
-async def file_set_authority(
-    request: Request,
-    body: AuthoritySetRequest = Body(...)
-):
-    # 处理可能的嵌套格式兼容 (如果前端发的是 {"permissions": {...}, "recursive": false})
-    # 由于我们定义了 model 就是这种结构，所以直接使用即可
-    perm_map = body.permissions
-    recursive = body.recursive
-    
-    if not perm_map:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "status": "error",
-                "total": 0,
-                "success": 0,
-                "results": []
-            }
-        )
-    
-    fm = request.app.state.file_manager
-    result = fm.set_authority(perm_map, recursive)
-    return result
-
-
-# --- POST /api/file/cat : 查看文件文本内容 ---
-@app.post("/api/file/cat", response_model=FileCatResponse)
-async def file_cat(
-    request: Request,
-    body: FileCatRequest = Body(...)
-):
+@app.post(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0066\\u0069\\u006c\\u0065\\u002f\\u0063\\u0061\\u0074', 'unicode_escape'), response_model=FileCatResponse)
+async def O0_fn_10(request: Request, body: FileCatRequest=Body(...)):
     if not body.path:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "status": "error",
-                "path": "",
-                "content": "",
-                "encoding": "",
-                "is_binary": False,
-                "size": 0
-            }
-        )
-    
-    fm = request.app.state.file_manager
-    result = fm.cat_file(body.path)
-    return result
+        return JSONResponse(status_code=400, content={codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'), codecs.decode('\\u0070\\u0061\\u0074\\u0068', 'unicode_escape'): codecs.decode('', 'unicode_escape'), codecs.decode('\\u0063\\u006f\\u006e\\u0074\\u0065\\u006e\\u0074', 'unicode_escape'): codecs.decode('', 'unicode_escape'), codecs.decode('\\u0065\\u006e\\u0063\\u006f\\u0064\\u0069\\u006e\\u0067', 'unicode_escape'): codecs.decode('', 'unicode_escape'), codecs.decode('\\u0069\\u0073\\u005f\\u0062\\u0069\\u006e\\u0061\\u0072\\u0079', 'unicode_escape'): False, codecs.decode('\\u0073\\u0069\\u007a\\u0065', 'unicode_escape'): 0})
+    O0_var_349 = request.app.state.file_manager
+    O0_var_350 = O0_var_349.cat_file(body.path)
+    return O0_var_350
 
-
-# --- POST /api/file : 上传文件 ---
-@app.post("/api/file", response_model=FileUploadResponse)
-async def file_upload(
-    request: Request,
-    body: FileUploadRequest = Body(...)
-):
+@app.post(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0066\\u0069\\u006c\\u0065', 'unicode_escape'), response_model=FileUploadResponse)
+async def O0_fn_11(request: Request, body: FileUploadRequest=Body(...)):
     if not body.content:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "status": "content (base64) required",
-                "path": None,
-                "received": None,
-                "total": None,
-                "chunked": None
-            }
-        )
-    
+        return JSONResponse(status_code=400, content={codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0063\\u006f\\u006e\\u0074\\u0065\\u006e\\u0074\\u0020\\u0028\\u0062\\u0061\\u0073\\u0065\\u0036\\u0034\\u0029\\u0020\\u0072\\u0065\\u0071\\u0075\\u0069\\u0072\\u0065\\u0064', 'unicode_escape'), codecs.decode('\\u0070\\u0061\\u0074\\u0068', 'unicode_escape'): None, codecs.decode('\\u0072\\u0065\\u0063\\u0065\\u0069\\u0076\\u0065\\u0064', 'unicode_escape'): None, codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c', 'unicode_escape'): None, codecs.decode('\\u0063\\u0068\\u0075\\u006e\\u006b\\u0065\\u0064', 'unicode_escape'): None})
     try:
-        file_content = base64.b64decode(body.content)
+        O0_var_351 = base64.b64decode(body.content)
     except Exception:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "status": "Invalid base64 content",
-                "path": None,
-                "received": None,
-                "total": None,
-                "chunked": None
-            })
-    
-    fm = request.app.state.file_manager
-    result = fm.upload_file(
-        file_content=file_content,
-        target_path=body.path,
-        filename=body.filename,
-        chunk_id=body.chunk_id,
-        total_chunks=body.total_chunks
-    )
-    return result
-# ============================================================================
-# 🚀 裸二进制流文件上传接口 (支持结构体返回，零体积膨胀)
-# ============================================================================
-@app.post("/api/fileraw", response_model=FileUploadRawResponse)
-async def file_upload_raw(request: Request):
-    headers = request.headers
-    
-    # 1. 从 HTTP Header 中提取元数据
-    file_path = unquote(headers.get("X-File-Path", ""))
-    filename = unquote(headers.get("X-File-Name", ""))
-    chunk_id_raw = headers.get("X-Chunk-Id")
-    total_chunks_raw = headers.get("X-Total-Chunks")
-    
-    if not file_path or not filename:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, 
-            detail="Missing required custom headers: X-File-Path and X-File-Name"
-        )
-        
-    chunk_id = int(chunk_id_raw) if chunk_id_raw is not None else None
-    total_chunks = int(total_chunks_raw) if total_chunks_raw is not None else None
-    
-    # 2. 读取 Body 中的裸二进制数据流
-    file_content = await request.body()
-    
-    # 3. 移交给底层核心驱动进行落盘/分块累加
-    fm = request.app.state.file_manager
-    result = fm.upload_file(
-        file_content=file_content,
-        target_path=file_path,
-        filename=filename,
-        chunk_id=chunk_id,
-        total_chunks=total_chunks
-    )
-    
-    # 4. 🚀 强类型无感返回：直接实例化结构体，FastAPI 自动将其转化为精简 JSON
-    if result.get("status") == "ok":
-        return FileUploadRawResponse(
-            status="ok",
-            path=result.get("path"),
-            chunk_id=chunk_id,
-            completed=True,
-            message="All chunks received. File merged successfully." if result.get("chunked") else "File uploaded successfully."
-        )
-        
-    elif result.get("status") == "pending":
-        return FileUploadRawResponse(
-            status="ok",
-            path=os.path.join(file_path, filename),
-            chunk_id=chunk_id,
-            completed=False,
-            message=f"Chunk {chunk_id} uploaded. Waiting for remaining blocks."
-        )
-    
-    return FileUploadRawResponse(
-        status="error",
-        completed=False,
-        message=result.get("message", "Unknown upload error")
-    )
+        return JSONResponse(status_code=400, content={codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0049\\u006e\\u0076\\u0061\\u006c\\u0069\\u0064\\u0020\\u0062\\u0061\\u0073\\u0065\\u0036\\u0034\\u0020\\u0063\\u006f\\u006e\\u0074\\u0065\\u006e\\u0074', 'unicode_escape'), codecs.decode('\\u0070\\u0061\\u0074\\u0068', 'unicode_escape'): None, codecs.decode('\\u0072\\u0065\\u0063\\u0065\\u0069\\u0076\\u0065\\u0064', 'unicode_escape'): None, codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c', 'unicode_escape'): None, codecs.decode('\\u0063\\u0068\\u0075\\u006e\\u006b\\u0065\\u0064', 'unicode_escape'): None})
+    O0_var_352 = request.app.state.file_manager
+    O0_var_353 = O0_var_352.upload_file(file_content=O0_var_351, target_path=body.path, filename=body.filename, chunk_id=body.chunk_id, total_chunks=body.total_chunks)
+    return O0_var_353
 
-# --- POST /api/file/download : 下载文件 ---
-@app.post("/api/file/download")
-async def file_download(
-    request: Request,
-    body: FileDownloadRequest = Body(...)
-):
+@app.post(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0066\\u0069\\u006c\\u0065\\u0072\\u0061\\u0077', 'unicode_escape'), response_model=FileUploadRawResponse)
+async def O0_fn_12(request: Request):
+    O0_var_354 = request.headers
+    O0_var_355 = unquote(O0_var_354.get(codecs.decode('\\u0058\\u002d\\u0046\\u0069\\u006c\\u0065\\u002d\\u0050\\u0061\\u0074\\u0068', 'unicode_escape'), codecs.decode('', 'unicode_escape')))
+    O0_var_356 = unquote(O0_var_354.get(codecs.decode('\\u0058\\u002d\\u0046\\u0069\\u006c\\u0065\\u002d\\u004e\\u0061\\u006d\\u0065', 'unicode_escape'), codecs.decode('', 'unicode_escape')))
+    O0_var_357 = O0_var_354.get(codecs.decode('\\u0058\\u002d\\u0043\\u0068\\u0075\\u006e\\u006b\\u002d\\u0049\\u0064', 'unicode_escape'))
+    O0_var_358 = O0_var_354.get(codecs.decode('\\u0058\\u002d\\u0054\\u006f\\u0074\\u0061\\u006c\\u002d\\u0043\\u0068\\u0075\\u006e\\u006b\\u0073', 'unicode_escape'))
+    if not O0_var_355 or not O0_var_356:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=codecs.decode('\\u004d\\u0069\\u0073\\u0073\\u0069\\u006e\\u0067\\u0020\\u0072\\u0065\\u0071\\u0075\\u0069\\u0072\\u0065\\u0064\\u0020\\u0063\\u0075\\u0073\\u0074\\u006f\\u006d\\u0020\\u0068\\u0065\\u0061\\u0064\\u0065\\u0072\\u0073\\u003a\\u0020\\u0058\\u002d\\u0046\\u0069\\u006c\\u0065\\u002d\\u0050\\u0061\\u0074\\u0068\\u0020\\u0061\\u006e\\u0064\\u0020\\u0058\\u002d\\u0046\\u0069\\u006c\\u0065\\u002d\\u004e\\u0061\\u006d\\u0065', 'unicode_escape'))
+    O0_var_359 = int(O0_var_357) if O0_var_357 is not None else None
+    O0_var_360 = int(O0_var_358) if O0_var_358 is not None else None
+    O0_var_361 = await request.body()
+    O0_var_362 = request.app.state.file_manager
+    O0_var_363 = O0_var_362.upload_file(file_content=O0_var_361, target_path=O0_var_355, filename=O0_var_356, chunk_id=O0_var_359, total_chunks=O0_var_360)
+    if O0_var_363.get(codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape')) == codecs.decode('\\u006f\\u006b', 'unicode_escape'):
+        return FileUploadRawResponse(status=codecs.decode('\\u006f\\u006b', 'unicode_escape'), path=O0_var_363.get(codecs.decode('\\u0070\\u0061\\u0074\\u0068', 'unicode_escape')), chunk_id=O0_var_359, completed=True, message=codecs.decode('\\u0041\\u006c\\u006c\\u0020\\u0063\\u0068\\u0075\\u006e\\u006b\\u0073\\u0020\\u0072\\u0065\\u0063\\u0065\\u0069\\u0076\\u0065\\u0064\\u002e\\u0020\\u0046\\u0069\\u006c\\u0065\\u0020\\u006d\\u0065\\u0072\\u0067\\u0065\\u0064\\u0020\\u0073\\u0075\\u0063\\u0063\\u0065\\u0073\\u0073\\u0066\\u0075\\u006c\\u006c\\u0079\\u002e', 'unicode_escape') if O0_var_363.get(codecs.decode('\\u0063\\u0068\\u0075\\u006e\\u006b\\u0065\\u0064', 'unicode_escape')) else codecs.decode('\\u0046\\u0069\\u006c\\u0065\\u0020\\u0075\\u0070\\u006c\\u006f\\u0061\\u0064\\u0065\\u0064\\u0020\\u0073\\u0075\\u0063\\u0063\\u0065\\u0073\\u0073\\u0066\\u0075\\u006c\\u006c\\u0079\\u002e', 'unicode_escape'))
+    elif O0_var_363.get(codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape')) == codecs.decode('\\u0070\\u0065\\u006e\\u0064\\u0069\\u006e\\u0067', 'unicode_escape'):
+        return FileUploadRawResponse(status=codecs.decode('\\u006f\\u006b', 'unicode_escape'), path=os.path.join(O0_var_355, O0_var_356), chunk_id=O0_var_359, completed=False, message=codecs.decode('\\u0043\\u0068\\u0075\\u006e\\u006b\\u0020', 'unicode_escape') + str(O0_var_359) + codecs.decode('\\u0020\\u0075\\u0070\\u006c\\u006f\\u0061\\u0064\\u0065\\u0064\\u002e\\u0020\\u0057\\u0061\\u0069\\u0074\\u0069\\u006e\\u0067\\u0020\\u0066\\u006f\\u0072\\u0020\\u0072\\u0065\\u006d\\u0061\\u0069\\u006e\\u0069\\u006e\\u0067\\u0020\\u0062\\u006c\\u006f\\u0063\\u006b\\u0073\\u002e', 'unicode_escape'))
+    return FileUploadRawResponse(status=codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'), completed=False, message=O0_var_363.get(codecs.decode('\\u006d\\u0065\\u0073\\u0073\\u0061\\u0067\\u0065', 'unicode_escape'), codecs.decode('\\u0055\\u006e\\u006b\\u006e\\u006f\\u0077\\u006e\\u0020\\u0075\\u0070\\u006c\\u006f\\u0061\\u0064\\u0020\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape')))
+
+@app.post(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0066\\u0069\\u006c\\u0065\\u002f\\u0064\\u006f\\u0077\\u006e\\u006c\\u006f\\u0061\\u0064', 'unicode_escape'))
+async def O0_fn_13(request: Request, body: FileDownloadRequest=Body(...)):
     if not body.path:
-        return JSONResponse(400, {"error": "path required"})
-    
-    fm = request.app.state.file_manager
-    file_path, mime_type, size = fm.download_file(body.path)
-    
+        return JSONResponse(400, {codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'): codecs.decode('\\u0070\\u0061\\u0074\\u0068\\u0020\\u0072\\u0065\\u0071\\u0075\\u0069\\u0072\\u0065\\u0064', 'unicode_escape')})
+    O0_var_364 = request.app.state.file_manager
+    O0_var_365, O0_var_366, O0_var_367 = O0_var_364.download_file(body.path)
     from fastapi.responses import FileResponse
-    return FileResponse(
-        path=str(file_path),
-        filename=file_path.name,
-        media_type=mime_type,
-        headers={
-            "x-file-size": str(size),
-            "x-original-path": str(file_path.relative_to(Path(Config.FILE_ROOT)))
-        }
-    )
+    return FileResponse(path=str(O0_var_365), filename=O0_var_365.name, media_type=O0_var_366, headers={codecs.decode('\\u0078\\u002d\\u0066\\u0069\\u006c\\u0065\\u002d\\u0073\\u0069\\u007a\\u0065', 'unicode_escape'): str(O0_var_367), codecs.decode('\\u0078\\u002d\\u006f\\u0072\\u0069\\u0067\\u0069\\u006e\\u0061\\u006c\\u002d\\u0070\\u0061\\u0074\\u0068', 'unicode_escape'): str(O0_var_365.relative_to(Path(Config.FILE_ROOT)))})
 
+@app.delete(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0066\\u0069\\u006c\\u0065', 'unicode_escape'), response_model=FileDeleteResponse)
+async def O0_fn_14(request: Request, body: FileDeleteRequest=Body(...)):
+    O0_var_368 = body.paths
+    if not O0_var_368:
+        O0_var_369 = await request.body()
+        O0_var_370 = json.loads(O0_var_369.decode()) if O0_var_369 else {}
+        O0_var_368 = [O0_var_372 for O0_var_371 in [codecs.decode('\\u0070\\u0061\\u0074\\u0068', 'unicode_escape'), codecs.decode('\\u0070\\u0061\\u0074\\u0068\\u0032', 'unicode_escape'), codecs.decode('\\u0070\\u0031', 'unicode_escape'), codecs.decode('\\u0070\\u0032', 'unicode_escape')] if (O0_var_372 := O0_var_370.get(O0_var_371))]
+    if not O0_var_368:
+        return JSONResponse(status_code=400, content={codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'), codecs.decode('\\u0072\\u0065\\u0073\\u0075\\u006c\\u0074\\u0073', 'unicode_escape'): []})
+    O0_var_373 = request.app.state.file_manager
+    O0_var_374 = O0_var_373.delete_paths(O0_var_368)
+    return O0_var_374
 
-# --- DELETE /api/file : 批量删除 ---
-@app.delete("/api/file", response_model=FileDeleteResponse)
-async def file_delete(
-    request: Request,
-    body: FileDeleteRequest = Body(...)
-):
-    # 兼容旧格式：如果 paths 为空，尝试从 path/path2 等字段提取
-    paths = body.paths
-    if not paths:
-        # 这里需要从 request.body() 重新读取原始数据来兼容旧格式，因为 Pydantic 已经过滤了 exclude=True 的字段
-        # 简单起见，我们要求新客户端使用 paths 字段。如果必须兼容，可以保留少量手动解析逻辑
-        raw_body = await request.body()
-        params = json.loads(raw_body.decode()) if raw_body else {}
-        paths = [p for k in ["path", "path2", "p1", "p2"] if (p := params.get(k))]
-    
-    if not paths:
-        return JSONResponse(status_code=400, content={"status": "error", "results": []})
-    
-    fm = request.app.state.file_manager
-    result = fm.delete_paths(paths)
-    return result
-
-
-# --- PUT /api/file : 批量移动/重命名 ---
-@app.put("/api/file", response_model=FileMoveResponse)
-async def file_move(
-    request: Request,
-    # 修正：直接接收 Dict[str, str] 作为整个 Body，不再寻找 "move_map" 键
-    move_map: Dict[str, str] = Body(..., examples={ "/tmp/old.txt": "/archive/old.txt" })
-):
+@app.put(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0066\\u0069\\u006c\\u0065', 'unicode_escape'), response_model=FileMoveResponse)
+async def O0_fn_15(request: Request, move_map: Dict[str, str]=Body(..., examples={codecs.decode('\\u002f\\u0074\\u006d\\u0070\\u002f\\u006f\\u006c\\u0064\\u002e\\u0074\\u0078\\u0074', 'unicode_escape'): codecs.decode('\\u002f\\u0061\\u0072\\u0063\\u0068\\u0069\\u0076\\u0065\\u002f\\u006f\\u006c\\u0064\\u002e\\u0074\\u0078\\u0074', 'unicode_escape')})):
     if not move_map:
-        return JSONResponse(status_code=400, content={"error": "At least one src->dst pair required"})
-    
-    fm = request.app.state.file_manager
-    # 执行逻辑
-    result = fm.move_paths(move_map) 
-    return result
-    
-@app.post("/api/file/cp", response_model=FileMoveResponse)
-async def file_copy(
-    request: Request,
-    # 直接接收字典映射作为整个请求体
-    copy_map: Dict[str, str] = Body(..., description="源路径到目标路径的映射", examples=[{"/tmp/old.txt": "/archive/old.txt", "/tmp/logs": "/backup/logs"}])
-):
-    """
-    批量复制文件/目录
-    Body: {"src1": "dst1", "src2": "dst2", ...}
-    
-    行为说明:
-    - 如果目标是目录，文件/目录会被复制到该目录下 (保持原名)
-    - 如果目标路径已存在，该条目会标记为错误并跳过
-    - 文件复制保留元数据 (mtime, mode 等)
-    """
+        return JSONResponse(status_code=400, content={codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'): codecs.decode('\\u0041\\u0074\\u0020\\u006c\\u0065\\u0061\\u0073\\u0074\\u0020\\u006f\\u006e\\u0065\\u0020\\u0073\\u0072\\u0063\\u002d\\u003e\\u0064\\u0073\\u0074\\u0020\\u0070\\u0061\\u0069\\u0072\\u0020\\u0072\\u0065\\u0071\\u0075\\u0069\\u0072\\u0065\\u0064', 'unicode_escape')})
+    O0_var_375 = request.app.state.file_manager
+    O0_var_376 = O0_var_375.move_paths(move_map)
+    return O0_var_376
+
+@app.post(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0066\\u0069\\u006c\\u0065\\u002f\\u0063\\u0070', 'unicode_escape'), response_model=FileMoveResponse)
+async def O0_fn_16(request: Request, copy_map: Dict[str, str]=Body(..., description=codecs.decode('\\u6e90\\u8def\\u5f84\\u5230\\u76ee\\u6807\\u8def\\u5f84\\u7684\\u6620\\u5c04', 'unicode_escape'), examples=[{codecs.decode('\\u002f\\u0074\\u006d\\u0070\\u002f\\u006f\\u006c\\u0064\\u002e\\u0074\\u0078\\u0074', 'unicode_escape'): codecs.decode('\\u002f\\u0061\\u0072\\u0063\\u0068\\u0069\\u0076\\u0065\\u002f\\u006f\\u006c\\u0064\\u002e\\u0074\\u0078\\u0074', 'unicode_escape'), codecs.decode('\\u002f\\u0074\\u006d\\u0070\\u002f\\u006c\\u006f\\u0067\\u0073', 'unicode_escape'): codecs.decode('\\u002f\\u0062\\u0061\\u0063\\u006b\\u0075\\u0070\\u002f\\u006c\\u006f\\u0067\\u0073', 'unicode_escape')}])):
     if not copy_map:
-        return JSONResponse(status_code=400, content={"error": "At least one src->dst pair required"})
-    
-    fm = request.app.state.file_manager
-    # 调用 FileManager 的 copy_paths 方法
-    result = fm.copy_paths(copy_map) 
-    return result
+        return JSONResponse(status_code=400, content={codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'): codecs.decode('\\u0041\\u0074\\u0020\\u006c\\u0065\\u0061\\u0073\\u0074\\u0020\\u006f\\u006e\\u0065\\u0020\\u0073\\u0072\\u0063\\u002d\\u003e\\u0064\\u0073\\u0074\\u0020\\u0070\\u0061\\u0069\\u0072\\u0020\\u0072\\u0065\\u0071\\u0075\\u0069\\u0072\\u0065\\u0064', 'unicode_escape')})
+    O0_var_377 = request.app.state.file_manager
+    O0_var_378 = O0_var_377.copy_paths(copy_map)
+    return O0_var_378
 
-# --- POST /api/file/new : 新建目录 ---
-@app.post("/api/file/new", response_model=FileMkdirResponse)
-async def file_mkdir(
-    request: Request,
-    body: FileMkdirRequest = Body(...)
-):
+@app.post(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0066\\u0069\\u006c\\u0065\\u002f\\u006e\\u0065\\u0077', 'unicode_escape'), response_model=FileMkdirResponse)
+async def O0_fn_17(request: Request, body: FileMkdirRequest=Body(...)):
     if not body.path:
-        return JSONResponse(status_code=400, content={"status": "path required", "path": ""})
-        
-    
-    fm = request.app.state.file_manager
-    result = fm.create_directory(body.path)
-    return result
+        return JSONResponse(status_code=400, content={codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0070\\u0061\\u0074\\u0068\\u0020\\u0072\\u0065\\u0071\\u0075\\u0069\\u0072\\u0065\\u0064', 'unicode_escape'), codecs.decode('\\u0070\\u0061\\u0074\\u0068', 'unicode_escape'): codecs.decode('', 'unicode_escape')})
+    O0_var_379 = request.app.state.file_manager
+    O0_var_380 = O0_var_379.create_directory(body.path)
+    return O0_var_380
 
+@app.get(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0074\\u0061\\u0073\\u006b\\u002f\\u006f\\u006e\\u0065\\u0074\\u0069\\u006d\\u0065', 'unicode_escape'), response_model=OneTimeTaskGetResponse)
+async def O0_fn_18(request: Request):
+    O0_var_381 = request.app.state.task_manager.get_onetime_tasks()
+    return O0_var_381
 
-# ============================================================================
-# 📋 任务模块: RESTful 路由
-# ============================================================================
-
-# --- GET /api/task/onetime : 获取启动任务 ---
-@app.get("/api/task/onetime", response_model=OneTimeTaskGetResponse)
-async def get_onetime_tasks(request: Request):
-    """获取待执行的启动任务列表"""
-    tasks = request.app.state.task_manager.get_onetime_tasks()
-    return tasks
-
-
-# --- POST /api/task/onetime : 设置启动任务 ---
-@app.post("/api/task/onetime", response_model=OneTimeTaskResponse)
-async def set_onetime_tasks(
-    request: Request,
-    tasks: List[str] = Body(default=[])  # 👈 直接声明你需要一个字符串列表
-):
-    """
-    设置启动任务列表
-    请求体必须是: ["cmd1", "cmd2"]
-    """
-    # 1. 写入任务
+@app.post(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0074\\u0061\\u0073\\u006b\\u002f\\u006f\\u006e\\u0065\\u0074\\u0069\\u006d\\u0065', 'unicode_escape'), response_model=OneTimeTaskResponse)
+async def O0_fn_19(request: Request, tasks: List[str]=Body(default=[])):
     request.app.state.task_manager.set_onetime_tasks(tasks)
-    # 2. 构建基础返回
-    res = {
-        "status": "ok",
-        "count": len(tasks),
-        "tasks": tasks
-    }
-    # 3. 触发立即执行逻辑
+    O0_var_382 = {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape'), codecs.decode('\\u0063\\u006f\\u0075\\u006e\\u0074', 'unicode_escape'): len(tasks), codecs.decode('\\u0074\\u0061\\u0073\\u006b\\u0073', 'unicode_escape'): tasks}
     if Config.InitTask and tasks:
-        res["executed"] = request.app.state.task_manager.run_onetime_tasks()
-    return res
+        O0_var_382[codecs.decode('\\u0065\\u0078\\u0065\\u0063\\u0075\\u0074\\u0065\\u0064', 'unicode_escape')] = request.app.state.task_manager.run_onetime_tasks()
+    return O0_var_382
 
+@app.get(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0074\\u0061\\u0073\\u006b\\u002f\\u0063\\u0072\\u006f\\u006e', 'unicode_escape'), response_model=CronTasksResponse)
+async def O0_fn_20(request: Request):
+    O0_var_383 = request.app.state.task_manager.get_cron_tasks()
+    return O0_var_383
 
-# --- GET /api/task/cron : 获取定时任务 ---
-@app.get("/api/task/cron", response_model=CronTasksResponse)
-async def get_cron_tasks(request: Request):
-    """获取定时任务列表"""
-    result = request.app.state.task_manager.get_cron_tasks()
-    return result
+@app.post(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0074\\u0061\\u0073\\u006b\\u002f\\u0063\\u0072\\u006f\\u006e', 'unicode_escape'), response_model=CronTasksResponse)
+async def O0_fn_21(request: Request, tasks: Dict[str, str]=Body(default={}, examples=[{codecs.decode('\\u002a\\u002f\\u0031\\u0030\\u0020\\u002a\\u0020\\u002a\\u0020\\u002a\\u0020\\u002a', 'unicode_escape'): codecs.decode('\\u0070\\u0079\\u0074\\u0068\\u006f\\u006e\\u0020\\u002f\\u006f\\u0070\\u0074\\u002f\\u0073\\u0063\\u0072\\u0069\\u0070\\u0074\\u0073\\u002f\\u0068\\u0065\\u0061\\u006c\\u0074\\u0068\\u005f\\u0063\\u0068\\u0065\\u0063\\u006b\\u002e\\u0070\\u0079', 'unicode_escape'), codecs.decode('\\u0030\\u0020\\u0030\\u0020\\u002a\\u0020\\u002a\\u0020\\u0030', 'unicode_escape'): codecs.decode('\\u002f\\u006f\\u0070\\u0074\\u002f\\u0073\\u0063\\u0072\\u0069\\u0070\\u0074\\u0073\\u002f\\u0077\\u0065\\u0065\\u006b\\u006c\\u0079\\u005f\\u0072\\u0065\\u0070\\u006f\\u0072\\u0074\\u002e\\u0073\\u0068', 'unicode_escape')}])):
+    O0_var_384 = request.app.state.task_manager.set_cron_tasks(tasks)
+    return O0_var_384
 
-
-# --- POST /api/task/cron : 设置定时任务 ---
-@app.post("/api/task/cron", response_model=CronTasksResponse)
-async def set_cron_tasks(
-    request: Request,
-    # 🌟 直接注入字典，FastAPI 自动解析并验证
-    tasks: Dict[str, str] = Body(default={}, examples=[{
-    "*/10 * * * *": "python /opt/scripts/health_check.py",
-    "0 0 * * 0": "/opt/scripts/weekly_report.sh"
-    }])
-):
-    """
-    设置定时任务 {cron_expr: command}
-    Body: {"*/5 * * * *": "echo hello", "0 2 * * *": "backup.sh"}
-    """
-    result = request.app.state.task_manager.set_cron_tasks(tasks)
-    return result
-
-
-# --- GET /api/task/status : 获取任务模块状态 (辅助接口) ---
-@app.get("/api/task/status", response_model=TaskStatusResponse)
-async def get_task_status(request: Request):
-    """获取任务模块运行状态"""
+@app.get(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0074\\u0061\\u0073\\u006b\\u002f\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'), response_model=TaskStatusResponse)
+async def O0_fn_22(request: Request):
     return request.app.state.task_manager.get_status()
 
-
-# --- POST /api/task/onetime/execute : 手动触发启动任务执行 (可选) ---
-@app.post("/api/task/onetime/execute", response_model=OnetimeExecuteResponse)
-async def execute_onetime_tasks(request: Request):
-    """
-    手动触发执行启动任务
-    """
+@app.post(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0074\\u0061\\u0073\\u006b\\u002f\\u006f\\u006e\\u0065\\u0074\\u0069\\u006d\\u0065\\u002f\\u0065\\u0078\\u0065\\u0063\\u0075\\u0074\\u0065', 'unicode_escape'), response_model=OnetimeExecuteResponse)
+async def O0_fn_23(request: Request):
     if not Config.onetasks:
-        return {
-            "status": "ok",
-            "message": "No tasks to execute",
-            "executed": 0,
-            "results": []
-        }
-    
-    # 临时标记为待执行
+        return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape'), codecs.decode('\\u006d\\u0065\\u0073\\u0073\\u0061\\u0067\\u0065', 'unicode_escape'): codecs.decode('\\u004e\\u006f\\u0020\\u0074\\u0061\\u0073\\u006b\\u0073\\u0020\\u0074\\u006f\\u0020\\u0065\\u0078\\u0065\\u0063\\u0075\\u0074\\u0065', 'unicode_escape'), codecs.decode('\\u0065\\u0078\\u0065\\u0063\\u0075\\u0074\\u0065\\u0064', 'unicode_escape'): 0, codecs.decode('\\u0072\\u0065\\u0073\\u0075\\u006c\\u0074\\u0073', 'unicode_escape'): []}
     Config.InitTask = True
-    results = request.app.state.task_manager.run_onetime_tasks()
-    return {"status": "ok", "executed": len(results), "results": results}
-# ============================================================================
-# 📋 任务模块: 日志查询路由
-# ============================================================================
-# --- GET /api/task/log/onetime : 获取启动任务日志 ---
-@app.get("/api/task/log/onetime", response_model=TaskLogResponse)
-async def get_onetime_log(
-    request: Request, 
-    limit: int = Query(100, ge=1, le=100) # 👈 自动限制 1-100
-):
-    """查询启动任务执行记录"""
-    logs = request.app.state.task_manager.get_onetime_log(limit)
-    return {"status": "ok", "count": len(logs), "logs": list(logs)}
+    O0_var_385 = request.app.state.task_manager.run_onetime_tasks()
+    return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape'), codecs.decode('\\u0065\\u0078\\u0065\\u0063\\u0075\\u0074\\u0065\\u0064', 'unicode_escape'): len(O0_var_385), codecs.decode('\\u0072\\u0065\\u0073\\u0075\\u006c\\u0074\\u0073', 'unicode_escape'): O0_var_385}
 
+@app.get(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0074\\u0061\\u0073\\u006b\\u002f\\u006c\\u006f\\u0067\\u002f\\u006f\\u006e\\u0065\\u0074\\u0069\\u006d\\u0065', 'unicode_escape'), response_model=TaskLogResponse)
+async def O0_fn_24(request: Request, limit: int=Query(100, ge=1, le=100)):
+    O0_var_386 = request.app.state.task_manager.get_onetime_log(limit)
+    return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape'), codecs.decode('\\u0063\\u006f\\u0075\\u006e\\u0074', 'unicode_escape'): len(O0_var_386), codecs.decode('\\u006c\\u006f\\u0067\\u0073', 'unicode_escape'): list(O0_var_386)}
 
-# --- GET /api/task/log/cron : 获取定时任务日志 ---
-@app.get("/api/task/log/cron", response_model=TaskLogResponse)
-async def get_cron_log(
-    request: Request, 
-    limit: int = Query(100, ge=1, le=100)
-):
-    """查询定时任务执行记录"""
-    logs = request.app.state.task_manager.get_cron_log(limit)
-    return {"status": "ok", "count": len(logs), "logs": list(logs)}
+@app.get(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0074\\u0061\\u0073\\u006b\\u002f\\u006c\\u006f\\u0067\\u002f\\u0063\\u0072\\u006f\\u006e', 'unicode_escape'), response_model=TaskLogResponse)
+async def O0_fn_25(request: Request, limit: int=Query(100, ge=1, le=100)):
+    O0_var_387 = request.app.state.task_manager.get_cron_log(limit)
+    return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape'), codecs.decode('\\u0063\\u006f\\u0075\\u006e\\u0074', 'unicode_escape'): len(O0_var_387), codecs.decode('\\u006c\\u006f\\u0067\\u0073', 'unicode_escape'): list(O0_var_387)}
 
+@app.delete(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0074\\u0061\\u0073\\u006b\\u002f\\u006c\\u006f\\u0067\\u002f\\u006f\\u006e\\u0065\\u0074\\u0069\\u006d\\u0065', 'unicode_escape'), response_model=LogClearResponse)
+async def O0_fn_26(request: Request):
+    return request.app.state.task_manager.clear_logs(codecs.decode('\\u006f\\u006e\\u0065\\u0074\\u0069\\u006d\\u0065', 'unicode_escape'))
 
-# --- DELETE /api/task/log/onetime : 清空启动任务日志 ---
-@app.delete("/api/task/log/onetime", response_model=LogClearResponse)
-async def clear_onetime_log(request: Request):
-    """清空启动任务日志"""
-    return request.app.state.task_manager.clear_logs("onetime")
+@app.delete(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0074\\u0061\\u0073\\u006b\\u002f\\u006c\\u006f\\u0067\\u002f\\u0063\\u0072\\u006f\\u006e', 'unicode_escape'), response_model=LogClearResponse)
+async def O0_fn_27(request: Request):
+    return request.app.state.task_manager.clear_logs(codecs.decode('\\u0063\\u0072\\u006f\\u006e', 'unicode_escape'))
 
+@app.get(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0074\\u0061\\u0073\\u006b\\u002f\\u006c\\u006f\\u0067\\u002f\\u0073\\u0075\\u006d\\u006d\\u0061\\u0072\\u0079', 'unicode_escape'), response_model=LogSummaryResponse)
+async def O0_fn_28(request: Request):
 
-# --- DELETE /api/task/log/cron : 清空定时任务日志 ---
-@app.delete("/api/task/log/cron", response_model=LogClearResponse)
-async def clear_cron_log(request: Request):
-    """清空定时任务日志"""
-    return request.app.state.task_manager.clear_logs("cron")
+    def O0_fn_29(O0_var_388):
+        O0_var_389 = list(O0_var_388)[-10:]
+        return {codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c\\u005f\\u006c\\u006f\\u0067\\u0067\\u0065\\u0064', 'unicode_escape'): len(O0_var_388), codecs.decode('\\u006d\\u0061\\u0078\\u005f\\u0063\\u0061\\u0070\\u0061\\u0063\\u0069\\u0074\\u0079', 'unicode_escape'): Config.MAX_TASK_LOG_SIZE, codecs.decode('\\u0072\\u0065\\u0063\\u0065\\u006e\\u0074\\u005f\\u0073\\u0075\\u0063\\u0063\\u0065\\u0073\\u0073', 'unicode_escape'): sum((1 for O0_var_390 in O0_var_389 if O0_var_390.get(codecs.decode('\\u0065\\u0078\\u0069\\u0074\\u0063\\u006f\\u0064\\u0065', 'unicode_escape')) == 0)), codecs.decode('\\u0072\\u0065\\u0063\\u0065\\u006e\\u0074\\u005f\\u0066\\u0061\\u0069\\u006c\\u0065\\u0064', 'unicode_escape'): sum((1 for O0_var_391 in O0_var_389 if O0_var_391.get(codecs.decode('\\u0065\\u0078\\u0069\\u0074\\u0063\\u006f\\u0064\\u0065', 'unicode_escape'), -1) != 0))}
+    return {codecs.decode('\\u006f\\u006e\\u0065\\u0074\\u0069\\u006d\\u0065', 'unicode_escape'): O0_fn_29(Config.onetimetasks_log), codecs.decode('\\u0063\\u0072\\u006f\\u006e', 'unicode_escape'): O0_fn_29(Config.crontasks_log)}
 
+@app.get(codecs.decode('\\u002f\\u0068\\u0065\\u0061\\u006c\\u0074\\u0068', 'unicode_escape'))
+async def O0_fn_30():
+    return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape'), codecs.decode('\\u0064\\u0065\\u0062\\u0075\\u0067', 'unicode_escape'): Config.DEBUG, codecs.decode('\\u0074\\u0069\\u006d\\u0065\\u0073\\u0074\\u0061\\u006d\\u0070', 'unicode_escape'): int(time.time()), codecs.decode('\\u0076\\u0065\\u0072\\u0073\\u0069\\u006f\\u006e', 'unicode_escape'): Config.AGENT_VERSION}
 
-# --- GET /api/task/log/summary : 日志统计摘要 ---
-@app.get("/api/task/log/summary", response_model=LogSummaryResponse)
-async def get_log_summary(request: Request):
-    """获取日志数量与成功率统计"""
-    def calc_stats(log_deque):
-        recent = list(log_deque)[-10:]
-        return {
-            "total_logged": len(log_deque),
-            "max_capacity": Config.MAX_TASK_LOG_SIZE,
-            "recent_success": sum(1 for l in recent if l.get("exitcode") == 0),
-            "recent_failed": sum(1 for l in recent if l.get("exitcode", -1) != 0)
-        }
+@app.get(codecs.decode('\\u002f', 'unicode_escape'))
+async def O0_fn_31():
+    return {codecs.decode('\\u006e\\u0061\\u006d\\u0065', 'unicode_escape'): codecs.decode('\\u0050\\u0072\\u006f\\u0078\\u0079\\u0020\\u0041\\u0067\\u0065\\u006e\\u0074', 'unicode_escape'), codecs.decode('\\u0076\\u0065\\u0072\\u0073\\u0069\\u006f\\u006e', 'unicode_escape'): Config.AGENT_VERSION, codecs.decode('\\u0065\\u006e\\u0064\\u0070\\u006f\\u0069\\u006e\\u0074\\u0073', 'unicode_escape'): {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'), codecs.decode('\\u0068\\u0065\\u0061\\u006c\\u0074\\u0068', 'unicode_escape'): codecs.decode('\\u002f\\u0068\\u0065\\u0061\\u006c\\u0074\\u0068', 'unicode_escape'), codecs.decode('\\u0064\\u006f\\u0063\\u0073', 'unicode_escape'): codecs.decode('\\u002f\\u0064\\u006f\\u0063\\u0073\\u0020\\u0028\\u4ec5\\u0044\\u0045\\u0042\\u0055\\u0047\\u6a21\\u5f0f\\u0029', 'unicode_escape')}}
 
-    return {
-        "onetime": calc_stats(Config.onetimetasks_log),
-        "cron": calc_stats(Config.crontasks_log)
-    }
-
-
-@app.get("/health")
-async def health_check():
-    """健康检查接口 - 可选认证"""
-    return {
-        "status": "ok",
-        "debug": Config.DEBUG,
-        "timestamp": int(time.time()),
-        "version": Config.AGENT_VERSION
-    }
-
-
-@app.get("/")
-async def root():
-    """根路径 - 返回代理信息"""
-    return {
-        "name": "Proxy Agent",
-        "version": Config.AGENT_VERSION,
-        "endpoints": {
-            "status": "/api/status",
-            "health": "/health",
-            "docs": "/docs (仅DEBUG模式)"
-        }
-    }
-#超级终端
-@app.websocket("/api/ws/{path:path}")
-async def terminal_websocket(websocket: WebSocket, path: str, request_id: str = Query(...),token: str = Query(None)):
-    handler = TerminalSessionHandler()
-    use_noise = True
-    
+@app.websocket(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0077\\u0073\\u002f\\u007b\\u0070\\u0061\\u0074\\u0068\\u003a\\u0070\\u0061\\u0074\\u0068\\u007d', 'unicode_escape'))
+async def O0_fn_32(websocket: WebSocket, path: str, request_id: str=Query(...), token: str=Query(None)):
+    O0_var_392 = TerminalSessionHandler()
+    O0_var_393 = True
     if token is not None:
-        use_noise = False
-        # 🔥 认证逻辑：校验传来的 token 是否等于服务端的 AGENT_PUBLIC_KEY
-        expected_token = Config.keys['agent'].public_b64
-        Logger.debug(f"expected_token{expected_token}")
-        Logger.debug(f"token:{token}")
-        if token != expected_token:
-            await websocket.close(code=1008, reason="Authentication failed: Invalid Token")
-            Logger.warning(f"🚨 [终端会话 {request_id}] 认证失败，非法 Token！")
+        O0_var_393 = False
+        O0_var_394 = Config.keys[codecs.decode('\\u0061\\u0067\\u0065\\u006e\\u0074', 'unicode_escape')].public_b64
+        Logger.debug(codecs.decode('\\u0065\\u0078\\u0070\\u0065\\u0063\\u0074\\u0065\\u0064\\u005f\\u0074\\u006f\\u006b\\u0065\\u006e', 'unicode_escape') + str(O0_var_394))
+        Logger.debug(codecs.decode('\\u0074\\u006f\\u006b\\u0065\\u006e\\u003a', 'unicode_escape') + str(token))
+        if token != O0_var_394:
+            await websocket.close(code=1008, reason=codecs.decode('\\u0041\\u0075\\u0074\\u0068\\u0065\\u006e\\u0074\\u0069\\u0063\\u0061\\u0074\\u0069\\u006f\\u006e\\u0020\\u0066\\u0061\\u0069\\u006c\\u0065\\u0064\\u003a\\u0020\\u0049\\u006e\\u0076\\u0061\\u006c\\u0069\\u0064\\u0020\\u0054\\u006f\\u006b\\u0065\\u006e', 'unicode_escape'))
+            Logger.warning(codecs.decode('\\U0001f6a8\\u0020\\u005b\\u7ec8\\u7aef\\u4f1a\\u8bdd\\u0020', 'unicode_escape') + str(request_id) + codecs.decode('\\u005d\\u0020\\u8ba4\\u8bc1\\u5931\\u8d25\\uff0c\\u975e\\u6cd5\\u0020\\u0054\\u006f\\u006b\\u0065\\u006e\\uff01', 'unicode_escape'))
             return
-        
-        Logger.info(f"✅ [终端会话 {request_id}] Token 认证通过 (HTTPS 降级模式)")
-    await handler.start_session(websocket, request_id, use_noise)
+        Logger.info(codecs.decode('\\u2705\\u0020\\u005b\\u7ec8\\u7aef\\u4f1a\\u8bdd\\u0020', 'unicode_escape') + str(request_id) + codecs.decode('\\u005d\\u0020\\u0054\\u006f\\u006b\\u0065\\u006e\\u0020\\u8ba4\\u8bc1\\u901a\\u8fc7\\u0020\\u0028\\u0048\\u0054\\u0054\\u0050\\u0053\\u0020\\u964d\\u7ea7\\u6a21\\u5f0f\\u0029', 'unicode_escape'))
+    await O0_var_392.start_session(websocket, request_id, O0_var_393)
 
-# 全局异常处理
 @app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException):
-    """统一处理认证失败等异常"""
-    content = {"error": exc.detail, "code": exc.status_code}
-    # 异常响应也走加密流程
-    encrypted = crypto.encrypt_response(content) if not Config.DEBUG else json.dumps(content)
-    return JSONResponse(
-        status_code=exc.status_code,
-        content=json.loads(encrypted) if Config.DEBUG else {"_encrypted": encrypted},
-        headers={"x-encrypted": "false" if Config.DEBUG else "true"}
-    )
+async def O0_fn_33(request: Request, exc: HTTPException):
+    O0_var_395 = {codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'): exc.detail, codecs.decode('\\u0063\\u006f\\u0064\\u0065', 'unicode_escape'): exc.status_code}
+    O0_var_396 = crypto.encrypt_response(O0_var_395) if not Config.DEBUG else json.dumps(O0_var_395)
+    return JSONResponse(status_code=exc.status_code, content=json.loads(O0_var_396) if Config.DEBUG else {codecs.decode('\\u005f\\u0065\\u006e\\u0063\\u0072\\u0079\\u0070\\u0074\\u0065\\u0064', 'unicode_escape'): O0_var_396}, headers={codecs.decode('\\u0078\\u002d\\u0065\\u006e\\u0063\\u0072\\u0079\\u0070\\u0074\\u0065\\u0064', 'unicode_escape'): codecs.decode('\\u0066\\u0061\\u006c\\u0073\\u0065', 'unicode_escape') if Config.DEBUG else codecs.decode('\\u0074\\u0072\\u0075\\u0065', 'unicode_escape')})
 
+class NoSignalsUvicornServer(uvicorn.Server):
+    codecs.decode('\\u000a\\u0020\\u0020\\u0020\\u0020\\u81ea\\u5b9a\\u4e49\\u0020\\u0055\\u0076\\u0069\\u0063\\u006f\\u0072\\u006e\\u0020\\u670d\\u52a1\\u5668\\u7c7b\\u000a\\u0020\\u0020\\u0020\\u0020\\U0001f31f\\u0020\\u6838\\u5fc3\\u6280\\u5de7\\uff1a\\u91cd\\u5199\\u4fe1\\u53f7\\u5b89\\u88c5\\u51fd\\u6570\\u3002\\u76f4\\u63a5\\u0020\\u0070\\u0061\\u0073\\u0073\\u0020\\u6389\\uff0c\\u963b\\u6b62\\u0020\\u0055\\u0076\\u0069\\u0063\\u006f\\u0072\\u006e\\u0020\\u5c1d\\u8bd5\\u5728\\u5b50\\u7ebf\\u7a0b\\u000a\\u0020\\u0020\\u0020\\u0020\\u6ce8\\u518c\\u4e3b\\u7ebf\\u7a0b\\u4e13\\u7528\\u7684\\u7cfb\\u7edf\\u4fe1\\u53f7\\uff08\\u89e3\\u51b3\\u0020\\u0056\\u0061\\u006c\\u0075\\u0065\\u0045\\u0072\\u0072\\u006f\\u0072\\u003a\\u0020\\u0073\\u0065\\u0074\\u005f\\u0077\\u0061\\u006b\\u0065\\u0075\\u0070\\u005f\\u0066\\u0064\\u0020\\u006f\\u006e\\u006c\\u0079\\u0020\\u0077\\u006f\\u0072\\u006b\\u0073\\u0020\\u0069\\u006e\\u0020\\u006d\\u0061\\u0069\\u006e\\u0020\\u0074\\u0068\\u0072\\u0065\\u0061\\u0064\\uff09\\u000a\\u0020\\u0020\\u0020\\u0020', 'unicode_escape')
 
-# ============================================================================
-# 🚀 程序入口
-# ============================================================================
-# ✅ 在 main() 函数中初始化并挂载
-def main():
-    """主入口"""
-    
-    # 🔍 启动前校验
+    def install_signal_handlers(self) -> None:
+        pass
+
+def _start_uvicorn_server(O0_var_397, host, port, log_level):
+    O0_var_398 = asyncio.new_event_loop()
+    asyncio.set_event_loop(O0_var_398)
+    O0_var_399 = uvicorn.Config(app=O0_var_397, host=host, port=port, reload=False, log_level=log_level)
+    O0_var_400 = NoSignalsUvicornServer(O0_var_399)
+    O0_var_400.run()
+
+def O0_fn_34(blocking: bool=False):
     Config.validate()
-    init_crypto()
-    
-    # 🔄 确保 asyncio 事件循环存在（避免 get_event_loop() 的 DeprecationWarning）
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
-    script_name = os.path.splitext(os.path.basename(__file__))[0]
-    
-    if "kisama" in sys.modules:
-        app_import_string = "kisama.agent:app"
-    else:
-        app_import_string = "agent:app"
-    
-    Logger.debug(f" 使用重载模式启动: {app_import_string}")
-    
-    uvicorn.run(
-        app_import_string,
-        host=Config.HOST, 
-        port=Config.PORT, 
-        reload=Config.DEBUG,
-        log_level="debug" if Config.DEBUG else "info"
-    )
+    O0_fn_1()
+    O0_var_401 = codecs.decode('\\u0064\\u0065\\u0062\\u0075\\u0067', 'unicode_escape') if Config.DEBUG else codecs.decode('\\u0069\\u006e\\u0066\\u006f', 'unicode_escape')
+    if Config.DEBUG:
+        Logger.warning(codecs.decode('\\u26a0\\ufe0f\\u0020\\u5f53\\u524d\\u5904\\u4e8e\\u0020\\u0044\\u0045\\u0042\\u0055\\u0047\\u0020\\u6a21\\u5f0f\\uff0c\\u4f46\\u7531\\u4e8e\\u91c7\\u7528\\u4e86\\u975e\\u963b\\u585e\\u540e\\u53f0\\u6302\\u8f7d\\uff0c\\u5df2\\u81ea\\u52a8\\u5173\\u95ed\\u70ed\\u91cd\\u8f7d\\u0028\\u0052\\u0065\\u006c\\u006f\\u0061\\u0064\\u0029\\u529f\\u80fd\\u3002', 'unicode_escape'))
+    Logger.info(codecs.decode('\\u0020\\U0001f680\\u0020\\u004b\\u0069\\u0073\\u0061\\u006d\\u0061\\u0020\\u0041\\u0067\\u0065\\u006e\\u0074\\u0020\\u5f00\\u59cb\\u5728\\u540e\\u53f0\\u5b88\\u62a4\\u7ebf\\u7a0b\\u4e2d\\u542f\\u52a8\\u002e\\u002e\\u002e', 'unicode_escape'))
+    O0_var_402 = threading.Thread(target=_start_uvicorn_server, args=(app, Config.HOST, Config.PORT, O0_var_401), daemon=True)
+    O0_var_402.start()
+    Logger.info(codecs.decode('\\u0020\\u005b\\u002d\\u005d\\u0020\\u540e\\u53f0\\u670d\\u52a1\\u5df2\\u6210\\u529f\\u6302\\u8f7d\\uff0c\\u6b63\\u5728\\u76d1\\u542c\\u7aef\\u53e3\\u003a\\u0020', 'unicode_escape') + str(Config.PORT))
+    if blocking:
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            Logger.info(codecs.decode('\\U0001f6d1\\u0020\\u6536\\u5230\\u7ec8\\u6b62\\u4fe1\\u53f7\\uff0c\\u004b\\u0069\\u0073\\u0061\\u006d\\u0061\\u0020\\u0041\\u0067\\u0065\\u006e\\u0074\\u0020\\u5b88\\u62a4\\u8fdb\\u7a0b\\u5df2\\u5b89\\u5168\\u9000\\u51fa\\u3002', 'unicode_escape'))
 
-if __name__ == "__main__":
-    # 全局文件管理器实例
-    main()
+def cli():
+    O0_fn_34(blocking=True)
+if __name__ == codecs.decode('\\u005f\\u005f\\u006d\\u0061\\u0069\\u006e\\u005f\\u005f', 'unicode_escape'):
+    cli()
