@@ -1,6 +1,6 @@
 [project]
 name = "kisama"
-version = "0.3.0"
+version = "0.3.3"
 description = "kisama agent for python"
 readme = "README.md"
 authors = [
@@ -23,7 +23,7 @@ dependencies = [
 ]
 
 [project.scripts]
-kisama = "kisama.agent:main"
+kisama = "kisama.agent:cli"
 
 [build-system]
 requires = ["uv_build>=0.11.26,<0.12.0"]

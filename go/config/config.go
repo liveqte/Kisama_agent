@@ -232,7 +232,7 @@ func New() (*Config, error) {
 	
 	agentVersion := os.Getenv("AGENT_VERSION")
 	if agentVersion == "" {
-		agentVersion = "0.3.0-go"
+		agentVersion = "0.3.3-go"
 	}
 
 	fileRoot := os.Getenv("FILE_ROOT")
