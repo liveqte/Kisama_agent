@@ -197,7 +197,7 @@ public class kisama {
                     }
                 }
 
-                // 🌟 修改：只有在未被标记为“未认证”的情况下，才去执行签名校验
+                // 🌟 修改：只有在未被标记为“未认证”的情况下，才去执行签名签名校验
                 if (Boolean.TRUE.equals(req.attribute("is_authenticated"))) {
                     try {
                         verifySignature(nonce, timestamp, authToken);
@@ -778,7 +778,7 @@ public class kisama {
         get("/", (req, res) -> "kisama-running");
 
         after((req, res) -> {
-            res.header("X-Agent-Version", "0.3.4-java");
+            res.header("X-Agent-Version", "0.3.4-java11");
             if ("OPTIONS".equalsIgnoreCase(req.requestMethod())) {
                 res.header("X-Encrypted", "false");
                 return;
@@ -890,39 +890,69 @@ public class kisama {
         long currentTx = 0;
         long now = System.currentTimeMillis();
 
-        Path p = Paths.get("/proc/net/dev");
-        if (Files.isReadable(p)) {
-            try {
-                List<String> lines = Files.readAllLines(p, StandardCharsets.UTF_8);
-                String[] excludePatterns = {"lo", "docker", "veth", "br-", "tun", "virbr"};
-                
+        String os = System.getProperty("os.name", "").toLowerCase();
+        if (os.contains("freebsd")) {
+            // 🍏 FreeBSD 专属：执行 netstat -bin 命令抓取底层链路层 Link 状态包
+            String netstatOut = runCommand(1500, "netstat", "-bin");
+            if (netstatOut != null && !netstatOut.isBlank()) {
+                String[] lines = netstatOut.split("\\R");
                 for (String line : lines) {
                     line = line.trim();
-                    if (!line.contains(":")) continue;
-                    
-                    String[] parts = line.split(":");
-                    String iface = parts[0].trim();
-                    
-                    // 过滤虚拟网卡
-                    boolean exclude = false;
-                    for (String pattern : excludePatterns) {
-                        if (iface.contains(pattern)) { exclude = true; break; }
-                    }
-                    if (exclude) continue;
-                    
-                    String dataStr = parts[1].trim();
-                    String[] stats = dataStr.split("\\s+");
-                    if (stats.length >= 9) {
-                        currentRx += Long.parseLong(stats[0]); // 接收字节数
-                        currentTx += Long.parseLong(stats[8]); // 发送字节数
+                    // 仅清洗包含 <Link# 的物理或虚拟网卡行
+                    if (line.contains("<Link#")) {
+                        // 过滤本地环回网卡 (lo0, lo1 等)
+                        if (line.startsWith("lo")) continue;
+                        
+                        String[] tokens = line.split("\\s+");
+                        // FreeBSD netstat 尾部列固定为: Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll
+                        // 采用倒序索引法，完美免疫因 Address 列为空导致的左侧列错位
+                        if (tokens.length >= 6) {
+                            try {
+                                long rx = Long.parseLong(tokens[tokens.length - 5]); // 倒数第5列为接收字节数
+                                long tx = Long.parseLong(tokens[tokens.length - 2]); // 倒数第2列为发送字节数
+                                currentRx += rx;
+                                currentTx += tx;
+                            } catch (Exception ignored) {}
+                        }
                     }
                 }
-            } catch (Exception ignored) {}
+            }
+        } else {
+            // 🐧 Linux 经典路径：解析 /proc/net/dev
+            Path p = Paths.get("/proc/net/dev");
+            if (Files.isReadable(p)) {
+                try {
+                    List<String> lines = Files.readAllLines(p, StandardCharsets.UTF_8);
+                    String[] excludePatterns = {"lo", "docker", "veth", "br-", "tun", "virbr"};
+                    
+                    for (String line : lines) {
+                        line = line.trim();
+                        if (!line.contains(":")) continue;
+                        
+                        String[] parts = line.split(":");
+                        String iface = parts[0].trim();
+                        
+                        boolean exclude = false;
+                        for (String pattern : excludePatterns) {
+                            if (iface.contains(pattern)) { exclude = true; break; }
+                        }
+                        if (exclude) continue;
+                        
+                        String dataStr = parts[1].trim();
+                        String[] stats = dataStr.split("\\s+");
+                        if (stats.length >= 9) {
+                            currentRx += Long.parseLong(stats[0]);
+                            currentTx += Long.parseLong(stats[8]);
+                        }
+                    }
+                } catch (Exception ignored) {}
+            }
         }
 
         long upSpeed = 0;
         long downSpeed = 0;
 
+        // 计算时间差并推导瞬时网络速率
         synchronized (netLock) {
             if (lastNetworkTime > 0) {
                 double timeDiff = (now - lastNetworkTime) / 1000.0;
@@ -948,7 +978,34 @@ public class kisama {
     }
 
     // 🌟 新增：解析 /proc/net/tcp(udp) 统计当前处于 ESTABLISHED 状态的真实连接数
+    // 🌟 完美重构：自适应 Linux (procfs) 与 FreeBSD (netstat -an -p) 网络活跃连接计数器
     private int getConnectionCount(String protocol) {
+        String os = System.getProperty("os.name", "").toLowerCase();
+        if (os.contains("freebsd")) {
+            // 🍏 FreeBSD 专属：通过 netstat 指定协议审查活跃套接字
+            String netstatOut = runCommand(1500, "netstat", "-an", "-p", protocol.toLowerCase());
+            if (netstatOut == null || netstatOut.isBlank()) return 0;
+            
+            int count = 0;
+            String[] lines = netstatOut.split("\\R");
+            for (String line : lines) {
+                line = line.trim();
+                if (line.startsWith(protocol.toLowerCase())) {
+                    if ("tcp".equalsIgnoreCase(protocol)) {
+                        // TCP 仅统计真正握手成功的 ESTABLISHED 活跃状态
+                        if (line.contains("ESTABLISHED")) {
+                            count++;
+                        }
+                    } else {
+                        // UDP 为无状态协议，只要有绑定的 Socket 暴露即算作活跃通道
+                        count++;
+                    }
+                }
+            }
+            return count;
+        }
+
+        // 🐧 Linux 经典路径：解析 /proc/net/tcp 或 udp
         Path p = Paths.get("/proc/net/" + protocol);
         if (!Files.isReadable(p)) return 0;
         try {
@@ -958,14 +1015,14 @@ public class kisama {
                 int established = 0;
                 for (int i = 1; i < lines.size(); i++) {
                     String[] parts = lines.get(i).trim().split("\\s+");
-                    // TCP 状态码 "01" 代表 ESTABLISHED
+                    // Linux 下 "01" 代表 ESTABLISHED
                     if (parts.length >= 4 && "01".equals(parts[3])) {
                         established++;
                     }
                 }
                 return established;
             }
-            return lines.size() - 1; // UDP 直接返回连接行数
+            return lines.size() - 1;
         } catch (Exception e) {
             return 0;
         }
@@ -986,7 +1043,7 @@ public class kisama {
         obj.put("os", getOsPrettyName());
         obj.put("kernel_version", getKernelVersion());
         obj.put("swap_total", getTotalSwapBytes());
-        obj.put("version", "0.3.4-java");
+        obj.put("version", "0.3.4-java11");
         obj.put("virtualization", getVirtualization());
         return obj;
     }
@@ -997,16 +1054,32 @@ public class kisama {
         int tcpCount = getConnectionCount("tcp");
         int udpCount = getConnectionCount("udp");
         
-        // 2. 获取 JVM 级别的系统 CPU 使用率
+        // 2. 安全获取系统 CPU 使用率
         double cpuUsage = 0.0;
         try {
             java.lang.management.OperatingSystemMXBean bean = ManagementFactory.getOperatingSystemMXBean();
-            if (bean instanceof com.sun.management.OperatingSystemMXBean) {
-                com.sun.management.OperatingSystemMXBean sunBean = (com.sun.management.OperatingSystemMXBean) bean;
-                cpuUsage = sunBean.getCpuLoad() * 100.0;
-                if (cpuUsage < 0) cpuUsage = 0.0;
+            // 必须加载导出的公开接口类，从而合法绕过 Java 11 强封装限制
+            Class<?> osMXBeanClass = Class.forName("com.sun.management.OperatingSystemMXBean");
+            if (osMXBeanClass.isInstance(bean)) {
+                java.lang.reflect.Method method;
+                try {
+                    method = osMXBeanClass.getMethod("getSystemCpuLoad");
+                } catch (NoSuchMethodException e) {
+                    method = osMXBeanClass.getMethod("getCpuLoad");
+                }
+                double value = (Double) method.invoke(bean);
+                
+                if (value >= 0) {
+                    cpuUsage = value * 100.0;
+                } else {
+                    // 如果返回 -1.0 (FreeBSD OpenJDK 常见未实现返回值)，触发 FreeBSD 专属命令补救
+                    cpuUsage = getFreeBsdCpuFallback();
+                }
             }
-        } catch (Exception ignored) {}
+        } catch (Exception e) {
+            // 反射若彻底崩溃，直接走 FreeBSD 命令补救
+            cpuUsage = getFreeBsdCpuFallback();
+        }
 
         // 3. 全面的 cgroup 容器级总上限与净已用内存计算
         long totalMem = getTotalMemoryBytes();
@@ -1039,6 +1112,36 @@ public class kisama {
         st.put("message", " ");
         return st;
     }
+    private double getFreeBsdCpuFallback() {
+        String os = System.getProperty("os.name", "").toLowerCase();
+        if (!os.contains("freebsd")) return 0.0;
+        
+        // 执行 FreeBSD 的 top 命令获取单次 CPU 状态快照 (-d 1 代表展示 1 次后直接退出)
+        String topOut = runCommand(1500, "top", "-b", "-d", "1");
+        if (topOut == null || topOut.isBlank()) return 0.0;
+        
+        for (String line : topOut.split("\\R")) {
+            line = line.trim();
+            // FreeBSD 的 top 输出格式形如: CPU:  1.3% user,  0.0% nice,  0.7% system,  0.0% interrupt, 98.0% idle
+            if (line.startsWith("CPU:") && line.contains("idle")) {
+                try {
+                    int idleIdx = line.indexOf("% idle");
+                    if (idleIdx > 0) {
+                        int start = idleIdx - 1;
+                        // 反向向前裁剪出空闲率浮点数字符串
+                        while (start >= 0 && (Character.isDigit(line.charAt(start)) || line.charAt(start) == '.')) {
+                            start--;
+                        }
+                        String idleStr = line.substring(start + 1, idleIdx).trim();
+                        double idleVal = Double.parseDouble(idleStr);
+                        // 真实使用率 = 100% - 空闲率
+                        return Math.max(0.0, Math.min(100.0, 100.0 - idleVal));
+                    }
+                } catch (Exception ignored) {}
+            }
+        }
+        return 0.0;
+    }
     // 🌟 修改：为函数增加 boolean isAuthenticated 参数
     private Map<String, Object> buildBaseInfo(boolean isAuthenticated) throws Exception {
         Map<String, Object> obj = new LinkedHashMap<>();
@@ -1055,7 +1158,7 @@ public class kisama {
         obj.put("os", getOsPrettyName());
         obj.put("kernel_version", getKernelVersion());
         obj.put("swap_total", getTotalSwapBytes());
-        obj.put("version", "0.3.4-java");
+        obj.put("version", "0.3.4-java11");
         obj.put("virtualization", getVirtualization());
 
         // 🌟 修改：根据是否通过验证状态，动态清空核心敏感凭证
@@ -1114,8 +1217,66 @@ public class kisama {
         return null;
     }
     // 🌟 新增：获取容器或宿主机真实的、不含 Cache/Buffers 的已用内存（字节单位）
+    private long getTotalMemoryBytes() {
+        // 1. Linux 路径探测
+        long memInfo = readMemInfoBytes("MemTotal");
+        long cgroupLimit = readCgroupMemoryLimitBytes();
+        if (memInfo > 0 && cgroupLimit > 0) return Math.min(memInfo, cgroupLimit);
+        if (cgroupLimit > 0) return cgroupLimit;
+        if (memInfo > 0) return memInfo;
+
+        // 2. 🌟 新增：FreeBSD 专属原生内核 sysctl 探测
+        String os = System.getProperty("os.name", "").toLowerCase();
+        if (os.contains("freebsd")) {
+            String physmem = firstLine(runCommand(1000, "sysctl", "-n", "hw.physmem"));
+            if (physmem != null && !physmem.isBlank()) {
+                try { return Long.parseLong(physmem.trim()); } catch (Exception ignored) {}
+            }
+        }
+
+        // 3. 🌟 修复：绕过 Java 11 强封装的公开接口反射法
+        try {
+            java.lang.management.OperatingSystemMXBean bean = ManagementFactory.getOperatingSystemMXBean();
+            // 必须加载导出的公开接口类，从接口上获取 Method 才能合法 invoke 内部实现类
+            Class<?> osMXBeanClass = Class.forName("com.sun.management.OperatingSystemMXBean");
+            if (osMXBeanClass.isInstance(bean)) {
+                java.lang.reflect.Method method = osMXBeanClass.getMethod("getTotalPhysicalMemorySize");
+                long total = (Long) method.invoke(bean);
+                if (total > 0) return total;
+            }
+        } catch (Exception ignored) {}
+        return 0L;
+    }
+
+    private long getTotalSwapBytes() {
+        // 1. Linux 路径探测
+        long swap = readMemInfoBytes("SwapTotal");
+        if (swap > 0) return swap;
+
+        // 2. 🌟 新增：FreeBSD 专属原生内核 sysctl 探测
+        String os = System.getProperty("os.name", "").toLowerCase();
+        if (os.contains("freebsd")) {
+            String swapBytes = firstLine(runCommand(1000, "sysctl", "-n", "vm.swap_total"));
+            if (swapBytes != null && !swapBytes.isBlank()) {
+                try { return Long.parseLong(swapBytes.trim()); } catch (Exception ignored) {}
+            }
+        }
+
+        // 3. 🌟 修复：绕过 Java 11 强封装的公开接口反射法
+        try {
+            java.lang.management.OperatingSystemMXBean bean = ManagementFactory.getOperatingSystemMXBean();
+            Class<?> osMXBeanClass = Class.forName("com.sun.management.OperatingSystemMXBean");
+            if (osMXBeanClass.isInstance(bean)) {
+                java.lang.reflect.Method method = osMXBeanClass.getMethod("getTotalSwapSpaceSize");
+                long total = (Long) method.invoke(bean);
+                if (total > 0) return total;
+            }
+        } catch (Exception ignored) {}
+        return 0L;
+    }
+
     private long getMemoryUsedBytes() {
-        // 1. 尝试 cgroup v2 (现代 Linux 宿主机 / K8s 1.25+ 环境)
+        // 1. 尝试 cgroup v2
         Path v2Current = Paths.get("/sys/fs/cgroup/memory.current");
         Path v2Stat = Paths.get("/sys/fs/cgroup/memory.stat");
         if (Files.isReadable(v2Current) && Files.isReadable(v2Stat)) {
@@ -1133,7 +1294,7 @@ public class kisama {
             } catch (Exception ignored) {}
         }
 
-        // 2. 尝试 cgroup v1 (经典 Docker / 较旧的容器环境)
+        // 2. 尝试 cgroup v1
         Path v1Usage = Paths.get("/sys/fs/cgroup/memory/memory.usage_in_bytes");
         Path v1Stat = Paths.get("/sys/fs/cgroup/memory/memory.stat");
         if (Files.isReadable(v1Usage) && Files.isReadable(v1Stat)) {
@@ -1151,8 +1312,7 @@ public class kisama {
             } catch (Exception ignored) {}
         }
 
-        // 3. 非容器环境降级：直接分析宿主机 /proc/meminfo 
-        // 真实已用 = Total - Free - Buffers - Cached - SReclaimable
+        // 3. 非容器环境 Linux 降级
         Path meminfoPath = Paths.get("/proc/meminfo");
         if (Files.isReadable(meminfoPath)) {
             try {
@@ -1161,7 +1321,7 @@ public class kisama {
                     String[] parts = line.trim().split("\\s+");
                     if (parts.length >= 2) {
                         String key = parts[0];
-                        long val = Long.parseLong(parts[1]) * 1024L; // kB 转换为 Byte
+                        long val = Long.parseLong(parts[1]) * 1024L;
                         if ("MemTotal:".equals(key)) memTotal = val;
                         else if ("MemFree:".equals(key)) memFree = val;
                         else if ("Buffers:".equals(key)) buffers = val;
@@ -1169,48 +1329,25 @@ public class kisama {
                         else if ("SReclaimable:".equals(key)) sReclaimable = val;
                     }
                 }
-                if (memTotal > 0) {
-                    return Math.max(0, memTotal - memFree - buffers - cached - sReclaimable);
-                }
+                if (memTotal > 0) return Math.max(0, memTotal - memFree - buffers - cached - sReclaimable);
             } catch (Exception ignored) {}
         }
 
-        // 4. 终极保底：若以上皆失败，回退计算 JVM 当前已申请并占用的净内存
-        return Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();
-    }
-    private long getTotalMemoryBytes() {
-        long memInfo = readMemInfoBytes("MemTotal");
-        long cgroupLimit = readCgroupMemoryLimitBytes();
-        if (memInfo > 0 && cgroupLimit > 0) {
-            return Math.min(memInfo, cgroupLimit);
-        }
-        if (cgroupLimit > 0) return cgroupLimit;
-        if (memInfo > 0) return memInfo;
+        // 4. 🌟 新增：非 Linux 系统（如 FreeBSD）利用公开接口反射计算系统真实已用内存 (Total - Free)
         try {
             java.lang.management.OperatingSystemMXBean bean = ManagementFactory.getOperatingSystemMXBean();
-            if (bean instanceof com.sun.management.OperatingSystemMXBean) {
-                com.sun.management.OperatingSystemMXBean sunBean = (com.sun.management.OperatingSystemMXBean) bean;
-                long total = sunBean.getTotalPhysicalMemorySize();
-                if (total > 0) return total;
+            Class<?> osMXBeanClass = Class.forName("com.sun.management.OperatingSystemMXBean");
+            if (osMXBeanClass.isInstance(bean)) {
+                long total = (Long) osMXBeanClass.getMethod("getTotalPhysicalMemorySize").invoke(bean);
+                long free = (Long) osMXBeanClass.getMethod("getFreePhysicalMemorySize").invoke(bean);
+                if (total > 0 && free >= 0) {
+                    return Math.max(0, total - free);
+                }
             }
-        } catch (Exception ignored) {
-        }
-        return 0L;
-    }
+        } catch (Exception ignored) {}
 
-    private long getTotalSwapBytes() {
-        long swap = readMemInfoBytes("SwapTotal");
-        if (swap > 0) return swap;
-        try {
-            java.lang.management.OperatingSystemMXBean bean = ManagementFactory.getOperatingSystemMXBean();
-            if (bean instanceof com.sun.management.OperatingSystemMXBean) {
-                com.sun.management.OperatingSystemMXBean sunBean = (com.sun.management.OperatingSystemMXBean) bean;
-                long total = sunBean.getTotalSwapSpaceSize();
-                if (total > 0) return total;
-            }
-        } catch (Exception ignored) {
-        }
-        return 0L;
+        // 5. 终极保底：回退计算 JVM 当前占用的净堆内存
+        return Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();
     }
 
     private long readMemInfoBytes(String key) {
