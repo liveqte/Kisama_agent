@@ -39,9 +39,9 @@ class DocstringStripper(ast.NodeTransformer):
 
 class NameObfuscator(ast.NodeTransformer):
     # 框架钩子和保留方法名单
-    PROTECTED_METHODS = {'dispatch'}
+    PROTECTED_METHODS = {'dispatch','cli'}
     # 保护常见的内置属性、FastAPI/请求对象相关的关键字
-    PROTECTED_NAMES = {'self', 'cls', 'args', 'kwargs', 'request', 'response'}
+    PROTECTED_NAMES = {'self', 'cls', 'args', 'kwargs', 'request', 'response','cli'}
     
     def __init__(self) -> None:
         super().__init__()
