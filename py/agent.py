@@ -827,7 +827,7 @@ class CryptoManager:
                 sigdecode=decode_method
             )
         except BadSignatureError:
-            Logger.error("❌ 签名验证失败: 坏签名")
+            Logger.info("❌ 签名验证失败: 坏签名")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Signature verification failed: bad signature"
