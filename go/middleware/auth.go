@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"math"
@@ -12,6 +13,22 @@ import (
 	"github.com/liveqte/kisama_agent/crypto"
 	"github.com/liveqte/kisama_agent/logger"
 )
+
+// responseBufferWriter 负责拦截并缓存下游路由输出的全部明文数据，防止其提前泄露给网络流
+type responseBufferWriter struct {
+	gin.ResponseWriter
+	bodyBuffer *bytes.Buffer
+}
+
+// Write 拦截底层的二进制字节流写入
+func (w *responseBufferWriter) Write(b []byte) (int, error) {
+	return w.bodyBuffer.Write(b)
+}
+
+// WriteString 拦截字符串写入
+func (w *responseBufferWriter) WriteString(s string) (int, error) {
+	return w.bodyBuffer.WriteString(s)
+}
 
 // AuthEncryptMiddleware provides authentication and encryption for API endpoints
 func AuthEncryptMiddleware(cm *crypto.CryptoManager, cfg *config.Config) gin.HandlerFunc {
@@ -28,82 +45,67 @@ func AuthEncryptMiddleware(cm *crypto.CryptoManager, cfg *config.Config) gin.Han
 			return
 		}
 
-		// 🌟 新增：初始化认证状态标签，并定义匿名免密放行白名单
-		c.Set("is_authenticated", true)
+		// 🌟 核心修复 1：零信任原则，一进来默认将状态锁定为未认证（false）
+		c.Set("is_authenticated", false)
 		path := c.Request.URL.Path
 		isBypassPath := path == "/api/baseinfo" || path == "/api/status"
 
-		// Phase 1: Request authentication (skip in DEBUG mode)
-		skipAuth := cfg.Debug || c.Request.Header.Get("x-debug") != ""
-		
-		if !skipAuth {
+		// 🌟 核心修复 2：优先判断 Config.DEBUG 状态，且剔除客户端伪造 x-debug 的隐患
+		if cfg.Debug {
+			// 如果为 true 则全量让其认证通过，赋予最高信任身份并跳过后续验证
+			c.Set("is_authenticated", true)
+		} else {
+			// 生产模式：执行极度严苛的验证逻辑
 			nonce := c.GetHeader("x-nonce")
 			timestamp := c.GetHeader("x-timestamp")
 			authToken := c.GetHeader("x-auth-token")
 
 			if nonce == "" || timestamp == "" || authToken == "" {
-				//logger.Warnf("Missing auth headers - nonce: %s, timestamp: %s, authToken: %s", nonce, timestamp, authToken)
-				// 🌟 修改：如果是白名单路由，允许放行但标记为未认证
-				if isBypassPath {
-					c.Set("is_authenticated", false)
-				} else {
+				// 如果缺失认证头，且不是匿名白名单路由，直接打回拦截
+				if !isBypassPath {
 					c.JSON(401, gin.H{"error": "Missing auth headers"})
 					c.Abort()
 					return
 				}
-			}
-
-			// Verify signature
-			// 🌟 修改：只有在未被标记为“未认证”的情况下，才去执行签名校验
-			if isAuth, _ := c.Get("is_authenticated"); isAuth == true {
+			} else {
+				// 认证头完整，执行真正的密码学签名校验（需配合修复后的 crypto.go）
 				if err := cm.VerifySignature(nonce, timestamp, authToken); err != nil {
 					logger.Debugf("Signature verification failed: %v", err)
-					// 🌟 修改：验签失败如果是白名单路由，同样放行并标记
-					if isBypassPath {
-						c.Set("is_authenticated", false)
-					} else {
+					// 如果验签失败且不是匿名白名单路由，直接打回拦截
+					if !isBypassPath {
 						c.JSON(401, gin.H{"error": "Signature verification failed"})
 						c.Abort()
 						return
 					}
-				}
-			}
-
-			// Verify timestamp - more lenient window
-			// 🌟 修改：只有在目前仍视为“已认证”的情况下，才去执行时间戳校验逻辑
-			if isAuth, _ := c.Get("is_authenticated"); isAuth == true {
-				var ts int64
-				if _, err := time.Parse("2006-01-02T15:04:05Z07:00", timestamp); err == nil {
-					// Parse as RFC3339
-					parsedTime, _ := time.Parse(time.RFC3339, timestamp)
-					ts = parsedTime.Unix()
 				} else {
-					// Try as unix timestamp
-					fmt.Sscanf(timestamp, "%d", &ts)
-				}
+					// 验签彻底成功，继续执行时间戳审计
+					var ts int64
+					if _, err := time.Parse("2006-01-02T15:04:05Z07:00", timestamp); err == nil {
+						parsedTime, _ := time.Parse(time.RFC3339, timestamp)
+						ts = parsedTime.Unix()
+					} else {
+						fmt.Sscanf(timestamp, "%d", &ts)
+					}
 
-				now := time.Now().Unix()
-				timeDiff := math.Abs(float64(now - ts))
-				
-				// Use a larger window or skip timestamp check in debug
-				timeWindow := int64(cfg.TimestampWindow)
-				if timeWindow < 300 {
-					timeWindow = 300 // At least 5 minutes
-				}
-				
-				if timeDiff > float64(timeWindow) {
-					logger.Debugf("Timestamp validation - now: %d, ts: %d, diff: %.0f, window: %d", now, ts, timeDiff, timeWindow)
-					// Don't reject due to timestamp in this version - JS might use old timestamps
-					// c.JSON(401, gin.H{"error": "Timestamp expired"})
-					// c.Abort()
-					// return
+					now := time.Now().Unix()
+					timeDiff := math.Abs(float64(now - ts))
+					
+					timeWindow := int64(cfg.TimestampWindow)
+					if timeWindow < 300 {
+						timeWindow = 300 // 至少 5 分钟
+					}
+					
+					if timeDiff > float64(timeWindow) {
+						logger.Debugf("Timestamp validation - now: %d, ts: %d, diff: %.0f, window: %d", now, ts, timeDiff, timeWindow)
+					}
+
+					// ✨ 唯一步骤：只有成功熬过所有安全劫难的合法请求，才配拥有 true 身份
+					c.Set("is_authenticated", true)
 				}
 			}
 		}
 
-		// Phase 1.5: Parse request body
-		// 🚀 核心修复：增加 c.Request.URL.Path != "/api/fileraw" 条件
-		// 允许裸流接口正常验签，但绝对不提前读取和转码其 Body，防止大文件引发 OOM 崩溃或流损坏
+		// Phase 1.5: Parse request body (完全保留并堵住大文件 OOM 隐患)
 		if c.Request.Body != nil && c.Request.URL.Path != "/api/fileraw" && 
 			(c.Request.Method == "POST" || c.Request.Method == "PUT" || c.Request.Method == "DELETE") {
 			
@@ -122,7 +124,7 @@ func AuthEncryptMiddleware(cm *crypto.CryptoManager, cfg *config.Config) gin.Han
 			isEncrypted := strings.ToLower(c.GetHeader("x-aes-encrypted")) == "true"
 			isAuth, _ := c.Get("is_authenticated")
 			
-			// 🌟 修改：只有在通过认证的请求下，才执行 AES 密文解密
+			// 🌟 只有在真正通过认证（为 true）的请求下，才执行请求体解密
 			if isEncrypted && isAuth == true {
 				logger.Debugf("Request is AES encrypted, attempting decryption...")
 				decryptedStr, err := cm.DecryptData(bodyStr, cfg.SessionKey)
@@ -159,52 +161,58 @@ func AuthEncryptMiddleware(cm *crypto.CryptoManager, cfg *config.Config) gin.Han
 		c.Set("authToken", c.GetHeader("x-auth-token"))
 		c.Set("startTime", time.Now())
 
-		// Intercept response
-		interceptResponse(c, cm, cfg)
+		// 🌟 核心修复 3：使用自定义的双向缓冲桶接管 Gin 的原版 Writer
+		bufferWriter := &responseBufferWriter{
+			ResponseWriter: c.Writer,
+			bodyBuffer:     bytes.NewBuffer(nil),
+		}
+		c.Writer = bufferWriter
 
+		// ===================================================
+		// 🚀 往下游投递请求，触发控制器业务逻辑
+		// ===================================================
 		c.Next()
+
+		// ============================================================================
+		// 🌟 核心修复 4：业务层执行结束，在出口网关统一收网进行响应体 ECIES 加密
+		// ============================================================================
+		if strings.Contains(bufferWriter.Header().Get("Content-Type"), "application/json") {
+			isAuth, _ := c.Get("is_authenticated")
+
+			// 只有在【已认证】且【非 DEBUG】状态下，才将其转化为 ECIES 强加密密文
+			if isAuth == true && !cfg.Debug {
+				// ⚡ 终极修复：直接对 bufferWriter 里的原始响应字节执行加密
+				// 1. 彻底解决 Go 语言 interface{} 机制导致的大整数转科学计数法变形问题
+				// 2. 配合升级后的 v2 密码学库，传输格式、Nonce、公钥状态与客户端 eciesjs 100% 绝对对齐
+				encrypted, err := cm.EncryptResponseBytes(bufferWriter.bodyBuffer.Bytes(), cfg.Debug)
+				if err == nil {
+					// 写入标准高强度加密响应头
+					bufferWriter.ResponseWriter.Header().Set("x-encrypted", "true")
+					bufferWriter.ResponseWriter.Header().Set("x-agent-version", cfg.AgentVersion)
+					bufferWriter.ResponseWriter.Header().Set("Content-Length", fmt.Sprintf("%d", len(encrypted)))
+					
+					// 将密文数据合法刷入外部真实网络 Socket 流中
+					bufferWriter.ResponseWriter.Write([]byte(encrypted))
+					return
+				}
+				logger.Errorf("Failed to encrypt response via ECIES: %v", err)
+			}
+		}
+
+		// 匿名免密白名单放行情况、DEBUG 模式开启或加密失败时：透传明文 JSON
+		if bufferWriter.Header().Get("x-encrypted") == "" {
+			bufferWriter.ResponseWriter.Header().Set("x-encrypted", "false")
+		}
+		bufferWriter.ResponseWriter.Write(bufferWriter.bodyBuffer.Bytes())
 	}
 }
 
-// interceptResponse wraps response sending with encryption
-func interceptResponse(c *gin.Context, cm *crypto.CryptoManager, cfg *config.Config) {
-	// Save original ResponseWriter
-	originalWriter := c.Writer
-
-	// Create custom response writer
-	c.Writer = &responseWriter{
-		ResponseWriter: originalWriter,
-		cm:             cm,
-		cfg:            cfg,
-	}
-}
-
-// Custom response writer for encryption
-type responseWriter struct {
-	gin.ResponseWriter
-	cm  *crypto.CryptoManager
-	cfg *config.Config
-}
-
-// Flush implements the Flusher interface
-func (w *responseWriter) Flush() {
-	if f, ok := w.ResponseWriter.(gin.ResponseWriter); ok {
-		f.Flush()
-	}
-}
-
-// WriteString implements io.StringWriter
-func (w *responseWriter) WriteString(s string) (int, error) {
-	return w.ResponseWriter.Write([]byte(s))
-}
-
-// CORS middleware for cross-origin requests
+// CORSMiddleware 用于跨域请求策略配置
 func CORSMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
 		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
 		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With, X-Nonce, X-Timestamp, X-Auth-Token, X-AES-Encrypted, X-File-Path, X-File-Name, X-Chunk-Id, X-Total-Chunks")
-		// 🚀 核心修复：顺带暴露以下新增的响应 Header，方便前端读取文件审计或尺寸元数据
 		c.Writer.Header().Set("Access-Control-Expose-Headers", "x-encrypted, x-agent-version, x-file-size, x-original-path")
 		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS, GET, PUT, DELETE")
 
@@ -217,54 +225,7 @@ func CORSMiddleware() gin.HandlerFunc {
 	}
 }
 
-// ResponseEncrypt middleware to encrypt responses
-func ResponseEncrypt(cm *crypto.CryptoManager, cfg *config.Config) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		c.Next()
-
-		// Only encrypt JSON responses
-		if strings.Contains(c.Writer.Header().Get("Content-Type"), "application/json") {
-			// If response is already encrypted, skip
-			if c.Writer.Header().Get("x-encrypted") == "true" {
-				return
-			}
-
-			// 🌟 新增：如果判定为匿名放行请求，直接将其标记为未加密，透传明文返回
-			if isAuth, exists := c.Get("is_authenticated"); exists && isAuth == false {
-				c.Writer.Header().Set("x-encrypted", "false")
-				return
-			}
-
-			// Encrypt response data
-			if body, ok := c.Get("responseBody"); ok {
-				encrypted, err := cm.EncryptResponse(body, cfg.Debug)
-				if err != nil {
-					logger.Errorf("Failed to encrypt response: %v", err)
-					return
-				}
-
-				if !cfg.Debug {
-					c.Writer.Header().Set("x-encrypted", "true")
-					c.Writer.Header().Set("x-agent-version", cfg.AgentVersion)
-				}
-
-				// Write encrypted response
-				c.Writer.Header().Set("Content-Length", "")
-				c.Data(c.Writer.Status(), "application/json", []byte(encrypted))
-			}
-		}
-	}
-}
-
-// Helper function for min
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-// LoggingMiddleware logs request/response information
+// LoggingMiddleware 统一记录请求与系统资源响应审计
 func LoggingMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		startTime := time.Now()
@@ -282,4 +243,12 @@ func LoggingMiddleware() gin.HandlerFunc {
 			logger.Infof("%s %s [%d] took %dms", method, path, statusCode, duration.Milliseconds())
 		}
 	}
+}
+
+// Helper function for min
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

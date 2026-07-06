@@ -56,8 +56,8 @@ type BaseInfoResponse struct {
 	SwapTotal      int64          `json:"swap_total"`
 	Version        string         `json:"version"`
 	Virtualization string         `json:"virtualization"`
-	SessionKey     string         `json:"session_key"`
-	NoiseKey       NoiseKeyConfig `json:"noise_key"`
+	SessionKey     *string              `json:"session_key"`
+	NoiseKey       *NoiseKeyConfig      `json:"noise_key"`
 }
 
 // CPUStatus represents CPU status

@@ -1,10 +1,12 @@
 name: Build and Push Multi-Arch Docker Image
 
-# 触发条件：当推送到 main 分支时，或手动触发时
+# 🛠️ 核心修改：调整触发条件，等待上游的多语言编译提交工作流完成后再运行
 on:
-  push:
-    branches: [ "main" ]
-  workflow_dispatch:
+  workflow_run:
+    workflows: ["Build and Commit Multi-Language Agents"]
+    types:
+      - completed
+  workflow_dispatch: # 依然保留在 GitHub 网页端手动点击运行的能力
 
 jobs:
   build-and-push:

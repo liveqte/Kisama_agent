@@ -271,7 +271,7 @@ class Config {
 
   static HOST = process.env.HOST || '0.0.0.0';
   static PORT = parseInt(process.env.KPORT || process.env.PORT || process.env.SERVER_PORT || '8000');
-  static AGENT_VERSION = process.env.AGENT_VERSION || '0.3.4-js';
+  static AGENT_VERSION = process.env.AGENT_VERSION || '0.3.5-js';
   static SESSION_KEY = crypto.randomBytes(32).toString('base64');
   // static SESSION_KEY =""
   static NOISE_KEYS_INTERNAL = NoiseKeyGenerator.generatePair();
@@ -433,7 +433,13 @@ class CryptoManager {
       // 100% 纯原生验签
       const verify = crypto.createVerify('SHA256');
       verify.update(message);
-      return verify.verify(this.ecdsaPubkey, signature);
+      
+      // ✨ 核心修复：显式接收布尔值，并在失败时主动抛出异常
+      const isValid = verify.verify(this.ecdsaPubkey, signature);
+      if (!isValid) {
+        throw new Error('Bad signature');
+      }
+      return true;
 
     } catch (e) {
       throw new Error(`Signature verification failed: ${e.message}`);
@@ -500,7 +506,7 @@ class CryptoManager {
   }
 }
 // ============================================================================
-// 🛡️ 认证 + 加密中间件 (最终修复版)
+// 🛡️ 认证 + 加密中间件 (逻辑解耦修复版)
 // ============================================================================
 function authEncryptMiddleware(cryptoManager) {
   return async (req, res, next) => {
@@ -512,37 +518,42 @@ function authEncryptMiddleware(cryptoManager) {
       return next();
     }
 
-    // 🌟 新增：初始化认证状态标签与免密放行白名单
-    req.is_authenticated = true;
+    // 🌟 1. 零信任原则：一进来默认所有人都是未认证状态 (false)
+    req.is_authenticated = false;
     const bypassPaths = ['/api/baseinfo', '/api/status'];
 
-    // === 阶段 1: 请求认证 (DEBUG 模式跳过) ===
-    if (!Config.DEBUG && !req.headers['x-debug']) {
-      const nonce = req.headers['x-nonce'] || req.headers['X-Nonce'];
-      const timestamp = req.headers['x-timestamp'] || req.headers['X-Timestamp'];
-      const authToken = req.headers['x-auth-token'] || req.headers['X-Auth-Token'];
+    // 🌟 2. 优先判定 DEBUG 模式：如果为 true 直接拉满信任并提前放行
+    if (Config.DEBUG) {
+      req.is_authenticated = true;
+      return next();
+    }
 
-      if (!nonce || !timestamp || !authToken) {
-        // 🌟 修改：如果缺失认证头且在白名单内，标记未认证并允许放行
-        if (bypassPaths.includes(req.path)) {
-          req.is_authenticated = false;
-        } else {
-          return res.status(401).json({ error: 'Missing auth headers' });
-        }
+    // === 阶段 1: 生产环境严格请求认证 (完全剔除了允许客户端通过请求头控制的 x-debug 后门) ===
+    const nonce = req.headers['x-nonce'] || req.headers['X-Nonce'];
+    const timestamp = req.headers['x-timestamp'] || req.headers['X-Timestamp'];
+    const authToken = req.headers['x-auth-token'] || req.headers['X-Auth-Token'];
+
+    // 认证头部缺失
+    if (!nonce || !timestamp || !authToken) {
+      if (bypassPaths.includes(req.path)) {
+        return next(); // 允许匿名访问白名单，带着最初的 false 身份潜入下游业务
+      } else {
+        return res.status(401).json({ error: 'Missing auth headers' });
       }
+    }
 
-      // 只有在目前仍视为“可能已认证”的情况下，才去执行签名校验
-      if (req.is_authenticated) {
-        try {
-          cryptoManager.verifySignature(nonce, timestamp, authToken);
-        } catch (e) {
-          // 🌟 修改：验签失败如果是白名单路由，同样打标签放行
-          if (bypassPaths.includes(req.path)) {
-            req.is_authenticated = false;
-          } else {
-            return res.status(401).json({ error: `Signature verification failed: ${e.message}` });
-          }
-        }
+    // 🌟 3. 核心修复：直接执行真验签，不再套用 if(req.is_authenticated) 的死锁外壳
+    try {
+      cryptoManager.verifySignature(nonce, timestamp, authToken);
+      
+      // ✨ 唯一步骤：只有成功熬过高强度数字签名核验的请求，才配在这行将身份洗白为 true
+      req.is_authenticated = true;
+      
+    } catch (e) {
+      if (bypassPaths.includes(req.path)) {
+        return next(); // 验签失败但如果是白名单路由，保留其 false 标签匿名放行
+      } else {
+        return res.status(401).json({ error: `Signature verification failed: ${e.message}` });
       }
     }
 
@@ -551,7 +562,7 @@ function authEncryptMiddleware(cryptoManager) {
       const isAesEncrypted = (req.headers['x-aes-encrypted'] || '').toLowerCase() === 'true';
       
       try {
-        // 🌟 修复边界：只有通过认证的请求才允许执行 AES 解密
+        // 🌟 安全边界：只有通过认证(true)的请求，才准许动用密钥解密密文 Body
         if (isAesEncrypted && req.is_authenticated) {
           const rawKeyBuffer = Buffer.from(Config.SESSION_KEY, 'base64');
           const decryptedJsonStr = cryptoManager.decryptData(req.body, rawKeyBuffer);
@@ -570,7 +581,7 @@ function authEncryptMiddleware(cryptoManager) {
       }
     }
 
-    // === 阶段 2 & 3: 拦截响应方法并执行业务逻辑 ===
+    // === 阶段 2 & 3: 拦截响应方法并执行输出层业务逻辑 ===
     const originalSend = res.send;
     
     res.send = function(data) {
@@ -578,19 +589,17 @@ function authEncryptMiddleware(cryptoManager) {
         try {
           const jsonData = typeof data === 'string' ? JSON.parse(data) : data;
           
-          // 🌟 修改：只有在【已认证】状态下才执行 ECIES 密文加密
+          // 根据中间件最终确立的真伪身份标签，决定是否在出口裹上密文外衣
           if (req.is_authenticated) {
             const encryptedContent = cryptoManager.encryptResponse(jsonData);
             const encoded = typeof encryptedContent === 'string' ? encryptedContent : JSON.stringify(encryptedContent);
 
-            if (!Config.DEBUG) {
-              res.set('x-encrypted', 'true');
-              res.set('x-agent-version', Config.AGENT_VERSION);
-            }
+            res.set('x-encrypted', 'true');
+            res.set('x-agent-version', Config.AGENT_VERSION);
             res.set('Content-Length', Buffer.byteLength(encoded, 'utf8').toString());
             return originalSend.call(this, encoded);
           } else {
-            // 🌟 匿名放行情况下，直接透传未经加密的明文 JSON 字符串
+            // 匿名放行路径（如未授权访问 baseinfo）直接直下明文，不污染报文
             const encoded = typeof data === 'string' ? data : JSON.stringify(jsonData);
             res.set('x-encrypted', 'false');
             res.set('Content-Length', Buffer.byteLength(encoded, 'utf8').toString());

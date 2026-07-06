@@ -12,7 +12,7 @@ import (
 	"github.com/liveqte/kisama_agent/utils"
 )
 
-// 🚀 新增：定义线程安全的响应模型缓存槽与时间戳
+// 定义线程安全的响应模型缓存槽与时间戳
 var (
 	baseInfoCache     models.BaseInfoResponse
 	baseInfoCacheTime int64
@@ -63,14 +63,16 @@ func GetBaseInfo(c *gin.Context) {
 	response := baseInfoCache
 	baseInfoMu.Unlock()
 
-	// 2. 安全隔离层：根据当前请求的鉴权状态，动态组装或剔除核心密钥
-	sessionKey := cfg.SessionKey
-	var noiseKey models.NoiseKeyConfig
+	// 2. ✨ 安全隔离层：根据当前请求的鉴权状态，动态组装或初始化为标准的 nil 指针
+	var sessionKeyPtr *string
+	var noiseKeyPtr *models.NoiseKeyConfig
 
-	if isAuth, exists := c.Get("is_authenticated"); exists && isAuth == false {
-		sessionKey = ""
-	} else {
-		noiseKey = models.NoiseKeyConfig{
+	if isAuth, exists := c.Get("is_authenticated"); exists && isAuth == true {
+		// 【已认证状态】：创建真实数据的指针副本
+		sKeyStr := cfg.SessionKey
+		sessionKeyPtr = &sKeyStr
+
+		noiseKeyPtr = &models.NoiseKeyConfig{
 			Controller: struct {
 				Private string `json:"private"`
 			}{
@@ -82,11 +84,15 @@ func GetBaseInfo(c *gin.Context) {
 				Public: cfg.NoiseKeys.Agent.PublicB64,
 			},
 		}
+	} else {
+		// 【未认证状态】：显式置为 nil 指针，Go 的 JSON 引擎遇到 nil 指针会雷打不动地渲染为明文 null
+		sessionKeyPtr = nil
+		noiseKeyPtr = nil
 	}
 
-	// 将动态组装好的凭证塞入当前副本
-	response.SessionKey = sessionKey
-	response.NoiseKey = noiseKey
+	// 将动态组装好的指针凭证塞入当前副本
+	response.SessionKey = sessionKeyPtr
+	response.NoiseKey = noiseKeyPtr
 
 	c.Set("responseBody", response)
 	c.JSON(http.StatusOK, response)
