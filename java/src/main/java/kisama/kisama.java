@@ -174,54 +174,66 @@ public class kisama {
         before((req, res) -> {
             String endpoint = req.pathInfo();
             log("\n[TRACE-ROUTE] >>> 捕获到网络请求路径: [" + req.requestMethod() + "] " + endpoint);
+            
+            // 放行超级终端通道
             if (endpoint != null && endpoint.startsWith("/api/ws/")) {
                 return;
             }
 
-            // 🌟 新增：初始化当前请求的认证状态标签与免密放行白名单判定
-            req.attribute("is_authenticated", true);
+            // 🌟 1. 默认所有人都是未认证状态 (false)
+            req.attribute("is_authenticated", false);
+            
             boolean isBypassPath = "/api/baseinfo".equals(endpoint) || "/api/status".equals(endpoint);
 
-            if (!this.DEBUG && !"OPTIONS".equalsIgnoreCase(req.requestMethod())) {
-                String nonce = req.headers("x-nonce");
-                String timestamp = req.headers("x-timestamp");
-                String authToken = req.headers("x-auth-token");
+            // 🌟 2. 优先判定 DEBUG 模式：如果为 true 直接拉满信任并放行
+            if (this.DEBUG) {
+                req.attribute("is_authenticated", true);
+                return; 
+            }
 
-                if (nonce == null || timestamp == null || authToken == null) {
-                    log("[TRACE-AUTH] ❌ 强认证失败: 核心头部要素缺失");
-                    // 🌟 修改：如果是白名单路由，允许放行但标记为未认证
-                    if (isBypassPath) {
-                        req.attribute("is_authenticated", false);
-                    } else {
-                        halt(401, this.gson.toJson(Map.of("error", "Missing auth headers")));
-                    }
-                }
+            // 预检请求直接放行
+            if ("OPTIONS".equalsIgnoreCase(req.requestMethod()) || "HEAD".equalsIgnoreCase(req.requestMethod())) {
+                return;
+            }
 
-                // 🌟 修改：只有在未被标记为“未认证”的情况下，才去执行签名校验
-                if (Boolean.TRUE.equals(req.attribute("is_authenticated"))) {
-                    try {
-                        verifySignature(nonce, timestamp, authToken);
-                        log("[TRACE-AUTH] ✅ ECDSA 签名核验完全匹配，予以放行");
-                    } catch (Exception e) {
-                        log("[TRACE-AUTH] ❌ 强认证失败: 验签爆裂 -> " + e.getMessage());
-                        // 🌟 修改：验签失败如果是白名单路由，同样放行并标记
-                        if (isBypassPath) {
-                            req.attribute("is_authenticated", false);
-                        } else {
-                            halt(401, this.gson.toJson(Map.of("error", "Signature verification failed: " + e.getMessage())));
-                        }
-                    }
+			// 🌟 3. 生产环境执行极为严苛的卡关校验
+            String nonce = req.headers("x-nonce");
+            String timestamp = req.headers("x-timestamp");
+            String authToken = req.headers("x-auth-token");
+
+            // 核心头部元素缺失
+            if (nonce == null || timestamp == null || authToken == null) {
+                if (isBypassPath) {
+                    return; // 允许白名单接口以匿名身份(false)潜入下游业务层
+                } else {
+                    halt(401, this.gson.toJson(Map.of("error", "Missing auth headers")));
                 }
             }
 
+            // 执行货真价实的 ECDSA 椭圆曲线数字签名校验
+            try {
+                verifySignature(nonce, timestamp, authToken);
+                
+                // ✨ 唯一步骤：只有成功通过真实验签，才在这行洗白身份，篡改为 true！
+                req.attribute("is_authenticated", true);
+                log("[TRACE-AUTH] ✅ ECDSA 签名核验完全匹配，确立合法已认证身份。");
+                
+            } catch (Exception e) {
+                log("[TRACE-AUTH] ❌ 强认证失败: 验签爆裂 -> " + e.getMessage());
+                if (isBypassPath) {
+                    return; // 验签失败如果是白名单路由，保留其 false 标签并允许放行
+                } else {
+                    halt(401, this.gson.toJson(Map.of("error", "Signature verification failed: " + e.getMessage())));
+                }
+            }
+
+            // 🌟 4. 安全解密边界：只有被上面确立为 true 的合法请求，才准许动用 SessionKey 解密 Body
             if ("true".equalsIgnoreCase(req.headers("X-AES-Encrypted"))) {
-                // 🌟 修复边界：只有通过认证的请求才允许执行其 AES 解密流
                 if (Boolean.TRUE.equals(req.attribute("is_authenticated"))) {
                     log("[TRACE-DECRYPT] 检测到 X-AES-Encrypted=true, 启动反向 AES-GCM 解密流程...");
                     try {
                         String body = req.body();
                         String json = decryptAesPayload(body, this.SESSION_KEY);
-                        log("[TRACE-DECRYPT] ✅ 逆向解密明文成功: " + json);
                         Object parsed = this.gson.fromJson(json, new TypeToken<Object>() {}.getType());
                         req.attribute("json_body", parsed);
                     } catch (Exception e) {
@@ -229,19 +241,17 @@ public class kisama {
                         halt(400, this.gson.toJson(Map.of("error", "Invalid encrypted body: " + e.getMessage())));
                     }
                 } else {
-                    log("[TRACE-DECRYPT] ⚠️ 未认证请求，跳过 AES 解密流程");
+                    halt(403, this.gson.toJson(Map.of("error", "Access Denied: Decryption rejected for unauthenticated requests")));
                 }
             } else {
-                if (req.body() != null && !req.body().isBlank()) {
+                if (req.body() != null && !req.body().isBlank() && !"/api/fileraw".equals(endpoint)) {
                     try {
                         Object parsed = this.gson.fromJson(req.body(), new TypeToken<Object>() {}.getType());
                         req.attribute("json_body", parsed);
-                    } catch (Exception ignored) {
-                    }
+                    } catch (Exception ignored) {}
                 }
             }
         });
-
         // ==================== 完整保留所有业务路由 ====================
         // ==================== 🚀 包含高性能缓存防御机制的重构路由 ====================
         get("/api/baseinfo", (req, res) -> {
@@ -778,38 +788,36 @@ public class kisama {
         get("/", (req, res) -> "kisama-running");
 
         after((req, res) -> {
-            res.header("X-Agent-Version", "0.3.4-java");
-            if ("OPTIONS".equalsIgnoreCase(req.requestMethod())) {
+            res.header("X-Agent-Version", "0.3.5-java");
+            if ("OPTIONS".equalsIgnoreCase(req.requestMethod()) || "HEAD".equalsIgnoreCase(req.requestMethod())) {
                 res.header("X-Encrypted", "false");
                 return;
-            }
-            if (res.body() != null && !res.body().isBlank()) {
-                // 🌟 新增：提取当前的认证标签状态
-                boolean isAuthenticated = req.attribute("is_authenticated") == null || Boolean.TRUE.equals(req.attribute("is_authenticated"));
+			}
+            
+			if (res.body() != null && !res.body().isBlank()) {
+                // 安全提取当前请求在中间件入口最终确立的真伪身份标签
+                boolean isAuthenticated = Boolean.TRUE.equals(req.attribute("is_authenticated"));
 
+                // 🌟 只有非 DEBUG 且身份确实为已认证（true）状态，才在出口统一披上密文外衣
                 if (!this.DEBUG && isAuthenticated) {
-                    log("[TRACE-OUT] <<< 捕获到出口明文响应流，长度: " + res.body().length());
                     try {
                         String encrypted = encryptResponse(res.body().getBytes(StandardCharsets.UTF_8));
                         if (encrypted != null) {
                             res.body(encrypted);
                             res.header("X-Encrypted", "true");
-                            log("[TRACE-OUT] ✅ 响应 ECIES 密文流成功完成终极封包并挂载");
                         } else {
-                            log("[TRACE-OUT] ❌ 加密处理层无密文返回 (null)");
                             res.status(500);
                             res.body(this.gson.toJson(Map.of("error", "Crypto Error: Uninitialized")));
                         }
                     } catch (Exception e) {
-                        log("[TRACE-OUT] ❌ 加密流在底层崩溃爆破: " + e.getMessage());
                         res.status(500);
                         res.body(this.gson.toJson(Map.of("error", "Crypto Exception: " + e.getMessage())));
                     }
                 } else {
-                    // 🌟 匿名放行或开启 DEBUG 情况下，直接透传明文，不执行 ECIES 加密封包
+                    // 匿名免密白名单放行（false 状态）或开启 DEBUG 模式下，直接直下明文，不污染报文
                     res.header("X-Encrypted", "false");
                 }
-            }
+			}
         });
 
         isRunning = true;
@@ -986,7 +994,7 @@ public class kisama {
         obj.put("os", getOsPrettyName());
         obj.put("kernel_version", getKernelVersion());
         obj.put("swap_total", getTotalSwapBytes());
-        obj.put("version", "0.3.4-java");
+        obj.put("version", "0.3.5-java");
         obj.put("virtualization", getVirtualization());
         return obj;
     }
@@ -1055,7 +1063,7 @@ public class kisama {
         obj.put("os", getOsPrettyName());
         obj.put("kernel_version", getKernelVersion());
         obj.put("swap_total", getTotalSwapBytes());
-        obj.put("version", "0.3.4-java");
+        obj.put("version", "0.3.5-java");
         obj.put("virtualization", getVirtualization());
 
         // 🌟 修改：根据是否通过验证状态，动态清空核心敏感凭证

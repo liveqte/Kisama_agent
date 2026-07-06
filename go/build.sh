@@ -23,6 +23,7 @@ echo "📦 Downloading dependencies..."
 go mod download
 
 echo "🔨 Building binaries..."
+go mod tidy
 
 # 1. Build for current architecture
 CURRENT_OS=$(go env GOOS)

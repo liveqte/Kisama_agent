@@ -582,7 +582,7 @@ class Config:
     PORT = int(os.getenv("KPORT") or os.getenv("PORT") or os.environ.get('SERVER_PORT') or 8000)
     
     # 代理版本信息
-    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.3.4-python")
+    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.3.5-python")
     
     # ================= 启动校验 =================
     
@@ -902,7 +902,7 @@ def init_crypto():
 
 
 # ============================================================================
-# 🛡️ 认证中间件: 请求签名验证 + 响应加密
+# 🛡️ 认证中间件: 请求签名验证 + 响应加密 (逻辑解耦修复版)
 # ============================================================================
 class AuthEncryptMiddleware(BaseHTTPMiddleware):
     """
@@ -914,62 +914,77 @@ class AuthEncryptMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         headers = request.headers
         path = request.url.path  # 获取当前请求路径
-        
-        # 🌟 新增：免密放行路由白名单
         bypass_paths = ["/api/baseinfo", "/api/status"]
         
-        # === 阶段 1: 请求认证 (DEBUG 模式跳过) ===
-        request.state.is_authenticated = True  # 默认初始化认证状态为 True
+        # 🌟 核心修复 1：零信任原则，默认初始化认证状态为 False
+        request.state.is_authenticated = False  
         
-        if not Config.DEBUG and request.method not in ["OPTIONS", "HEAD"]:
-            nonce = headers.get("x-nonce")
-            timestamp = headers.get("x-timestamp") 
-            auth_token = headers.get("x-auth-token")
+        # 🌟 核心修复 2：优先判断 DEBUG 模式，如果为 True 直接拉满权限并提前放行
+        if Config.DEBUG:
+            request.state.is_authenticated = True 
+            return await call_next(request)
             
-            # 检查是否缺失认证头
-            if not all([nonce, timestamp, auth_token]):
-                # 🌟 修改：如果在白名单内，允许放行但标记为未认证
-                if path in bypass_paths:
-                    request.state.is_authenticated = False
-                else:
-                    return JSONResponse(
-                        status_code=status.HTTP_401_UNAUTHORIZED,
-                        content={"error": "Missing auth headers"}
-                    )
-            
-            # 如果认证头完整，且未被前面标记为伪认证，则执行签名校验
-            if request.state.is_authenticated:
-                try:
-                    crypto.verify_signature(nonce, timestamp, auth_token)
-                except Exception as e:
-                    # 🌟 修改：验签失败如果是白名单路由，同样放行并标记
-                    if path in bypass_paths:
-                        request.state.is_authenticated = False
-                    else:
-                        return JSONResponse(
-                            status_code=status.HTTP_401_UNAUTHORIZED,
-                            content={"error": f"Signature verification failed: {str(e)}"}
-                        )
+        # 放行预检请求和轻量探测
+        if request.method in ["OPTIONS", "HEAD"]:
+            return await call_next(request)
 
-        # === 阶段 1.5: AES 请求体解密 (保持不变) ===
+        # 生产环境：强制执行严格签名校验
+        nonce = headers.get("x-nonce")
+        timestamp = headers.get("x-timestamp") 
+        auth_token = headers.get("x-auth-token")
+        
+        # 检查是否缺失认证头
+        if not all([nonce, timestamp, auth_token]):
+            if path in bypass_paths:
+                return await call_next(request)  # 白名单允许匿名放行，身份保持最初的 False
+            else:
+                return JSONResponse(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    content={"error": "Missing auth headers"}
+                )
+        
+        # 🌟 核心修复 3：直接进行密码学签名校验，剥离原先导致死锁的 if 判断外壳
+        try:
+            crypto.verify_signature(nonce, timestamp, auth_token)
+            
+            # ✨ 唯一步骤：只有当椭圆曲线点乘验签彻底通过时，才在此处将身份显式改为 True
+            request.state.is_authenticated = True
+            
+        except Exception as e:
+            if path in bypass_paths:
+                return await call_next(request)  # 验签失败但如果是白名单路由，保留其 False 标签匿名放行
+            else:
+                return JSONResponse(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    content={"error": f"Signature verification failed: {str(e)}"}
+                )
+
+        # === 阶段 1.5: AES 请求体解密 ===
         decrypted_body_bytes = None
         if headers.get("x-aes-encrypted") == "true":
-            original_body = await request.body()
-            if original_body:
-                try:
-                    encrypted_str = original_body.decode('utf-8')
-                    decrypted_json_str = CryptoManager.decrypt_data(encrypted_str, Config._raw_key)
-                    if Config.DEBUG:
-                        Logger.debug(f" [AES Decrypt] Success: {decrypted_json_str[:100]}...")
-                    json.loads(decrypted_json_str) 
-                    decrypted_body_bytes = decrypted_json_str.encode('utf-8')
-                    request._body = decrypted_body_bytes
-                except Exception as e:
-                    Logger.error(f"💥 [AES Decrypt] Failed: {str(e)}")
-                    return JSONResponse(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        content={"error": f"AES Decrypt failed: {str(e)}"}
-                    )
+            # 🌟 安全边界：只有通过认证(True)的请求才允许解密，防止未授权恶意探测
+            if request.state.is_authenticated:
+                original_body = await request.body()
+                if original_body:
+                    try:
+                        encrypted_str = original_body.decode('utf-8')
+                        decrypted_json_str = CryptoManager.decrypt_data(encrypted_str, Config._raw_key)
+                        if Config.DEBUG:
+                            Logger.debug(f" [AES Decrypt] Success: {decrypted_json_str[:100]}...")
+                        json.loads(decrypted_json_str) 
+                        decrypted_body_bytes = decrypted_json_str.encode('utf-8')
+                        request._body = decrypted_body_bytes
+                    except Exception as e:
+                        Logger.error(f"💥 [AES Decrypt] Failed: {str(e)}")
+                        return JSONResponse(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            content={"error": f"AES Decrypt failed: {str(e)}"}
+                        )
+            else:
+                return JSONResponse(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    content={"error": "Decryption rejected for unauthenticated requests"}
+                )
                     
         original_receive = request.receive
         has_returned_body = False
@@ -1003,15 +1018,15 @@ class AuthEncryptMiddleware(BaseHTTPMiddleware):
             try:
                 original_data = json.loads(original_body.decode('utf-8'))
                 
-                # 🌟 修改：只有在【已认证】状态下才执行加密；未认证请求直接返回明文
-                if getattr(request.state, "is_authenticated", True):
+                # 根据中间件最终确立的真伪身份标签，决定是否在出口裹上密文外衣
+                if getattr(request.state, "is_authenticated", False):
                     encrypted_content = crypto.encrypt_response(original_data)
                     encoded = encrypted_content.encode('utf-8')
                     if not Config.DEBUG:
                         response.headers["x-encrypted"] = "true"
                         response.headers["x-agent-version"] = Config.AGENT_VERSION
                 else:
-                    # 未认证情况，直接透传明文
+                    # 匿名放行路径（如未登录访问 baseinfo）直接透传明文 JSON 字符串
                     encoded = original_body
                     response.headers["x-encrypted"] = "false"
                 

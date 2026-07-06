@@ -14,8 +14,9 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"strings"
+	"math/big"
 
-	ecies "github.com/ecies/go"
+	ecies "github.com/ecies/go/v2"
 	"github.com/liveqte/kisama_agent/logger"
 )
 
@@ -110,14 +111,42 @@ func parseECDSAPublicKey(keyStr string) (*ecdsa.PublicKey, error) {
 
 // VerifySignature verifies ECDSA signature (simplified for now)
 func (cm *CryptoManager) VerifySignature(nonce, timestamp, authToken string) error {
-	// In production, implement proper ECDSA signature verification
-	// This is a simplified version
 	if nonce == "" || timestamp == "" || authToken == "" {
 		return fmt.Errorf("missing signature components")
 	}
 
-	logger.Debugf("Signature verification skipped in simplified version (implement real ECDSA verification)")
-	return nil
+	// 如果没有加载公钥（比如本地文件缺失），在非DEBUG模式下这属于异常
+	if cm.ecdsaPublicKey == nil {
+		return fmt.Errorf("ecdsa public key not loaded")
+	}
+
+	// 1. 组装原始消息并计算 SHA256 哈希
+	message := fmt.Sprintf("%s%s", nonce, timestamp)
+	hash := sha256.Sum256([]byte(message))
+
+	// 2. 将前端传来的 Base64 字符串解码为原始字节流
+	sigBytes, err := base64.StdEncoding.DecodeString(authToken)
+	if err != nil {
+		return fmt.Errorf("failed to decode signature base64: %w", err)
+	}
+
+	// 3. 智能识别签名格式并执行严格校验
+	// 如果长度正好是 64 字节，说明是 Web Crypto API 常见的 Raw 格式（32字节 R + 32字节 S）
+	if len(sigBytes) == 64 {
+		r := new(big.Int).SetBytes(sigBytes[:32])
+		s := new(big.Int).SetBytes(sigBytes[32:])
+		if ecdsa.Verify(cm.ecdsaPublicKey, hash[:], r, s) {
+			return nil // ✨ 验签成功！
+		}
+	} else {
+		// 否则，尝试作为标准的 ASN.1 DER 格式（以 0x30 开头）进行解包验签
+		if ecdsa.VerifyASN1(cm.ecdsaPublicKey, hash[:], sigBytes) {
+			return nil // ✨ 验签成功！
+		}
+	}
+
+	// 如果两套格式都对不上，说明签名被伪造或篡改
+	return fmt.Errorf("invalid cryptographic signature")
 }
 
 // EncryptResponse encrypts response data using ECIES
@@ -296,4 +325,21 @@ func Base64Encode(data []byte) string {
 // Base64Decode decodes base64 string
 func Base64Decode(data string) ([]byte, error) {
 	return base64.StdEncoding.DecodeString(data)
+}
+
+
+// EncryptResponseBytes 直接对已经序列化好的 JSON 字节流进行 ECIES 加密
+func (cm *CryptoManager) EncryptResponseBytes(jsonData []byte, debug bool) (string, error) {
+	if debug || cm.eciesPublicKey == nil {
+		return string(jsonData), nil
+	}
+
+	// 直接使用 ECIES 核心库加密字节流
+	ciphertext, err := ecies.Encrypt(cm.eciesPublicKey, jsonData)
+	if err != nil {
+		return "", err
+	}
+
+	// 返回 Base64 密文
+	return base64.StdEncoding.EncodeToString(ciphertext), nil
 }
