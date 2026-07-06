@@ -352,6 +352,7 @@ func UploadFile(c *gin.Context) {
 
 			// 5. 释放暂存区垃圾
 			os.RemoveAll(chunkDir)
+			os.Remove(filepath.Dir(chunkDir))
 		}
 
 		c.JSON(http.StatusOK, gin.H{
@@ -676,6 +677,7 @@ func UploadFileRaw(c *gin.Context) {
 				}
 			}
 			os.RemoveAll(chunkDir) // 清理垃圾暂存区
+			os.Remove(filepath.Dir(chunkDir))
 
 			c.JSON(http.StatusOK, gin.H{
 				"status":    "ok",
