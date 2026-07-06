@@ -7,119 +7,79 @@ on:
       - completed
   workflow_dispatch: # 允许在 GitHub 网页端手动点击运行
 
-# 赋予工作流推送代码到仓库的权限（非常重要）
+# 赋予工作流推送代码到仓库的权限
 permissions:
   contents: write
 
 jobs:
-  # ==================== Job 1: 编译 Java 17 版本 ====================
-  build-and-update:
+  build-all-and-push:
     runs-on: ubuntu-latest
 
     steps:
+      # ==================== 1. 初始化环境与克隆 ====================
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # ==================== 2. 编译 Java 17 组件 ====================
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
-          cache: 'maven'
+          cache: 'maven' # 开启 Maven 依赖缓存
 
-      - name: Build project
+      - name: Build Java 17 project
         working-directory: java  
         run: |
           chmod +x build.sh
           ./build.sh
 
-      - name: Commit and push jar
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          
-          git add java/target/kisama-agent-java-0.1.0-obfuscated.jar
-          
-          if git diff --staged --quiet; then
-            echo "No changes to commit, the jar file is up to date."
-          else
-            git commit -m "chore: update obfuscated jar [skip ci]"
-            git push
-          fi
-
-  # ==================== Job 2: 编译 Java 11 版本 ====================
-  build-and-update-java11:
-    runs-on: ubuntu-latest
-    needs: build-and-update # 👈 等待 Java 17 推送完毕
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
+      # ==================== 3. 编译 Java 11 组件 ====================
       - name: Set up JDK 11
         uses: actions/setup-java@v4
         with:
-          java-version: '11'
+          java-version: '11' # 👈 切换为 Java 11
           distribution: 'temurin'
+          # 注意：因为同一作业里的缓存是共享的，如果项目结构相似，可以继续复用或不设缓存
           cache: 'maven'
 
-      - name: Build project
-        working-directory: java11
+      - name: Build Java 11 project
+        working-directory: java11 # 👈 切换到 java11 目录
         run: |
           chmod +x build.sh
           ./build.sh
 
-      - name: Commit and push jar
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          
-          git add java11/target/kisama-agent-java-0.1.0-obfuscated.jar
-          
-          if git diff --staged --quiet; then
-            echo "No changes to commit, the java11 jar file is up to date."
-          else
-            git commit -m "chore: update obfuscated java11 jar [skip ci]"
-            git push
-          fi
-
-  # ==================== Job 3: 🚀 新增：编译 GO 版本组件 ====================
-  build-and-update-go:
-    runs-on: ubuntu-latest
-    needs: build-and-update-java11 # 👈 核心关键：排在 Java 11 后面执行，彻底杜绝 Git 并发冲突
-
-    steps:
-      # 1. 克隆包含前面两个任务提交后的最新代码
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      # 2. 设置 Go 编译环境
+      # ==================== 4. 编译 GO 版本组件 ====================
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22' # 👈 可以指定具体版本，或者改为 'stable' 使用最新稳定版
-          cache: true        # 自动开启 go 依赖和构建缓存，提速编译
+          go-version: '1.22'
+          cache: true # 开启 Go 依赖缓存
 
-      # 3. 切换到 go 目录并执行构建脚本
       - name: Build Go project
-        working-directory: go # 👈 切换到 go 工作目录
+        working-directory: go # 👈 切换到 go 目录
         run: |
           chmod +x build.sh
           ./build.sh
 
-      # 4. 提交并推送生成的三个 Go 二进制执行文件
-      - name: Commit and push Go binaries
+      # ==================== 5. 🌟 终极收网：所有组件合并为单次 Push ====================
+      - name: Commit and push all agents
         run: |
+          # 1. 配置 Git 机器人身份
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           
-          # 👈 一口气追踪三个编译产物文件
+          # 2. 一口气将所有编译出来的产物全部加进暂存区
+          git add java/target/kisama-agent-java-0.1.0-obfuscated.jar
+          git add java11/target/kisama-agent-java-0.1.0-obfuscated.jar
           git add go/agent go/agent-darwin-arm64 go/agent-linux-arm64
           
+          # 3. 检查这三个目录下的产物是否有任何实际更新，防止无变化提交报错
           if git diff --staged --quiet; then
-            echo "No changes to commit, Go binaries are up to date."
+            echo "🎉 所有组件均未发生变化，无需提交。"
           else
-            # 加上 [skip ci] 避免由于 Actions 自动推送触发反向死循环
-            git commit -m "chore: update compiled go binaries [skip ci]"
+            # 4. 仅提交一次，并加上 [skip ci] 堵死死循环
+            git commit -m "chore: update compiled go binaries and obfuscated jars [skip ci]"
+            echo "🚀 正在单次向远程推送所有组件..."
             git push
           fi
