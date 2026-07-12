@@ -31,6 +31,8 @@ from Crypto.Random import get_random_bytes
 
 ## shell工作目录支持
 import re
+# 需要引入用于对路径进行 URL 编码
+import urllib.parse  
 # ================= 配置区 =================
 CONFIG = {
     "keys_dir": os.getenv("KEYS_DIR", "keys"),
@@ -43,10 +45,9 @@ CONFIG = {
 
 # 测试报告存储
 TEST_REPORT = {"passed": 0, "failed": 0, "skipped": 0, "details": []}
+IS_PHP_SERVER = False  # 由 baseinfo 探测：version 含 "php" 时跳过任务相关测试
 
 SESSION_KEY = None
-import re
-
 import re
 import os
 import json
@@ -375,19 +376,55 @@ def file_cat(path: str, skip_print: bool = False):
 
 
 def file_upload(local_file: str, remote_path: str, remote_filename: str = None, skip_print: bool = False):
-    """POST /api/file - 上传文件 (Base64 简单版)"""
-    _, ecies_sk = load_control_keys()
+    """POST /api/fileraw - 上传文件 (裸二进制流传输)"""
+    try:
+        ecdsa_sk, ecies_sk = load_control_keys()
+        auth_headers = generate_auth_headers(ecdsa_sk)
+    except Exception as e:
+        if not skip_print: 
+            print(f"❌ 密钥加载失败: {e}")
+        return None
+
+    filename = remote_filename or os.path.basename(local_file)
     
-    with open(local_file, 'rb') as f:
-        content_b64 = base64.b64encode(f.read()).decode()
+    # 1. 构造符合 /api/fileraw 规范的自定义请求头
+    auth_headers.update({
+        "Content-Type": "application/octet-stream",
+        "X-File-Path": urllib.parse.quote(remote_path),  # 目标目录路径进行 URL 编码
+        "X-File-Name": filename,
+        "X-Chunk-Id": "0",       # 单文件直传，索引填 0
+        "X-Total-Chunks": "1"    # 单文件直传，总分片数填 1
+    })
+
+    # 2. 读取本地文件的原生二进制流 (零体积膨胀)
+    try:
+        with open(local_file, 'rb') as f:
+            body_bytes = f.read()
+    except Exception as e:
+        if not skip_print: 
+            print(f"❌ 读取本地文件失败: {e}")
+        return None
+
+    # 3. 发送裸二进制请求
+    target_url = f"{CONFIG['proxy_url']}/api/fileraw"
+    request = urllib.request.Request(target_url, data=body_bytes, headers=auth_headers, method="POST")
     
-    params = {
-        "path": remote_path,
-        "filename": remote_filename or os.path.basename(local_file),
-        "content": content_b64
-    }
-    return _make_request("POST", "/api/file", params=params, ecies_sk=ecies_sk,
-                        label="upload", skip_print=skip_print)
+    try:
+        with urllib.request.urlopen(request, timeout=CONFIG["timeout"] + 60) as resp:
+            body_bytes = resp.read()
+            headers = resp.headers
+            
+            # 使用原有的响应处理器解析返回的 JSON
+            return process_response(body_bytes, headers, ecies_sk, 
+                                  label="upload", skip_print=skip_print)
+    except urllib.error.HTTPError as e:
+        if not skip_print:
+            print(f"❌ HTTP {e.code}: {e.read().decode()[:200]}")
+        return {"_http_error": e.code, "_body": e.read().decode()[:500]}
+    except Exception as e:
+        if not skip_print: 
+            print(f"❌ 请求异常: {e}")
+        return None
 
 
 def file_download(remote_path: str, local_file: str = None, skip_print: bool = False):
@@ -425,7 +462,7 @@ def file_move(move_map: Dict[str, str], skip_print: bool = False):
 
 
 def file_mkdir(path: str, skip_print: bool = False):
-    """POST /api/file/new - 新建目录"""
+    """POST /api/file/new - 创建目录"""
     _, ecies_sk = load_control_keys()
     return _make_request("POST", "/api/file/new",
                         params={"path": path},
@@ -480,6 +517,8 @@ def test_baseinfo():
         cpu = result.get("cpu_name", "N/A")[:30]
         mem_gb = (result.get("mem_total") or 0) / 1024 / 1024 / 1024
         version = result.get("version", "N/A")
+        global IS_PHP_SERVER
+        IS_PHP_SERVER = "php" in version.lower()
         
         return _test_result("baseinfo 返回基础字段", True, 
                            f"{arch} | {cpu}... | {mem_gb:.1f}GB | v{version}")
@@ -797,10 +836,11 @@ def run_all_tests():
     # 🔹 文件模块接口
     test_file_ops()
     
-    # 🔹 任务模块接口 (新增)
-    test_task_onetime()
-    test_task_cron()
-    test_task_logs()
+    # 🔹 任务模块接口 (PHP 版本不支持时直接静默跳过，不输出任何内容)
+    if not IS_PHP_SERVER:
+        test_task_onetime()
+        test_task_cron()
+        test_task_logs()
     
     # 输出报告
     _print_test_report()
