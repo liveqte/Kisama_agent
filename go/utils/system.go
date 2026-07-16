@@ -1,16 +1,16 @@
 package utils
 
 import (
-	"io"
-    "net/http"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
+	"os/user"
 	"strconv"
 	"strings"
-	"time"
-	"os/user"
 	"syscall"
+	"time"
 
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/disk"
@@ -23,37 +23,37 @@ import (
 
 // SystemInfo represents basic system information
 type SystemInfo struct {
-	CPUName      string
-	DiskTotal    int64
-	IPv4         *string
-	IPv6         *string
-	MemTotal     int64
-	OS           string
-	KernelVersion string
-	SwapTotal    int64
+	CPUName        string
+	DiskTotal      int64
+	IPv4           *string
+	IPv6           *string
+	MemTotal       int64
+	OS             string
+	KernelVersion  string
+	SwapTotal      int64
 	Virtualization string
 }
 
 // SystemStatus represents real-time system status
 type SystemStatus struct {
-	CPUUsage       float64
-	MemTotal       int64
-	MemUsed        int64
-	SwapTotal      int64
-	SwapUsed       int64
-	Load1          float64
-	Load5          float64
-	Load15         float64
-	DiskTotal      int64
-	DiskUsed       int64
-	NetworkUp      int64
-	NetworkDown    int64
-	TotalNetworkUp int64
+	CPUUsage         float64
+	MemTotal         int64
+	MemUsed          int64
+	SwapTotal        int64
+	SwapUsed         int64
+	Load1            float64
+	Load5            float64
+	Load15           float64
+	DiskTotal        int64
+	DiskUsed         int64
+	NetworkUp        int64
+	NetworkDown      int64
+	TotalNetworkUp   int64
 	TotalNetworkDown int64
-	TCPConnections int
-	UDPConnections int
-	Uptime         uint64
-	ProcessCount   int
+	TCPConnections   int
+	UDPConnections   int
+	Uptime           uint64
+	ProcessCount     int
 }
 
 // GetSystemInfo retrieves basic system information
@@ -92,11 +92,11 @@ func GetSystemInfo() (*SystemInfo, error) {
 		if sysName == "" {
 			sysName = osInfo.OS
 		}
-		
+
 		// 如果想让首字母大写（比如 ubuntu 变成 Ubuntu），可以加上 strings.Title
 		// 但直接用 sysName 也完全没问题
 		osName = fmt.Sprintf("%s %s", sysName, osInfo.PlatformVersion)
-		
+
 		kernelVersion = osInfo.KernelVersion
 		virtualization = osInfo.VirtualizationSystem
 	}
@@ -271,29 +271,29 @@ func GetPublicIPv6() (string, error) {
 // Helper functions
 
 func fetchIP(url string) (string, error) {
-    // 设置 5 秒超时，防止某一个服务挂了导致整个程序卡住
-    client := &http.Client{
-        Timeout: 5 * time.Second,
-    }
+	// 设置 5 秒超时，防止某一个服务挂了导致整个程序卡住
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+	}
 
-    resp, err := client.Get(url)
-    if err != nil {
-        return "", err
-    }
-    defer resp.Body.Close()
+	resp, err := client.Get(url)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
 
-    if resp.StatusCode != http.StatusOK {
-        return "", fmt.Errorf("bad status: %s", resp.Status)
-    }
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("bad status: %s", resp.Status)
+	}
 
-    body, err := io.ReadAll(resp.Body)
-    if err != nil {
-        return "", err
-    }
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
 
-    // 很多接口返回的 IP 会带有换行符 \n，需要裁切掉
-    ip := strings.TrimSpace(string(body))
-    return ip, nil
+	// 很多接口返回的 IP 会带有换行符 \n，需要裁切掉
+	ip := strings.TrimSpace(string(body))
+	return ip, nil
 }
 
 func getLocalIPv4() string {
