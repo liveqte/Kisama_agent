@@ -73,6 +73,12 @@ jobs:
           git add java/target/kisama-agent-java-0.1.0-obfuscated.jar
           git add java11/target/kisama-agent-java-0.1.0-obfuscated.jar
           git add go/agent go/agent-darwin-arm64 go/agent-linux-arm64
+
+          for so in go/libkisama.so go/libkisama-linux-amd64.so go/libkisama-linux-arm64.so; do
+            if [ -f "$so" ]; then
+              git add "$so"
+            fi
+          done
           
           # 3. 检查这三个目录下的产物是否有任何实际更新，防止无变化提交报错
           if git diff --staged --quiet; then

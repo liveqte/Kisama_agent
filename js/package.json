@@ -1,6 +1,6 @@
 {
   "name": "kisama-js",
-  "version": "0.3.5",
+  "version": "0.3.7",
   "description": "Kisama Agent - Node.js implementation",
   "main": "agent.js",
   "scripts": {

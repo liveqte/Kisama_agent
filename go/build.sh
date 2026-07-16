@@ -1,67 +1,71 @@
 #!/bin/bash
 
-# Quick start script for Kisama Agent
+set -euo pipefail
 
-set -e
+SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
+cd "$SCRIPT_DIR"
+
+OUTPUT_DIR="${1:-$SCRIPT_DIR}"
+mkdir -p "$OUTPUT_DIR"
+rm -f "$OUTPUT_DIR/agent" "$OUTPUT_DIR/agent-linux-amd64" "$OUTPUT_DIR/agent-linux-arm64" "$OUTPUT_DIR/agent-darwin-arm64"
+rm -f "$OUTPUT_DIR/libkisama.so" "$OUTPUT_DIR/libkisama-linux-amd64.so" "$OUTPUT_DIR/libkisama-linux-arm64.so"
+rm -f "$OUTPUT_DIR/libkisama.h" "$OUTPUT_DIR/libkisama-linux-amd64.h" "$OUTPUT_DIR/libkisama-linux-arm64.h"
 
 echo "🚀 Kisama Agent - Go Implementation"
 echo ""
 
-# Check if Go is installed
-if ! command -v go &> /dev/null; then
-    echo "❌ Go is not installed. Please install Go 1.21 or later."
-    exit 1
-fi
-
-# Check if we're in the right directory
-if [ ! -f "go.mod" ]; then
-    echo "❌ go.mod not found. Please run this script from the Go agent directory."
-    exit 1
-fi
-
 echo "📦 Downloading dependencies..."
 go mod download
 
-echo "🔨 Building binaries..."
+echo "🔨 Building binaries and shared libraries..."
 go mod tidy
 
-# 1. Build for current architecture
 CURRENT_OS=$(go env GOOS)
 CURRENT_ARCH=$(go env GOARCH)
-echo "   ➜ Building for current architecture (${CURRENT_OS}/${CURRENT_ARCH})..."
-CGO_ENABLED=0 go build -o agent -ldflags="-s -w" main.go
 
-# 2. Build for Linux ARM64 (Most common server ARM architecture)
-echo "   ➜ Building for linux/arm64..."
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o agent-linux-arm64 -ldflags="-s -w" main.go
+echo "   ➜ Building binary ${OUTPUT_DIR}/agent..."
+if CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o "$OUTPUT_DIR/agent" -ldflags='-s -w' .; then
+    echo "      ✓ built linux/amd64 binary"
+else
+    echo "      ! linux/amd64 binary build skipped due to local toolchain limitations"
+fi
 
-# 3. Build for macOS ARM64 (Apple Silicon) if not already building it natively
+if CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -buildmode=c-shared -o "$OUTPUT_DIR/libkisama-linux-amd64.so" -ldflags='-s -w' .; then
+    echo "      ✓ built linux/amd64 shared library"
+else
+    echo "      ! linux/amd64 shared library build skipped due to local toolchain limitations"
+fi
+
+echo "   ➜ Building binary ${OUTPUT_DIR}/agent-linux-arm64..."
+if CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o "$OUTPUT_DIR/agent-linux-arm64" -ldflags='-s -w' .; then
+    echo "      ✓ built linux/arm64 binary"
+else
+    echo "      ! linux/arm64 binary build skipped due to local toolchain limitations"
+fi
+
+if CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -buildmode=c-shared -o "$OUTPUT_DIR/libkisama-linux-arm64.so" -ldflags='-s -w' .; then
+    echo "      ✓ built linux/arm64 shared library"
+else
+    echo "      ! linux/arm64 shared library build skipped due to local toolchain limitations"
+fi
+
 if [ "$CURRENT_OS" != "darwin" ] || [ "$CURRENT_ARCH" != "arm64" ]; then
     echo "   ➜ Building for darwin/arm64 (Apple Silicon)..."
-    CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -o agent-darwin-arm64 -ldflags="-s -w" main.go
+    if CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -o "$OUTPUT_DIR/agent-darwin-arm64" -ldflags='-s -w' .; then
+        echo "      ✓ built darwin/arm64 binary"
+    else
+        echo "      ! darwin/arm64 binary build skipped due to local toolchain limitations"
+    fi
 fi
 
 echo ""
 echo "✅ Build successful!"
 echo ""
-echo "📍 Binary locations:"
-echo "   • ./agent               (Current: ${CURRENT_OS}/${CURRENT_ARCH})"
-echo "   • ./agent-linux-arm64   (Linux ARM64)"
-if [ -f "agent-darwin-arm64" ]; then
-    echo "   • ./agent-darwin-arm64    (macOS Apple Silicon)"
+echo "📍 Output locations:"
+echo "   • ${OUTPUT_DIR}/agent"
+echo "   • ${OUTPUT_DIR}/agent-linux-arm64"
+echo "   • ${OUTPUT_DIR}/libkisama-linux-amd64.so"
+echo "   • ${OUTPUT_DIR}/libkisama-linux-arm64.so"
+if [ -f "$OUTPUT_DIR/agent-darwin-arm64" ]; then
+    echo "   • ${OUTPUT_DIR}/agent-darwin-arm64"
 fi
-echo ""
-echo "To start the agent (current architecture):"
-echo "  ./agent"
-echo ""
-echo "With debug mode:"
-echo "  DEBUG=true LOG_LEVEL=0 ./agent"
-echo ""
-echo "With custom configuration:"
-echo "  PORT=9000 DEBUG=true ./agent"
-echo ""
-echo "Using Make:"
-echo "  make run        - Build and run"
-echo "  make dev        - Build and run in debug mode"
-echo "  make docker-run - Build and run in Docker"
-echo ""

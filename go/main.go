@@ -13,6 +13,20 @@ import (
 )
 
 func main() {
+	if err := run(); err != nil {
+		logger.Errorf("Failed to start Kisama Agent: %v", err)
+		os.Exit(1)
+	}
+}
+
+func setEnv(key, value string) error {
+	if err := os.Setenv(key, value); err != nil {
+		return fmt.Errorf("failed to set environment variable %s: %w", key, err)
+	}
+	return nil
+}
+
+func run() error {
 	// Initialize logger
 	logger.Init()
 
@@ -20,24 +34,41 @@ func main() {
 	cfg, err := config.New()
 	if err != nil {
 		logger.Errorf("Failed to create configuration: %v", err)
-		os.Exit(1)
+		return err
 	}
 
 	// Validate configuration
 	if err := cfg.Validate(); err != nil {
 		logger.Errorf("Configuration validation failed: %v", err)
-		os.Exit(1)
+		return err
 	}
 
 	// Create crypto manager
 	cm, err := crypto.NewCryptoManager(cfg.ECDSAPublicKey, cfg.ECIESPublicKeyB64)
 	if err != nil {
 		logger.Errorf("Failed to create crypto manager: %v", err)
-		os.Exit(1)
+		return err
 	}
 
+	// Create Gin router
+	router := newRouter(cfg, cm)
+
+	// Start server
+	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
+	logger.Infof("Starting Kisama Agent server on %s", addr)
+	logger.Infof("Agent version: %s", cfg.AgentVersion)
+
+	if err := router.Run(addr); err != nil {
+		logger.Errorf("Failed to start server: %v", err)
+		return err
+	}
+
+	return nil
+}
+
+func newRouter(cfg *config.Config, cm *crypto.CryptoManager) *gin.Engine {
 	// Set Gin mode
-	if cfg.Debug {
+	if cfg != nil && cfg.Debug {
 		gin.SetMode(gin.DebugMode)
 	} else {
 		gin.SetMode(gin.ReleaseMode)
@@ -49,23 +80,19 @@ func main() {
 	// Apply middleware
 	router.Use(middleware.LoggingMiddleware())
 	router.Use(middleware.CORSMiddleware())
-	router.Use(middleware.AuthEncryptMiddleware(cm, cfg))
+	if cfg != nil && cm != nil {
+		router.Use(middleware.AuthEncryptMiddleware(cm, cfg))
+	}
 
 	// Initialize task manager
-	handlers.InitTaskManager(cfg.MaxTaskLogSize)
+	if cfg != nil {
+		handlers.InitTaskManager(cfg.MaxTaskLogSize)
+	}
 
 	// Register API routes
 	registerRoutes(router)
 
-	// Start server
-	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
-	logger.Infof("Starting Kisama Agent server on %s", addr)
-	logger.Infof("Agent version: %s", cfg.AgentVersion)
-
-	if err := router.Run(addr); err != nil {
-		logger.Errorf("Failed to start server: %v", err)
-		os.Exit(1)
-	}
+	return router
 }
 
 // registerRoutes registers all API routes
