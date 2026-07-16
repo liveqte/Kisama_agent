@@ -6,16 +6,16 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
-	"strconv"
-	"net/url"
 
 	"github.com/gin-gonic/gin"
-	"github.com/liveqte/kisama_agent/config"
-	"github.com/liveqte/kisama_agent/models"
+	"github.com/liveqte/kisama_agent/go/config"
+	"github.com/liveqte/kisama_agent/go/models"
 )
 
 // ListFiles lists files in a directory
@@ -62,12 +62,12 @@ func ListFiles(c *gin.Context) {
 
 		relPath := filepath.Join(req.Path, file.Name())
 		fileInfo := models.FileInfo{
-			Name:  file.Name(),
-			Path:  relPath,
-			Type:  fileType,
-			Size:  file.Size(),
-			Mtime: file.ModTime().Format(time.RFC3339),
-			Mode:  file.Mode().String(),
+			Name:      file.Name(),
+			Path:      relPath,
+			Type:      fileType,
+			Size:      file.Size(),
+			Mtime:     file.ModTime().Format(time.RFC3339),
+			Mode:      file.Mode().String(),
 			ModeOctal: fmt.Sprintf("0o%o", file.Mode().Perm()),
 		}
 

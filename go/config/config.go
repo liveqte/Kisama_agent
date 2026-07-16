@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/liveqte/kisama_agent/logger"
+	"github.com/liveqte/kisama_agent/go/logger"
 	"golang.org/x/crypto/curve25519"
 )
 
@@ -34,7 +34,7 @@ type Config struct {
 	LogLevel        int
 
 	// Crypto
-	ECDSAPublicKey string
+	ECDSAPublicKey    string
 	ECIESPublicKeyB64 string
 
 	// File Management
@@ -44,10 +44,10 @@ type Config struct {
 	FileAuditLog   bool
 
 	// Tasks
-	InitTask           bool
-	TaskTimeout        int
-	CronCheckInterval  int
-	MaxTaskLogSize     int
+	InitTask          bool
+	TaskTimeout       int
+	CronCheckInterval int
+	MaxTaskLogSize    int
 
 	// Server
 	Host         string
@@ -229,10 +229,10 @@ func New() (*Config, error) {
 			}
 		}
 	}
-	
+
 	agentVersion := os.Getenv("AGENT_VERSION")
 	if agentVersion == "" {
-		agentVersion = "0.3.9-go"
+		agentVersion = "0.4.0-go"
 	}
 
 	fileRoot := os.Getenv("FILE_ROOT")
@@ -242,28 +242,28 @@ func New() (*Config, error) {
 	}
 
 	cfg := &Config{
-		ExecTimeout:      execTimeout,
-		ExecShellMode:    execShellMode,
-		Debug:            debug,
-		TimestampWindow:  timestampWindow,
-		LogLevel:         logLevel,
-		ECDSAPublicKey: getConfigValue("ECDSA_PUBKEY", "keys/agent_ecdsa_pub.pem"),
+		ExecTimeout:       execTimeout,
+		ExecShellMode:     execShellMode,
+		Debug:             debug,
+		TimestampWindow:   timestampWindow,
+		LogLevel:          logLevel,
+		ECDSAPublicKey:    getConfigValue("ECDSA_PUBKEY", "keys/agent_ecdsa_pub.pem"),
 		ECIESPublicKeyB64: getConfigValue("ECIES_PUBKEY", "keys/agent_ecies_pub.b64"),
-		FileRoot:         fileRoot,
-		MaxUploadSize:    maxUploadSize,
-		FollowSymlinks:   followSymlinks,
-		FileAuditLog:     fileAuditLog,
-		InitTask:         true,
-		TaskTimeout:      taskTimeout,
+		FileRoot:          fileRoot,
+		MaxUploadSize:     maxUploadSize,
+		FollowSymlinks:    followSymlinks,
+		FileAuditLog:      fileAuditLog,
+		InitTask:          true,
+		TaskTimeout:       taskTimeout,
 		CronCheckInterval: cronCheckInterval,
-		MaxTaskLogSize:   maxTaskLogSize,
-		Host:             host,
-		Port:             port,
-		AgentVersion:     agentVersion,
-		SessionKey:       sessionKey,
-		NoiseKeys:        noiseKeys,
-		OneTimeTasks:     []string{},
-		CronTasks:        make(map[string]string),
+		MaxTaskLogSize:    maxTaskLogSize,
+		Host:              host,
+		Port:              port,
+		AgentVersion:      agentVersion,
+		SessionKey:        sessionKey,
+		NoiseKeys:         noiseKeys,
+		OneTimeTasks:      []string{},
+		CronTasks:         make(map[string]string),
 	}
 
 	globalConfig = cfg

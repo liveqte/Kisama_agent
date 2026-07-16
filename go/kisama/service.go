@@ -15,11 +15,11 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/liveqte/kisama_agent/config"
-	"github.com/liveqte/kisama_agent/crypto"
-	"github.com/liveqte/kisama_agent/handlers"
-	"github.com/liveqte/kisama_agent/logger"
-	"github.com/liveqte/kisama_agent/middleware"
+	"github.com/liveqte/kisama_agent/go/config"
+	"github.com/liveqte/kisama_agent/go/crypto"
+	"github.com/liveqte/kisama_agent/go/handlers"
+	"github.com/liveqte/kisama_agent/go/logger"
+	"github.com/liveqte/kisama_agent/go/middleware"
 )
 
 // Options is the constructor input for a Kisama service.

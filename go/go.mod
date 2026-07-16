@@ -1,4 +1,4 @@
-module github.com/liveqte/kisama_agent
+module github.com/liveqte/kisama_agent/go
 
 go 1.23.0
 

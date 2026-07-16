@@ -8,8 +8,8 @@ package main
 import "C"
 
 import (
-	"github.com/liveqte/kisama_agent/kisama"
-	"github.com/liveqte/kisama_agent/logger"
+	"github.com/liveqte/kisama_agent/go/kisama"
+	"github.com/liveqte/kisama_agent/go/logger"
 )
 
 //export StartServer

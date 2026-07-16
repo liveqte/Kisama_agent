@@ -8,7 +8,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	"github.com/liveqte/kisama_agent/config"
+	"github.com/liveqte/kisama_agent/go/config"
 )
 
 // DownloadFile 处理安全文件下载，直接透传纯二进制流与自定义 Headers

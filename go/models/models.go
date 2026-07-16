@@ -43,21 +43,21 @@ type NoiseKeyConfig struct {
 // BaseInfoResponse represents basic system information
 type BaseInfoResponse struct {
 	BaseResponse
-	Arch           string         `json:"arch"`
-	CPUCores       int            `json:"cpu_cores"`
-	CPUName        string         `json:"cpu_name"`
-	DiskTotal      int64          `json:"disk_total"`
-	GPUName        string         `json:"gpu_name"`
-	IPv4           *string        `json:"ipv4"`
-	IPv6           *string        `json:"ipv6"`
-	MemTotal       int64          `json:"mem_total"`
-	OS             string         `json:"os"`
-	KernelVersion  string         `json:"kernel_version"`
-	SwapTotal      int64          `json:"swap_total"`
-	Version        string         `json:"version"`
-	Virtualization string         `json:"virtualization"`
-	SessionKey     *string              `json:"session_key"`
-	NoiseKey       *NoiseKeyConfig      `json:"noise_key"`
+	Arch           string          `json:"arch"`
+	CPUCores       int             `json:"cpu_cores"`
+	CPUName        string          `json:"cpu_name"`
+	DiskTotal      int64           `json:"disk_total"`
+	GPUName        string          `json:"gpu_name"`
+	IPv4           *string         `json:"ipv4"`
+	IPv6           *string         `json:"ipv6"`
+	MemTotal       int64           `json:"mem_total"`
+	OS             string          `json:"os"`
+	KernelVersion  string          `json:"kernel_version"`
+	SwapTotal      int64           `json:"swap_total"`
+	Version        string          `json:"version"`
+	Virtualization string          `json:"virtualization"`
+	SessionKey     *string         `json:"session_key"`
+	NoiseKey       *NoiseKeyConfig `json:"noise_key"`
 }
 
 // CPUStatus represents CPU status
@@ -92,9 +92,9 @@ type DiskStatus struct {
 
 // NetworkStatus represents network status
 type NetworkStatus struct {
-	Up       int64 `json:"up"`
-	Down     int64 `json:"down"`
-	TotalUp  int64 `json:"totalUp"`
+	Up        int64 `json:"up"`
+	Down      int64 `json:"down"`
+	TotalUp   int64 `json:"totalUp"`
 	TotalDown int64 `json:"totalDown"`
 }
 
@@ -107,16 +107,16 @@ type ConnectionStatus struct {
 // StatusResponse represents real-time system status
 type StatusResponse struct {
 	BaseResponse
-	CPU         CPUStatus         `json:"cpu"`
-	RAM         MemoryStatus      `json:"ram"`
-	Swap        SwapStatus        `json:"swap"`
-	Load        LoadStatus        `json:"load"`
-	Disk        DiskStatus        `json:"disk"`
-	Network     NetworkStatus     `json:"network"`
-	Connections ConnectionStatus  `json:"connections"`
-	Uptime      int64             `json:"uptime"`
-	Process     int               `json:"process"`
-	Message     string            `json:"message"`
+	CPU         CPUStatus        `json:"cpu"`
+	RAM         MemoryStatus     `json:"ram"`
+	Swap        SwapStatus       `json:"swap"`
+	Load        LoadStatus       `json:"load"`
+	Disk        DiskStatus       `json:"disk"`
+	Network     NetworkStatus    `json:"network"`
+	Connections ConnectionStatus `json:"connections"`
+	Uptime      int64            `json:"uptime"`
+	Process     int              `json:"process"`
+	Message     string           `json:"message"`
 }
 
 // ========== Command Execution Models ==========
@@ -153,13 +153,13 @@ type FileInfo struct {
 
 // AuthorityInfo represents file authority information
 type AuthorityInfo struct {
-	Path      string `json:"path"`
-	Name      string `json:"name,omitempty"`
-	Mode      string `json:"mode"`
-	ModeOctal string `json:"mode_octal"`
-	Type      string `json:"type,omitempty"`
-	Readable  bool   `json:"readable"`
-	Writable  bool   `json:"writable"`
+	Path       string `json:"path"`
+	Name       string `json:"name,omitempty"`
+	Mode       string `json:"mode"`
+	ModeOctal  string `json:"mode_octal"`
+	Type       string `json:"type,omitempty"`
+	Readable   bool   `json:"readable"`
+	Writable   bool   `json:"writable"`
 	Executable bool   `json:"executable"`
 }
 
@@ -203,9 +203,9 @@ type FileAuthoritySetResult struct {
 // FileAuthoritySetResponse represents a file authority set response
 type FileAuthoritySetResponse struct {
 	BaseResponse
-	Total   int                        `json:"total"`
-	Success int                        `json:"success"`
-	Results []FileAuthoritySetResult   `json:"results"`
+	Total   int                      `json:"total"`
+	Success int                      `json:"success"`
+	Results []FileAuthoritySetResult `json:"results"`
 }
 
 // FileCatRequest represents a file content read request
@@ -225,10 +225,10 @@ type FileCatResponse struct {
 
 // FileUploadRequest represents a file upload request
 type FileUploadRequest struct {
-	Path     string `json:"path"`
-	Filename string `json:"filename"`
-	Content  string `json:"content"` 
-	ChunkID     int    `json:"chunk_id"`    
+	Path        string `json:"path"`
+	Filename    string `json:"filename"`
+	Content     string `json:"content"`
+	ChunkID     int    `json:"chunk_id"`
 	TotalChunks int    `json:"total_chunks"`
 }
 
@@ -315,9 +315,9 @@ type ExecutedTask struct {
 // OneTimeTaskSetResponse represents onetime task set response
 type OneTimeTaskSetResponse struct {
 	BaseResponse
-	Count    int             `json:"count"`
-	Tasks    []string        `json:"tasks"`
-	Executed []ExecutedTask  `json:"executed,omitempty"`
+	Count    int            `json:"count"`
+	Tasks    []string       `json:"tasks"`
+	Executed []ExecutedTask `json:"executed,omitempty"`
 }
 
 // CronTaskRequest represents cron task request

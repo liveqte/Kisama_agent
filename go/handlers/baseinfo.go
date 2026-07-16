@@ -7,9 +7,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/liveqte/kisama_agent/config"
-	"github.com/liveqte/kisama_agent/models"
-	"github.com/liveqte/kisama_agent/utils"
+	"github.com/liveqte/kisama_agent/go/config"
+	"github.com/liveqte/kisama_agent/go/models"
+	"github.com/liveqte/kisama_agent/go/utils"
 )
 
 // 定义线程安全的响应模型缓存槽与时间戳
@@ -18,9 +18,9 @@ var (
 	baseInfoCacheTime int64
 	baseInfoMu        sync.Mutex // 基础信息互斥锁，防止并发击穿
 
-	statusCache       models.StatusResponse
-	statusCacheTime   int64
-	statusMu          sync.Mutex // 实时监控互斥锁，防止并发击穿
+	statusCache     models.StatusResponse
+	statusCacheTime int64
+	statusMu        sync.Mutex // 实时监控互斥锁，防止并发击穿
 )
 
 // GetBaseInfo retrieves basic system information (带 1 小时高性能缓存机制)
@@ -41,24 +41,24 @@ func GetBaseInfo(c *gin.Context) {
 
 		// 缓存不含敏感密钥的纯净系统快照
 		baseInfoCache = models.BaseInfoResponse{
-			BaseResponse: models.BaseResponse{Status: "ok"},
-			Arch:         runtime.GOARCH,
-			CPUCores:     runtime.NumCPU(),
-			CPUName:      sysInfo.CPUName,
-			DiskTotal:    sysInfo.DiskTotal,
-			GPUName:      "",
-			IPv4:         sysInfo.IPv4,
-			IPv6:         sysInfo.IPv6,
-			MemTotal:     sysInfo.MemTotal,
-			OS:           sysInfo.OS,
-			KernelVersion: sysInfo.KernelVersion,
-			SwapTotal:    sysInfo.SwapTotal,
-			Version:      cfg.AgentVersion,
+			BaseResponse:   models.BaseResponse{Status: "ok"},
+			Arch:           runtime.GOARCH,
+			CPUCores:       runtime.NumCPU(),
+			CPUName:        sysInfo.CPUName,
+			DiskTotal:      sysInfo.DiskTotal,
+			GPUName:        "",
+			IPv4:           sysInfo.IPv4,
+			IPv6:           sysInfo.IPv6,
+			MemTotal:       sysInfo.MemTotal,
+			OS:             sysInfo.OS,
+			KernelVersion:  sysInfo.KernelVersion,
+			SwapTotal:      sysInfo.SwapTotal,
+			Version:        cfg.AgentVersion,
 			Virtualization: sysInfo.Virtualization,
 		}
 		baseInfoCacheTime = now
 	}
-	
+
 	// 通过值复制（Shallow Copy）派生出当前请求的独立副本，随后立即解锁释放协程
 	response := baseInfoCache
 	baseInfoMu.Unlock()
@@ -150,7 +150,7 @@ func GetStatus(c *gin.Context) {
 		}
 		statusCacheTime = now
 	}
-	
+
 	response := statusCache
 	statusMu.Unlock()
 

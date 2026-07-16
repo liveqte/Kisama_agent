@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/liveqte/kisama_agent/config"
-	"github.com/liveqte/kisama_agent/models"
+	"github.com/liveqte/kisama_agent/go/config"
+	"github.com/liveqte/kisama_agent/go/models"
 	"github.com/robfig/cron/v3"
 )
 

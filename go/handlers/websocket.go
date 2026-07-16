@@ -17,8 +17,8 @@ import (
 	"github.com/flynn/noise"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
-	"github.com/liveqte/kisama_agent/config"
-	"github.com/liveqte/kisama_agent/logger"
+	"github.com/liveqte/kisama_agent/go/config"
+	"github.com/liveqte/kisama_agent/go/logger"
 	"golang.org/x/crypto/curve25519"
 )
 

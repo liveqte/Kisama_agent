@@ -9,9 +9,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/liveqte/kisama_agent/config"
-	"github.com/liveqte/kisama_agent/crypto"
-	"github.com/liveqte/kisama_agent/logger"
+	"github.com/liveqte/kisama_agent/go/config"
+	"github.com/liveqte/kisama_agent/go/crypto"
+	"github.com/liveqte/kisama_agent/go/logger"
 )
 
 // responseBufferWriter 负责拦截并缓存下游路由输出的全部明文数据，防止其提前泄露给网络流
@@ -89,12 +89,12 @@ func AuthEncryptMiddleware(cm *crypto.CryptoManager, cfg *config.Config) gin.Han
 
 					now := time.Now().Unix()
 					timeDiff := math.Abs(float64(now - ts))
-					
+
 					timeWindow := int64(cfg.TimestampWindow)
 					if timeWindow < 300 {
 						timeWindow = 300 // 至少 5 分钟
 					}
-					
+
 					if timeDiff > float64(timeWindow) {
 						logger.Debugf("Timestamp validation - now: %d, ts: %d, diff: %.0f, window: %d", now, ts, timeDiff, timeWindow)
 					}
@@ -106,9 +106,9 @@ func AuthEncryptMiddleware(cm *crypto.CryptoManager, cfg *config.Config) gin.Han
 		}
 
 		// Phase 1.5: Parse request body (完全保留并堵住大文件 OOM 隐患)
-		if c.Request.Body != nil && c.Request.URL.Path != "/api/fileraw" && 
+		if c.Request.Body != nil && c.Request.URL.Path != "/api/fileraw" &&
 			(c.Request.Method == "POST" || c.Request.Method == "PUT" || c.Request.Method == "DELETE") {
-			
+
 			// Read body
 			bodyBytes, err := io.ReadAll(c.Request.Body)
 			if err != nil {
@@ -123,7 +123,7 @@ func AuthEncryptMiddleware(cm *crypto.CryptoManager, cfg *config.Config) gin.Han
 			// Check if AES encrypted
 			isEncrypted := strings.ToLower(c.GetHeader("x-aes-encrypted")) == "true"
 			isAuth, _ := c.Get("is_authenticated")
-			
+
 			// 🌟 只有在真正通过认证（为 true）的请求下，才执行请求体解密
 			if isEncrypted && isAuth == true {
 				logger.Debugf("Request is AES encrypted, attempting decryption...")
@@ -150,7 +150,7 @@ func AuthEncryptMiddleware(cm *crypto.CryptoManager, cfg *config.Config) gin.Han
 
 			// Reset body for later use by handlers
 			c.Request.Body = io.NopCloser(strings.NewReader(bodyStr))
-			
+
 			// Store decrypted body in context
 			c.Set("_rawRequestBody", bodyStr)
 		}
@@ -190,7 +190,7 @@ func AuthEncryptMiddleware(cm *crypto.CryptoManager, cfg *config.Config) gin.Han
 					bufferWriter.ResponseWriter.Header().Set("x-encrypted", "true")
 					bufferWriter.ResponseWriter.Header().Set("x-agent-version", cfg.AgentVersion)
 					bufferWriter.ResponseWriter.Header().Set("Content-Length", fmt.Sprintf("%d", len(encrypted)))
-					
+
 					// 将密文数据合法刷入外部真实网络 Socket 流中
 					bufferWriter.ResponseWriter.Write([]byte(encrypted))
 					return
