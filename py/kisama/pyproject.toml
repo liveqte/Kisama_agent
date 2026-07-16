@@ -1,6 +1,6 @@
 [project]
 name = "kisama"
-version = "0.3.8"
+version = "0.3.9"
 description = "kisama agent for python"
 readme = "README.md"
 authors = [

@@ -7,7 +7,10 @@ package main
 */
 import "C"
 
-import "github.com/liveqte/kisama_agent/logger"
+import (
+	"github.com/liveqte/kisama_agent/kisama"
+	"github.com/liveqte/kisama_agent/logger"
+)
 
 //export StartServer
 func StartServer(host *C.char, port *C.char, ecdsaPub *C.char, eciesPub *C.char) C.int {
@@ -40,7 +43,12 @@ func StartServer(host *C.char, port *C.char, ecdsaPub *C.char, eciesPub *C.char)
 		return 1
 	}
 
-	if err := run(); err != nil {
+	service, err := kisama.NewServiceFromEnv()
+	if err != nil {
+		logger.Errorf("Failed to create Kisama service: %v", err)
+		return 1
+	}
+	if err := service.Run(); err != nil {
 		logger.Errorf("Failed to start Kisama Agent: %v", err)
 		return 1
 	}
