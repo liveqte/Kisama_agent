@@ -43,10 +43,14 @@ else
     echo "      ! linux/arm64 binary build skipped due to local toolchain limitations"
 fi
 
-if CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -buildmode=c-shared -o "$OUTPUT_DIR/libkisama-linux-arm64.so" -ldflags='-s -w' .; then
-    echo "      ✓ built linux/arm64 shared library"
+if command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
+    if CC=aarch64-linux-gnu-gcc CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -buildmode=c-shared -o "$OUTPUT_DIR/libkisama-linux-arm64.so" -ldflags='-s -w' .; then
+        echo "      ✓ built linux/arm64 shared library"
+    else
+        echo "      ! linux/arm64 shared library build skipped due to local toolchain limitations"
+    fi
 else
-    echo "      ! linux/arm64 shared library build skipped due to local toolchain limitations"
+    echo "      ! linux/arm64 shared library build skipped: aarch64-linux-gnu-gcc not installed"
 fi
 
 if [ "$CURRENT_OS" != "darwin" ] || [ "$CURRENT_ARCH" != "arm64" ]; then

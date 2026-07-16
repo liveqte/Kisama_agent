@@ -1052,7 +1052,7 @@ public class kisama {
         obj.put("os", getOsPrettyName());
         obj.put("kernel_version", getKernelVersion());
         obj.put("swap_total", getTotalSwapBytes());
-        obj.put("version", "0.3.7-java11");
+        obj.put("version", "0.3.8-java11");
         obj.put("virtualization", getVirtualization());
         return obj;
     }
@@ -1167,7 +1167,7 @@ public class kisama {
         obj.put("os", getOsPrettyName());
         obj.put("kernel_version", getKernelVersion());
         obj.put("swap_total", getTotalSwapBytes());
-        obj.put("version", "0.3.7-java11");
+        obj.put("version", "0.3.8-java11");
         obj.put("virtualization", getVirtualization());
 
         // 🌟 修改：根据是否通过验证状态，动态清空核心敏感凭证
