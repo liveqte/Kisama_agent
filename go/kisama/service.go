@@ -220,6 +220,15 @@ func (s *Service) Run() error {
 func (s *Service) Addr() string {
 	return fmt.Sprintf("%s:%d", s.cfg.Host, s.cfg.Port)
 }
+// Handler returns the configured Kisama HTTP handler without starting a listener.
+func (s *Service) Handler() http.Handler {
+	return s.router
+}
+
+// Router returns the underlying Gin router for applications that need to add routes.
+func (s *Service) Router() *gin.Engine {
+	return s.router
+}
 
 func newRouter(cfg *config.Config, cm *crypto.CryptoManager) *gin.Engine {
 	if cfg != nil && cfg.Debug {
