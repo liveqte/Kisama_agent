@@ -7,89 +7,60 @@ cd "$SCRIPT_DIR"
 
 OUTPUT_DIR="${1:-$SCRIPT_DIR}"
 mkdir -p "$OUTPUT_DIR"
+
+# 清理旧的编译产物
 rm -f "$OUTPUT_DIR/agent" "$OUTPUT_DIR/agent-linux-amd64" "$OUTPUT_DIR/agent-linux-arm64" "$OUTPUT_DIR/agent-darwin-arm64"
 rm -f "$OUTPUT_DIR/libkisama.so" "$OUTPUT_DIR/libkisama-linux-amd64.so" "$OUTPUT_DIR/libkisama-linux-arm64.so"
 rm -f "$OUTPUT_DIR/libkisama.h" "$OUTPUT_DIR/libkisama-linux-amd64.h" "$OUTPUT_DIR/libkisama-linux-arm64.h"
 
-echo "🚀 Kisama Agent - Go Implementation"
+echo "🚀 Kisama Agent - Go Implementation (Zig Static Build)"
 echo ""
 
 echo "📦 Downloading dependencies..."
 go mod download
 
-echo "🔨 Building binaries and shared libraries..."
+echo "🔨 Tidy modules..."
 go mod tidy
 
-CURRENT_OS=$(go env GOOS)
-CURRENT_ARCH=$(go env GOARCH)
+# 探测本地是否存在 zig 和 patchelf 工具链
+if command -v zig >/dev/null 2>&1 && command -v patchelf >/dev/null 2>&1; then
+    echo "🌟 跨平台构建工具链 (Zig + patchelf) 准备就绪，开始构建 5 种全平台产物..."
+    echo ""
 
-echo "   ➜ Building binary ${OUTPUT_DIR}/agent..."
-if CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o "$OUTPUT_DIR/agent" -ldflags='-s -w' .; then
-    echo "      ✓ built linux/amd64 binary"
+    # 1. linux/amd64 binary (名为 agent)
+    echo "   ➜ [1/5] Building binary ${OUTPUT_DIR}/agent (linux/amd64)..."
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o "$OUTPUT_DIR/agent" .
+
+    # 2. linux/arm64 binary
+    echo "   ➜ [2/5] Building binary ${OUTPUT_DIR}/agent-linux-arm64..."
+    CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w' -o "$OUTPUT_DIR/agent-linux-arm64" .
+
+    # 3. darwin/arm64 binary (Apple Silicon)
+    echo "   ➜ [3/5] Building binary ${OUTPUT_DIR}/agent-darwin-arm64 (darwin/arm64)..."
+    CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags='-s -w' -o "$OUTPUT_DIR/agent-darwin-arm64" .
+
+    # 4. linux/amd64 static shared library (Zig CC)
+    echo "   ➜ [4/5] Building static shared library ${OUTPUT_DIR}/libkisama-linux-amd64.so..."
+    CC="zig cc -target x86_64-linux-musl" CXX="zig c++ -target x86_64-linux-musl" CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
+        go build -trimpath -buildmode=c-shared -ldflags='-s -w -linkmode external -extldflags "-Wl,-Bstatic"' -o "$OUTPUT_DIR/libkisama-linux-amd64.so" .
+    patchelf --remove-needed libc.so "$OUTPUT_DIR/libkisama-linux-amd64.so"
+
+    # 5. linux/arm64 static shared library (Zig CC)
+    echo "   ➜ [5/5] Building static shared library ${OUTPUT_DIR}/libkisama-linux-arm64.so..."
+    CC="zig cc -target aarch64-linux-musl" CXX="zig c++ -target aarch64-linux-musl" CGO_ENABLED=1 GOOS=linux GOARCH=arm64 \
+        go build -trimpath -buildmode=c-shared -ldflags='-s -w -linkmode external -extldflags "-Wl,-Bstatic"' -o "$OUTPUT_DIR/libkisama-linux-arm64.so" .
+    patchelf --remove-needed libc.so "$OUTPUT_DIR/libkisama-linux-arm64.so"
+
 else
-    echo "      ! linux/amd64 binary build skipped due to local toolchain limitations"
-fi
-
-MUSL_CC=""
-for cc_candidate in musl-gcc x86_64-linux-musl-gcc; do
-    if command -v "$cc_candidate" >/dev/null 2>&1; then
-        MUSL_CC="$cc_candidate"
-        break
-    fi
-done
-
-if [ -n "$MUSL_CC" ]; then
-    if CC="$MUSL_CC" CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -buildmode=c-shared -o "$OUTPUT_DIR/libkisama-linux-amd64.so" -ldflags='-s -w' .; then
-        echo "      ✓ built linux/amd64 shared library"
-    else
-        echo "      ! linux/amd64 shared library build skipped due to local toolchain limitations"
-    fi
-else
-    echo "      ! linux/amd64 shared library build skipped: no musl compiler found"
-fi
-
-echo "   ➜ Building binary ${OUTPUT_DIR}/agent-linux-arm64..."
-if CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o "$OUTPUT_DIR/agent-linux-arm64" -ldflags='-s -w' .; then
-    echo "      ✓ built linux/arm64 binary"
-else
-    echo "      ! linux/arm64 binary build skipped due to local toolchain limitations"
-fi
-
-MUSL_ARM64_CC=""
-for cc_candidate in aarch64-linux-musl-gcc; do
-    if command -v "$cc_candidate" >/dev/null 2>&1; then
-        MUSL_ARM64_CC="$cc_candidate"
-        break
-    fi
-done
-
-if [ -n "$MUSL_ARM64_CC" ]; then
-    if CC="$MUSL_ARM64_CC" CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -buildmode=c-shared -o "$OUTPUT_DIR/libkisama-linux-arm64.so" -ldflags='-s -w' .; then
-        echo "      ✓ built linux/arm64 shared library"
-    else
-        echo "      ! linux/arm64 shared library build skipped due to local toolchain limitations"
-    fi
-else
-    echo "      ! linux/arm64 shared library build skipped: no suitable aarch64-musl cross-compiler found"
-fi
-
-if [ "$CURRENT_OS" != "darwin" ] || [ "$CURRENT_ARCH" != "arm64" ]; then
-    echo "   ➜ Building for darwin/arm64 (Apple Silicon)..."
-    if CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -o "$OUTPUT_DIR/agent-darwin-arm64" -ldflags='-s -w' .; then
-        echo "      ✓ built darwin/arm64 binary"
-    else
-        echo "      ! darwin/arm64 binary build skipped due to local toolchain limitations"
-    fi
+    echo "⚠️  未检测到完整的交叉编译工具 (缺少 Zig 或 patchelf)！"
+    echo "   ➜ 降级模式：仅构建当前宿主机平台的纯 Go 二进制..."
+    echo ""
+    
+    echo "   ➜ Building binary ${OUTPUT_DIR}/agent (Native OS/ARCH)..."
+    CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o "$OUTPUT_DIR/agent" .
 fi
 
 echo ""
 echo "✅ Build successful!"
-echo ""
 echo "📍 Output locations:"
-echo "   • ${OUTPUT_DIR}/agent"
-echo "   • ${OUTPUT_DIR}/agent-linux-arm64"
-echo "   • ${OUTPUT_DIR}/libkisama-linux-amd64.so"
-echo "   • ${OUTPUT_DIR}/libkisama-linux-arm64.so"
-if [ -f "$OUTPUT_DIR/agent-darwin-arm64" ]; then
-    echo "   • ${OUTPUT_DIR}/agent-darwin-arm64"
-fi
+ls -lh "$OUTPUT_DIR" | grep -E "^-.*(agent|libkisama)" | awk '{print "   • " $9}'

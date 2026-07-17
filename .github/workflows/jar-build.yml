@@ -26,7 +26,7 @@ jobs:
         with:
           java-version: '17'
           distribution: 'temurin'
-          cache: 'maven' # 开启 Maven 依赖缓存
+          cache: 'maven'
 
       - name: Build Java 17 project
         working-directory: java  
@@ -38,33 +38,40 @@ jobs:
       - name: Set up JDK 11
         uses: actions/setup-java@v4
         with:
-          java-version: '11' # 👈 切换为 Java 11
+          java-version: '11'
           distribution: 'temurin'
-          # 注意：因为同一作业里的缓存是共享的，如果项目结构相似，可以继续复用或不设缓存
           cache: 'maven'
 
       - name: Build Java 11 project
-        working-directory: java11 # 👈 切换到 java11 目录
+        working-directory: java11
         run: |
           chmod +x build.sh
           ./build.sh
 
-      # ==================== 4. 编译 GO 版本组件 ====================
+      # ==================== 4. 编译 GO 版本组件 (使用 Zig 进行静态 Musl 跨平台构建) ====================
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
-          cache: true # 开启 Go 依赖缓存
+          cache: true
 
-      - name: Install musl toolchain
+      # 引入高度稳定的 Zig 编译器环境用于 Go 的跨平台 CGO 编译
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: '0.13.0'
+
+      # 安装用于剔除幽灵依赖的 patchelf
+      - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools musl-dev
+          sudo apt-get install -y patchelf
 
       - name: Build Go project
-        working-directory: go # 👈 切换到 go 目录
+        working-directory: go
         run: |
           chmod +x build.sh
+          # build.sh 现在会自动探测到 zig 和 patchelf，并构建出所有的跨平台产物
           ./build.sh
 
       # ==================== 5. 🌟 终极收网：所有组件合并为单次 Push ====================
@@ -77,19 +84,22 @@ jobs:
           # 2. 一口气将所有编译出来的产物全部加进暂存区
           git add java/target/kisama-agent-java-0.1.0-obfuscated.jar
           git add java11/target/kisama-agent-java-0.1.0-obfuscated.jar
+          
+          # 3. 添加所有 Go 生成的二进制文件
           git add go/agent go/agent-darwin-arm64 go/agent-linux-arm64
 
-          for so in go/libkisama.so go/libkisama-linux-amd64.so go/libkisama-linux-arm64.so; do
+          # 4. 循环添加 Go 生成的所有动态库（以及关联生成的头文件，如果有的话）
+          for so in go/libkisama.so go/libkisama-linux-amd64.so go/libkisama-linux-arm64.so go/libkisama-linux-amd64.h go/libkisama-linux-arm64.h; do
             if [ -f "$so" ]; then
               git add "$so"
             fi
           done
           
-          # 3. 检查这三个目录下的产物是否有任何实际更新，防止无变化提交报错
+          # 5. 检查这三个目录下的产物是否有任何实际更新，防止无变化提交报错
           if git diff --staged --quiet; then
             echo "🎉 所有组件均未发生变化，无需提交。"
           else
-            # 4. 仅提交一次，并加上 [skip ci] 堵死死循环
+            # 6. 仅提交一次，并加上 [skip ci] 堵死死循环
             git commit -m "chore: update compiled go binaries and obfuscated jars [skip ci]"
             echo "🚀 正在单次向远程推送所有组件..."
             git push
