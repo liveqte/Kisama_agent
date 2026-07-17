@@ -21,28 +21,29 @@ jobs:
           go-version: '1.23'
           cache: true
 
-      - name: Install musl toolchain
+      - name: Install musl toolchain (x86_64)
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools musl-dev
 
-      - name: Install zig for aarch64 musl cross-compile
+      - name: Install aarch64 musl cross-toolchain
         run: |
-          if ! command -v zig >/dev/null 2>&1; then
-            curl -L https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz -o /tmp/zig.tar.xz
-            tar -xf /tmp/zig.tar.xz -C /tmp
-            sudo mv /tmp/zig-linux-x86_64-0.13.0 /opt/zig
-            echo "/opt/zig" >> "$GITHUB_PATH"
-          fi
+          # musl.cc provides the same gcc-based musl toolchain as musl-tools,
+          # but for aarch64. This handles -extldflags "-static" correctly for
+          # c-shared mode, just like musl-gcc does for x86_64.
+          curl -fL --retry 3 --retry-delay 5 \
+            https://musl.cc/aarch64-linux-musl-cross.tgz \
+            -o /tmp/aarch64-musl.tgz
+          sudo tar -xf /tmp/aarch64-musl.tgz -C /opt
+          echo "/opt/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
 
-      - name: Create zig wrapper for aarch64 musl
+      - name: Verify toolchains
         run: |
-          cat > /tmp/aarch64-musl-cc <<'EOF'
-          #!/usr/bin/env bash
-          exec /opt/zig/zig cc -target aarch64-linux-musl "$@"
-          EOF
-          chmod +x /tmp/aarch64-musl-cc
-          echo "/tmp" >> "$GITHUB_PATH"
+          echo "=== x86_64 musl-gcc ==="
+          which musl-gcc && musl-gcc --version | head -1
+          echo ""
+          echo "=== aarch64 musl cross-compiler ==="
+          which aarch64-linux-musl-gcc && aarch64-linux-musl-gcc --version | head -1
 
       - name: Prepare build directory
         working-directory: go
@@ -83,14 +84,14 @@ jobs:
         run: |
           go build -trimpath -ldflags='-s -w' -o dist/agent-linux-arm64 .
 
-      # ---- linux/arm64 static shared library (zig musl, libc embedded) ----
+      # ---- linux/arm64 static shared library (musl cross, libc embedded) ----
       - name: Build linux/arm64 static shared library
         working-directory: go
         env:
           CGO_ENABLED: 1
           GOOS: linux
           GOARCH: arm64
-          CC: /tmp/aarch64-musl-cc
+          CC: aarch64-linux-musl-gcc
         run: |
           go build -trimpath -buildmode=c-shared \
             -ldflags='-s -w -linkmode external -extldflags "-static"' \
@@ -121,7 +122,7 @@ jobs:
           for so in dist/libkisama-linux-amd64.so dist/libkisama-linux-arm64.so; do
             if [ -f "$so" ]; then
               needed=$(objdump -p "$so" 2>/dev/null | grep 'NEEDED' || true)
-              if echo "$needed" | grep -qi 'libc\.\|libpthread\.\|libdl\.\|libm\.'; then
+              if echo "$needed" | grep -qiE 'libc\.|libpthread\.|libdl\.|libm\.'; then
                 echo "ERROR: $so still depends on a C library"
                 echo "  NEEDED: $needed"
                 exit 1
