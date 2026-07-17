@@ -30,10 +30,22 @@ else
     echo "      ! linux/amd64 binary build skipped due to local toolchain limitations"
 fi
 
-if CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -buildmode=c-shared -o "$OUTPUT_DIR/libkisama-linux-amd64.so" -ldflags='-s -w' .; then
-    echo "      ✓ built linux/amd64 shared library"
+MUSL_CC=""
+for cc_candidate in musl-gcc x86_64-linux-musl-gcc; do
+    if command -v "$cc_candidate" >/dev/null 2>&1; then
+        MUSL_CC="$cc_candidate"
+        break
+    fi
+done
+
+if [ -n "$MUSL_CC" ]; then
+    if CC="$MUSL_CC" CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -buildmode=c-shared -o "$OUTPUT_DIR/libkisama-linux-amd64.so" -ldflags='-s -w' .; then
+        echo "      ✓ built linux/amd64 shared library"
+    else
+        echo "      ! linux/amd64 shared library build skipped due to local toolchain limitations"
+    fi
 else
-    echo "      ! linux/amd64 shared library build skipped due to local toolchain limitations"
+    echo "      ! linux/amd64 shared library build skipped: no musl compiler found"
 fi
 
 echo "   ➜ Building binary ${OUTPUT_DIR}/agent-linux-arm64..."
@@ -43,14 +55,22 @@ else
     echo "      ! linux/arm64 binary build skipped due to local toolchain limitations"
 fi
 
-if command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
-    if CC=aarch64-linux-gnu-gcc CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -buildmode=c-shared -o "$OUTPUT_DIR/libkisama-linux-arm64.so" -ldflags='-s -w' .; then
+MUSL_ARM64_CC=""
+for cc_candidate in aarch64-linux-musl-gcc; do
+    if command -v "$cc_candidate" >/dev/null 2>&1; then
+        MUSL_ARM64_CC="$cc_candidate"
+        break
+    fi
+done
+
+if [ -n "$MUSL_ARM64_CC" ]; then
+    if CC="$MUSL_ARM64_CC" CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -buildmode=c-shared -o "$OUTPUT_DIR/libkisama-linux-arm64.so" -ldflags='-s -w' .; then
         echo "      ✓ built linux/arm64 shared library"
     else
         echo "      ! linux/arm64 shared library build skipped due to local toolchain limitations"
     fi
 else
-    echo "      ! linux/arm64 shared library build skipped: aarch64-linux-gnu-gcc not installed"
+    echo "      ! linux/arm64 shared library build skipped: no suitable aarch64-musl cross-compiler found"
 fi
 
 if [ "$CURRENT_OS" != "darwin" ] || [ "$CURRENT_ARCH" != "arm64" ]; then

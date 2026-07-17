@@ -1,0 +1,90 @@
+name: Go musl build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  build-musl-artifacts:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Install musl toolchain and cross-compiler helpers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools musl-dev clang lld
+          if ! command -v zig >/dev/null 2>&1; then
+            curl -L https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz -o /tmp/zig.tar.xz
+            tar -xf /tmp/zig.tar.xz -C /tmp
+            sudo mv /tmp/zig-linux-x86_64-0.13.0 /opt/zig
+            echo "/opt/zig" >> "$GITHUB_PATH"
+          fi
+
+      - name: Create zig wrapper for aarch64 musl
+        run: |
+          cat > /tmp/aarch64-musl-cc <<'EOF'
+          #!/usr/bin/env bash
+          exec /opt/zig/zig cc -target aarch64-linux-musl "$@"
+          EOF
+          chmod +x /tmp/aarch64-musl-cc
+          echo "/tmp" >> "$GITHUB_PATH"
+
+      - name: Build linux/amd64 static binary
+        working-directory: go
+        env:
+          CGO_ENABLED: 1
+          GOOS: linux
+          GOARCH: amd64
+          CC: musl-gcc
+        run: |
+          mkdir -p dist
+          go mod download
+          go build -trimpath -ldflags='-s -w -linkmode external -extldflags "-static"' -o dist/agent-linux-amd64 .
+
+      - name: Build linux/amd64 musl shared library
+        working-directory: go
+        env:
+          CGO_ENABLED: 1
+          GOOS: linux
+          GOARCH: amd64
+          CC: musl-gcc
+        run: |
+          go build -trimpath -buildmode=c-shared -ldflags='-s -w' -o dist/libkisama-linux-amd64.so .
+
+      - name: Build linux/arm64 static binary
+        working-directory: go
+        env:
+          CGO_ENABLED: 1
+          GOOS: linux
+          GOARCH: arm64
+          CC: /tmp/aarch64-musl-cc
+        run: |
+          go build -trimpath -ldflags='-s -w -linkmode external -extldflags "-static"' -o dist/agent-linux-arm64 .
+
+      - name: Build linux/arm64 musl shared library
+        working-directory: go
+        env:
+          CGO_ENABLED: 1
+          GOOS: linux
+          GOARCH: arm64
+          CC: /tmp/aarch64-musl-cc
+        run: |
+          go build -trimpath -buildmode=c-shared -ldflags='-s -w' -o dist/libkisama-linux-arm64.so .
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: musl-go-builds
+          path: go/dist/*

@@ -56,10 +56,10 @@ jobs:
           go-version: '1.22'
           cache: true # 开启 Go 依赖缓存
 
-      - name: Install cross-compiler for arm64 cgo
+      - name: Install musl toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+          sudo apt-get install -y musl-tools musl-dev
 
       - name: Build Go project
         working-directory: go # 👈 切换到 go 目录
