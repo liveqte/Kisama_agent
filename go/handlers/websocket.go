@@ -12,6 +12,8 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/creack/pty"
 	"github.com/flynn/noise"
@@ -20,6 +22,14 @@ import (
 	"github.com/liveqte/kisama_agent/go/config"
 	"github.com/liveqte/kisama_agent/go/logger"
 	"golang.org/x/crypto/curve25519"
+)
+
+const (
+	terminalIdleTimeout      = 30 * time.Minute
+	terminalWriteTimeout     = 10 * time.Second
+	terminalMaxMessageSize   = 1 << 20
+	terminalMessageQueueSize = 200
+	terminalProcessStopGrace = 2 * time.Second
 )
 
 var upgrader = websocket.Upgrader{
@@ -194,8 +204,13 @@ type TerminalSessionHandler struct {
 	useNoise   bool
 	cipher     *NoiseSessionWrapper
 
-	msgChan   chan []byte
-	closeOnce sync.Once
+	msgChan     chan []byte
+	closeOnce   sync.Once
+	cmd         *exec.Cmd
+	processDone chan struct{}
+	done        chan struct{}
+	writeMu     sync.Mutex
+	cipherMu    sync.Mutex
 }
 
 func NewTerminalSessionHandler(agentPrivKey, controlPubKey string) (*TerminalSessionHandler, error) {
@@ -205,8 +220,10 @@ func NewTerminalSessionHandler(agentPrivKey, controlPubKey string) (*TerminalSes
 	}
 
 	return &TerminalSessionHandler{
-		cipher:  cipher,
-		msgChan: make(chan []byte, 200),
+		cipher:      cipher,
+		msgChan:     make(chan []byte, terminalMessageQueueSize),
+		done:        make(chan struct{}),
+		processDone: make(chan struct{}),
 	}, nil
 }
 
@@ -250,6 +267,11 @@ func (h *TerminalSessionHandler) StartSession(ws *websocket.Conn, requestID stri
 	h.ws = ws
 	h.requestID = requestID
 	h.useNoise = (token == "")
+	h.ws.SetReadLimit(terminalMaxMessageSize)
+	_ = h.ws.SetReadDeadline(time.Now().Add(terminalIdleTimeout))
+	h.ws.SetPongHandler(func(string) error {
+		return h.ws.SetReadDeadline(time.Now().Add(terminalIdleTimeout))
+	})
 
 	if h.useNoise {
 		logger.Infof("[终端会话 %s] 检测到 WS 连接，启用 Noise 加密", requestID)
@@ -268,6 +290,10 @@ func (h *TerminalSessionHandler) StartSession(ws *websocket.Conn, requestID stri
 		}
 	}
 
+	if h.isClosed() {
+		return
+	}
+
 	if err := h.runTerminal(); err != nil {
 		logger.Errorf("[终端会话 %s] ❌ 终端会话异常: %v", requestID, err)
 		return
@@ -281,7 +307,18 @@ func (h *TerminalSessionHandler) readPump() {
 		if err != nil {
 			return
 		}
-		h.msgChan <- message
+		if err := h.ws.SetReadDeadline(time.Now().Add(terminalIdleTimeout)); err != nil {
+			return
+		}
+		select {
+		case h.msgChan <- message:
+		case <-h.done:
+			return
+		default:
+			logger.Warnf("[终端会话 %s] 消息队列已满，关闭会话", h.requestID)
+			h.Cleanup()
+			return
+		}
 	}
 }
 
@@ -303,7 +340,7 @@ func (h *TerminalSessionHandler) doNoiseHandshake() error {
 
 	// Step 2: 发送响应包 msg2
 	if len(msg2) > 0 {
-		if err := h.ws.WriteMessage(websocket.BinaryMessage, msg2); err != nil {
+		if err := h.writeMessage(websocket.BinaryMessage, msg2); err != nil {
 			return err
 		}
 	}
@@ -318,7 +355,7 @@ func (h *TerminalSessionHandler) doNoiseHandshake() error {
 		return fmt.Errorf("handshake step 3 process failed: %w", err)
 	}
 
-	if !h.cipher.HandshakeFinished() {
+	if !h.handshakeFinished() {
 		return errors.New("三次握手交互后仍未进入 Established 状态")
 	}
 
@@ -348,8 +385,19 @@ func (h *TerminalSessionHandler) runTerminal() error {
 	if err != nil {
 		return fmt.Errorf("💥 启动终端失败: %w", err)
 	}
+	if h.isClosed() {
+		_ = ptyPtr.Close()
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return errors.New("session closed before terminal startup")
+	}
+	h.cmd = cmd
 	h.ptyProcess = ptyPtr
-	logger.Infof("[终端会话 %s] 🚀 终端进程已启动", h.requestID)
+	go func() {
+		_ = cmd.Wait()
+		close(h.processDone)
+	}()
 
 	// PTY -> WS
 	go func() {
@@ -363,11 +411,11 @@ func (h *TerminalSessionHandler) runTerminal() error {
 			}
 
 			sendData := buf[:n]
-			if h.useNoise && h.cipher.HandshakeFinished() {
-				sendData = h.cipher.Encrypt(sendData)
+			if h.useNoise && h.handshakeFinished() {
+				sendData = h.encrypt(sendData)
 			}
 
-			err = h.ws.WriteMessage(websocket.BinaryMessage, sendData)
+			err = h.writeMessage(websocket.BinaryMessage, sendData)
 			if err != nil {
 				return
 			}
@@ -391,7 +439,7 @@ func (h *TerminalSessionHandler) processTerminalMessage(message []byte) {
 	var err error
 
 	if h.useNoise {
-		decrypted, err = h.cipher.Decrypt(message)
+		decrypted, err = h.decrypt(message)
 		if err != nil {
 			logger.Errorf("[终端会话 %s] ⚠️ 解密失败: %v", h.requestID, err)
 			if h.useNoise {
@@ -414,9 +462,9 @@ func (h *TerminalSessionHandler) processTerminalMessage(message []byte) {
 			case "heartbeat":
 				reply, _ := json.Marshal(map[string]string{"type": "heartbeat"})
 				if h.useNoise {
-					reply = h.cipher.Encrypt(reply)
+					reply = h.encrypt(reply)
 				}
-				_ = h.ws.WriteMessage(websocket.BinaryMessage, reply)
+				_ = h.writeMessage(websocket.BinaryMessage, reply)
 
 			case "resize":
 				_ = pty.Setsize(h.ptyProcess, &pty.Winsize{Rows: msg.Rows, Cols: msg.Cols})
@@ -459,20 +507,77 @@ func (h *TerminalSessionHandler) getAvailableShell() string {
 	return "/bin/sh"
 }
 
+func (h *TerminalSessionHandler) writeMessage(messageType int, data []byte) error {
+	h.writeMu.Lock()
+	defer h.writeMu.Unlock()
+	if h.ws == nil {
+		return errors.New("websocket is nil")
+	}
+	if err := h.ws.SetWriteDeadline(time.Now().Add(terminalWriteTimeout)); err != nil {
+		return err
+	}
+	return h.ws.WriteMessage(messageType, data)
+}
+
+func (h *TerminalSessionHandler) encrypt(data []byte) []byte {
+	h.cipherMu.Lock()
+	defer h.cipherMu.Unlock()
+	if h.cipher == nil {
+		return data
+	}
+	return h.cipher.Encrypt(data)
+}
+
+func (h *TerminalSessionHandler) decrypt(data []byte) ([]byte, error) {
+	h.cipherMu.Lock()
+	defer h.cipherMu.Unlock()
+	if h.cipher == nil {
+		return nil, errors.New("cipher is nil")
+	}
+	return h.cipher.Decrypt(data)
+}
+
+func (h *TerminalSessionHandler) handshakeFinished() bool {
+	h.cipherMu.Lock()
+	defer h.cipherMu.Unlock()
+	return h.cipher != nil && h.cipher.HandshakeFinished()
+}
+
+func (h *TerminalSessionHandler) isClosed() bool {
+	select {
+	case <-h.done:
+		return true
+	default:
+		return false
+	}
+}
+
 func (h *TerminalSessionHandler) Cleanup() {
 	h.closeOnce.Do(func() {
-		if h.requestID != "" {
-			logger.Infof("[%s] 执行终端资源清理...", h.requestID)
+		close(h.done)
+		if h.ws != nil {
+			_ = h.writeMessage(websocket.CloseMessage, websocket.FormatCloseMessage(1000, "Cleanly closed"))
+			_ = h.ws.Close()
 		}
 		if h.ptyProcess != nil {
 			_ = h.ptyProcess.Close()
 		}
+		if h.cmd != nil && h.cmd.Process != nil {
+			pid := h.cmd.Process.Pid
+			_ = syscall.Kill(-pid, syscall.SIGKILL)
+			_ = h.cmd.Process.Kill()
+			select {
+			case <-h.processDone:
+			case <-time.After(terminalProcessStopGrace):
+				_ = syscall.Kill(-pid, syscall.SIGKILL)
+				_ = h.cmd.Process.Kill()
+				<-h.processDone
+			}
+		}
+		h.cipherMu.Lock()
 		if h.cipher != nil {
 			h.cipher.Free()
 		}
-		if h.ws != nil {
-			_ = h.ws.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(1000, "Cleanly closed"))
-			_ = h.ws.Close()
-		}
+		h.cipherMu.Unlock()
 	})
 }

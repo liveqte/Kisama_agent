@@ -20,7 +20,8 @@ jobs:
       # 1. 拉取代码
       - name: Checkout repository
         uses: actions/checkout@v4
-
+        with:
+          ref: release
       # 2. 设置 QEMU (解决跨架构构建时的 exec format error 问题)
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
