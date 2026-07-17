@@ -50,11 +50,8 @@ jobs:
           
           git add py/agent_obs.py js/agent_obs.js
           
-          if git diff --cached --quiet; then
-            echo "No obfuscated changes to commit."
-          else
-            git commit -m "Auto-update obfuscated files"
-            # 💡 关键改进：在 push 前拉取远程最新改动并采用 rebase 策略，防止并发冲突
-            git pull --rebase origin ${{ github.head_ref || github.ref_name }}
-            git push origin ${{ github.head_ref || github.ref_name }}
-          fi
+          # 无论混淆文件是否变化，都允许空提交，确保 release 分支能对齐最新的 main 源码
+          git commit -m "Auto-update obfuscated files" --allow-empty
+          
+          # 💡 核心改动：将当前带有混淆文件的 commit 强推到独立的 release 分支，不污染 main
+          git push origin HEAD:release --force

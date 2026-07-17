@@ -19,7 +19,8 @@ jobs:
       # ==================== 1. 初始化环境与克隆 ====================
       - name: Checkout repository
         uses: actions/checkout@v4
-
+        with:
+          ref: release
       # ==================== 2. 编译 Java 17 组件 ====================
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -77,30 +78,20 @@ jobs:
       # ==================== 5. 🌟 终极收网：所有组件合并为单次 Push ====================
       - name: Commit and push all agents
         run: |
-          # 1. 配置 Git 机器人身份
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           
-          # 2. 一口气将所有编译出来的产物全部加进暂存区
           git add java/target/kisama-agent-java-0.1.0-obfuscated.jar
           git add java11/target/kisama-agent-java-0.1.0-obfuscated.jar
-          
-          # 3. 添加所有 Go 生成的二进制文件
           git add go/agent go/agent-darwin-arm64 go/agent-linux-arm64
-
-          # 4. 循环添加 Go 生成的所有动态库（以及关联生成的头文件，如果有的话）
           for so in go/libkisama.so go/libkisama-linux-amd64.so go/libkisama-linux-arm64.so go/libkisama-linux-amd64.h go/libkisama-linux-arm64.h; do
-            if [ -f "$so" ]; then
-              git add "$so"
-            fi
+            if [ -f "$so" ]; then git add "$so"; fi
           done
           
-          # 5. 检查这三个目录下的产物是否有任何实际更新，防止无变化提交报错
           if git diff --staged --quiet; then
             echo "🎉 所有组件均未发生变化，无需提交。"
           else
-            # 6. 仅提交一次，并加上 [skip ci] 堵死死循环
             git commit -m "chore: update compiled go binaries and obfuscated jars [skip ci]"
-            echo "🚀 正在单次向远程推送所有组件..."
-            git push
+            echo "🚀 正在向 release 分支推送所有组件..."
+            git push origin release # 💡 核心改动：显式推送到 release 分支
           fi
