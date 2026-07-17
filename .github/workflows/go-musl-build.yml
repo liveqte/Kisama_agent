@@ -18,13 +18,16 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: '1.23'
           cache: true
 
-      - name: Install musl toolchain and cross-compiler helpers
+      - name: Install musl toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools musl-dev clang lld
+          sudo apt-get install -y musl-tools musl-dev
+
+      - name: Install zig for aarch64 musl cross-compile
+        run: |
           if ! command -v zig >/dev/null 2>&1; then
             curl -L https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz -o /tmp/zig.tar.xz
             tar -xf /tmp/zig.tar.xz -C /tmp
@@ -41,47 +44,94 @@ jobs:
           chmod +x /tmp/aarch64-musl-cc
           echo "/tmp" >> "$GITHUB_PATH"
 
+      - name: Prepare build directory
+        working-directory: go
+        run: |
+          mkdir -p dist
+          go mod download
+
+      # ---- linux/amd64 static binary (pure Go, no CGO) ----
       - name: Build linux/amd64 static binary
         working-directory: go
         env:
           CGO_ENABLED: 0
           GOOS: linux
           GOARCH: amd64
-          CC: musl-gcc
         run: |
-          mkdir -p dist
-          go mod download
-          go build -trimpath -ldflags='-s -w -linkmode external -extldflags "-static"' -o dist/agent-linux-amd64 .
+          go build -trimpath -ldflags='-s -w' -o dist/agent-linux-amd64 .
 
-      - name: Build linux/amd64 musl shared library
+      # ---- linux/amd64 static shared library (musl, libc embedded) ----
+      - name: Build linux/amd64 static shared library
         working-directory: go
         env:
-          CGO_ENABLED: 0
+          CGO_ENABLED: 1
           GOOS: linux
           GOARCH: amd64
           CC: musl-gcc
         run: |
-          go build -trimpath -buildmode=c-shared -ldflags='-s -w' -o dist/libkisama-linux-amd64.so .
+          go build -trimpath -buildmode=c-shared \
+            -ldflags='-s -w -linkmode external -extldflags "-static"' \
+            -o dist/libkisama-linux-amd64.so .
 
+      # ---- linux/arm64 static binary (pure Go, no CGO) ----
       - name: Build linux/arm64 static binary
         working-directory: go
         env:
           CGO_ENABLED: 0
           GOOS: linux
           GOARCH: arm64
-          CC: /tmp/aarch64-musl-cc
         run: |
-          go build -trimpath -ldflags='-s -w -linkmode external -extldflags "-static"' -o dist/agent-linux-arm64 .
+          go build -trimpath -ldflags='-s -w' -o dist/agent-linux-arm64 .
 
-      - name: Build linux/arm64 musl shared library
+      # ---- linux/arm64 static shared library (zig musl, libc embedded) ----
+      - name: Build linux/arm64 static shared library
         working-directory: go
         env:
-          CGO_ENABLED: 0
+          CGO_ENABLED: 1
           GOOS: linux
           GOARCH: arm64
           CC: /tmp/aarch64-musl-cc
         run: |
-          go build -trimpath -buildmode=c-shared -ldflags='-s -w' -o dist/libkisama-linux-arm64.so .
+          go build -trimpath -buildmode=c-shared \
+            -ldflags='-s -w -linkmode external -extldflags "-static"' \
+            -o dist/libkisama-linux-arm64.so .
+
+      # ---- Verify artifacts are static (no glibc / no external libc NEEDED) ----
+      - name: Verify static linking
+        working-directory: go
+        run: |
+          set -e
+          echo "=== Checking agent binaries (should be static, no NEEDED) ==="
+          for bin in dist/agent-linux-amd64 dist/agent-linux-arm64; do
+            if [ -f "$bin" ]; then
+              needed=$(objdump -p "$bin" 2>/dev/null | grep 'NEEDED' || true)
+              interp=$(objdump -p "$bin" 2>/dev/null | grep 'INTERP' || true)
+              if [ -n "$needed" ] || [ -n "$interp" ]; then
+                echo "ERROR: $bin is not fully static"
+                echo "  NEEDED: $needed"
+                echo "  INTERP: $interp"
+                exit 1
+              fi
+              echo "OK: $bin is fully static"
+            fi
+          done
+
+          echo ""
+          echo "=== Checking shared libraries (should have no libc NEEDED) ==="
+          for so in dist/libkisama-linux-amd64.so dist/libkisama-linux-arm64.so; do
+            if [ -f "$so" ]; then
+              needed=$(objdump -p "$so" 2>/dev/null | grep 'NEEDED' || true)
+              if echo "$needed" | grep -qi 'libc\.\|libpthread\.\|libdl\.\|libm\.'; then
+                echo "ERROR: $so still depends on a C library"
+                echo "  NEEDED: $needed"
+                exit 1
+              fi
+              echo "OK: $so has no external libc dependency"
+              if [ -n "$needed" ]; then
+                echo "  (remaining NEEDED: $needed)"
+              fi
+            fi
+          done
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
