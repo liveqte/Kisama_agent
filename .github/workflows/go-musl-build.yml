@@ -54,7 +54,7 @@ jobs:
           CXX: "zig c++ -target x86_64-linux-musl"
         run: |
           go build -trimpath -buildmode=c-shared \
-            -ldflags='-s -w -linkmode external -extldflags "-static-libgcc -Wl,-Bstatic -lc -Wl,-Bdynamic"' \
+            -ldflags='-s -w -linkmode external -extldflags "-static-libgcc -Wl,-Bstatic"' \
             -o dist/libkisama-linux-amd64.so .
 
       # ---- linux/arm64 static binary (pure Go, no CGO) ----
@@ -78,7 +78,7 @@ jobs:
           CXX: "zig c++ -target aarch64-linux-musl"
         run: |
           go build -trimpath -buildmode=c-shared \
-            -ldflags='-s -w -linkmode external -extldflags "-static-libgcc -Wl,-Bstatic -lc -Wl,-Bdynamic"' \
+            -ldflags='-s -w -linkmode external -extldflags "-static-libgcc -Wl,-Bstatic"' \
             -o dist/libkisama-linux-arm64.so .
 
       # ---- Verify artifacts are static (no glibc / no external libc NEEDED) ----
