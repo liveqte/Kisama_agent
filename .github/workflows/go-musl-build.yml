@@ -21,29 +21,13 @@ jobs:
           go-version: '1.23'
           cache: true
 
-      - name: Install musl toolchain (x86_64)
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Install x86_64 musl toolchain
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools musl-dev
-
-      - name: Install aarch64 musl cross-toolchain
-        run: |
-          # musl.cc provides the same gcc-based musl toolchain as musl-tools,
-          # but for aarch64. This handles -extldflags "-static" correctly for
-          # c-shared mode, just like musl-gcc does for x86_64.
-          curl -fL --retry 3 --retry-delay 5 \
-            https://musl.cc/aarch64-linux-musl-cross.tgz \
-            -o /tmp/aarch64-musl.tgz
-          sudo tar -xf /tmp/aarch64-musl.tgz -C /opt
-          echo "/opt/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
-
-      - name: Verify toolchains
-        run: |
-          echo "=== x86_64 musl-gcc ==="
-          which musl-gcc && musl-gcc --version | head -1
-          echo ""
-          echo "=== aarch64 musl cross-compiler ==="
-          which aarch64-linux-musl-gcc && aarch64-linux-musl-gcc --version | head -1
 
       - name: Prepare build directory
         working-directory: go
@@ -84,18 +68,35 @@ jobs:
         run: |
           go build -trimpath -ldflags='-s -w' -o dist/agent-linux-arm64 .
 
-      # ---- linux/arm64 static shared library (musl cross, libc embedded) ----
+      # ---- linux/arm64 static shared library (native build inside alpine arm64 container) ----
+      # QEMU-emulated arm64 Alpine container provides the real musl toolchain
+      # without depending on any external download (musl.cc is often unreachable).
+      # Uses the official golang:1.23-alpine image so the Go version matches go.mod
+      # (go 1.23.0); only `gcc` + `musl-dev` are added for the C toolchain.
+      # GitHub Actions strips the common YAML indentation from the heredoc body,
+      # so the script written to disk has no leading spaces.
       - name: Build linux/arm64 static shared library
-        working-directory: go
-        env:
-          CGO_ENABLED: 1
-          GOOS: linux
-          GOARCH: arm64
-          CC: aarch64-linux-musl-gcc
         run: |
-          go build -trimpath -buildmode=c-shared \
-            -ldflags='-s -w -linkmode external -extldflags "-static"' \
-            -o dist/libkisama-linux-arm64.so .
+          mkdir -p go/dist
+          cat > go/build-arm64-so.sh <<'BUILD_SCRIPT'
+          #!/bin/sh
+          set -e
+          apk add --no-cache gcc musl-dev
+          export GOCACHE=/tmp/gocache
+          export GOMODCACHE=/work/.gomodcache
+          CGO_ENABLED=1 GOOS=linux GOARCH=arm64 CC=gcc \
+            go build -trimpath -buildmode=c-shared \
+              -ldflags='-s -w -linkmode external -extldflags "-static"' \
+              -o dist/libkisama-linux-arm64.so .
+          BUILD_SCRIPT
+          docker run --rm \
+            --platform linux/arm64 \
+            -v "$PWD/go:/work" \
+            -w /work \
+            golang:1.23-alpine \
+            sh /work/build-arm64-so.sh
+          rm -f go/build-arm64-so.sh
+          rm -rf go/.gomodcache
 
       # ---- Verify artifacts are static (no glibc / no external libc NEEDED) ----
       - name: Verify static linking
