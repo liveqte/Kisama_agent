@@ -27,6 +27,11 @@ jobs:
         with:
           version: '0.13.0'
 
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y patchelf
+
       - name: Prepare build directory
         working-directory: go
         run: |
@@ -54,8 +59,10 @@ jobs:
           CXX: "zig c++ -target x86_64-linux-musl"
         run: |
           go build -trimpath -buildmode=c-shared \
-            -ldflags='-s -w -linkmode external -extldflags "-static-libgcc -Wl,-Bstatic"' \
+            -ldflags='-s -w -linkmode external -extldflags "-Wl,-Bstatic"' \
             -o dist/libkisama-linux-amd64.so .
+          # 抹除 Zig 强行注入的幽灵依赖标签
+          patchelf --remove-needed libc.so dist/libkisama-linux-amd64.so
 
       # ---- linux/arm64 static binary (pure Go, no CGO) ----
       - name: Build linux/arm64 static binary
@@ -78,8 +85,10 @@ jobs:
           CXX: "zig c++ -target aarch64-linux-musl"
         run: |
           go build -trimpath -buildmode=c-shared \
-            -ldflags='-s -w -linkmode external -extldflags "-static-libgcc -Wl,-Bstatic"' \
+            -ldflags='-s -w -linkmode external -extldflags "-Wl,-Bstatic"' \
             -o dist/libkisama-linux-arm64.so .
+          # 抹除 Zig 强行注入的幽灵依赖标签
+          patchelf --remove-needed libc.so dist/libkisama-linux-arm64.so
 
       # ---- Verify artifacts are static (no glibc / no external libc NEEDED) ----
       - name: Verify static linking
