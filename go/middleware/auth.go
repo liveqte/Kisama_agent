@@ -12,6 +12,7 @@ import (
 	"github.com/liveqte/kisama_agent/go/config"
 	"github.com/liveqte/kisama_agent/go/crypto"
 	"github.com/liveqte/kisama_agent/go/logger"
+	"github.com/liveqte/kisama_agent/go/tempkey"
 )
 
 // responseBufferWriter 负责拦截并缓存下游路由输出的全部明文数据，防止其提前泄露给网络流
@@ -31,7 +32,7 @@ func (w *responseBufferWriter) WriteString(s string) (int, error) {
 }
 
 // AuthEncryptMiddleware provides authentication and encryption for API endpoints
-func AuthEncryptMiddleware(cm *crypto.CryptoManager, cfg *config.Config) gin.HandlerFunc {
+func AuthEncryptMiddleware(cm *crypto.CryptoManager, cfg *config.Config, tk *tempkey.Manager) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Phase 0: Skip WebSocket and preflight requests
 		if strings.HasPrefix(c.Request.URL.Path, "/api/ws/") ||
@@ -68,8 +69,9 @@ func AuthEncryptMiddleware(cm *crypto.CryptoManager, cfg *config.Config) gin.Han
 					return
 				}
 			} else {
-				// 认证头完整，执行真正的密码学签名校验（需配合修复后的 crypto.go）
-				if err := cm.VerifySignature(nonce, timestamp, authToken); err != nil {
+				// 认证头完整，执行真正的密码学签名校验 (静态密钥优先, 无果再尝试有效期内临时密钥)
+				keySource, err := cm.IdentifySigner(nonce, timestamp, authToken, tk.ActiveEcdsaVK())
+				if err != nil {
 					logger.Debugf("Signature verification failed: %v", err)
 					// 如果验签失败且不是匿名白名单路由，直接打回拦截
 					if !isBypassPath {
@@ -97,10 +99,17 @@ func AuthEncryptMiddleware(cm *crypto.CryptoManager, cfg *config.Config) gin.Han
 
 					if timeDiff > float64(timeWindow) {
 						logger.Debugf("Timestamp validation - now: %d, ts: %d, diff: %.0f, window: %d", now, ts, timeDiff, timeWindow)
+						// 时间戳超出窗口直接拒绝 (与 Python/JS/Java 版一致)
+						if !isBypassPath {
+							c.JSON(401, gin.H{"error": "Timestamp expired"})
+							c.Abort()
+							return
+						}
+					} else {
+						// ✨ 唯一步骤：只有成功熬过所有安全劫难的合法请求，才配拥有 true 身份
+						c.Set("is_authenticated", true)
+						c.Set("key_source", keySource)
 					}
-
-					// ✨ 唯一步骤：只有成功熬过所有安全劫难的合法请求，才配拥有 true 身份
-					c.Set("is_authenticated", true)
 				}
 			}
 		}
@@ -184,7 +193,14 @@ func AuthEncryptMiddleware(cm *crypto.CryptoManager, cfg *config.Config) gin.Han
 				// ⚡ 终极修复：直接对 bufferWriter 里的原始响应字节执行加密
 				// 1. 彻底解决 Go 语言 interface{} 机制导致的大整数转科学计数法变形问题
 				// 2. 配合升级后的 v2 密码学库，传输格式、Nonce、公钥状态与客户端 eciesjs 100% 绝对对齐
-				encrypted, err := cm.EncryptResponseBytes(bufferWriter.bodyBuffer.Bytes(), cfg.Debug)
+				// 3. 按验签来源选择对应 ECIES 公钥: 静态密钥->静态公钥, 临时密钥->临时公钥
+				targetPub := cm.ECIESPublicKey()
+				if keySource, _ := c.Get("key_source"); keySource == "temp" {
+					if tempPub := tk.ActiveEciesPub(); tempPub != nil {
+						targetPub = tempPub
+					}
+				}
+				encrypted, err := cm.EncryptResponseBytesTo(bufferWriter.bodyBuffer.Bytes(), cfg.Debug, targetPub)
 				if err == nil {
 					// 写入标准高强度加密响应头
 					bufferWriter.ResponseWriter.Header().Set("x-encrypted", "true")

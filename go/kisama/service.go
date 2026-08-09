@@ -20,6 +20,7 @@ import (
 	"github.com/liveqte/kisama_agent/go/handlers"
 	"github.com/liveqte/kisama_agent/go/logger"
 	"github.com/liveqte/kisama_agent/go/middleware"
+	"github.com/liveqte/kisama_agent/go/tempkey"
 )
 
 // Options is the constructor input for a Kisama service.
@@ -84,7 +85,8 @@ func NewService(opts Options) (*Service, error) {
 		return nil, err
 	}
 
-	router := newRouter(cfg, cm)
+	tk := tempkey.New()
+	router := newRouter(cfg, cm, tk)
 
 	return &Service{
 		cfg:        cfg,
@@ -220,6 +222,7 @@ func (s *Service) Run() error {
 func (s *Service) Addr() string {
 	return fmt.Sprintf("%s:%d", s.cfg.Host, s.cfg.Port)
 }
+
 // Handler returns the configured Kisama HTTP handler without starting a listener.
 func (s *Service) Handler() http.Handler {
 	return s.router
@@ -230,7 +233,7 @@ func (s *Service) Router() *gin.Engine {
 	return s.router
 }
 
-func newRouter(cfg *config.Config, cm *crypto.CryptoManager) *gin.Engine {
+func newRouter(cfg *config.Config, cm *crypto.CryptoManager, tk *tempkey.Manager) *gin.Engine {
 	if cfg != nil && cfg.Debug {
 		gin.SetMode(gin.DebugMode)
 	} else {
@@ -241,22 +244,23 @@ func newRouter(cfg *config.Config, cm *crypto.CryptoManager) *gin.Engine {
 	router.Use(middleware.LoggingMiddleware())
 	router.Use(middleware.CORSMiddleware())
 	if cfg != nil && cm != nil {
-		router.Use(middleware.AuthEncryptMiddleware(cm, cfg))
+		router.Use(middleware.AuthEncryptMiddleware(cm, cfg, tk))
 	}
 
 	if cfg != nil {
 		handlers.InitTaskManager(cfg.MaxTaskLogSize)
 	}
 
-	registerRoutes(router)
+	registerRoutes(router, tk, cfg)
 	return router
 }
 
-func registerRoutes(router *gin.Engine) {
+func registerRoutes(router *gin.Engine, tk *tempkey.Manager, cfg *config.Config) {
 	api := router.Group("/api")
 
 	api.GET("/baseinfo", handlers.GetBaseInfo)
 	api.GET("/status", handlers.GetStatus)
+	api.GET("/tempkey", handlers.GetTempKey(tk, cfg))
 	api.POST("/exec", handlers.ExecuteCommand)
 	api.POST("/file/list", handlers.ListFiles)
 	api.POST("/file/authority", handlers.QueryFileAuthority)

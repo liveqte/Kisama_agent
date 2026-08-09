@@ -386,6 +386,46 @@ token：仅在https传输下使用，其使用代理端noise公钥进行认证�
 ```
 返回示例：无。 
 
+## 五、临时密钥模块（临时授权）
+
+
+### 25. 获取临时密钥对
+路径：GET /api/tempkey?ttl=24  
+用途：获取一对临时密钥（ECDSA + ECIES），用于临时授权第三方（如 AI Agent、其他协作者）连接本代理。  
+兼容实现：✅ Python 版（py/agent.py）、✅ JS 版（js/agent.js）、✅ Java 版（java/、java11/，0.4.2+）均提供该接口，语义一致。  
+行为约定：
+- 有效期内重复请求返回**同一份**密钥对（幂等，不重复生成，避免代理内部多头密钥管理负担）；
+- 密钥过期后（或首次请求）自动生成**新的**密钥对，旧密钥立即作废；
+- 该接口本身受认证保护（需控制端静态密钥签名），响应按控制端密钥加密。  
+密钥规格：
+- `ecdsa`：**ECDSA P-256**（secp256r1 / prime256v1，OID 1.2.840.10045.3.1.7），私钥为 **PKCS#8 PEM**（`-----BEGIN PRIVATE KEY-----`；部分部署版本可能返回 SEC1 格式 `-----BEGIN EC PRIVATE KEY-----`，两种均可被控制端解析），公钥为 SubjectPublicKeyInfo PEM；
+- `ecies`：secp256k1，私钥为 32 字节原始密钥的 hex（64 字符），公钥为 65 字节未压缩点 hex（130 字符）。  
+输入：`ttl`（小时，默认 24，范围 1~168，超出范围返回 422）  
+返回示例：
+```
+{
+  "status": "ok",
+  "key_id": "3f9a0b2c4d5e6f78",
+  "ttl_seconds": 86400,
+  "created_at": "2026-08-08T10:00:00Z",
+  "expires_at": "2026-08-09T10:00:00Z",
+  "ecdsa": {
+    "private_key": "-----BEGIN PRIVATE KEY-----\nMIGFAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg...\n-----END PRIVATE KEY-----",
+    "public_key": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----"
+  },
+  "ecies": {
+    "private_key": "<hex 64字符 临时ECIES私钥>",
+    "public_key": "<hex 130字符 临时ECIES公钥>"
+  }
+}
+```
+
+临时密钥使用方式（与静态密钥完全一致的请求流程）：
+1. 调用方持有 `ecdsa.private_key`，对消息 `SHA256(nonce + timestamp)` 做 ECDSA 签名，放入 `X-Auth-Token`（Raw 64 字节或 DER 格式均可）；
+2. 代理端验签时自动识别签名来源（静态密钥 → 临时密钥），响应体使用与来源**对应**的 ECIES 公钥加密；
+3. 临时调用方用 `ecies.private_key` 解密响应内容，无需任何额外请求头。
+
+
 ## 六、FastAPI 自动帮助页面说明
 
 
@@ -447,6 +487,7 @@ token：仅在https传输下使用，其使用代理端noise公钥进行认证�
 | **任务日志-清** | DELETE | `/api/task/log/onetime` | 清空启动任务日志 | ✅ | ✅ |
 | **任务日志-清** | DELETE | `/api/task/log/cron` | 清空定时任务日志 | ✅ | ✅ |
 | **日志统计** | GET | `/api/task/log/summary` | 获取统计摘要 | ✅ | ✅ |
+| **临时密钥** | GET | `/api/tempkey` | 获取临时授权密钥对 | ✅ | ✅ |
 | **超级终端** | WS | `/api/ws/terminal` | 使用交互性终端 | ✅ | ✅ |
 ---
 
@@ -457,6 +498,8 @@ token：仅在https传输下使用，其使用代理端noise公钥进行认证�
 2. `X-Timestamp`: `<UTC时间戳>`
 3. `X-Auth-Token`: `<ECDSA签名>`
 4. `Content-Type`: `application/json`
+
+签名密钥说明：`X-Auth-Token` 可由控制端**静态密钥**签名，也可由 `GET /api/tempkey` 获取的**有效临时密钥**签名（`ecdsa.private_key`）。代理端验签时自动切换，并据此选择对应的 ECIES 公钥加密响应（静态密钥请求→静态公钥，临时密钥请求→临时公钥）。
 
 ### 自动化文档地址
 * **交互式文档 (Swagger UI):** `/docs` (仅在 `DEBUG=true` 时可用，仅python版本有此文档)

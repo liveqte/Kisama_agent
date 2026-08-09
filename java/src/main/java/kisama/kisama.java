@@ -10,6 +10,7 @@ import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 import java.io.*;
 import java.lang.management.ManagementFactory;
+import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -54,6 +55,7 @@ public class kisama {
     private PublicKey ECDSA_PUBLIC_KEY = null;
     private byte[] ECIES_PUBLIC_KEY = null;
     private byte[] SESSION_KEY = null;
+    private final TempKeyManager tempKeyManager = new TempKeyManager();
 
     private final List<String> onetime = Collections.synchronizedList(new ArrayList<>());
     private final List<Map<String, Object>> onetime_log = Collections.synchronizedList(new ArrayList<>());
@@ -73,6 +75,9 @@ public class kisama {
     // ==================== 🚀 新增：高性能防刷缓存槽与生命周期参数 ====================
     private static final long BASEINFO_CACHE_TTL_MS = 3600 * 1000L; // 基础信息缓存 1 小时 (毫秒)
     private static final long STATUS_CACHE_TTL_MS = 30 * 1000L;    // 实时状态缓存 30 秒 (毫秒)
+    private static final int TEMPKEY_DEFAULT_TTL_HOURS = Integer.parseInt(System.getenv().getOrDefault("TEMPKEY_TTL", "24"));
+    private static final int TEMPKEY_MAX_TTL_HOURS = Integer.parseInt(System.getenv().getOrDefault("TEMPKEY_MAX_TTL", "168"));
+    private static final String AGENT_VERSION = "0.4.3-java";
 
     private Map<String, Object> baseInfoCache = null;
     private long lastBaseInfoCacheTime = 0;
@@ -210,13 +215,15 @@ public class kisama {
                 }
             }
 
-            // 执行货真价实的 ECDSA 椭圆曲线数字签名校验
+            // 执行货真价实的 ECDSA 椭圆曲线数字签名校验 (静态密钥优先, 无果再尝试有效期内临时密钥)
             try {
-                verifySignature(nonce, timestamp, authToken);
+                PublicKey tempVk = this.tempKeyManager.getActiveEcdsaVk();
+                String keySource = verifySignature(nonce, timestamp, authToken, tempVk);
                 
                 // ✨ 唯一步骤：只有成功通过真实验签，才在这行洗白身份，篡改为 true！
                 req.attribute("is_authenticated", true);
-                log("[TRACE-AUTH] ✅ ECDSA 签名核验完全匹配，确立合法已认证身份。");
+                req.attribute("key_source", keySource);
+                log("[TRACE-AUTH] ✅ ECDSA 签名核验完全匹配，确立合法已认证身份 (" + keySource + ")。");
                 
             } catch (Exception e) {
                 log("[TRACE-AUTH] ❌ 强认证失败: 验签爆裂 -> " + e.getMessage());
@@ -288,6 +295,48 @@ public class kisama {
             }
 
             return this.gson.toJson(clientResponseMap);
+        });
+
+        // 🔑 临时密钥对: GET /api/tempkey?ttl=<小时> (1~168, 默认24, 超范围422)
+        // - 有效期内重复请求返回同一密钥对 (幂等, 不重复生成)
+        // - 过期后自动生成新的密钥对, 旧密钥立即作废
+        // - 响应按验签来源加密: 静态密钥->控制端静态公钥, 临时密钥->当前临时 ECIES 公钥
+        get("/api/tempkey", (req, res) -> {
+            res.type("application/json");
+            int ttl = TEMPKEY_DEFAULT_TTL_HOURS;
+            String q = req.queryParams("ttl");
+            if (q != null && !q.isBlank()) {
+                try {
+                    ttl = Integer.parseInt(q.trim());
+                } catch (NumberFormatException e) {
+                    ttl = 0;
+                }
+                if (ttl < 1 || ttl > TEMPKEY_MAX_TTL_HOURS) {
+                    halt(422, this.gson.toJson(Map.of("error", "ttl must be an integer between 1 and " + TEMPKEY_MAX_TTL_HOURS)));
+                }
+            }
+            try {
+                Map<String, Object> key = this.tempKeyManager.getKeys(ttl);
+                Map<String, String> ecdsa = new LinkedHashMap<>();
+                ecdsa.put("private_key", ((String) key.get("ecdsa_private_key")).trim());
+                ecdsa.put("public_key", ((String) key.get("ecdsa_public_key")).trim());
+                Map<String, String> ecies = new LinkedHashMap<>();
+                ecies.put("private_key", (String) key.get("ecies_private_key"));
+                ecies.put("public_key", (String) key.get("ecies_public_key"));
+                Map<String, Object> payload = new LinkedHashMap<>();
+                payload.put("status", "ok");
+                payload.put("key_id", key.get("key_id"));
+                payload.put("ttl_seconds", key.get("ttl_seconds"));
+                payload.put("created_at", isoGmt((Long) key.get("created_at")));
+                payload.put("expires_at", isoGmt((Long) key.get("expires_at")));
+                payload.put("ecdsa", ecdsa);
+                payload.put("ecies", ecies);
+                res.body(this.gson.toJson(payload));
+            } catch (Exception e) {
+                res.status(500);
+                res.body(this.gson.toJson(Map.of("error", "TempKey generation failed: " + e.getMessage())));
+            }
+            return "";
         });
 
         get("/api/status", (req, res) -> {
@@ -788,7 +837,7 @@ public class kisama {
         get("/", (req, res) -> "kisama-running");
 
         after((req, res) -> {
-            res.header("X-Agent-Version", "0.4.2-java");
+            res.header("X-Agent-Version", AGENT_VERSION);
             if ("OPTIONS".equalsIgnoreCase(req.requestMethod()) || "HEAD".equalsIgnoreCase(req.requestMethod())) {
                 res.header("X-Encrypted", "false");
                 return;
@@ -801,7 +850,13 @@ public class kisama {
                 // 🌟 只有非 DEBUG 且身份确实为已认证（true）状态，才在出口统一披上密文外衣
                 if (!this.DEBUG && isAuthenticated) {
                     try {
-                        String encrypted = encryptResponse(res.body().getBytes(StandardCharsets.UTF_8));
+                        // 按验签来源选择对应 ECIES 公钥: 静态密钥->静态公钥, 临时密钥->临时公钥
+                        byte[] targetPub = this.ECIES_PUBLIC_KEY;
+                        if ("temp".equals(req.attribute("key_source"))) {
+                            byte[] tempPub = this.tempKeyManager.getActiveEciesPub();
+                            if (tempPub != null) targetPub = tempPub;
+                        }
+                        String encrypted = encryptResponse(res.body().getBytes(StandardCharsets.UTF_8), targetPub);
                         if (encrypted != null) {
                             res.body(encrypted);
                             res.header("X-Encrypted", "true");
@@ -994,7 +1049,7 @@ public class kisama {
         obj.put("os", getOsPrettyName());
         obj.put("kernel_version", getKernelVersion());
         obj.put("swap_total", getTotalSwapBytes());
-        obj.put("version", "0.4.2-java");
+        obj.put("version", AGENT_VERSION);
         obj.put("virtualization", getVirtualization());
         return obj;
     }
@@ -1063,7 +1118,7 @@ public class kisama {
         obj.put("os", getOsPrettyName());
         obj.put("kernel_version", getKernelVersion());
         obj.put("swap_total", getTotalSwapBytes());
-        obj.put("version", "0.4.2-java");
+        obj.put("version", AGENT_VERSION);
         obj.put("virtualization", getVirtualization());
 
         // 🌟 修改：根据是否通过验证状态，动态清空核心敏感凭证
@@ -1608,16 +1663,129 @@ public class kisama {
         return KeyFactory.getInstance("EC", "BC").generatePublic(spec);
     }
 
-    private void verifySignature(String nonce, String timestamp, String authToken) throws Exception {
+    // ==================== 🔑 临时密钥管理器 (与 Python/JS 版语义一致) ====================
+    private final class TempKeyManager {
+        private final Object lock = new Object();
+        private long expiresAt = 0;
+        private long createdAt = 0;
+        private String keyId = "";
+        private String ecdsaPrivatePem = "";
+        private String ecdsaPublicPem = "";
+        private String eciesPrivateHex = "";
+        private String eciesPublicHex = "";
+        private PublicKey ecdsaVk = null;
+        private byte[] eciesPub = null;
+
+        Map<String, Object> getKeys(int ttlHours) throws Exception {
+            synchronized (lock) {
+                if (expiresAt > 0 && System.currentTimeMillis() / 1000 < expiresAt) {
+                    return snapshot();
+                }
+                generate(ttlHours);
+                log("[TEMPKEY] 🔑 新临时密钥已生成: key_id=" + keyId + ", 有效期 " + ttlHours + " 小时");
+                return snapshot();
+            }
+        }
+
+        PublicKey getActiveEcdsaVk() {
+            synchronized (lock) {
+                if (expiresAt > 0 && System.currentTimeMillis() / 1000 < expiresAt) return ecdsaVk;
+                return null;
+            }
+        }
+
+        byte[] getActiveEciesPub() {
+            synchronized (lock) {
+                if (expiresAt > 0 && System.currentTimeMillis() / 1000 < expiresAt) return eciesPub;
+                return null;
+            }
+        }
+
+        private Map<String, Object> snapshot() {
+            long now = System.currentTimeMillis() / 1000;
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("key_id", keyId);
+            m.put("ttl_seconds", expiresAt - now);
+            m.put("created_at", createdAt);
+            m.put("expires_at", expiresAt);
+            m.put("ecdsa_private_key", ecdsaPrivatePem);
+            m.put("ecdsa_public_key", ecdsaPublicPem);
+            m.put("ecies_private_key", eciesPrivateHex);
+            m.put("ecies_public_key", eciesPublicHex);
+            return m;
+        }
+
+        private void generate(int ttlHours) throws Exception {
+            // 1. ECDSA P-256 (secp256r1): PKCS#8 私钥 + SPKI 公钥 PEM
+            ECNamedCurveParameterSpec p256 = ECNamedCurveTable.getParameterSpec("secp256r1");
+            if (p256 == null) p256 = ECNamedCurveTable.getParameterSpec("prime256v1");
+            KeyPairGenerator kpg = KeyPairGenerator.getInstance("EC", "BC");
+            kpg.initialize(p256);
+            KeyPair pair = kpg.generateKeyPair();
+            this.ecdsaPrivatePem = pemWrap(pair.getPrivate().getEncoded(), "PRIVATE KEY");
+            this.ecdsaPublicPem = pemWrap(pair.getPublic().getEncoded(), "PUBLIC KEY");
+            this.ecdsaVk = pair.getPublic();
+
+            // 2. ECIES secp256k1: 32字节随机私钥 + 65字节未压缩公钥
+            byte[] priv32 = new byte[32];
+            new SecureRandom().nextBytes(priv32);
+            BigInteger d = new BigInteger(1, priv32);
+            ECNamedCurveParameterSpec k1 = ECNamedCurveTable.getParameterSpec("secp256k1");
+            byte[] pub65 = k1.getG().multiply(d).normalize().getEncoded(false);
+            this.eciesPrivateHex = toHex(priv32);
+            this.eciesPublicHex = toHex(pub65);
+            this.eciesPub = pub65;
+
+            byte[] id8 = new byte[8];
+            new SecureRandom().nextBytes(id8);
+            this.keyId = toHex(id8);
+
+            long now = System.currentTimeMillis() / 1000;
+            this.createdAt = now;
+            this.expiresAt = now + (long) ttlHours * 3600;
+        }
+
+        private static String pemWrap(byte[] der, String label) {
+            String b64 = Base64.getEncoder().encodeToString(der);
+            StringBuilder sb = new StringBuilder("-----BEGIN ").append(label).append("-----\n");
+            for (int i = 0; i < b64.length(); i += 64) {
+                sb.append(b64, i, Math.min(i + 64, b64.length())).append('\n');
+            }
+            return sb.append("-----END ").append(label).append("-----").toString();
+        }
+
+        private static String toHex(byte[] bytes) {
+            StringBuilder sb = new StringBuilder();
+            for (byte b : bytes) sb.append(String.format("%02x", b));
+            return sb.toString();
+        }
+    }
+
+    private static String isoGmt(long epochSeconds) {
+        return java.time.Instant.ofEpochSecond(epochSeconds).atZone(java.time.ZoneOffset.UTC)
+                .format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss'Z'"));
+    }
+
+    private String verifySignature(String nonce, String timestamp, String authToken, PublicKey tempVk) throws Exception {
         if (this.ECDSA_PUBLIC_KEY == null) throw new IllegalStateException("ECDSA public key not configured");
         long ts = Long.parseLong(timestamp);
         if (Math.abs((System.currentTimeMillis() / 1000) - ts) > 3600)
             throw new IllegalArgumentException("Timestamp expired");
-        Signature sig = Signature.getInstance("SHA256withECDSA");
-        sig.initVerify(this.ECDSA_PUBLIC_KEY);
-        sig.update((nonce + timestamp).getBytes(StandardCharsets.UTF_8));
-        if (!sig.verify(Base64.getDecoder().decode(authToken)))
-            throw new IllegalArgumentException("Signature mismatch");
+        byte[] message = (nonce + timestamp).getBytes(StandardCharsets.UTF_8);
+        if (tryVerify(this.ECDSA_PUBLIC_KEY, message, authToken)) return "static";
+        if (tempVk != null && tryVerify(tempVk, message, authToken)) return "temp";
+        throw new IllegalArgumentException("Signature mismatch");
+    }
+
+    private boolean tryVerify(PublicKey pub, byte[] message, String authToken) {
+        try {
+            Signature sig = Signature.getInstance("SHA256withECDSA");
+            sig.initVerify(pub);
+            sig.update(message);
+            return sig.verify(Base64.getDecoder().decode(authToken));
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     private byte[] hkdfSha256(byte[] ikm, int outLen) throws Exception {
@@ -1633,10 +1801,14 @@ public class kisama {
     }
 
     private String encryptResponse(byte[] plaintext) throws Exception {
-        if (this.ECIES_PUBLIC_KEY == null) return null;
+        return encryptResponse(plaintext, this.ECIES_PUBLIC_KEY);
+    }
+
+    private String encryptResponse(byte[] plaintext, byte[] targetPubKey) throws Exception {
+        if (targetPubKey == null) return null;
         log("[TRACE-ECIES] 启动标准 ECIES 加密包封装...  ");
         ECNamedCurveParameterSpec ecSpec = ECNamedCurveTable.getParameterSpec("secp256k1");
-        ECPoint receiverPoint = ecSpec.getCurve().decodePoint(this.ECIES_PUBLIC_KEY);
+        ECPoint receiverPoint = ecSpec.getCurve().decodePoint(targetPubKey);
         KeyPairGenerator kpg = KeyPairGenerator.getInstance("EC", "BC");
         kpg.initialize(ecSpec);
         KeyPair ephemeralKeyPair = kpg.generateKeyPair();

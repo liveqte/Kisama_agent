@@ -8,6 +8,7 @@ import json
 import time
 import base64
 import hashlib
+import secrets
 import threading
 from datetime import datetime
 from typing import Union,List, Dict, Any, Optional
@@ -18,7 +19,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from urllib.parse import unquote
 # 加密相关
-from ecdsa import VerifyingKey, BadSignatureError, NIST256p
+from ecdsa import SigningKey, VerifyingKey, BadSignatureError, NIST256p
 from ecdsa.util import sigdecode_der, sigdecode_string
 from ecies import encrypt as ecies_encrypt
 import binascii
@@ -113,6 +114,27 @@ class ExecResponse(BaseModel):
     exitcode: int = Field(..., description="退出码 (0=成功, 124=超时, 127=未找到)", examples=[0])
     timeout: bool = Field(..., description="是否因超时被终止", examples=[False])
     cmd: str = Field(..., description="实际执行的命令", examples=["ls -la /tmp"])
+
+# --- 临时密钥响应模型 ---
+class TempKeyEcdsaPair(BaseModel):
+    """临时 ECDSA 密钥对 (PEM 格式)"""
+    private_key: str = Field(..., description="临时 ECDSA 私钥 (PEM, 用于签名请求)", examples=["-----BEGIN PRIVATE KEY-----..."])
+    public_key: str = Field(..., description="临时 ECDSA 公钥 (PEM)", examples=["-----BEGIN PUBLIC KEY-----..."])
+
+class TempKeyEciesPair(BaseModel):
+    """临时 ECIES 密钥对 (十六进制格式)"""
+    private_key: str = Field(..., description="临时 ECIES 私钥 (hex, 64字符=32字节, 用于解密响应)", examples=["ae68d0ec83e7ea0d47434a59c42656d30e6ebe1c92976b571859c8fcbdd04870"])
+    public_key: str = Field(..., description="临时 ECIES 公钥 (hex, 130字符=65字节, 供代理端加密响应)", examples=["04bcf71c67b9f36725f54c41f9652acf..."])
+
+class TempKeyResponse(BaseModel):
+    """获取临时密钥响应模型"""
+    status: str = Field("ok", examples=["ok"])
+    key_id: str = Field(..., description="临时密钥标识", examples=["3f9a0b2c4d5e6f78"])
+    ttl_seconds: int = Field(..., description="有效期(秒)", examples=[86400])
+    created_at: str = Field(..., description="生成时间 (UTC ISO8601)", examples=["2026-08-08T10:00:00Z"])
+    expires_at: str = Field(..., description="过期时间 (UTC ISO8601)", examples=["2026-08-09T10:00:00Z"])
+    ecdsa: TempKeyEcdsaPair
+    ecies: TempKeyEciesPair
 
 # --- 请求模型 (兼容 JSON 和 纯文本) ---
 class ExecRequestJSON(BaseModel):
@@ -563,6 +585,11 @@ class Config:
 
     # 日志最大条数限制
     MAX_TASK_LOG_SIZE = int(os.getenv("MAX_TASK_LOG", "100"))
+    # ================= 新增：临时密钥模块配置 =================
+    # 临时密钥默认有效期(小时)
+    TEMPKEY_DEFAULT_TTL_HOURS = int(os.getenv("TEMPKEY_TTL", "24"))
+    # 临时密钥最大有效期(小时), 防止无期限授权
+    TEMPKEY_MAX_TTL_HOURS = int(os.getenv("TEMPKEY_MAX_TTL", "168"))
     # ================= 🚀 新增：缓存模块配置 =================
     BASEINFO_CACHE_TTL = 3600  # 基础信息缓存 1 小时 (单位: 秒)
     STATUS_CACHE_TTL = 30     # 实时状态缓存 30 秒 (单位: 秒)
@@ -582,7 +609,7 @@ class Config:
     PORT = int(os.getenv("KPORT") or os.getenv("PORT") or os.environ.get('SERVER_PORT') or 8000)
     
     # 代理版本信息
-    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.4.2-python")
+    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.4.3-python")
     
     # ================= 启动校验 =================
     
@@ -729,8 +756,8 @@ class CryptoManager:
         # 未压缩公钥通常以 \x04 开头，长度为 65 字节
         if len(key_bytes) in (33, 65) and key_bytes[0] in (2, 3, 4):
             try:
-                # 注意：此处必须明确指定你的项目用的曲线是什么
-                return VerifyingKey.from_string(key_bytes, curve=NIST256p)
+                # 注意：此处必须明确指定你的项目用的曲线是什么 (P-256)
+                return VerifyingKey.from_string(key_bytes, curve=TEMP_ECDSA_CURVE)
             except Exception as e:
                 raise ValueError(f"Invalid raw SEC1/Compressed public key: {e}")
 
@@ -839,21 +866,96 @@ class CryptoManager:
             )
         
         return True
+
+    def identify_signer(self, nonce: str, timestamp: str, auth_token: str,
+                        temp_vk: Optional[VerifyingKey] = None) -> str:
+        """
+        验证请求签名并识别密钥来源
+        优先级: 控制端静态密钥 > 有效期内临时密钥
+        :param temp_vk: 当前有效临时密钥的 ECDSA 公钥 (无则跳过临时校验)
+        :return: "static" (静态密钥) 或 "temp" (临时密钥)
+        :raises HTTPException 401: 时间戳非法或签名均不匹配
+        """
+        # 1. 时间窗口校验
+        try:
+            ts = int(timestamp)
+            now = int(time.time())
+            if abs(now - ts) > Config.TIMESTAMP_WINDOW:
+                raise ValueError(f"Timestamp expired: diff={abs(now-ts)}s > {Config.TIMESTAMP_WINDOW}s")
+        except ValueError as e:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"Invalid timestamp: {str(e)}"
+            )
+
+        # 2. 签名校验: message = nonce + timestamp
+        message = f"{nonce}{timestamp}".encode('utf-8')
+        hash_obj = hashlib.sha256(message)
+        Logger.debug(f"[Backend] message: {nonce}{timestamp}")
+        Logger.debug(f"[Backend] SHA256: {hash_obj.hexdigest()}")
+
+        # 3. 依次尝试静态密钥 → 临时密钥
+        if self._verify_with(self.ecdsa_vk, auth_token, message):
+            Logger.debug("[Auth] 签名来源: static (控制端静态密钥)")
+            return "static"
+        if temp_vk is not None and self._verify_with(temp_vk, auth_token, message):
+            Logger.debug("[Auth] 签名来源: temp (临时密钥)")
+            return "temp"
+
+        Logger.info("❌ 签名验证失败: 静态密钥与临时密钥均不匹配")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Signature verification failed: bad signature"
+        )
+
+    @staticmethod
+    def _verify_with(vk: VerifyingKey, auth_token: str, message: bytes) -> bool:
+        """
+        使用指定公钥验签 (兼容 Raw 64字节 与 DER 两种签名格式)
+        :return: True=验签通过, False=任何失败 (不抛异常)
+        """
+        try:
+            signature = base64.b64decode(auth_token)
+            sig_length = len(signature)
+
+            if sig_length == 64:
+                # 命中：Web Crypto API 标准的 Raw 格式 (r + s)
+                decode_method = sigdecode_string
+            elif sig_length > 64 and signature[0] == 0x30:
+                # 命中：Python/OpenSSL 标准的 DER 格式 (以 0x30 开头)
+                decode_method = sigdecode_der
+            else:
+                decode_method = sigdecode_der
+
+            vk.verify(
+                signature,
+                message,
+                hashfunc=hashlib.sha256,
+                sigdecode=decode_method
+            )
+            return True
+        except BadSignatureError:
+            return False
+        except Exception:
+            return False
     
-    def encrypt_response(self, data: Dict[str, Any]) -> str:
+    def encrypt_response(self, data: Dict[str, Any], pubkey: Optional[bytes] = None) -> str:
         """
         加密响应数据
         :param data: 待加密的字典数据
+        :param pubkey: 目标公钥字节 (临时密钥请求时传入临时 ECIES 公钥; None 时用控制端静态公钥)
         :return: DEBUG模式返回明文JSON，否则返回Base64编码的ECIES密文
         """
-        if Config.DEBUG or not self.ecies_pubkey:
+        target_pubkey = pubkey or self.ecies_pubkey
+
+        if Config.DEBUG or not target_pubkey:
             # 调试模式或无加密公钥: 明文返回
             return json.dumps(data, ensure_ascii=False, default=str)
         
         try:
             # ECIES加密: 自动协商临时AES密钥加密数据
             plaintext = json.dumps(data, ensure_ascii=False, default=str).encode('utf-8')
-            ciphertext = ecies_encrypt(self.ecies_pubkey, plaintext)
+            ciphertext = ecies_encrypt(target_pubkey, plaintext)
             return base64.b64encode(ciphertext).decode('ascii')
         except Exception as e:
             # 加密失败时返回错误标识(生产环境应记录日志)
@@ -901,6 +1003,130 @@ def init_crypto():
     return crypto
 
 
+def _generate_ecies_keypair() -> Tuple[bytes, bytes]:
+    """
+    生成 secp256k1 ECIES 密钥对，兼容 eciespy 各版本 API
+    :return: (私钥 32 字节, 未压缩公钥 65 字节)
+    """
+    try:
+        # eciespy >= 0.4.5 新 API
+        from ecies.keys import PrivateKey as EciesPrivateKey
+        sk = EciesPrivateKey("secp256k1")
+        return sk.secret, sk.public_key.to_bytes()
+    except Exception:
+        pass
+    try:
+        # eciespy 旧版 API: generate_keypair / generate_eth_key
+        try:
+            from ecies.utils import generate_keypair
+            pub_hex, priv_hex = generate_keypair()
+        except Exception:
+            from ecies.utils import generate_eth_key
+            eth_key = generate_eth_key()
+            pub_hex, priv_hex = eth_key.public_key.to_hex(), eth_key.to_hex()
+        pub = bytes.fromhex(pub_hex[2:] if pub_hex.startswith("0x") else pub_hex)
+        priv = bytes.fromhex(priv_hex[2:] if priv_hex.startswith("0x") else priv_hex)
+        return priv, pub
+    except Exception as e:
+        raise RuntimeError(f"eciespy 密钥生成失败: {e}")
+
+
+# ============================================================================
+# 🔑 临时密钥管理器: 单一活跃临时密钥 (ECDSA + ECIES)
+# ============================================================================
+# 临时密钥 ECDSA 曲线: 固定为 ECDSA P-256 (secp256r1 / prime256v1, OID 1.2.840.10045.3.1.7)
+TEMP_ECDSA_CURVE = NIST256p
+
+
+def _ecdsa_private_pkcs8_pem(sk: "SigningKey") -> str:
+    """将 ECDSA 私钥渲染为 PKCS#8 PEM（-----BEGIN PRIVATE KEY-----）。
+
+    python-ecdsa 的 to_pem() 默认输出 SEC1 格式（-----BEGIN EC PRIVATE KEY-----），
+    为与交付约定一致 (PKCS#8) 显式转换；极旧版本不支持 pkcs8 时回退 SEC1，
+    两种 PEM 控制端均可解析。
+    """
+    try:
+        der = sk.to_der(format="pkcs8")
+    except (TypeError, ValueError):
+        return sk.to_pem().decode("utf-8")
+    b64 = base64.b64encode(der).decode("ascii")
+    wrapped = "\n".join(b64[i:i + 64] for i in range(0, len(b64), 64))
+    return f"-----BEGIN PRIVATE KEY-----\n{wrapped}\n-----END PRIVATE KEY-----"
+
+
+class TempKeyManager:
+    """
+    临时密钥管理器 (线程安全)
+    - 同一时刻仅维护一份有效临时密钥对，避免内部多头密钥管理负担
+    - 有效期内重复查询返回同一密钥对；过期后自动生成新的密钥对
+    - 临时持有者: 用临时 ECDSA P-256 私钥签名请求, 用临时 ECIES 私钥解密响应
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._key: Optional[Dict[str, Any]] = None
+
+    # ================= 对外接口 =================
+
+    def get_or_create(self, ttl_hours: int) -> Dict[str, Any]:
+        """获取临时密钥: 有效期内幂等返回同一密钥, 过期/不存在则重新生成"""
+        with self._lock:
+            if self._key and not self._is_expired(self._key):
+                return self._key
+            self._key = self._generate(ttl_hours)
+            Logger.info(
+                f"🔑 [TempKey] 新临时密钥已生成: key_id={self._key['key_id']}, "
+                f"有效期 {ttl_hours} 小时"
+            )
+            return self._key
+
+    def get_active_ecdsa_vk(self) -> Optional[VerifyingKey]:
+        """当前有效临时密钥的 ECDSA 验签公钥 (供中间件验签, 无密钥时返回 None)"""
+        with self._lock:
+            if self._key and not self._is_expired(self._key):
+                return self._key.get("ecdsa_vk")
+            return None
+
+    def get_active_ecies_pub(self) -> Optional[bytes]:
+        """当前有效临时密钥的 ECIES 公钥 (供中间件加密响应, 无密钥时返回 None)"""
+        with self._lock:
+            if self._key and not self._is_expired(self._key):
+                return self._key.get("ecies_pub")
+            return None
+
+    # ================= 内部实现 =================
+
+    def _is_expired(self, key: Dict[str, Any]) -> bool:
+        return int(time.time()) >= key["expires_at"]
+
+    def _generate(self, ttl_hours: int) -> Dict[str, Any]:
+        """生成一对临时密钥 (ECDSA P-256 + ECIES secp256k1)"""
+        # 1. ECDSA 临时密钥对 (P-256 / prime256v1, PEM 格式下发, 供临时持有者签名请求)
+        sk = SigningKey.generate(curve=TEMP_ECDSA_CURVE)
+        ecdsa_priv_pem = _ecdsa_private_pkcs8_pem(sk)
+        ecdsa_pub_pem = sk.get_verifying_key().to_pem().decode('utf-8')
+
+        # 2. ECIES 临时密钥对 (32字节私钥 + 65字节未压缩公钥, 十六进制下发)
+        ecies_priv, ecies_pub = _generate_ecies_keypair()
+
+        now = int(time.time())
+        ttl_seconds = int(ttl_hours) * 3600
+        return {
+            "key_id": secrets.token_hex(8),
+            "created_at": now,
+            "expires_at": now + ttl_seconds,
+            "ttl_seconds": ttl_seconds,
+            # 下发字段
+            "ecdsa_private_key": ecdsa_priv_pem,
+            "ecdsa_public_key": ecdsa_pub_pem,
+            "ecies_private_key": ecies_priv.hex(),
+            "ecies_public_key": ecies_pub.hex(),
+            # 内存字段 (不下发)
+            "ecdsa_vk": sk.get_verifying_key(),
+            "ecies_pub": ecies_pub,
+        }
+
+
 # ============================================================================
 # 🛡️ 认证中间件: 请求签名验证 + 响应加密 (逻辑解耦修复版)
 # ============================================================================
@@ -945,10 +1171,17 @@ class AuthEncryptMiddleware(BaseHTTPMiddleware):
         
         # 🌟 核心修复 3：直接进行密码学签名校验，剥离原先导致死锁的 if 判断外壳
         try:
-            crypto.verify_signature(nonce, timestamp, auth_token)
-            
+            # 🔑 组合验签: 优先静态密钥, 无果再尝试当前有效临时密钥
+            temp_vk = None
+            tkm = getattr(request.app.state, "temp_key_manager", None)
+            if tkm is not None:
+                temp_vk = tkm.get_active_ecdsa_vk()
+
+            key_source = crypto.identify_signer(nonce, timestamp, auth_token, temp_vk)
+
             # ✨ 唯一步骤：只有当椭圆曲线点乘验签彻底通过时，才在此处将身份显式改为 True
             request.state.is_authenticated = True
+            request.state.key_source = key_source  # "static" | "temp"
             
         except Exception as e:
             if path in bypass_paths:
@@ -1020,7 +1253,13 @@ class AuthEncryptMiddleware(BaseHTTPMiddleware):
                 
                 # 根据中间件最终确立的真伪身份标签，决定是否在出口裹上密文外衣
                 if getattr(request.state, "is_authenticated", False):
-                    encrypted_content = crypto.encrypt_response(original_data)
+                    # 🔑 按验签来源选择对应 ECIES 公钥: 静态密钥->静态公钥, 临时密钥->临时公钥
+                    response_pubkey = crypto.ecies_pubkey
+                    if getattr(request.state, "key_source", "static") == "temp":
+                        tkm = getattr(request.app.state, "temp_key_manager", None)
+                        if tkm is not None:
+                            response_pubkey = tkm.get_active_ecies_pub() or response_pubkey
+                    encrypted_content = crypto.encrypt_response(original_data, response_pubkey)
                     encoded = encrypted_content.encode('utf-8')
                     if not Config.DEBUG:
                         response.headers["x-encrypted"] = "true"
@@ -1440,30 +1679,37 @@ class SystemInfoCollector:
         return {'name': 'Unknown', 'version': 'Unknown'}
     
     def _get_virtualization(self) -> str:
+        def try_read(p: str) -> str:
+            """安全读取文件内容, 不存在的路径/读取失败一律返回空串, 不做 ERROR 报错"""
+            try:
+                if os.path.exists(p):
+                    with open(p, 'r', encoding='utf-8', errors='ignore') as f:
+                        return f.read()
+            except Exception:
+                pass
+            return ""
+
+        if platform.system() != "Linux":
+            return 'None'
         try:
-            if platform.system() == "Linux":
-                if os.path.exists('//.dockerenv'): return 'Docker'
-                if os.path.exists('/run/.containerenv'): return 'Podman'
-                if os.path.exists('/proc/1/cgroup'):
-                    with open('/proc/proc/1/cgroup', 'r', encoding='utf-8', errors='ignore') as f:
-                        content = f.read().lower()
-                        if 'docker' in content or 'containerd' in content: return 'Docker'
-                        elif 'kubepods' in content: return 'Kubernetes'
-                        elif 'lxc' in content: return 'LXC'
-                if os.path.exists('/proc/self/mountinfo'):
-                    with open('/proc/self/mountinfo', 'r', encoding='utf-8', errors='ignore') as f:
-                        content = f.read()
-                        if '/docker/containers/' in content or 'workdir=/var/lib/docker' in content: return 'Docker'
-                        elif '/pods/' in content or 'kubelet' in content: return 'Kubernetes'
-                if os.path.exists('/proc/1/environ'):
-                    with open('/proc/1/environ', 'r', encoding='utf-8', errors='ignore') as f:
-                        if 'container=lxc' in f.read(): return 'LXC'
-                if os.path.exists('/proc/cpuinfo'):
-                    with open('/proc/cpuinfo', 'r', encoding='utf-8', errors='ignore') as f:
-                        content = f.read()
-                        if 'QEMU' in content or 'KVM' in content: return 'QEMU'
+            if os.path.exists('//.dockerenv'): return 'Docker'
+            if os.path.exists('/run/.containerenv'): return 'Podman'
+
+            content = try_read('/proc/1/cgroup').lower()
+            if 'docker' in content or 'containerd' in content: return 'Docker'
+            elif 'kubepods' in content: return 'Kubernetes'
+            elif 'lxc' in content: return 'LXC'
+
+            content = try_read('/proc/self/mountinfo')
+            if '/docker/containers/' in content or 'workdir=/var/lib/docker' in content: return 'Docker'
+            elif '/pods/' in content or 'kubelet' in content: return 'Kubernetes'
+
+            if 'container=lxc' in try_read('/proc/1/environ'): return 'LXC'
+
+            content = try_read('/proc/cpuinfo')
+            if 'QEMU' in content or 'KVM' in content: return 'QEMU'
         except Exception as e:
-            Logger.error(f"❌ 获取虚拟化信息失败: {e}")
+            Logger.debug(f"获取虚拟化信息失败(非致命): {e}", 1)
         return 'None'
     
     async def _get_public_ip_v4(self) -> Optional[str]:
@@ -2364,6 +2610,8 @@ async def lifespan(app: FastAPI):
         check_interval=Config.CRON_CHECK_INTERVAL
     )
     
+    app.state.temp_key_manager = TempKeyManager()
+    
     if Config.DEBUG:
         Logger.debug(f"✅ 管理器已挂载到 app.state")
         Logger.debug(f"   • file_manager: {app.state.file_manager}")
@@ -2549,6 +2797,43 @@ async def exec_command(
             "timeout": False,
             "cmd": cmd
         }
+
+
+# ============================================================================
+# 🔑 临时密钥模块: RESTful 路由
+# ============================================================================
+
+@app.get("/api/tempkey", response_model=TempKeyResponse)
+async def get_tempkey(
+    request: Request,
+    ttl: int = Query(Config.TEMPKEY_DEFAULT_TTL_HOURS, ge=1, le=Config.TEMPKEY_MAX_TTL_HOURS)
+):
+    """
+    获取临时密钥对 (ECDSA + ECIES)，用于临时授权第三方/AI Agent 访问本代理
+    - 有效期内重复请求返回同一密钥对 (幂等, 不重复生成)
+    - 过期后自动生成新的密钥对, 旧密钥立即作废
+    - 临时持有者: 用 ecdsa.private_key 签名请求, 用 ecies.private_key 解密响应
+    """
+    manager = request.app.state.temp_key_manager
+    key = manager.get_or_create(ttl)
+
+    return TempKeyResponse(
+        status="ok",
+        key_id=key["key_id"],
+        ttl_seconds=key["ttl_seconds"],
+        created_at=datetime.utcfromtimestamp(key["created_at"]).isoformat() + "Z",
+        expires_at=datetime.utcfromtimestamp(key["expires_at"]).isoformat() + "Z",
+        ecdsa=TempKeyEcdsaPair(
+            private_key=key["ecdsa_private_key"].strip(),
+            public_key=key["ecdsa_public_key"].strip()
+        ),
+        ecies=TempKeyEciesPair(
+            private_key=key["ecies_private_key"],
+            public_key=key["ecies_public_key"]
+        )
+    )
+
+
 class TaskManager:
     """
     任务管理器 - 纯内存存储，动态执行
@@ -3375,15 +3660,9 @@ async def terminal_websocket(websocket: WebSocket, path: str, request_id: str = 
 # 全局异常处理
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    """统一处理认证失败等异常"""
+    """统一处理认证失败等异常；响应加密由 AuthEncryptMiddleware 统一执行(单一加密点)"""
     content = {"error": exc.detail, "code": exc.status_code}
-    # 异常响应也走加密流程
-    encrypted = crypto.encrypt_response(content) if not Config.DEBUG else json.dumps(content)
-    return JSONResponse(
-        status_code=exc.status_code,
-        content=json.loads(encrypted) if Config.DEBUG else {"_encrypted": encrypted},
-        headers={"x-encrypted": "false" if Config.DEBUG else "true"}
-    )
+    return JSONResponse(status_code=exc.status_code, content=content)
     
 # ============================================================================
 # 🚀 程序入口

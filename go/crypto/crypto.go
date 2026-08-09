@@ -111,13 +111,21 @@ func parseECDSAPublicKey(keyStr string) (*ecdsa.PublicKey, error) {
 
 // VerifySignature verifies ECDSA signature (simplified for now)
 func (cm *CryptoManager) VerifySignature(nonce, timestamp, authToken string) error {
+	_, err := cm.IdentifySigner(nonce, timestamp, authToken, nil)
+	return err
+}
+
+// IdentifySigner 验证请求签名并识别密钥来源 (与 Python/JS/Java 版一致)
+// 优先级: 控制端静态密钥 > 有效期内临时密钥
+// 返回 "static" (静态密钥) 或 "temp" (临时密钥)
+func (cm *CryptoManager) IdentifySigner(nonce, timestamp, authToken string, tempVk *ecdsa.PublicKey) (string, error) {
 	if nonce == "" || timestamp == "" || authToken == "" {
-		return fmt.Errorf("missing signature components")
+		return "", fmt.Errorf("missing signature components")
 	}
 
 	// 如果没有加载公钥（比如本地文件缺失），在非DEBUG模式下这属于异常
 	if cm.ecdsaPublicKey == nil {
-		return fmt.Errorf("ecdsa public key not loaded")
+		return "", fmt.Errorf("ecdsa public key not loaded")
 	}
 
 	// 1. 组装原始消息并计算 SHA256 哈希
@@ -127,26 +135,33 @@ func (cm *CryptoManager) VerifySignature(nonce, timestamp, authToken string) err
 	// 2. 将前端传来的 Base64 字符串解码为原始字节流
 	sigBytes, err := base64.StdEncoding.DecodeString(authToken)
 	if err != nil {
-		return fmt.Errorf("failed to decode signature base64: %w", err)
+		return "", fmt.Errorf("failed to decode signature base64: %w", err)
 	}
 
-	// 3. 智能识别签名格式并执行严格校验
-	// 如果长度正好是 64 字节，说明是 Web Crypto API 常见的 Raw 格式（32字节 R + 32字节 S）
+	// 3. 依次尝试静态密钥 → 临时密钥
+	if verifyWithPublicKey(cm.ecdsaPublicKey, hash[:], sigBytes) {
+		return "static", nil
+	}
+	if tempVk != nil && verifyWithPublicKey(tempVk, hash[:], sigBytes) {
+		return "temp", nil
+	}
+
+	return "", fmt.Errorf("invalid cryptographic signature")
+}
+
+// verifyWithPublicKey 使用指定公钥验签 (兼容 Raw 64字节 与 DER 两种签名格式)
+func verifyWithPublicKey(pub *ecdsa.PublicKey, hash []byte, sigBytes []byte) bool {
+	if pub == nil {
+		return false
+	}
+	// 长度正好 64 字节, 为 Web Crypto Raw 格式 (32字节 R + 32字节 S)
 	if len(sigBytes) == 64 {
 		r := new(big.Int).SetBytes(sigBytes[:32])
 		s := new(big.Int).SetBytes(sigBytes[32:])
-		if ecdsa.Verify(cm.ecdsaPublicKey, hash[:], r, s) {
-			return nil // ✨ 验签成功！
-		}
-	} else {
-		// 否则，尝试作为标准的 ASN.1 DER 格式（以 0x30 开头）进行解包验签
-		if ecdsa.VerifyASN1(cm.ecdsaPublicKey, hash[:], sigBytes) {
-			return nil // ✨ 验签成功！
-		}
+		return ecdsa.Verify(pub, hash, r, s)
 	}
-
-	// 如果两套格式都对不上，说明签名被伪造或篡改
-	return fmt.Errorf("invalid cryptographic signature")
+	// 否则按标准 ASN.1 DER 格式验签
+	return ecdsa.VerifyASN1(pub, hash, sigBytes)
 }
 
 // EncryptResponse encrypts response data using ECIES
@@ -327,6 +342,11 @@ func Base64Decode(data string) ([]byte, error) {
 	return base64.StdEncoding.DecodeString(data)
 }
 
+// ECIESPublicKey 返回控制端静态 ECIES 公钥 (供中间件按验签来源选择加密目标)
+func (cm *CryptoManager) ECIESPublicKey() *ecies.PublicKey {
+	return cm.eciesPublicKey
+}
+
 // EncryptResponseBytes 直接对已经序列化好的 JSON 字节流进行 ECIES 加密
 func (cm *CryptoManager) EncryptResponseBytes(jsonData []byte, debug bool) (string, error) {
 	if debug || cm.eciesPublicKey == nil {
@@ -340,5 +360,22 @@ func (cm *CryptoManager) EncryptResponseBytes(jsonData []byte, debug bool) (stri
 	}
 
 	// 返回 Base64 密文
+	return base64.StdEncoding.EncodeToString(ciphertext), nil
+}
+
+// EncryptResponseBytesTo 使用指定 ECIES 公钥加密响应 (临时密钥请求时按来源选择目标公钥)
+func (cm *CryptoManager) EncryptResponseBytesTo(jsonData []byte, debug bool, targetPub *ecies.PublicKey) (string, error) {
+	if debug {
+		return string(jsonData), nil
+	}
+	if targetPub == nil {
+		return "", fmt.Errorf("uninitialized ECIES public key")
+	}
+
+	ciphertext, err := ecies.Encrypt(targetPub, jsonData)
+	if err != nil {
+		return "", err
+	}
+
 	return base64.StdEncoding.EncodeToString(ciphertext), nil
 }

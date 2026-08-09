@@ -36,6 +36,7 @@ const expressWs = require('express-ws');
 const createNoise = require('noise-c.wasm');
 
 let p256;
+let secp256k1;
 
 let pty;
 try {
@@ -252,6 +253,8 @@ class Config {
   
   static ECDSA_PUBLIC_KEY_PEM = Config._getConfigValue('ECDSA_PUBKEY', 'keys/agent_ecdsa_pub.pem') || 'ECDSA公钥内容';
   static ECIES_PUBLIC_KEY_PEM = Config._getConfigValue('ECIES_PUBKEY', 'keys/agent_ecies_pub.b64') || 'ECIES公钥内容';
+  static TEMPKEY_DEFAULT_TTL_HOURS = parseInt(process.env.TEMPKEY_TTL || '24', 10);
+  static TEMPKEY_MAX_TTL_HOURS = parseInt(process.env.TEMPKEY_MAX_TTL || '168', 10);
 
   static FILE_ROOT = process.env.FILE_ROOT || os.homedir();
   static MAX_UPLOAD_SIZE = parseInt(process.env.MAX_UPLOAD_SIZE || '104857600');
@@ -271,7 +274,7 @@ class Config {
 
   static HOST = process.env.HOST || '0.0.0.0';
   static PORT = parseInt(process.env.KPORT || process.env.PORT || process.env.SERVER_PORT || '8000');
-  static AGENT_VERSION = process.env.AGENT_VERSION || '0.4.2-js';
+  static AGENT_VERSION = process.env.AGENT_VERSION || '0.4.3-js';
   static SESSION_KEY = crypto.randomBytes(32).toString('base64');
   // static SESSION_KEY =""
   static NOISE_KEYS_INTERNAL = NoiseKeyGenerator.generatePair();
@@ -357,6 +360,69 @@ class Config {
 }
 
 // ============================================================================
+// ============================================================================
+// 🔑 临时密钥管理: 同一时刻仅维护一份有效密钥对 (与 Python 版 TempKeyManager 语义一致)
+// - 有效期内重复查询返回同一密钥对 (幂等, 不重复生成)
+// - 过期后自动生成新的密钥对, 旧密钥立即作废
+// - 临时持有者: 用临时 ECDSA P-256 私钥签名请求, 用临时 ECIES 私钥解密响应
+// ============================================================================
+class TempKeyManager {
+  constructor() {
+    this._key = null;
+  }
+
+  getOrCreate(ttlHours) {
+    if (this._key && !this._isExpired(this._key)) {
+      return this._key;
+    }
+    this._key = this._generate(ttlHours);
+    Logger.info(`🔑 [TempKey] 新临时密钥已生成: key_id=${this._key.key_id}, 有效期 ${ttlHours} 小时`);
+    return this._key;
+  }
+
+  getActiveEcdsaVk() {
+    if (this._key && !this._isExpired(this._key)) return this._key.ecdsa_vk;
+    return null;
+  }
+
+  getActiveEciesPub() {
+    if (this._key && !this._isExpired(this._key)) return this._key.ecies_pub;
+    return null;
+  }
+
+  _isExpired(key) {
+    return Math.floor(Date.now() / 1000) >= key.expires_at;
+  }
+
+  _generate(ttlHours) {
+    // 1. ECDSA 临时密钥对 (P-256 / prime256v1, PKCS#8 私钥 + SPKI 公钥 PEM 下发)
+    const { privateKey, publicKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+    const ecdsaPrivatePem = privateKey.export({ type: 'pkcs8', format: 'pem' });
+    const ecdsaPublicPem = publicKey.export({ type: 'spki', format: 'pem' });
+
+    // 2. ECIES 临时密钥对 (secp256k1: 32字节私钥 + 65字节未压缩公钥, hex 下发)
+    const eciesPriv = crypto.randomBytes(32);
+    const eciesPub = Buffer.from(secp256k1.getPublicKey(eciesPriv, false));
+
+    const now = Math.floor(Date.now() / 1000);
+    const ttlSeconds = ttlHours * 3600;
+    return {
+      key_id: crypto.randomBytes(8).toString('hex'),
+      created_at: now,
+      expires_at: now + ttlSeconds,
+      ttl_seconds: ttlSeconds,
+      // 下发字段
+      ecdsa_private_key: ecdsaPrivatePem,
+      ecdsa_public_key: ecdsaPublicPem,
+      ecies_private_key: eciesPriv.toString('hex'),
+      ecies_public_key: eciesPub.toString('hex'),
+      // 内存字段 (不下发)
+      ecdsa_vk: publicKey,
+      ecies_pub: eciesPub
+    };
+  }
+}
+// ============================================================================
 // 🔐 加密模块: ECDSA签名验证 + ECIES加密
 // ============================================================================
 class CryptoManager {
@@ -417,7 +483,7 @@ class CryptoManager {
     }
   }
 
-  verifySignature(nonce, timestamp, authToken) {
+  verifySignature(nonce, timestamp, authToken, tempVk = null) {
     if (!this.ecdsaPubkey) return true; // DEBUG mode
 
     try {
@@ -427,29 +493,40 @@ class CryptoManager {
         throw new Error(`Timestamp expired: diff=${Math.abs(now-ts)}s > ${Config.TIMESTAMP_WINDOW}s`);
       }
 
+      // 组合验签: 优先静态密钥, 无果再尝试当前有效临时密钥
       const message = `${nonce}${timestamp}`;
-      const signature = base64.toByteArray(authToken);
-
-      // 100% 纯原生验签
-      const verify = crypto.createVerify('SHA256');
-      verify.update(message);
-      
-      // ✨ 核心修复：显式接收布尔值，并在失败时主动抛出异常
-      const isValid = verify.verify(this.ecdsaPubkey, signature);
-      if (!isValid) {
-        throw new Error('Bad signature');
+      if (this._verifyWith(this.ecdsaPubkey, message, authToken)) {
+        return 'static';
       }
-      return true;
+      if (tempVk && this._verifyWith(tempVk, message, authToken)) {
+        return 'temp';
+      }
+      throw new Error('Bad signature');
 
     } catch (e) {
       throw new Error(`Signature verification failed: ${e.message}`);
     }
   }
 
+  _verifyWith(pubkey, message, authToken) {
+    if (!pubkey) return false;
+    try {
+      const signature = base64.toByteArray(authToken);
+      // 100% 纯原生验签
+      const verify = crypto.createVerify('SHA256');
+      verify.update(message);
+      return verify.verify(pubkey, signature);
+    } catch (e) {
+      return false;
+    }
+  }
+
   /**
    * 加密响应数据
+   * @param {Object|string} data 待加密数据
+   * @param {Buffer} [pubkeyBuffer] 目标 ECIES 公钥 (临时密钥请求时传入临时公钥, 缺省用控制端静态公钥)
    */
-  encryptResponse(data) {
+  encryptResponse(data, pubkeyBuffer = null) {
     if (Config.DEBUG || !this.eciesPubkey) {
       return JSON.stringify(data);
     }
@@ -457,7 +534,7 @@ class CryptoManager {
     try {
       const plaintextStr = JSON.stringify(data);
       const plaintextBuffer = Buffer.from(plaintextStr, 'utf-8');
-      const pubKeyBuffer = Buffer.from(this.eciesPubkey);
+      const pubKeyBuffer = pubkeyBuffer || Buffer.from(this.eciesPubkey);
       
       const ciphertext = ecies_encrypt(pubKeyBuffer, plaintextBuffer);
       
@@ -508,7 +585,7 @@ class CryptoManager {
 // ============================================================================
 // 🛡️ 认证 + 加密中间件 (逻辑解耦修复版)
 // ============================================================================
-function authEncryptMiddleware(cryptoManager) {
+function authEncryptMiddleware(cryptoManager, tempKeyManager = null) {
   return async (req, res, next) => {
     // === 阶段 0: 放行 WebSocket 和预检请求 ===
     if (req.path.startsWith('/api/ws/') || (req.headers.upgrade || '').toLowerCase() === 'websocket') {
@@ -542,12 +619,14 @@ function authEncryptMiddleware(cryptoManager) {
       }
     }
 
-    // 🌟 3. 核心修复：直接执行真验签，不再套用 if(req.is_authenticated) 的死锁外壳
+    // 🌟 3. 核心修复：直接执行真验签 (静态 + 有效期内临时密钥), 不再套用 if(req.is_authenticated) 的死锁外壳
     try {
-      cryptoManager.verifySignature(nonce, timestamp, authToken);
+      const tempVk = tempKeyManager ? tempKeyManager.getActiveEcdsaVk() : null;
+      const keySource = cryptoManager.verifySignature(nonce, timestamp, authToken, tempVk);
       
       // ✨ 唯一步骤：只有成功熬过高强度数字签名核验的请求，才配在这行将身份洗白为 true
       req.is_authenticated = true;
+      req.key_source = keySource === 'temp' ? 'temp' : 'static';
       
     } catch (e) {
       if (bypassPaths.includes(req.path)) {
@@ -591,7 +670,12 @@ function authEncryptMiddleware(cryptoManager) {
           
           // 根据中间件最终确立的真伪身份标签，决定是否在出口裹上密文外衣
           if (req.is_authenticated) {
-            const encryptedContent = cryptoManager.encryptResponse(jsonData);
+            // 按验签来源选择对应 ECIES 公钥: 静态密钥->静态公钥, 临时密钥->临时公钥
+            let targetPub = null;
+            if (req.key_source === 'temp' && tempKeyManager) {
+              targetPub = tempKeyManager.getActiveEciesPub();
+            }
+            const encryptedContent = cryptoManager.encryptResponse(jsonData, targetPub);
             const encoded = typeof encryptedContent === 'string' ? encryptedContent : JSON.stringify(encryptedContent);
 
             res.set('x-encrypted', 'true');
@@ -2132,6 +2216,8 @@ async function main(options = {}) {
   try {
     const curves = await import('@noble/curves/nist.js');
     p256 = curves.p256;
+    const secpModule = await import('@noble/curves/secp256k1.js');
+    secp256k1 = secpModule.secp256k1;
     Logger.debug('Starting main() function...');
     Config.merge(options);
     // 配置校验
@@ -2143,6 +2229,11 @@ async function main(options = {}) {
     Logger.debug('Initializing CryptoManager...');
     const cryptoManager = new CryptoManager(Config.ECDSA_PUBLIC_KEY_PEM, Config.ECIES_PUBLIC_KEY_PEM);
     Logger.debug('CryptoManager initialized');
+
+    // 🆕 临时密钥管理器 (持久单实例, 供 /api/tempkey 与中间件临时验签/响应加密)
+    Logger.debug('Initializing TempKeyManager...');
+    const tempKeyManager = new TempKeyManager();
+    Logger.debug('TempKeyManager initialized');
     
     Logger.debug('Initializing SystemInfoCollector...');
     const systemInfo = new SystemInfoCollector();
@@ -2193,7 +2284,7 @@ async function main(options = {}) {
   app.use(express.urlencoded({ extended: true }));
   
  
-  app.use(authEncryptMiddleware(cryptoManager));
+  app.use(authEncryptMiddleware(cryptoManager, tempKeyManager));
 
   Logger.debug('Middleware applied, setting up routes...');
 
@@ -2241,6 +2332,39 @@ async function main(options = {}) {
     } catch (e) {
       res.status(500).json({ status: 'error', message: e.message });
     }
+  });
+
+  // 🔑 临时密钥对: GET /api/tempkey?ttl=<小时> (1~168, 默认24, 超范围422)
+  // - 有效期内重复请求返回同一密钥对 (幂等, 不重复生成)
+  // - 过期后自动生成新的密钥对, 旧密钥立即作废
+  // - 响应按验签来源加密: 静态密钥->控制端静态公钥, 临时密钥->当前临时 ECIES 公钥
+  app.get('/api/tempkey', (req, res) => {
+    let ttl = Config.TEMPKEY_DEFAULT_TTL_HOURS;
+    if (req.query.ttl !== undefined) {
+      const parsed = parseInt(req.query.ttl, 10);
+      if (Number.isNaN(parsed) || parsed < 1 || parsed > Config.TEMPKEY_MAX_TTL_HOURS) {
+        return res.status(422).json({ error: `ttl must be an integer between 1 and ${Config.TEMPKEY_MAX_TTL_HOURS}` });
+      }
+      ttl = parsed;
+    }
+
+    const key = tempKeyManager.getOrCreate(ttl);
+    const iso = (t) => new Date(t * 1000).toISOString().replace('.000Z', 'Z');
+    res.json({
+      status: 'ok',
+      key_id: key.key_id,
+      ttl_seconds: key.ttl_seconds,
+      created_at: iso(key.created_at),
+      expires_at: iso(key.expires_at),
+      ecdsa: {
+        private_key: key.ecdsa_private_key.trim(),
+        public_key: key.ecdsa_public_key.trim()
+      },
+      ecies: {
+        private_key: key.ecies_private_key,
+        public_key: key.ecies_public_key
+      }
+    });
   });
 
   // 实时状态

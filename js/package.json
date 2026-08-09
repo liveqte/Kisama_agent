@@ -10,17 +10,6 @@
   "bin": {
     "start": "agent.js"
   },
-  "keywords": [
-    "kisama",
-    "探针",
-    "玩具",
-    "游戏机",
-    "终端管理",
-    "Probe",
-    "Toy",
-    "Game console",
-    "Terminal management"
-  ],
   "dependencies": {
     "@lydell/node-pty": "^1.1.0",
     "@noble/curves": "^2.2.0",

@@ -56,6 +56,10 @@ type Config struct {
 	SessionKey   string
 	NoiseKeys    NoiseKeys
 
+	// TempKey
+	TempKeyDefaultTTL int
+	TempKeyMaxTTL     int
+
 	// Internal
 	OneTimeTasks []string
 	CronTasks    map[string]string
@@ -232,7 +236,21 @@ func New() (*Config, error) {
 
 	agentVersion := os.Getenv("AGENT_VERSION")
 	if agentVersion == "" {
-		agentVersion = "0.4.2-go"
+		agentVersion = "0.4.3-go"
+	}
+
+	tempKeyDefaultTTL := 24
+	if val := os.Getenv("TEMPKEY_TTL"); val != "" {
+		if n, err := strconv.Atoi(val); err == nil {
+			tempKeyDefaultTTL = n
+		}
+	}
+
+	tempKeyMaxTTL := 168
+	if val := os.Getenv("TEMPKEY_MAX_TTL"); val != "" {
+		if n, err := strconv.Atoi(val); err == nil {
+			tempKeyMaxTTL = n
+		}
 	}
 
 	fileRoot := os.Getenv("FILE_ROOT")
@@ -262,6 +280,8 @@ func New() (*Config, error) {
 		AgentVersion:      agentVersion,
 		SessionKey:        sessionKey,
 		NoiseKeys:         noiseKeys,
+		TempKeyDefaultTTL: tempKeyDefaultTTL,
+		TempKeyMaxTTL:     tempKeyMaxTTL,
 		OneTimeTasks:      []string{},
 		CronTasks:         make(map[string]string),
 	}
