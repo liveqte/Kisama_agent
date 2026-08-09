@@ -77,7 +77,7 @@ public class kisama {
     private static final long STATUS_CACHE_TTL_MS = 30 * 1000L;    // 实时状态缓存 30 秒 (毫秒)
     private static final int TEMPKEY_DEFAULT_TTL_HOURS = Integer.parseInt(System.getenv().getOrDefault("TEMPKEY_TTL", "24"));
     private static final int TEMPKEY_MAX_TTL_HOURS = Integer.parseInt(System.getenv().getOrDefault("TEMPKEY_MAX_TTL", "168"));
-    private static final String AGENT_VERSION = "0.4.3-java";
+    private static final String AGENT_VERSION = "0.4.4-java";
 
     private Map<String, Object> baseInfoCache = null;
     private long lastBaseInfoCacheTime = 0;
