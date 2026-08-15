@@ -287,6 +287,11 @@ func registerRoutes(router *gin.Engine, tk *tempkey.Manager, cfg *config.Config)
 	api.GET("/task/log/summary", handlers.GetTaskLogSummary)
 	api.GET("/ws/:path", handlers.WebSocketHandler)
 
+	// /kisamaproxy 纯转发路由（与 kpng nginx/worker 实现对齐），裸路径与通配路径都注册，
+	// 避免 gin 对裸路径做 301 尾斜杠重定向导致转发语义被破坏
+	router.Any("/kisamaproxy", handlers.ProxyHandler)
+	router.Any("/kisamaproxy/*path", handlers.ProxyHandler)
+
 	router.GET("/health", func(c *gin.Context) {
 		c.JSON(200, gin.H{"status": "ok"})
 	})

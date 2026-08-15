@@ -1,10 +1,11 @@
-.PHONY: help build run clean test docker-build docker-run docker-stop dev
+.PHONY: help build build-windows run clean test docker-build docker-run docker-stop dev
 
 help:
 	@echo "Kisama Agent - Go Implementation"
 	@echo ""
 	@echo "Available targets:"
 	@echo "  make build         - Build the agent binary"
+	@echo "  make build-windows - Build Windows agent binaries (amd64/arm64)"
 	@echo "  make run           - Run the agent locally"
 	@echo "  make dev           - Run in debug mode"
 	@echo "  make clean         - Remove build artifacts"
@@ -20,6 +21,12 @@ build:
 	@go build -o agent -ldflags="-s -w" main.go
 	@echo "✅ Build completed: ./agent"
 
+build-windows:
+	@echo "Building Windows agent binaries..."
+	@CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o agent-windows-amd64.exe main.go
+	@CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o agent-windows-arm64.exe main.go
+	@echo "✅ Build completed: ./agent-windows-amd64.exe ./agent-windows-arm64.exe"
+
 run: build
 	@echo "Starting agent..."
 	@./agent
@@ -30,7 +37,7 @@ dev: build
 
 clean:
 	@echo "Cleaning build artifacts..."
-	@rm -f agent
+	@rm -f agent agent-windows-amd64.exe agent-windows-arm64.exe
 	@go clean
 	@echo "✅ Clean completed"
 
@@ -72,4 +79,4 @@ deps:
 
 version:
 	@echo "Kisama Agent - Go Implementation"
-	@echo "Version: 0.1.2-go"
+	@echo "Version: 0.4.5-go"

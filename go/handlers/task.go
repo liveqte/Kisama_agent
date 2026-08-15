@@ -359,8 +359,8 @@ func executeTask(cmd string) TaskResult {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.ExecTimeout)*time.Second)
 	defer cancel()
 
-	// Use shell to execute command
-	execCmd := exec.CommandContext(ctx, "/bin/sh", "-c", cmd)
+	// Use shell to execute command (平台自适应：Unix /bin/sh，Windows cmd.exe)
+	execCmd := shellCommand(ctx, cmd)
 
 	var stdout, stderr bytes.Buffer
 	execCmd.Stdout = &stdout

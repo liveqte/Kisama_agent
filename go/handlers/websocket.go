@@ -12,10 +12,8 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
-	"github.com/creack/pty"
 	"github.com/flynn/noise"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -198,11 +196,11 @@ func (n *NoiseSessionWrapper) Free() {
 // TerminalSessionHandler 终端会话核心类
 // ----------------------------------------------------------------------
 type TerminalSessionHandler struct {
-	ws         *websocket.Conn
-	ptyProcess *os.File
-	requestID  string
-	useNoise   bool
-	cipher     *NoiseSessionWrapper
+	ws        *websocket.Conn
+	term      terminalSession
+	requestID string
+	useNoise  bool
+	cipher    *NoiseSessionWrapper
 
 	msgChan     chan []byte
 	closeOnce   sync.Once
@@ -378,33 +376,35 @@ func (h *TerminalSessionHandler) runTerminal() error {
 	cmd.Env = filteredEnv
 	cmd.Dir = os.Getenv("HOME")
 	if cmd.Dir == "" {
+		cmd.Dir = os.Getenv("USERPROFILE")
+	}
+	if cmd.Dir == "" {
 		cmd.Dir = "."
 	}
 
-	ptyPtr, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: 24, Cols: 80})
+	term, err := newTerminalSession(cmd, 24, 80)
 	if err != nil {
 		return fmt.Errorf("💥 启动终端失败: %w", err)
 	}
 	if h.isClosed() {
-		_ = ptyPtr.Close()
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		_ = cmd.Process.Kill()
+		_ = term.Close()
+		_ = term.KillTree()
 		_ = cmd.Wait()
 		return errors.New("session closed before terminal startup")
 	}
 	h.cmd = cmd
-	h.ptyProcess = ptyPtr
+	h.term = term
 	go func() {
 		_ = cmd.Wait()
 		close(h.processDone)
 	}()
 
-	// PTY -> WS
+	// term -> WS
 	go func() {
 		defer h.Cleanup()
 		buf := make([]byte, 2048)
 		for {
-			n, err := h.ptyProcess.Read(buf)
+			n, err := h.term.Read(buf)
 			if err != nil {
 				logger.Infof("[终端会话 %s] 🔌 终端进程退出", h.requestID)
 				return
@@ -431,7 +431,7 @@ func (h *TerminalSessionHandler) runTerminal() error {
 }
 
 func (h *TerminalSessionHandler) processTerminalMessage(message []byte) {
-	if h.ptyProcess == nil {
+	if h.term == nil {
 		return
 	}
 
@@ -467,7 +467,7 @@ func (h *TerminalSessionHandler) processTerminalMessage(message []byte) {
 				_ = h.writeMessage(websocket.BinaryMessage, reply)
 
 			case "resize":
-				_ = pty.Setsize(h.ptyProcess, &pty.Winsize{Rows: msg.Rows, Cols: msg.Cols})
+				_ = h.term.Resize(msg.Rows, msg.Cols)
 
 			case "input":
 				var inputBytes []byte
@@ -476,35 +476,18 @@ func (h *TerminalSessionHandler) processTerminalMessage(message []byte) {
 				} else {
 					inputBytes = []byte(msg.Data)
 				}
-				_, _ = h.ptyProcess.Write(inputBytes)
+				_, _ = h.term.Write(inputBytes)
 			}
 		}
 	}
 
 	if !isJSON {
-		_, _ = h.ptyProcess.Write(decrypted)
+		_, _ = h.term.Write(decrypted)
 	}
 }
 
 func (h *TerminalSessionHandler) getAvailableShell() string {
-	// 🚀 1. 核心修复：优先寻找体验更佳的高级富文本 Shell
-	advancedShells := []string{"/bin/bash", "/bin/zsh", "/bin/ash"}
-	for _, sh := range advancedShells {
-		if _, err := os.Stat(sh); err == nil {
-			return sh // 只要有更高级的，直接采用
-		}
-	}
-
-	// 2. 如果没有高级 Shell，再退一步听从环境变量的安排
-	envShell := os.Getenv("SHELL")
-	if envShell != "" {
-		if _, err := os.Stat(envShell); err == nil {
-			return envShell
-		}
-	}
-
-	// 3. 最后的兜底
-	return "/bin/sh"
+	return defaultTerminalShell()
 }
 
 func (h *TerminalSessionHandler) writeMessage(messageType int, data []byte) error {
@@ -552,6 +535,15 @@ func (h *TerminalSessionHandler) isClosed() bool {
 	}
 }
 
+func (h *TerminalSessionHandler) killSessionTree() {
+	if h.term != nil {
+		_ = h.term.KillTree()
+	}
+	if h.cmd != nil && h.cmd.Process != nil {
+		_ = h.cmd.Process.Kill()
+	}
+}
+
 func (h *TerminalSessionHandler) Cleanup() {
 	h.closeOnce.Do(func() {
 		close(h.done)
@@ -559,18 +551,20 @@ func (h *TerminalSessionHandler) Cleanup() {
 			_ = h.writeMessage(websocket.CloseMessage, websocket.FormatCloseMessage(1000, "Cleanly closed"))
 			_ = h.ws.Close()
 		}
-		if h.ptyProcess != nil {
-			_ = h.ptyProcess.Close()
+		if h.term != nil {
+			// 先释放终端资源（ConPTY 场景关闭伪控制台即终止进程）
+			_ = h.term.Close()
+		}
+		if h.term != nil {
+			// 击杀进程树（Unix 用进程组信号，Windows 用 taskkill）
+			h.killSessionTree()
 		}
 		if h.cmd != nil && h.cmd.Process != nil {
-			pid := h.cmd.Process.Pid
-			_ = syscall.Kill(-pid, syscall.SIGKILL)
-			_ = h.cmd.Process.Kill()
+			// exec.Cmd 方式启动（Unix PTY / 管道回退）：等待进程退出，超时后补杀
 			select {
 			case <-h.processDone:
 			case <-time.After(terminalProcessStopGrace):
-				_ = syscall.Kill(-pid, syscall.SIGKILL)
-				_ = h.cmd.Process.Kill()
+				h.killSessionTree()
 				<-h.processDone
 			}
 		}

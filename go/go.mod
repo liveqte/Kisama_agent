@@ -3,6 +3,7 @@ module github.com/liveqte/kisama_agent/go
 go 1.23.0
 
 require (
+	github.com/UserExistsError/conpty v0.1.4
 	github.com/creack/pty v1.1.24
 	github.com/ecies/go/v2 v2.0.11
 	github.com/flynn/noise v1.1.0

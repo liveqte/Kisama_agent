@@ -51,8 +51,8 @@ func ExecuteCommand(c *gin.Context) {
 
 	var cmd *exec.Cmd
 	if cfg.ExecShellMode {
-		// Use shell
-		cmd = exec.CommandContext(ctx, "/bin/sh", "-c", req.Cmd)
+		// Use shell (平台自适应：Unix /bin/sh，Windows cmd.exe)
+		cmd = shellCommand(ctx, req.Cmd)
 	} else {
 		// Parse command
 		parts := strings.Fields(req.Cmd)

@@ -6,10 +6,8 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/user"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/shirou/gopsutil/v3/cpu"
@@ -354,26 +352,7 @@ func GetFileOwner(path string) (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
-
-	uidStr := "0"
-	gidStr := "0"
-
-	// 🚀 核心修复：通过跨平台的底层 Sys() 反射并抽取真实的 UID/GID
-	if stat, ok := fi.Sys().(*syscall.Stat_t); ok {
-		uidStr = strconv.FormatUint(uint64(stat.Uid), 10)
-		gidStr = strconv.FormatUint(uint64(stat.Gid), 10)
-
-		// 优雅转换：将数字 UID 翻译为真实的系统系统用户名（如 "root", "ubuntu"）
-		if u, err := user.LookupId(uidStr); err == nil {
-			uidStr = u.Username
-		}
-		// 将数字 GID 翻译为系统的组名
-		if g, err := user.LookupGroupId(gidStr); err == nil {
-			gidStr = g.Name
-		}
-	}
-
-	return uidStr, gidStr, nil
+	return platformFileOwner(fi)
 }
 
 // StringToUint64 converts string to uint64

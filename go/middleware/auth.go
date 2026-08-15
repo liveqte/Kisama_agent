@@ -34,9 +34,10 @@ func (w *responseBufferWriter) WriteString(s string) (int, error) {
 // AuthEncryptMiddleware provides authentication and encryption for API endpoints
 func AuthEncryptMiddleware(cm *crypto.CryptoManager, cfg *config.Config, tk *tempkey.Manager) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// Phase 0: Skip WebSocket and preflight requests
+		// Phase 0: Skip WebSocket, preflight and pure-forwarder (kisamaproxy) requests
 		if strings.HasPrefix(c.Request.URL.Path, "/api/ws/") ||
-			c.Request.Header.Get("Upgrade") == "websocket" {
+			c.Request.Header.Get("Upgrade") == "websocket" ||
+			strings.HasPrefix(c.Request.URL.Path, "/kisamaproxy") {
 			c.Next()
 			return
 		}
@@ -226,9 +227,16 @@ func AuthEncryptMiddleware(cm *crypto.CryptoManager, cfg *config.Config, tk *tem
 // CORSMiddleware 用于跨域请求策略配置
 func CORSMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// /kisamaproxy 转发器由 handler 自行管理 CORS 与 OPTIONS（与 kpng 语义一致）
+		if strings.HasPrefix(c.Request.URL.Path, "/kisamaproxy") {
+			c.Next()
+			return
+		}
+
 		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
 		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
-		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With, X-Nonce, X-Timestamp, X-Auth-Token, X-AES-Encrypted, X-File-Path, X-File-Name, X-Chunk-Id, X-Total-Chunks")
+		// 与 Java/JS 版本的 CORS 允许头对齐（含 user-agent 与 x-debug），保留原有扩展保证兼容
+		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With, User-Agent, X-Nonce, X-Timestamp, X-Auth-Token, X-AES-Encrypted, X-Debug, X-File-Path, X-File-Name, X-Chunk-Id, X-Total-Chunks")
 		c.Writer.Header().Set("Access-Control-Expose-Headers", "x-encrypted, x-agent-version, x-file-size, x-original-path")
 		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS, GET, PUT, DELETE")
 

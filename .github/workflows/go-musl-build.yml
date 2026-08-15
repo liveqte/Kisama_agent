@@ -86,6 +86,26 @@ jobs:
           # 抹除 Zig 强行注入的幽灵依赖标签
           patchelf --remove-needed libc.so dist/libkisama-linux-arm64.so
 
+      # ---- windows/amd64 binary (pure Go, no CGO) ----
+      - name: Build windows/amd64 binary
+        working-directory: go
+        env:
+          CGO_ENABLED: 0
+          GOOS: windows
+          GOARCH: amd64
+        run: |
+          go build -trimpath -ldflags='-s -w' -o dist/agent-windows-amd64.exe .
+
+      # ---- windows/arm64 binary (pure Go, no CGO) ----
+      - name: Build windows/arm64 binary
+        working-directory: go
+        env:
+          CGO_ENABLED: 0
+          GOOS: windows
+          GOARCH: arm64
+        run: |
+          go build -trimpath -ldflags='-s -w' -o dist/agent-windows-arm64.exe .
+
       # ---- Verify artifacts are static (no glibc / no external libc NEEDED) ----
       - name: Verify static linking
         working-directory: go
