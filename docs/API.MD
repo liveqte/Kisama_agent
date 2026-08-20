@@ -4,7 +4,7 @@
 通过环境变量KPORT、PORT、SERVER_PORT指定，优先级从高到低，若都没有为8000。
 
 【安全说明】
-除了/api/baseinfo和/api/status的
+除了/api/baseinfo、/api/status 以及 /kisamaproxy 转发器（纯转发，不参与认证）外，
 其他所有接口均受 AuthEncryptMiddleware 保护。
 请求必须携带签名认证头 (X-Nonce, X-Timestamp, X-Auth-Token)。
 响应体默认经过 ECIES 加密传输。
@@ -426,7 +426,198 @@ token：仅在https传输下使用，其使用代理端noise公钥进行认证�
 3. 临时调用方用 `ecies.private_key` 解密响应内容，无需任何额外请求头。
 
 
-## 六、FastAPI 自动帮助页面说明
+## 六、KisamaProxy 转发器模块（可选接口 · 仅 GO 版本已实现）
+
+> **可选接口**：该功能是独立的纯转发器（Proxy），与 kpng 转发组件的 nginx / worker 实现功能保持一致。
+> ⚠️ 当前**只有 GO 版本已实现**，Python / Java / JS 版本均未提供该路由。
+
+### 26. 代理转发（向上游转发任意请求）
+路径：`/kisamaproxy/<目标URL>`（任意 HTTP 方法，含 WebSocket 升级）  
+用途：将请求原样转发到任意上游地址（目标地址编码在路径中），常用于：
+- 借助 Agent 的出口网络访问其他 Kisama Agent 或上游 API；
+- 在无法直接访问内网 Agent 的场景下，通过该转发器做中转；
+- 等价于 kpng 的 `/kisamaproxy/` 路由，可替代其 nginx/worker 部署。
+
+认证：**无需认证（❌）**，不参与 AuthEncryptMiddleware 加密链路，请求头原样发往上游。  
+输入：无请求体参数，目标地址直接编码在路径中。
+
+#### 目标地址格式
+```
+GET /kisamaproxy/http://host:8000/api/baseinfo
+GET /kisamaproxy/https://host:8443/api/exec
+```
+- **合规检查**：URI（路径 + 查询串）必须包含 `api`，否则直接返回 `444`（与 kpng 行为一致）；
+- URI 中未出现 `/kisamaproxy/` 标志位时返回 `400 Invalid Proxy URL Structure`；
+- 兼容被压缩的单斜杠路径：`https:/host/..` 自动修复为 `https://host/..`；
+- 无协议前缀时自动补全为 `https://`。
+
+#### CORS 与 OPTIONS 预检
+- 全局 CORS 中间件对 `/kisamaproxy` 前缀直接放行，由转发器自行管理跨域头；
+- `OPTIONS` 预检请求直接返回 `204`，并附带 kpng 一致的 CORS 响应头（`Access-Control-Allow-Origin: *` 等）。
+
+#### 请求头处理
+- 客户端请求头原样透传，仅清理 `Origin` / `Referer`（避免泄露来源页）；
+- `Host` 改写为目标主机；附加 `X-Real-IP`、`X-Forwarded-For`（客户端 IP）与 `X-Forwarded-Proto`（目标协议）。
+
+#### 响应处理
+- 剥离上游响应中的 CORS 头后，统一补齐 kpng 配置的 CORS 头；
+- 上游返回 `101 Switching Protocols`（WebSocket 升级）时，建立双向隧道原样转发，不做任何头修改；
+- 上游不可达或转发失败时统一返回 `502`，响应体为 `Proxy Error: <原因>`。
+
+返回示例（转发到 `/api/baseinfo` 时，直接透传上游响应）：
+```
+{ ...上游服务返回的原始内容... }
+```
+
+
+## 七、Argo 临时隧道模块（可选接口 · 仅 Python 版已实现）
+
+> **可选接口**：创建 Cloudflare 临时公网隧道（Quick Tunnel / trycloudflare），将本代理监听端口或内网任意 TCP 端口暴露为一个随机的 `https://<随机域名>.trycloudflare.com` 临时公网域名，无需自有域名与 DNS/证书配置，隧道随进程退出而失效。
+> ✅ **实现状态**：Python 版（py/agent.py）已实现，隧道基于 Python 标准库手写的 HTTP/2 + Cap'n Proto 协议（与 cloudflared 相同的 Quick Tunnel 协议，无需安装任何外部二进制）；GO / JS / Java 版尚未提供该路由。
+
+### 27. 查询临时隧道列表
+路径：GET /api/argo  
+用途：返回当前已创建的全部临时隧道（隧道域名、转发端口、创建时间）  
+输入：无  
+行为约定：
+- 返回所有**存活中**的临时隧道（含通过 `duplicate: true` 创建的重复隧道）；
+- 隧道失效（cloudflared 进程退出 / 与 trycloudflare 连接断开）后自动从列表移除；
+- 无隧道时返回空列表（`count: 0`）。  
+返回示例：
+```
+{
+  "status": "ok",
+  "count": 2,
+  "tunnels": [
+    { "tunnel_domain": "https://lucky-wildflower-1a2b3c4d.trycloudflare.com", "port": 8000, "created_at": "2026-08-18T10:00:00Z" },
+    { "tunnel_domain": "https://quiet-cloud-9f8e7d6c.trycloudflare.com", "port": 8080, "created_at": "2026-08-18T11:30:00Z" }
+  ]
+}
+```
+字段说明：
+| 字段 | 类型 | 说明 |
+| :--- | :--- | :--- |
+| status | string | 固定为 `"ok"` |
+| count | number | 隧道数量 |
+| tunnels[].tunnel_domain | string | 临时隧道公网域名（含 `https://` 前缀） |
+| tunnels[].port | number | 隧道转发的本地端口 |
+| tunnels[].created_at | string | 创建时间（ISO8601 UTC，如 `2026-08-18T10:00:00Z`） |
+
+### 28. 创建临时隧道
+路径：POST /api/argo  
+用途：操纵 agent 创建一条 Cloudflare 快速隧道（Python 版为纯标准库实现），将指定端口转发为临时公网域名  
+输入示例：
+```
+{ "port": 8080 }
+```
+输入字段：
+| 字段 | 类型 | 必填 | 说明 |
+| :--- | :--- | :---: | :--- |
+| port | number | 否 | 隧道转发端口（整数，1~65535）。缺省时使用 agent 自身监听端口（按 KPORT → PORT → SERVER_PORT 优先级，默认 8000） |
+| duplicate | boolean | 否 | 是否允许同一端口重复创建隧道，默认 `false`。`false` 时若该端口已存在隧道则拒绝创建（409）；`true` 时强制创建，原隧道保留 |
+行为约定：
+- **重复策略**：默认阻止同一端口重复建隧道（409）；仅当请求体携带 `duplicate: true` 时才允许重复；
+- 端口缺省时取 agent 自身监听端口（与「默认端口」一节一致）；
+- `port` 非法（非整数 / 超出 1~65535）返回 422；
+- 隧道注册失败（网络异常 / 无法连接 trycloudflare）返回 500。
+
+返回示例（创建成功，HTTP 200）：
+```
+{
+  "status": "ok",
+  "created": true,
+  "tunnel_domain": "https://sunny-breeze-5a6b7c8d.trycloudflare.com",
+  "port": 8080,
+  "created_at": "2026-08-18T12:00:00Z"
+}
+```
+返回示例（同端口重复被拒，HTTP 409）：
+```
+{
+  "status": "error",
+  "created": false,
+  "port": 8080,
+  "message": "tunnel already exists on port 8080, set duplicate=true to force creation"
+}
+```
+返回示例（创建失败，HTTP 500）：
+```
+{
+  "status": "error",
+  "created": false,
+  "port": 8080,
+  "message": "failed to create tunnel: <具体原因>"
+}
+```
+字段说明：
+| 字段 | 类型 | 说明 |
+| :--- | :--- | :--- |
+| status | string | 请求处理结果：`"ok"` / `"error"` |
+| created | boolean | 隧道创建结果：`true`=创建成功 / `false`=创建失败 |
+| tunnel_domain | string | 创建成功时返回临时隧道域名；失败时无此字段 |
+| port | number | 本次请求的转发端口 |
+| created_at | string | 创建时间（ISO8601 UTC）；失败时无此字段 |
+| message | string | 失败原因（仅 `status=error` 时出现） |
+
+### 29. 删除临时隧道
+路径：DELETE /api/argo  
+用途：删除指定端口的临时隧道（停止隧道守护线程，释放云边连接与临时公网域名，域名立即失效）  
+输入示例：
+```
+{ "port": 8000 }
+```
+输入字段：
+| 字段 | 类型 | 必填 | 说明 |
+| :--- | :--- | :---: | :--- |
+| port | number | 是 | 要删除的隧道转发端口（整数，1~65535） |
+| tunnel_domain | string | 否 | 同一端口存在多条隧道（duplicate 创建）时用于精确定位；缺省且该端口仅一条隧道时直接删除该条 |
+行为约定：
+- 端口上无任何隧道返回 404；
+- 端口上存在多条隧道且未指定 `tunnel_domain` 返回 409（提示需精确定位），避免误删；
+- 指定了 `tunnel_domain` 但该端口无匹配隧道返回 404；
+- `port` 非法 / 缺失返回 422；
+- 删除后该公网域名立即失效，并从 GET /api/argo 列表中移除。
+
+返回示例（删除成功，HTTP 200）：
+```
+{
+  "status": "ok",
+  "deleted": 1,
+  "port": 8000,
+  "tunnels": [
+    { "tunnel_domain": "https://lucky-wildflower-1a2b3c4d.trycloudflare.com", "port": 8000, "created_at": "2026-08-18T10:00:00Z" }
+  ]
+}
+```
+返回示例（端口无隧道，HTTP 404）：
+```
+{
+  "status": "error",
+  "deleted": 0,
+  "port": 8000,
+  "message": "no tunnel found on port 8000"
+}
+```
+返回示例（端口存在多条隧道但未指定域名，HTTP 409）：
+```
+{
+  "status": "error",
+  "deleted": 0,
+  "port": 8000,
+  "message": "multiple tunnels exist on port 8000, specify tunnel_domain to disambiguate"
+}
+```
+字段说明：
+| 字段 | 类型 | 说明 |
+| :--- | :--- | :--- |
+| status | string | 请求处理结果：`"ok"` / `"error"` |
+| deleted | number | 实际删除的隧道数量（成功时 ≥1） |
+| port | number | 本次请求的端口 |
+| tunnels | array | 已删除隧道的明细（结构同 GET /api/argo 的 tunnels），失败时无此字段 |
+| message | string | 失败原因（仅 `status=error` 时出现） |
+
+
+## 八、FastAPI 自动帮助页面说明
 
 
 本项目使用 FastAPI 框架，自动生成并托管 OpenAPI 3.0 文档。
@@ -456,6 +647,8 @@ token：仅在https传输下使用，其使用代理端noise公钥进行认证�
 | :--- | :--- |
 | ✅ | 需要认证 / 报文加密 |
 | ❌ | 无需认证 / 明文传输 |
+| 仅GO | 仅 GO 版本已实现（其余版本未提供） |
+| 仅Py | 仅 Python 版已实现（其余版本未提供） |
 
 ---
 
@@ -489,6 +682,10 @@ token：仅在https传输下使用，其使用代理端noise公钥进行认证�
 | **日志统计** | GET | `/api/task/log/summary` | 获取统计摘要 | ✅ | ✅ |
 | **临时密钥** | GET | `/api/tempkey` | 获取临时授权密钥对 | ✅ | ✅ |
 | **超级终端** | WS | `/api/ws/terminal` | 使用交互性终端 | ✅ | ✅ |
+| **代理转发** | ANY | `/kisamaproxy/*` | 转发至任意地址（仅GO） | ❌ | ❌ |
+| **临时隧道-查** | GET | `/api/argo` | 查询临时隧道列表（Py/Js） | ✅ | ✅ |
+| **临时隧道-建** | POST | `/api/argo` | 创建临时隧道（Py/Js） | ✅ | ✅ |
+| **临时隧道-删** | DELETE | `/api/argo` | 删除临时隧道（Py/Js） | ✅ | ✅ |
 ---
 
 ### 通用请求头要求 (Headers)

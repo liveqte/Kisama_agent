@@ -26,7 +26,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y patchelf
+          sudo apt-get install -y patchelf upx-ucl
 
       - name: Prepare build directory
         working-directory: go
@@ -42,7 +42,7 @@ jobs:
           GOOS: linux
           GOARCH: amd64
         run: |
-          go build -trimpath -ldflags='-s -w' -o dist/agent-linux-amd64 .
+          go build -trimpath -buildvcs=false -ldflags='-s -w' -o dist/agent-linux-amd64 .
 
       # ---- linux/amd64 static shared library (musl, libc embedded via Zig) ----
       - name: Build linux/amd64 static shared library
@@ -54,7 +54,7 @@ jobs:
           CC: "zig cc -target x86_64-linux-musl"
           CXX: "zig c++ -target x86_64-linux-musl"
         run: |
-          go build -trimpath -buildmode=c-shared \
+          go build -trimpath -buildmode=c-shared -buildvcs=false \
             -ldflags='-s -w -linkmode external -extldflags "-Wl,-Bstatic"' \
             -o dist/libkisama-linux-amd64.so .
           # 抹除 Zig 强行注入的幽灵依赖标签
@@ -68,7 +68,7 @@ jobs:
           GOOS: linux
           GOARCH: arm64
         run: |
-          go build -trimpath -ldflags='-s -w' -o dist/agent-linux-arm64 .
+          go build -trimpath -buildvcs=false -ldflags='-s -w' -o dist/agent-linux-arm64 .
 
       # ---- linux/arm64 static shared library (musl, libc embedded via Zig) ----
       - name: Build linux/arm64 static shared library
@@ -80,7 +80,7 @@ jobs:
           CC: "zig cc -target aarch64-linux-musl"
           CXX: "zig c++ -target aarch64-linux-musl"
         run: |
-          go build -trimpath -buildmode=c-shared \
+          go build -trimpath -buildmode=c-shared -buildvcs=false \
             -ldflags='-s -w -linkmode external -extldflags "-Wl,-Bstatic"' \
             -o dist/libkisama-linux-arm64.so .
           # 抹除 Zig 强行注入的幽灵依赖标签
@@ -94,7 +94,7 @@ jobs:
           GOOS: windows
           GOARCH: amd64
         run: |
-          go build -trimpath -ldflags='-s -w' -o dist/agent-windows-amd64.exe .
+          go build -trimpath -buildvcs=false -ldflags='-s -w' -o dist/agent-windows-amd64.exe .
 
       # ---- windows/arm64 binary (pure Go, no CGO) ----
       - name: Build windows/arm64 binary
@@ -104,7 +104,7 @@ jobs:
           GOOS: windows
           GOARCH: arm64
         run: |
-          go build -trimpath -ldflags='-s -w' -o dist/agent-windows-arm64.exe .
+          go build -trimpath -buildvcs=false -ldflags='-s -w' -o dist/agent-windows-arm64.exe .
 
       # ---- Verify artifacts are static (no glibc / no external libc NEEDED) ----
       - name: Verify static linking
@@ -142,6 +142,20 @@ jobs:
               fi
             fi
           done
+
+      # ---- Compress static executables with UPX (keep .so and win/arm64 uncompressed) ----
+      - name: Compress binaries with UPX
+        working-directory: go
+        run: |
+          set -e
+          # UPX 4.x 尚不支持 win64/arm64 (CantPackException)，agent-windows-arm64.exe 不压缩
+          for bin in dist/agent-linux-amd64 dist/agent-linux-arm64 \
+                     dist/agent-windows-amd64.exe; do
+            if [ -f "$bin" ]; then
+              upx --best "$bin"
+            fi
+          done
+          echo "SKIP: libkisama-*.so shared libraries and win/arm64 stay uncompressed"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4

@@ -18,13 +18,13 @@ help:
 
 build:
 	@echo "Building agent binary..."
-	@go build -o agent -ldflags="-s -w" main.go
+	@go build -o agent -buildvcs=false -ldflags="-s -w" main.go
 	@echo "✅ Build completed: ./agent"
 
 build-windows:
 	@echo "Building Windows agent binaries..."
-	@CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o agent-windows-amd64.exe main.go
-	@CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o agent-windows-arm64.exe main.go
+	@CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags="-s -w" -o agent-windows-amd64.exe main.go
+	@CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build -trimpath -buildvcs=false -ldflags="-s -w" -o agent-windows-arm64.exe main.go
 	@echo "✅ Build completed: ./agent-windows-amd64.exe ./agent-windows-arm64.exe"
 
 run: build

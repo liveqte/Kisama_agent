@@ -30,35 +30,48 @@ if command -v zig >/dev/null 2>&1 && command -v patchelf >/dev/null 2>&1; then
 
     # 1. linux/amd64 binary (名为 agent)
     echo "   ➜ [1/7] Building binary ${OUTPUT_DIR}/agent (linux/amd64)..."
-    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o "$OUTPUT_DIR/agent" .
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags='-s -w' -o "$OUTPUT_DIR/agent" .
 
     # 2. linux/arm64 binary
     echo "   ➜ [2/7] Building binary ${OUTPUT_DIR}/agent-linux-arm64..."
-    CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w' -o "$OUTPUT_DIR/agent-linux-arm64" .
+    CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -buildvcs=false -ldflags='-s -w' -o "$OUTPUT_DIR/agent-linux-arm64" .
 
     # 3. darwin/arm64 binary (Apple Silicon)
     echo "   ➜ [3/7] Building binary ${OUTPUT_DIR}/agent-darwin-arm64 (darwin/arm64)..."
-    CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags='-s -w' -o "$OUTPUT_DIR/agent-darwin-arm64" .
+    CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -buildvcs=false -ldflags='-s -w' -o "$OUTPUT_DIR/agent-darwin-arm64" .
 
     # 4. linux/amd64 static shared library (Zig CC)
     echo "   ➜ [4/7] Building static shared library ${OUTPUT_DIR}/libkisama-linux-amd64.so..."
     CC="zig cc -target x86_64-linux-musl" CXX="zig c++ -target x86_64-linux-musl" CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
-        go build -trimpath -buildmode=c-shared -ldflags='-s -w -linkmode external -extldflags "-Wl,-Bstatic"' -o "$OUTPUT_DIR/libkisama-linux-amd64.so" .
+        go build -trimpath -buildmode=c-shared -buildvcs=false -ldflags='-s -w -linkmode external -extldflags "-Wl,-Bstatic"' -o "$OUTPUT_DIR/libkisama-linux-amd64.so" .
     patchelf --remove-needed libc.so "$OUTPUT_DIR/libkisama-linux-amd64.so"
 
     # 5. linux/arm64 static shared library (Zig CC)
     echo "   ➜ [5/7] Building static shared library ${OUTPUT_DIR}/libkisama-linux-arm64.so..."
     CC="zig cc -target aarch64-linux-musl" CXX="zig c++ -target aarch64-linux-musl" CGO_ENABLED=1 GOOS=linux GOARCH=arm64 \
-        go build -trimpath -buildmode=c-shared -ldflags='-s -w -linkmode external -extldflags "-Wl,-Bstatic"' -o "$OUTPUT_DIR/libkisama-linux-arm64.so" .
+        go build -trimpath -buildmode=c-shared -buildvcs=false -ldflags='-s -w -linkmode external -extldflags "-Wl,-Bstatic"' -o "$OUTPUT_DIR/libkisama-linux-arm64.so" .
     patchelf --remove-needed libc.so "$OUTPUT_DIR/libkisama-linux-arm64.so"
 
     # 6. windows/amd64 binary
     echo "   ➜ [6/7] Building binary ${OUTPUT_DIR}/agent-windows-amd64.exe (windows/amd64)..."
-    CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o "$OUTPUT_DIR/agent-windows-amd64.exe" .
+    CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags='-s -w' -o "$OUTPUT_DIR/agent-windows-amd64.exe" .
 
     # 7. windows/arm64 binary
     echo "   ➜ [7/7] Building binary ${OUTPUT_DIR}/agent-windows-arm64.exe (windows/arm64)..."
-    CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build -trimpath -ldflags='-s -w' -o "$OUTPUT_DIR/agent-windows-arm64.exe" .
+    CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build -trimpath -buildvcs=false -ldflags='-s -w' -o "$OUTPUT_DIR/agent-windows-arm64.exe" .
+
+    # 8. 压缩静态可执行文件 (UPX 可用时)；.so 库与 darwin 产物不压缩
+    #    agent-windows-arm64.exe 不压：UPX 4.x 尚不支持 win64/arm64 (CantPackException)
+    if command -v upx >/dev/null 2>&1; then
+        echo "   ➜ [8/8] Compressing static binaries with UPX..."
+        for bin in "$OUTPUT_DIR/agent" "$OUTPUT_DIR/agent-linux-arm64" "$OUTPUT_DIR/agent-windows-amd64.exe"; do
+            if [ -f "$bin" ]; then
+                upx --best "$bin"
+            fi
+        done
+    else
+        echo "   ⚠️  UPX 未安装，跳过二进制压缩"
+    fi
 
 else
     echo "⚠️  未检测到完整的交叉编译工具 (缺少 Zig 或 patchelf)！"
@@ -66,13 +79,13 @@ else
     echo ""
     
     echo "   ➜ Building binary ${OUTPUT_DIR}/agent (Native OS/ARCH)..."
-    CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o "$OUTPUT_DIR/agent" .
+    CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags='-s -w' -o "$OUTPUT_DIR/agent" .
 
     echo "   ➜ Building binary ${OUTPUT_DIR}/agent-windows-amd64.exe (windows/amd64)..."
-    CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o "$OUTPUT_DIR/agent-windows-amd64.exe" .
+    CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags='-s -w' -o "$OUTPUT_DIR/agent-windows-amd64.exe" .
 
     echo "   ➜ Building binary ${OUTPUT_DIR}/agent-windows-arm64.exe (windows/arm64)..."
-    CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build -trimpath -ldflags='-s -w' -o "$OUTPUT_DIR/agent-windows-arm64.exe" .
+    CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build -trimpath -buildvcs=false -ldflags='-s -w' -o "$OUTPUT_DIR/agent-windows-arm64.exe" .
 fi
 
 echo ""

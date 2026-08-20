@@ -56,6 +56,7 @@ public class kisama {
     private byte[] ECIES_PUBLIC_KEY = null;
     private byte[] SESSION_KEY = null;
     private final TempKeyManager tempKeyManager = new TempKeyManager();
+    private final ArgoTunnelManager argoTunnelManager = new ArgoTunnelManager();
 
     private final List<String> onetime = Collections.synchronizedList(new ArrayList<>());
     private final List<Map<String, Object>> onetime_log = Collections.synchronizedList(new ArrayList<>());
@@ -77,7 +78,7 @@ public class kisama {
     private static final long STATUS_CACHE_TTL_MS = 30 * 1000L;    // 实时状态缓存 30 秒 (毫秒)
     private static final int TEMPKEY_DEFAULT_TTL_HOURS = Integer.parseInt(System.getenv().getOrDefault("TEMPKEY_TTL", "24"));
     private static final int TEMPKEY_MAX_TTL_HOURS = Integer.parseInt(System.getenv().getOrDefault("TEMPKEY_MAX_TTL", "168"));
-    private static final String AGENT_VERSION = "0.4.4-java";
+    private static final String AGENT_VERSION = "0.4.5-java";
 
     private Map<String, Object> baseInfoCache = null;
     private long lastBaseInfoCacheTime = 0;
@@ -191,9 +192,16 @@ public class kisama {
             boolean isBypassPath = "/api/baseinfo".equals(endpoint) || "/api/status".equals(endpoint);
 
             // 🌟 2. 优先判定 DEBUG 模式：如果为 true 直接拉满信任并放行
+            // (同时解析 JSON body，否则 DEBUG 下 /api/exec 等 POST 路由会拿不到 json_body)
             if (this.DEBUG) {
                 req.attribute("is_authenticated", true);
-                return; 
+                try {
+                    if (req.body() != null && !req.body().isBlank() && !"/api/fileraw".equals(endpoint)) {
+                        req.attribute("json_body", this.gson.fromJson(req.body(), new TypeToken<Object>() {}.getType()));
+                    }
+                } catch (Exception ignored) {
+                }
+                return;
             }
 
             // 预检请求直接放行
@@ -834,6 +842,64 @@ public class kisama {
             ));
         });
 
+        // ==================== 🌟 Argo 临时隧道管理路由 (纯 Java 移植 Cloudflare Quick Tunnel 协议) ====================
+        // 与 js/agent.js 语义一致: GET 查询 / POST 创建 / DELETE 删除, 受 AuthEncryptMiddleware 保护
+        get("/api/argo", (req, res) -> {
+            res.type("application/json");
+            List<Map<String, Object>> tunnels = this.argoTunnelManager.list();
+            return this.gson.toJson(Map.of("status", "ok", "count", tunnels.size(), "tunnels", tunnels));
+        });
+
+        post("/api/argo", (req, res) -> {
+            res.type("application/json");
+            Map<String, Object> body = req.attribute("json_body");
+            Object port = body != null ? body.get("port") : null;
+            if (port == null || "".equals(String.valueOf(port))) {
+                port = this.PORT;
+            }
+            int portNum = toArgoPort(port);
+            if (portNum < 1 || portNum > 65535) {
+                halt(422, this.gson.toJson(Map.of(
+                        "status", "error", "created", false, "port", port,
+                        "message", "port must be an integer between 1 and 65535")));
+            }
+            boolean duplicate = body != null && Boolean.TRUE.equals(body.get("duplicate"));
+            try {
+                ArgoTunnelManager.TunnelEntry tunnel = this.argoTunnelManager.create(portNum, duplicate);
+                return this.gson.toJson(Map.of(
+                        "status", "ok",
+                        "created", true,
+                        "tunnel_domain", tunnel.tunnelDomain,
+                        "port", tunnel.port,
+                        "created_at", tunnel.createdAt));
+            } catch (ArgoTunnelManager.TunnelException e) {
+                halt(e.status, this.gson.toJson(Map.of(
+                        "status", "error", "created", false, "port", e.port, "message", e.getMessage())));
+            }
+            return "";
+        });
+
+        delete("/api/argo", (req, res) -> {
+            res.type("application/json");
+            Map<String, Object> body = req.attribute("json_body");
+            Object port = body != null ? body.get("port") : null;
+            int portNum = toArgoPort(port);
+            if (port == null || "".equals(String.valueOf(port)) || portNum < 1 || portNum > 65535) {
+                halt(422, this.gson.toJson(Map.of(
+                        "status", "error", "deleted", 0, "port", port,
+                        "message", "port is required and must be an integer between 1 and 65535")));
+            }
+            String tunnelDomain = body != null ? Objects.toString(body.get("tunnel_domain"), null) : null;
+            ArgoTunnelManager.RemoveResult result = this.argoTunnelManager.remove(portNum, tunnelDomain);
+            if (result.status == 200) {
+                return this.gson.toJson(Map.of(
+                        "status", "ok", "deleted", result.deleted, "port", portNum, "tunnels", result.tunnels));
+            }
+            halt(result.status, this.gson.toJson(Map.of(
+                    "status", "error", "deleted", 0, "port", portNum, "message", result.message)));
+            return "";
+        });
+
         get("/", (req, res) -> "kisama-running");
 
         after((req, res) -> {
@@ -881,6 +947,7 @@ public class kisama {
     public void stop() {
         if (!isRunning) return;
         log("[TRACE-INIT] 正在关闭 Kisama Agent...");
+        this.argoTunnelManager.shutdownAll();
         spark.Spark.stop();
         // 🌟 核心补全：在内部强制阻塞主线程，死等 Jetty 清理完所有 Servlet 并彻底烟消云散！
         // 这样可以确保在该方法返回前，所有类加载行为全部安全结束。
@@ -1509,7 +1576,15 @@ public class kisama {
         Map<String, Object> out = new HashMap<>();
         if (cmd == null) cmd = " ";
         try {
-            List<String> parts = Arrays.asList("/bin/sh", "-c", cmd);
+            // 🚀 Windows 分支: cmd.exe /C (对齐 Go shellCommand / py shell=True); Unix 保持 /bin/sh -c
+            List<String> parts;
+            if (System.getProperty("os.name", "").toLowerCase().contains("win")) {
+                String comspec = System.getenv("COMSPEC");
+                if (comspec == null || comspec.isBlank()) comspec = "cmd.exe";
+                parts = Arrays.asList(comspec, "/C", cmd);
+            } else {
+                parts = Arrays.asList("/bin/sh", "-c", cmd);
+            }
             ProcessBuilder pb = new ProcessBuilder(parts);
             if (cwd != null && !cwd.isBlank()) pb.directory(new File(cwd));
             pb.redirectErrorStream(true);
@@ -1565,17 +1640,19 @@ public class kisama {
             Security.addProvider(new BouncyCastleProvider());
         }
 
-        // 🌟 核心拦截点 1：硬编码占位符与空值防刷校验
+        // 🌟 核心拦截点 1：硬编码占位符与空值防刷校验 (DEBUG 模式跳过，对齐 JS Config.validate)
         String ecdsaStr = this.ECDSA_PUBLIC_KEY_B64;
         String eciesStr = this.ECIES_PUBLIC_KEY_B64;
 
-        if (ecdsaStr == null || ecdsaStr.isBlank() || ecdsaStr.contains("YOUR_HARDCODED_ECDSA_PUBLIC_KEY_HERE")) {
-            System.err.println("[FATAL-INIT] ❌ 启动熔断: ECDSA 公钥未配置，或仍在使用默认占位符！");
-            System.exit(1);
-        }
-        if (eciesStr == null || eciesStr.isBlank() || eciesStr.contains("YOUR_HARDCODED_ECIES_PUBLIC_KEY_HERE")) {
-            System.err.println("[FATAL-INIT] ❌ 启动熔断: ECIES 公钥未配置，或仍在使用默认占位符！");
-            System.exit(1);
+        if (!this.DEBUG) {
+            if (ecdsaStr == null || ecdsaStr.isBlank() || ecdsaStr.contains("YOUR_HARDCODED_ECDSA_PUBLIC_KEY_HERE")) {
+                System.err.println("[FATAL-INIT] ❌ 启动熔断: ECDSA 公钥未配置，或仍在使用默认占位符！");
+                System.exit(1);
+            }
+            if (eciesStr == null || eciesStr.isBlank() || eciesStr.contains("YOUR_HARDCODED_ECIES_PUBLIC_KEY_HERE")) {
+                System.err.println("[FATAL-INIT] ❌ 启动熔断: ECIES 公钥未配置，或仍在使用默认占位符！");
+                System.exit(1);
+            }
         }
 
         // 初始化超级终端 Noise 静态拓扑密钥链 (保持原逻辑)
@@ -1599,25 +1676,40 @@ public class kisama {
             System.exit(1);
         }
 
-        // 🌟 核心拦截点 2：强验密钥合法性，解析失败立即拒绝启动
-        try {
-            this.ECDSA_PUBLIC_KEY = loadEcdsaPublicKey(ecdsaStr);
-            log("[TRACE-CRYPTO] ✅ ECDSA 安全公钥加载成功并通过结构化拓扑校验。");
-        } catch (Exception e) {
-            System.err.println("[FATAL-INIT] ❌ 启动熔断: ECDSA 公钥内容破坏或格式不合法！损坏凭证: [" + ecdsaStr + "]");
-            System.err.println("[FATAL-INIT] 💡 异常堆栈信息: ");
-            e.printStackTrace();
-            System.exit(1);
-        }
+        // 🌟 核心拦截点 2：强验密钥合法性，解析失败立即拒绝启动 (DEBUG 模式尽力加载，失败仅告警)
+        if (this.DEBUG) {
+            try {
+                this.ECDSA_PUBLIC_KEY = loadEcdsaPublicKey(ecdsaStr);
+                log("[TRACE-CRYPTO] ✅ ECDSA 安全公钥加载成功 (DEBUG)。");
+            } catch (Exception e) {
+                log("[TRACE-CRYPTO] ⚠️ DEBUG 模式: ECDSA 公钥未配置或非法，已跳过 (" + e.getMessage() + ")");
+            }
+            try {
+                this.ECIES_PUBLIC_KEY = Base64.getDecoder().decode(eciesStr.trim());
+                log("[TRACE-CRYPTO] ✅ ECIES 安全公钥 Base64 解码成功 (DEBUG)。");
+            } catch (Exception e) {
+                log("[TRACE-CRYPTO] ⚠️ DEBUG 模式: ECIES 公钥未配置或非法，已跳过 (" + e.getMessage() + ")");
+            }
+        } else {
+            try {
+                this.ECDSA_PUBLIC_KEY = loadEcdsaPublicKey(ecdsaStr);
+                log("[TRACE-CRYPTO] ✅ ECDSA 安全公钥加载成功并通过结构化拓扑校验。");
+            } catch (Exception e) {
+                System.err.println("[FATAL-INIT] ❌ 启动熔断: ECDSA 公钥内容破坏或格式不合法！损坏凭证: [" + ecdsaStr + "]");
+                System.err.println("[FATAL-INIT] 💡 异常堆栈信息: ");
+                e.printStackTrace();
+                System.exit(1);
+            }
 
-        try {
-            this.ECIES_PUBLIC_KEY = Base64.getDecoder().decode(eciesStr.trim());
-            log("[TRACE-CRYPTO] ✅ ECIES 安全公钥 Base64 逆向解码合规性核验成功。");
-        } catch (Exception e) {
-            System.err.println("[FATAL-INIT] ❌ 启动熔断: ECIES 公钥非合法的标准 Base64 编码流！损坏凭证: [" + eciesStr + "]");
-            System.err.println("[FATAL-INIT] 💡 异常堆栈信息: ");
-            e.printStackTrace();
-            System.exit(1);
+            try {
+                this.ECIES_PUBLIC_KEY = Base64.getDecoder().decode(eciesStr.trim());
+                log("[TRACE-CRYPTO] ✅ ECIES 安全公钥 Base64 逆向解码合规性核验成功。");
+            } catch (Exception e) {
+                System.err.println("[FATAL-INIT] ❌ 启动熔断: ECIES 公钥非合法的标准 Base64 编码流！损坏凭证: [" + eciesStr + "]");
+                System.err.println("[FATAL-INIT] 💡 异常堆栈信息: ");
+                e.printStackTrace();
+                System.exit(1);
+            }
         }
     }
 
@@ -1946,6 +2038,7 @@ public class kisama {
         private final String requestId;
         private final String token;
         private final boolean useNoise;
+        private static final boolean IS_WINDOWS = System.getProperty("os.name", "").toLowerCase().contains("win");
         private PtyProcess ptyProcess;
         private int handshakePhase = 1;
         private NoiseSession noiseCipher;
@@ -1965,6 +2058,22 @@ public class kisama {
         }
         // 🚀 新增：依据优先级多维定位当前系统可用的最佳 Shell 进程
         private String getAvailableShell() {
+            // 🚀 Windows 分支：优先 PowerShell，退而求其次 COMSPEC，最后 cmd.exe (对齐 py/Go/JS defaultTerminalShell)
+            if (IS_WINDOWS) {
+                String systemRoot = System.getenv("SystemRoot");
+                if (systemRoot == null || systemRoot.isBlank()) systemRoot = "C:\\Windows";
+                String[] windowsShells = {
+                        systemRoot + "\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+                        System.getenv("COMSPEC"),
+                        systemRoot + "\\System32\\cmd.exe"
+                };
+                for (String sh : windowsShells) {
+                    if (sh != null && !sh.isBlank() && new File(sh).exists()) {
+                        return sh;
+                    }
+                }
+                return "cmd.exe";
+            }
             // 1. 核心修复：优先寻找体验更佳的高级富文本 Shell，具备执行权限才予以放行
             String[] advancedShells = {"/bin/bash", "/bin/zsh", "/bin/ash"};
             for (String sh : advancedShells) {
@@ -1998,7 +2107,7 @@ public class kisama {
             Map<String, String> env = new HashMap<>(System.getenv());
             env.remove("PROMPT_COMMAND");
             env.put("TERM", "xterm-256color");
-            env.put("LANG", "C.UTF-8");
+            env.putIfAbsent("LANG", "C.UTF-8");
 
             agent.log("[TRACE-WS] 🚀 正在使用 Pty4J 启动真正的原生伪终端...");
 
@@ -2006,10 +2115,22 @@ public class kisama {
             String shell = getAvailableShell();
             agent.log("[TRACE-WS] 🐚 优先级队列选定 Shell 路径: " + shell);
 
+            // Windows 下 USERPROFILE 优先，无则回退 HOME/FILE_ROOT (对齐 py/Go/JS)
+            String workDir = agent.FILE_ROOT;
+            if (IS_WINDOWS) {
+                String userProfile = System.getenv("USERPROFILE");
+                if (userProfile != null && !userProfile.isBlank()) {
+                    workDir = userProfile;
+                } else {
+                    String home = System.getenv("HOME");
+                    if (home != null && !home.isBlank()) workDir = home;
+                }
+            }
+
             this.ptyProcess = new PtyProcessBuilder()
                     .setCommand(new String[]{shell}) // 注入动态计算出的富文本 Shell
                     .setEnvironment(env)
-                    .setDirectory(agent.FILE_ROOT)
+                    .setDirectory(workDir)
                     .start();
 
             this.processStdin = ptyProcess.getOutputStream();
@@ -2139,6 +2260,14 @@ public class kisama {
             if (!isRunning) return;
             isRunning = false;
             try {
+                // Windows: taskkill 强制结束整个进程树 (对齐 py/Go/JS KillTree)，再关闭 ConPTY/winpty
+                if (IS_WINDOWS && ptyProcess != null) {
+                    try {
+                        new ProcessBuilder("taskkill", "/F", "/T", "/PID", String.valueOf(ptyProcess.pid()))
+                                .redirectErrorStream(true).start();
+                    } catch (Exception ignored) {
+                    }
+                }
                 if (ptyProcess != null) ptyProcess.destroyForcibly();
                 if (wsSession.isOpen()) wsSession.close();
             } catch (Exception ignored) {
@@ -2297,4 +2426,1902 @@ public class kisama {
             n_recv = 0;
         }
     }
-}
+
+
+    // ==================== 🌟 Argo 临时隧道模块 (纯 Java 移植 Cloudflare Quick Tunnel 协议) ====================
+    // 与 js/agent.js + cftunnel-product.js 语义完全一致: 手写 HTTP/2 + HPACK + Cap'n Proto 协议栈
+    private static final String QUICK_SERVICE = "https://api.trycloudflare.com";
+    private static final String[] EDGE_HOSTS = {"region1.v2.argotunnel.com", "region2.v2.argotunnel.com"};
+    private static final int EDGE_PORT = 7844;
+    private static final String CONTROL_HEADER = "cf-cloudflared-proxy-connection-upgrade";
+    private static final String CONTROL_STREAM = "control-stream";
+    private static final int MAX_FRAME_SIZE = 16384;
+    private static final java.util.regex.Pattern UUID_RE = java.util.regex.Pattern.compile(
+            "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$");
+
+    private static final Map<String, String> MIME_TYPES = buildMimeTypes();
+
+    private static Map<String, String> buildMimeTypes() {
+        Map<String, String> m = new HashMap<>();
+        m.put(".js", "text/javascript; charset=utf-8");
+        m.put(".mjs", "text/javascript; charset=utf-8");
+        m.put(".css", "text/css; charset=utf-8");
+        m.put(".json", "application/json; charset=utf-8");
+        m.put(".map", "application/json; charset=utf-8");
+        m.put(".wasm", "application/wasm");
+        m.put(".html", "text/html; charset=utf-8");
+        m.put(".htm", "text/html; charset=utf-8");
+        m.put(".svg", "image/svg+xml");
+        m.put(".xml", "application/xml");
+        m.put(".woff", "font/woff2");
+        m.put(".woff2", "font/woff2");
+        m.put(".png", "image/png");
+        m.put(".jpg", "image/jpeg");
+        m.put(".jpeg", "image/jpeg");
+        m.put(".gif", "image/gif");
+        m.put(".ico", "image/x-icon");
+        return Collections.unmodifiableMap(m);
+    }
+
+    private static final String[][] STATIC_TABLE = {
+            {":authority", ""},
+            {":method", "GET"},
+            {":method", "POST"},
+            {":path", "/"},
+            {":path", "/index.html"},
+            {":scheme", "http"},
+            {":scheme", "https"},
+            {":status", "200"},
+            {":status", "204"},
+            {":status", "206"},
+            {":status", "304"},
+            {":status", "400"},
+            {":status", "404"},
+            {":status", "500"},
+            {"accept-charset", ""},
+            {"accept-encoding", "gzip, deflate"},
+            {"accept-language", ""},
+            {"accept-ranges", ""},
+            {"accept", ""},
+            {"access-control-allow-origin", ""},
+            {"age", ""},
+            {"allow", ""},
+            {"authorization", ""},
+            {"cache-control", ""},
+            {"content-disposition", ""},
+            {"content-encoding", ""},
+            {"content-language", ""},
+            {"content-length", ""},
+            {"content-location", ""},
+            {"content-range", ""},
+            {"content-type", ""},
+            {"cookie", ""},
+            {"date", ""},
+            {"etag", ""},
+            {"expect", ""},
+            {"expires", ""},
+            {"from", ""},
+            {"host", ""},
+            {"if-match", ""},
+            {"if-modified-since", ""},
+            {"if-none-match", ""},
+            {"if-range", ""},
+            {"if-unmodified-since", ""},
+            {"last-modified", ""},
+            {"link", ""},
+            {"location", ""},
+            {"max-forwards", ""},
+            {"proxy-authenticate", ""},
+            {"proxy-authorization", ""},
+            {"range", ""},
+            {"referer", ""},
+            {"refresh", ""},
+            {"retry-after", ""},
+            {"server", ""},
+            {"set-cookie", ""},
+            {"strict-transport-security", ""},
+            {"transfer-encoding", ""},
+            {"user-agent", ""},
+            {"vary", ""},
+            {"via", ""},
+            {"www-authenticate", ""},
+    };
+
+    private static final int[] HUFFMAN_CODES = {
+            8184, 8388568, 268435426, 268435427, 268435428, 268435429, 268435430, 268435431, 268435432, 16777194, 1073741820, 268435433, 
+            268435434, 1073741821, 268435435, 268435436, 268435437, 268435438, 268435439, 268435440, 268435441, 268435442, 1073741822, 268435443, 
+            268435444, 268435445, 268435446, 268435447, 268435448, 268435449, 268435450, 268435451, 20, 1016, 1017, 4090, 
+            8185, 21, 248, 2042, 1018, 1019, 249, 2043, 250, 22, 23, 24, 
+            0, 1, 2, 25, 26, 27, 28, 29, 30, 31, 92, 251, 
+            32764, 32, 4091, 1020, 8186, 33, 93, 94, 95, 96, 97, 98, 
+            99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 
+            111, 112, 113, 114, 252, 115, 253, 8187, 524272, 8188, 16380, 34, 
+            32765, 3, 35, 4, 36, 5, 37, 38, 39, 6, 116, 117, 
+            40, 41, 42, 7, 43, 118, 44, 8, 9, 45, 119, 120, 
+            121, 122, 123, 32766, 2044, 16381, 8189, 268435452, 1048550, 4194258, 1048551, 1048552, 
+            4194259, 4194260, 4194261, 8388569, 4194262, 8388570, 8388571, 8388572, 8388573, 8388574, 16777195, 8388575, 
+            16777196, 16777197, 4194263, 8388576, 16777198, 8388577, 8388578, 8388579, 8388580, 2097116, 4194264, 8388581, 
+            4194265, 8388582, 8388583, 16777199, 4194266, 2097117, 1048553, 4194267, 4194268, 8388584, 8388585, 2097118, 
+            8388586, 4194269, 4194270, 16777200, 2097119, 4194271, 8388587, 8388588, 2097120, 2097121, 4194272, 2097122, 
+            8388589, 4194273, 8388590, 8388591, 1048554, 4194274, 4194275, 4194276, 8388592, 4194277, 4194278, 8388593, 
+            67108832, 67108833, 1048555, 524273, 4194279, 8388594, 4194280, 33554412, 67108834, 67108835, 67108836, 134217694, 
+            134217695, 67108837, 16777201, 33554413, 524274, 2097123, 67108838, 134217696, 134217697, 67108839, 134217698, 16777202, 
+            2097124, 2097125, 67108840, 67108841, 268435453, 134217699, 134217700, 134217701, 1048556, 16777203, 1048557, 2097126, 
+            4194281, 2097127, 2097128, 8388595, 4194282, 4194283, 33554414, 33554415, 16777204, 16777205, 67108842, 8388596, 
+            67108843, 134217702, 67108844, 67108845, 134217703, 134217704, 134217705, 134217706, 134217707, 268435454, 134217708, 134217709, 
+            134217710, 134217711, 134217712, 67108846, 1073741823, 
+    };
+
+    private static final int[] HUFFMAN_LENGTHS = {
+            13, 23, 28, 28, 28, 28, 28, 28, 28, 24, 30, 28, 
+            28, 30, 28, 28, 28, 28, 28, 28, 28, 28, 30, 28, 
+            28, 28, 28, 28, 28, 28, 28, 28, 6, 10, 10, 12, 
+            13, 6, 8, 11, 10, 10, 8, 11, 8, 6, 6, 6, 
+            5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 7, 8, 
+            15, 6, 12, 10, 13, 6, 7, 7, 7, 7, 7, 7, 
+            7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 
+            7, 7, 7, 7, 8, 7, 8, 13, 19, 13, 14, 6, 
+            15, 5, 6, 5, 6, 5, 6, 6, 6, 5, 7, 7, 
+            6, 6, 6, 5, 6, 7, 6, 5, 5, 6, 7, 7, 
+            7, 7, 7, 15, 11, 14, 13, 28, 20, 22, 20, 20, 
+            22, 22, 22, 23, 22, 23, 23, 23, 23, 23, 24, 23, 
+            24, 24, 22, 23, 24, 23, 23, 23, 23, 21, 22, 23, 
+            22, 23, 23, 24, 22, 21, 20, 22, 22, 23, 23, 21, 
+            23, 22, 22, 24, 21, 22, 23, 23, 21, 21, 22, 21, 
+            23, 22, 23, 23, 20, 22, 22, 22, 23, 22, 22, 23, 
+            26, 26, 20, 19, 22, 23, 22, 25, 26, 26, 26, 27, 
+            27, 26, 24, 25, 19, 21, 26, 27, 27, 26, 27, 24, 
+            21, 21, 26, 26, 28, 27, 27, 27, 20, 24, 20, 21, 
+            22, 21, 21, 23, 22, 22, 25, 25, 24, 24, 26, 23, 
+            26, 27, 26, 26, 27, 27, 27, 27, 27, 28, 27, 27, 
+            27, 27, 27, 26, 30, 
+    };
+
+    // ==================== HPACK 编解码 (对齐 cftunnel-product.js) ====================
+    private static final int[][] HUFFMAN_TREE = buildHuffmanTree();
+
+    private static int[][] buildHuffmanTree() {
+        List<int[]> nodes = new ArrayList<>();
+        nodes.add(new int[]{-1, -1, -1});
+        for (int symbol = 0; symbol < HUFFMAN_CODES.length; symbol++) {
+            int code = HUFFMAN_CODES[symbol];
+            int length = HUFFMAN_LENGTHS[symbol];
+            int node = 0;
+            for (int shift = length - 1; shift >= 0; shift--) {
+                int bit = (code >>> shift) & 1;
+                int next = nodes.get(node)[bit];
+                if (next < 0) {
+                    next = nodes.size();
+                    nodes.add(new int[]{-1, -1, -1});
+                    nodes.get(node)[bit] = next;
+                }
+                node = next;
+            }
+            nodes.get(node)[2] = symbol;
+        }
+        return nodes.toArray(new int[0][]);
+    }
+
+    private static byte[] decodeHuffman(byte[] data) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        int node = 0;
+        int pendingBits = 0;
+        int pendingLength = 0;
+        for (byte b : data) {
+            for (int shift = 7; shift >= 0; shift--) {
+                int bit = (b >>> shift) & 1;
+                pendingBits = (pendingBits << 1) | bit;
+                pendingLength++;
+                int next = HUFFMAN_TREE[node][bit];
+                if (next < 0) {
+                    throw new IllegalStateException("invalid HPACK Huffman string");
+                }
+                node = next;
+                int symbol = HUFFMAN_TREE[node][2];
+                if (symbol >= 0) {
+                    if (symbol == 256) {
+                        throw new IllegalStateException("HPACK Huffman EOS inside string");
+                    }
+                    out.write(symbol);
+                    node = 0;
+                    pendingBits = 0;
+                    pendingLength = 0;
+                }
+            }
+        }
+        if (pendingLength > 7 || pendingBits != (1 << pendingLength) - 1) {
+            throw new IllegalStateException("invalid HPACK Huffman padding");
+        }
+        return out.toByteArray();
+    }
+
+    private static int[] readInteger(byte[] data, int pos, int prefixBits) {
+        if (pos >= data.length) {
+            throw new IllegalStateException("truncated HPACK integer");
+        }
+        int first = data[pos] & 0xFF;
+        pos++;
+        int mask = (1 << prefixBits) - 1;
+        int value = first & mask;
+        if (value < mask) {
+            return new int[]{value, pos};
+        }
+        int shift = 0;
+        while (true) {
+            if (pos >= data.length) {
+                throw new IllegalStateException("truncated HPACK integer");
+            }
+            int b = data[pos] & 0xFF;
+            pos++;
+            value += (b & 127) * (1 << shift);
+            if ((b & 128) == 0) {
+                return new int[]{value, pos};
+            }
+            shift += 7;
+            if (shift > 28) {
+                throw new IllegalStateException("HPACK integer too large");
+            }
+        }
+    }
+
+    private static final class HpackString {
+        final byte[] value;
+        final int end;
+
+        HpackString(byte[] value, int end) {
+            this.value = value;
+            this.end = end;
+        }
+    }
+
+    private static HpackString readString(byte[] data, int pos) {
+        if (pos >= data.length) {
+            throw new IllegalStateException("truncated HPACK string");
+        }
+        boolean huffman = (data[pos] & 128) != 0;
+        int[] r = readInteger(data, pos, 7);
+        int length = r[0];
+        pos = r[1];
+        int end = pos + length;
+        if (end > data.length) {
+            throw new IllegalStateException("truncated HPACK string data");
+        }
+        byte[] value = Arrays.copyOfRange(data, pos, end);
+        return new HpackString(huffman ? decodeHuffman(value) : value, end);
+    }
+
+    private static final class HpackDecoder {
+        final List<String[]> dynamic = new ArrayList<>();
+        int dynamicSize = 0;
+        int maxSize = 4096;
+
+        String[] tableEntry(int index) {
+            if (index <= 0) {
+                throw new IllegalStateException("invalid HPACK index");
+            }
+            if (index <= STATIC_TABLE.length) {
+                return STATIC_TABLE[index - 1];
+            }
+            int dynamicIndex = index - STATIC_TABLE.length - 1;
+            if (dynamicIndex < 0 || dynamicIndex >= dynamic.size()) {
+                throw new IllegalStateException("HPACK dynamic index out of range");
+            }
+            return dynamic.get(dynamicIndex);
+        }
+
+        void add(String name, String value) {
+            int size = 32 + name.getBytes(StandardCharsets.UTF_8).length + value.getBytes(StandardCharsets.UTF_8).length;
+            if (size > maxSize) {
+                dynamic.clear();
+                dynamicSize = 0;
+                return;
+            }
+            while (!dynamic.isEmpty() && dynamicSize + size > maxSize) {
+                String[] old = dynamic.remove(dynamic.size() - 1);
+                dynamicSize -= 32 + old[0].getBytes(StandardCharsets.UTF_8).length + old[1].getBytes(StandardCharsets.UTF_8).length;
+            }
+            dynamic.add(0, new String[]{name, value});
+            dynamicSize += size;
+        }
+
+        List<String[]> decode(byte[] data) {
+            List<String[]> result = new ArrayList<>();
+            int pos = 0;
+            while (pos < data.length) {
+                int first = data[pos] & 0xFF;
+                if ((first & 128) != 0) {
+                    int[] r = readInteger(data, pos, 7);
+                    result.add(tableEntry(r[0]));
+                    pos = r[1];
+                    continue;
+                }
+                if ((first & 64) != 0) {
+                    int[] r = readInteger(data, pos, 6);
+                    pos = r[1];
+                    String name;
+                    if (r[0] != 0) {
+                        name = tableEntry(r[0])[0];
+                    } else {
+                        HpackString nameStr = readString(data, pos);
+                        pos = nameStr.end;
+                        name = new String(nameStr.value, StandardCharsets.UTF_8).toLowerCase(Locale.ROOT);
+                    }
+                    HpackString valueStr = readString(data, pos);
+                    pos = valueStr.end;
+                    String value = new String(valueStr.value, StandardCharsets.UTF_8);
+                    add(name, value);
+                    result.add(new String[]{name, value});
+                    continue;
+                }
+                if ((first & 32) != 0) {
+                    int[] r = readInteger(data, pos, 5);
+                    pos = r[1];
+                    int size = r[0];
+                    if (size > 4096) {
+                        throw new IllegalStateException("HPACK table size exceeds limit");
+                    }
+                    maxSize = size;
+                    while (!dynamic.isEmpty() && dynamicSize > size) {
+                        String[] old = dynamic.remove(dynamic.size() - 1);
+                        dynamicSize -= 32 + old[0].getBytes(StandardCharsets.UTF_8).length + old[1].getBytes(StandardCharsets.UTF_8).length;
+                    }
+                    continue;
+                }
+                int[] r = readInteger(data, pos, 4);
+                pos = r[1];
+                String name;
+                if (r[0] != 0) {
+                    name = tableEntry(r[0])[0];
+                } else {
+                    HpackString nameStr = readString(data, pos);
+                    pos = nameStr.end;
+                    name = new String(nameStr.value, StandardCharsets.UTF_8).toLowerCase(Locale.ROOT);
+                }
+                HpackString valueStr = readString(data, pos);
+                pos = valueStr.end;
+                result.add(new String[]{name, new String(valueStr.value, StandardCharsets.UTF_8)});
+            }
+            return result;
+        }
+    }
+
+    private static byte[] encodeInteger(int value, int prefixBits, int prefix) {
+        int limit = (1 << prefixBits) - 1;
+        if (value < limit) {
+            return new byte[]{(byte) (prefix | value)};
+        }
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        out.write(prefix | limit);
+        value -= limit;
+        while (value >= 128) {
+            out.write((value & 127) | 128);
+            value /= 128;
+        }
+        out.write(value);
+        return out.toByteArray();
+    }
+
+    private static byte[] encodeString(String value) {
+        byte[] raw = value.getBytes(StandardCharsets.UTF_8);
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        out.writeBytes(encodeInteger(raw.length, 7, 0));
+        out.writeBytes(raw);
+        return out.toByteArray();
+    }
+
+    private static byte[] encodeHeaders(List<String[]> headers) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        for (String[] pair : headers) {
+            String name = pair[0];
+            String value = pair[1];
+            if (":status".equals(name) && "200".equals(value)) {
+                out.write(0x88);
+            } else if (":status".equals(name) && "204".equals(value)) {
+                out.write(0x89);
+            } else if (":status".equals(name) && "206".equals(value)) {
+                out.write(0x8A);
+            } else if (":status".equals(name) && "304".equals(value)) {
+                out.write(0x8B);
+            } else if (":status".equals(name) && "400".equals(value)) {
+                out.write(0x8C);
+            } else if (":status".equals(name) && "404".equals(value)) {
+                out.write(0x8D);
+            } else if (":status".equals(name) && "500".equals(value)) {
+                out.write(0x8E);
+            } else {
+                out.writeBytes(encodeInteger(0, 4, 0));
+                out.writeBytes(encodeString(name));
+                out.writeBytes(encodeString(value));
+            }
+        }
+        return out.toByteArray();
+    }
+
+    private static String serializeHeaders(List<String[]> headers) {
+        List<String> parts = new ArrayList<>();
+        for (String[] pair : headers) {
+            parts.add(Base64.getEncoder().encodeToString(pair[0].getBytes(StandardCharsets.UTF_8)).replaceAll("=+$", "")
+                    + ":"
+                    + Base64.getEncoder().encodeToString(pair[1].getBytes(StandardCharsets.UTF_8)).replaceAll("=+$", ""));
+        }
+        return String.join(";", parts);
+    }
+
+    private static String inferContentType(String requestPath) {
+        String base = requestPath.endsWith("/") ? requestPath.substring(0, requestPath.length() - 1) : requestPath;
+        int dot = base.lastIndexOf('.');
+        if (dot < 0) {
+            return "";
+        }
+        return MIME_TYPES.getOrDefault(base.substring(dot).toLowerCase(Locale.ROOT), "");
+    }
+
+    private static byte[] b64Secret(String value) {
+        String padded = value + "=".repeat((-value.length()) % 4);
+        return Base64.getDecoder().decode(padded);
+    }
+
+    private static byte[] hexDecode(String hex) {
+        byte[] out = new byte[hex.length() / 2];
+        for (int i = 0; i < out.length; i++) {
+            out[i] = (byte) Integer.parseInt(hex.substring(i * 2, i * 2 + 2), 16);
+        }
+        return out;
+    }
+
+    // ==================== Cap'n Proto (对齐 cftunnel-product.js) ====================
+    private static final class CapnpBuilder {
+        private long[] words = new long[64];
+        private int len = 0;
+
+        int alloc(int count) {
+            int offset = len;
+            ensure(len + count);
+            len += count;
+            return offset;
+        }
+
+        private void ensure(int n) {
+            if (n > words.length) {
+                words = Arrays.copyOf(words, Math.max(n, words.length * 2));
+            }
+        }
+
+        void structPtr(int ptrWord, int targetWord, int dataWords, int pointerWords) {
+            long offset = (long) targetWord - ptrWord - 1;
+            long low = (offset << 2) & 0xFFFFFFFCL;
+            long high = (long) (dataWords & 0xFFFF) | ((long) (pointerWords & 0xFFFF) << 16);
+            words[ptrWord] = low | (high << 32);
+        }
+
+        void setU8(int word, int byteOffset, int value) {
+            long mask = 0xFFL << (byteOffset * 8);
+            words[word] = (words[word] & ~mask) | ((long) (value & 0xFF) << (byteOffset * 8));
+        }
+
+        void setU16(int word, int byteOffset, int value) {
+            long mask = 0xFFFFL << (byteOffset * 8);
+            words[word] = (words[word] & ~mask) | ((long) (value & 0xFFFF) << (byteOffset * 8));
+        }
+
+        void setU32(int word, int byteOffset, long value) {
+            long mask = 0xFFFFFFFFL << (byteOffset * 8);
+            words[word] = (words[word] & ~mask) | ((value & 0xFFFFFFFFL) << (byteOffset * 8));
+        }
+
+        void setU64(int word, long value) {
+            words[word] = value;
+        }
+
+        void writeBytes(int ptrWord, byte[] raw, boolean text) {
+            int count = raw.length + (text ? 1 : 0);
+            int content = alloc((count + 7) / 8);
+            for (int i = 0; i < raw.length; i++) {
+                setU8(content + i / 8, i % 8, raw[i] & 0xFF);
+            }
+            long offset = content - ptrWord - 1;
+            long low = (((offset << 2) | 1) & 0xFFFFFFFFL);
+            long high = 2L | ((long) (count & 0x1FFFFFFF) << 3);
+            words[ptrWord] = low | (high << 32);
+        }
+
+        void writeTextList(int ptrWord, List<String> values) {
+            if (values.isEmpty()) {
+                words[ptrWord] = 0;
+                return;
+            }
+            int items = alloc(values.size());
+            long offset = items - ptrWord - 1;
+            words[ptrWord] = (((offset << 2) | 1) & 0xFFFFFFFFL) | ((6L | ((long) values.size() << 3)) << 32);
+            for (int i = 0; i < values.size(); i++) {
+                writeBytes(items + i, values.get(i).getBytes(StandardCharsets.UTF_8), true);
+            }
+        }
+
+        byte[] finish() {
+            byte[] out = new byte[8 + len * 8];
+            out[0] = 0;
+            out[1] = 0;
+            out[2] = 0;
+            out[3] = 0;
+            out[4] = (byte) (len & 0xFF);
+            out[5] = (byte) ((len >> 8) & 0xFF);
+            out[6] = (byte) ((len >> 16) & 0xFF);
+            out[7] = (byte) ((len >> 24) & 0xFF);
+            for (int i = 0; i < len; i++) {
+                long w = words[i];
+                int base = 8 + i * 8;
+                for (int j = 0; j < 8; j++) {
+                    out[base + j] = (byte) (w >>> (j * 8));
+                }
+            }
+            return out;
+        }
+    }
+
+    private static byte[] capnpBootstrap(int questionId) {
+        CapnpBuilder msg = new CapnpBuilder();
+        int root = msg.alloc(1), msgData = msg.alloc(1), msgPtr = msg.alloc(1);
+        msg.structPtr(root, msgData, 1, 1);
+        msg.setU16(msgData, 0, 8);
+        int bootstrapData = msg.alloc(1);
+        msg.alloc(1);
+        msg.structPtr(msgPtr, bootstrapData, 1, 1);
+        msg.setU32(bootstrapData, 0, questionId);
+        return msg.finish();
+    }
+
+    private static byte[] capnpRegister(int questionId, int bootstrapQuestionId, String accountTag, byte[] tunnelSecret, byte[] tunnelId, int connIndex) {
+        CapnpBuilder msg = new CapnpBuilder();
+        int root = msg.alloc(1), msgData = msg.alloc(1), msgPtr = msg.alloc(1);
+        msg.structPtr(root, msgData, 1, 1);
+        msg.setU16(msgData, 0, 2);
+        int callData0 = msg.alloc(1), callData1 = msg.alloc(1);
+        msg.alloc(1);
+        int callPtr0 = msg.alloc(1), callPtr1 = msg.alloc(1);
+        msg.alloc(1);
+        msg.structPtr(msgPtr, callData0, 3, 3);
+        msg.setU32(callData0, 0, questionId);
+        msg.setU64(callData1, 0xF71695EC7FE85497L);
+        int mtData = msg.alloc(1), mtPtr = msg.alloc(1);
+        msg.structPtr(callPtr0, mtData, 1, 1);
+        msg.setU16(mtData, 4, 1);
+        int paData = msg.alloc(1);
+        msg.alloc(1);
+        msg.structPtr(mtPtr, paData, 1, 1);
+        msg.setU32(paData, 0, bootstrapQuestionId);
+        int payloadPtr0 = msg.alloc(1);
+        msg.alloc(1);
+        msg.structPtr(callPtr1, payloadPtr0, 0, 2);
+        int paramsData = msg.alloc(1), paramsPtr0 = msg.alloc(1), paramsPtr1 = msg.alloc(1), paramsPtr2 = msg.alloc(1);
+        msg.structPtr(payloadPtr0, paramsData, 1, 3);
+        msg.setU8(paramsData, 0, connIndex);
+        int authPtr0 = msg.alloc(1), authPtr1 = msg.alloc(1);
+        msg.structPtr(paramsPtr0, authPtr0, 0, 2);
+        msg.writeBytes(authPtr0, accountTag.getBytes(StandardCharsets.UTF_8), true);
+        msg.writeBytes(authPtr1, tunnelSecret, false);
+        msg.writeBytes(paramsPtr1, tunnelId, false);
+        int optData = msg.alloc(1), optPtr0 = msg.alloc(1);
+        msg.alloc(1);
+        msg.structPtr(paramsPtr2, optData, 1, 2);
+        int clientPtr0 = msg.alloc(1), clientPtr1 = msg.alloc(1), clientPtr2 = msg.alloc(1), clientPtr3 = msg.alloc(1);
+        msg.structPtr(optPtr0, clientPtr0, 0, 4);
+        byte[] clientId = new byte[16];
+        new SecureRandom().nextBytes(clientId);
+        clientId[6] = (byte) ((clientId[6] & 0x0F) | 0x40);
+        clientId[8] = (byte) ((clientId[8] & 0x3F) | 0x80);
+        msg.writeBytes(clientPtr0, clientId, false);
+        msg.writeTextList(clientPtr1, Arrays.asList("serialized_headers", "allow_remote_config"));
+        msg.writeBytes(clientPtr2, "2024.10.0-Nexus".getBytes(StandardCharsets.UTF_8), true);
+        msg.writeBytes(clientPtr3, "Nexus-Python".getBytes(StandardCharsets.UTF_8), true);
+        return msg.finish();
+    }
+
+    private static final class CapnpMessagesResult {
+        final List<byte[]> messages;
+        final byte[] rest;
+
+        CapnpMessagesResult(List<byte[]> messages, byte[] rest) {
+            this.messages = messages;
+            this.rest = rest;
+        }
+    }
+
+    private static long u32le(byte[] b, int off) {
+        return (b[off] & 0xFFL) | ((b[off + 1] & 0xFFL) << 8) | ((b[off + 2] & 0xFFL) << 16) | ((b[off + 3] & 0xFFL) << 24);
+    }
+
+    private static CapnpMessagesResult capnpMessages(byte[] buffer) {
+        List<byte[]> messages = new ArrayList<>();
+        int pos = 0;
+        while (buffer.length - pos >= 8) {
+            long segmentsMinusOne = u32le(buffer, pos);
+            long firstWords = u32le(buffer, pos + 4);
+            int segments = (int) segmentsMinusOne + 1;
+            int headerWords = 2 + segments;
+            int headerSize = headerWords * 4;
+            if (headerSize % 8 != 0) {
+                headerSize += 4;
+            }
+            if (buffer.length - pos < headerSize) {
+                break;
+            }
+            long total = headerSize;
+            total += firstWords * 8;
+            for (int i = 1; i < segments; i++) {
+                total += u32le(buffer, pos + 4 + i * 4) * 8;
+            }
+            if (buffer.length - pos < total) {
+                break;
+            }
+            if (segments != 1) {
+                throw new IllegalStateException("multi-segment Cap'n Proto message is not supported");
+            }
+            messages.add(Arrays.copyOfRange(buffer, pos + headerSize, pos + (int) total));
+            pos += (int) total;
+        }
+        return new CapnpMessagesResult(messages, Arrays.copyOfRange(buffer, pos, buffer.length));
+    }
+
+    private static int[] capnpStruct(long[] words, int pointerWord) {
+        if (pointerWord >= words.length) {
+            throw new IllegalStateException("Cap'n Proto pointer out of bounds");
+        }
+        long pointer = words[pointerWord];
+        if ((pointer & 3L) != 0L) {
+            throw new IllegalStateException("expected Cap'n Proto struct pointer");
+        }
+        long offset = (pointer >>> 2) & 0x3FFFFFFFL;
+        if ((offset & 0x20000000L) != 0) {
+            offset -= 0x40000000L;
+        }
+        long target = pointerWord + 1 + offset;
+        int dataWords = (int) ((pointer >>> 32) & 0xFFFFL);
+        int pointerWords = (int) ((pointer >>> 48) & 0xFFFFL);
+        if (target < 0 || target + dataWords + pointerWords > words.length) {
+            throw new IllegalStateException("Cap'n Proto pointer out of bounds");
+        }
+        return new int[]{(int) target, dataWords, pointerWords};
+    }
+
+    private static String capnpText(long[] words, int pointerWord) {
+        if (pointerWord >= words.length) {
+            return "";
+        }
+        long pointer = words[pointerWord];
+        if ((pointer & 3L) != 1L) {
+            return "";
+        }
+        long offset = (pointer >>> 2) & 0x3FFFFFFFL;
+        if ((offset & 0x20000000L) != 0) {
+            offset -= 0x40000000L;
+        }
+        long target = pointerWord + 1 + offset;
+        long elementSize = (pointer >>> 32) & 7L;
+        long count = pointer >>> 35;
+        long wordCount = (count + 7) / 8;
+        if (elementSize != 2 || target < 0 || target + wordCount > words.length) {
+            return "";
+        }
+        byte[] raw = new byte[(int) (wordCount * 8)];
+        for (int i = 0; i < wordCount; i++) {
+            long w = words[(int) (target + i)];
+            for (int j = 0; j < 8; j++) {
+                raw[i * 8 + j] = (byte) (w >>> (j * 8));
+            }
+        }
+        String s = new String(raw, 0, (int) count, StandardCharsets.UTF_8);
+        return s.replaceAll("\\0+$", "");
+    }
+
+    private static final class CapnpReturnResult {
+        final boolean ok;
+        final String location;
+        final boolean remoteManaged;
+        final String error;
+
+        CapnpReturnResult(boolean ok, String location, boolean remoteManaged, String error) {
+            this.ok = ok;
+            this.location = location;
+            this.remoteManaged = remoteManaged;
+            this.error = error;
+        }
+    }
+
+    private static CapnpReturnResult capnpReturnResult(byte[] data) {
+        if (data.length % 8 != 0 || data.length < 24) {
+            throw new IllegalStateException("short Cap'n Proto return");
+        }
+        long[] words = new long[data.length / 8];
+        for (int i = 0; i < words.length; i++) {
+            long w = 0;
+            for (int j = 0; j < 8; j++) {
+                w |= (data[i * 8 + j] & 0xFFL) << (j * 8);
+            }
+            words[i] = w;
+        }
+        int[] msgInfo = capnpStruct(words, 0);
+        int msgTarget = msgInfo[0], msgData = msgInfo[1];
+        if (msgData < 1 || (words[msgTarget] & 0xFFFFL) != 3L) {
+            throw new IllegalStateException("not an RPC return message");
+        }
+        int[] retInfo = capnpStruct(words, msgTarget + msgData);
+        int retTarget = retInfo[0], retData = retInfo[1];
+        long which = (words[retTarget] >>> 48) & 0xFFFFL;
+        if (which == 1) {
+            return new CapnpReturnResult(false, null, false, capnpText(words, retTarget + retData));
+        }
+        if (which != 0) {
+            return new CapnpReturnResult(false, null, false, "RPC return union " + which);
+        }
+        int[] payloadInfo = capnpStruct(words, retTarget + retData);
+        int payloadTarget = payloadInfo[0], payloadData = payloadInfo[1];
+        int[] contentInfo = capnpStruct(words, payloadTarget + payloadData);
+        int contentTarget = contentInfo[0], contentData = contentInfo[1];
+        long union = words[contentTarget];
+        long unionWhich = union & 0xFFFFL;
+        if (unionWhich == 0) {
+            return new CapnpReturnResult(false, null, false, capnpText(words, contentTarget + contentData));
+        }
+        if (unionWhich != 1) {
+            return new CapnpReturnResult(false, null, false, "registration union " + unionWhich);
+        }
+        int[] detailsInfo = capnpStruct(words, contentTarget + contentData);
+        int detailsTarget = detailsInfo[0], detailsData = detailsInfo[1];
+        String location = capnpText(words, detailsTarget + detailsData + 1);
+        return new CapnpReturnResult(true, location, (words[detailsTarget] & 1L) != 0L, null);
+    }
+
+    // ==================== Quick Tunnel 注册与边缘连接 (对齐 cftunnel-product.js) ====================
+    private static final class QuickTunnelInfo {
+        final String hostname;
+        final String accountTag;
+        final byte[] secret;
+        final byte[] tunnelId;
+
+        QuickTunnelInfo(String hostname, String accountTag, byte[] secret, byte[] tunnelId) {
+            this.hostname = hostname;
+            this.accountTag = accountTag;
+            this.secret = secret;
+            this.tunnelId = tunnelId;
+        }
+    }
+
+    private static QuickTunnelInfo requestQuickTunnel(String service) throws Exception {
+        java.net.http.HttpClient client = java.net.http.HttpClient.newBuilder()
+                .connectTimeout(java.time.Duration.ofSeconds(10))
+                .build();
+        java.net.http.HttpRequest request;
+        try {
+            request = java.net.http.HttpRequest.newBuilder()
+                    .uri(java.net.URI.create(service.replaceAll("/+$", "") + "/tunnel"))
+                    .timeout(java.time.Duration.ofSeconds(15))
+                    .header("Content-Type", "application/json")
+                    .header("User-Agent", "cftunnel.js/1.0")
+                    .POST(java.net.http.HttpRequest.BodyPublishers.noBody())
+                    .build();
+        } catch (Exception e) {
+            throw new Exception("requesting quick tunnel failed: " + e.getMessage());
+        }
+        java.net.http.HttpResponse<String> response;
+        try {
+            response = client.send(request, java.net.http.HttpResponse.BodyHandlers.ofString());
+        } catch (Exception e) {
+            throw new Exception("requesting quick tunnel failed: " + e.getMessage());
+        }
+        String body = response.body();
+        com.google.gson.JsonObject data;
+        try {
+            data = com.google.gson.JsonParser.parseString(body).getAsJsonObject();
+        } catch (Exception e) {
+            throw new Exception("quick tunnel returned non-JSON (" + response.statusCode() + "): "
+                    + body.substring(0, Math.min(300, body.length())));
+        }
+        com.google.gson.JsonObject result = data.has("result") ? data.getAsJsonObject("result") : null;
+        boolean success = !data.has("success") || data.get("success").getAsBoolean();
+        if (!success || result == null) {
+            String errors = data.has("errors") ? data.get("errors").toString() : "unknown";
+            throw new Exception("quick tunnel request was rejected: " + errors);
+        }
+        try {
+            String idStr = result.get("id").getAsString();
+            if (!UUID_RE.matcher(idStr).matches()) {
+                throw new Exception("bad tunnel id");
+            }
+            String accountTag = result.get("account_tag").getAsString();
+            String hostname = result.get("hostname").getAsString();
+            if (accountTag == null || hostname == null) {
+                throw new Exception("bad account tag or hostname");
+            }
+            byte[] secret = b64Secret(result.get("secret").getAsString());
+            byte[] tunnelId = hexDecode(idStr.replace("-", ""));
+            return new QuickTunnelInfo(hostname, accountTag, secret, tunnelId);
+        } catch (Exception e) {
+            throw new Exception("invalid quick tunnel response: " + e.getMessage());
+        }
+    }
+
+    private static javax.net.ssl.SSLContext trustAllContext() throws Exception {
+        javax.net.ssl.TrustManager[] trustAll = {new javax.net.ssl.X509TrustManager() {
+            public void checkClientTrusted(java.security.cert.X509Certificate[] chain, String authType) {
+            }
+
+            public void checkServerTrusted(java.security.cert.X509Certificate[] chain, String authType) {
+            }
+
+            public java.security.cert.X509Certificate[] getAcceptedIssuers() {
+                return new java.security.cert.X509Certificate[0];
+            }
+        }
+};
+        javax.net.ssl.SSLContext ctx = javax.net.ssl.SSLContext.getInstance("TLS");
+        ctx.init(null, trustAll, new SecureRandom());
+        return ctx;
+    }
+
+    private static javax.net.ssl.SSLSocket connectEdge(kisama agent) throws Exception {
+        List<String> hosts = new ArrayList<>(Arrays.asList(EDGE_HOSTS));
+        Collections.shuffle(hosts);
+        Exception lastError = null;
+        for (String host : hosts) {
+            try {
+                return connectEdgeHost(host);
+            } catch (Exception e) {
+                lastError = e;
+                agent.log("[TRACE-ARGO] ⚠️ 边缘节点 " + host + " 连接失败: " + e.getMessage());
+            }
+        }
+        throw new Exception("all Cloudflare edges failed: " + (lastError != null ? lastError.getMessage() : "unknown"));
+    }
+
+    private static javax.net.ssl.SSLSocket connectEdgeHost(String host) throws Exception {
+        javax.net.ssl.SSLSocket sock = (javax.net.ssl.SSLSocket) trustAllContext().getSocketFactory().createSocket();
+        sock.connect(new java.net.InetSocketAddress(host, EDGE_PORT), 10000);
+        javax.net.ssl.SSLParameters params = sock.getSSLParameters();
+        params.setApplicationProtocols(new String[]{"h2"});
+        params.setServerNames(Collections.singletonList(new javax.net.ssl.SNIHostName("h2.cftunnel.com")));
+        sock.setSSLParameters(params);
+        sock.setSoTimeout(10000);
+        sock.startHandshake();
+        String alpn = sock.getApplicationProtocol();
+        if (alpn != null && !alpn.isEmpty() && !"h2".equals(alpn)) {
+            sock.close();
+            throw new Exception("edge did not negotiate h2");
+        }
+        sock.setSoTimeout(0);
+        return sock;
+    }
+
+    private static final class Http1Response {
+        int status;
+        List<String[]> headers;
+        byte[] rest;
+    }
+
+    private static final class HttpProxyResponse {
+        int status;
+        List<String[]> headers;
+        InputStream body;
+    }
+
+    private static java.net.Socket openOriginSocket(String origin) throws Exception {
+        java.net.URI parsed;
+        try {
+            parsed = java.net.URI.create(origin);
+        } catch (Exception e) {
+            throw new Exception("origin must be an http:// or https:// URL");
+        }
+        if (!("http".equals(parsed.getScheme()) || "https".equals(parsed.getScheme())) || parsed.getHost() == null) {
+            throw new Exception("origin must be an http:// or https:// URL");
+        }
+        boolean isHttps = "https".equals(parsed.getScheme());
+        int port = parsed.getPort() > 0 ? parsed.getPort() : (isHttps ? 443 : 80);
+        java.net.Socket raw = new java.net.Socket();
+        raw.connect(new java.net.InetSocketAddress(parsed.getHost(), port), 30000);
+        raw.setSoTimeout(0);
+        if (!isHttps) {
+            return raw;
+        }
+        javax.net.ssl.SSLSocket tlsSock = (javax.net.ssl.SSLSocket) trustAllContext().getSocketFactory()
+                .createSocket(raw, parsed.getHost(), port, true);
+        javax.net.ssl.SSLParameters params = tlsSock.getSSLParameters();
+        params.setServerNames(Collections.singletonList(new javax.net.ssl.SNIHostName(parsed.getHost())));
+        tlsSock.setSSLParameters(params);
+        tlsSock.startHandshake();
+        return tlsSock;
+    }
+
+    private static Http1Response readHttp1Response(java.net.Socket sock) throws IOException {
+        InputStream in = sock.getInputStream();
+        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        int state = 0;
+        while (state < 4) {
+            int b = in.read();
+            if (b == -1) {
+                throw new IOException("origin closed before response headers");
+            }
+            buffer.write(b);
+            if (state == 0 && b == '\r') state = 1;
+            else if (state == 1 && b == '\n') state = 2;
+            else if (state == 2 && b == '\r') state = 3;
+            else if (state == 3 && b == '\n') state = 4;
+            else state = 0;
+        }
+        byte[] all = buffer.toByteArray();
+        String head = new String(all, 0, all.length - 4, StandardCharsets.ISO_8859_1);
+        String[] lines = head.split("\r\n", -1);
+        String[] parts = lines[0].split(" ");
+        int status;
+        try {
+            status = Integer.parseInt(parts[1]);
+        } catch (Exception e) {
+            throw new IOException("malformed HTTP/1.1 response status");
+        }
+        Http1Response resp = new Http1Response();
+        resp.status = status;
+        resp.headers = new ArrayList<>();
+        for (int i = 1; i < lines.length; i++) {
+            String line = lines[i];
+            if (line.isEmpty()) {
+                continue;
+            }
+            int colon = line.indexOf(':');
+            if (colon > 0) {
+                resp.headers.add(new String[]{line.substring(0, colon).trim(), line.substring(colon + 1).trim()});
+            }
+        }
+        resp.rest = new byte[0];
+        return resp;
+    }
+
+    private static HttpProxyResponse proxyToOrigin(String origin, String method, String requestPath, List<String[]> incomingHeaders, byte[] body) throws Exception {
+        java.net.URI parsed;
+        try {
+            parsed = java.net.URI.create(origin);
+        } catch (Exception e) {
+            throw new Exception("origin must be an http:// or https:// URL");
+        }
+        if (!("http".equals(parsed.getScheme()) || "https".equals(parsed.getScheme())) || parsed.getHost() == null) {
+            throw new Exception("origin must be an http:// or https:// URL");
+        }
+        String target = requestPath.startsWith("/") ? requestPath : "/" + requestPath;
+        java.net.http.HttpClient client = java.net.http.HttpClient.newBuilder()
+                .connectTimeout(java.time.Duration.ofSeconds(30))
+                .build();
+        java.net.http.HttpRequest.Builder builder = java.net.http.HttpRequest.newBuilder()
+                .uri(java.net.URI.create(origin + target))
+                .timeout(java.time.Duration.ofSeconds(30));
+        for (String[] pair : incomingHeaders) {
+            String lower = pair[0].toLowerCase(Locale.ROOT);
+            if ("host".equals(lower) || "connection".equals(lower) || "transfer-encoding".equals(lower)
+                    || "content-length".equals(lower) || "upgrade".equals(lower)) {
+                continue;
+            }
+            try {
+                builder.header(pair[0], pair[1]);
+            } catch (Exception ignored) {
+            }
+        }
+        if (body.length > 0) {
+            builder.method(method, java.net.http.HttpRequest.BodyPublishers.ofByteArray(body));
+        } else {
+            builder.method(method, java.net.http.HttpRequest.BodyPublishers.noBody());
+        }
+        java.net.http.HttpResponse<InputStream> response = client.send(builder.build(),
+                java.net.http.HttpResponse.BodyHandlers.ofInputStream());
+        HttpProxyResponse r = new HttpProxyResponse();
+        r.status = response.statusCode();
+        r.headers = new ArrayList<>();
+        response.headers().map().forEach((name, values) -> {
+            for (String value : values) {
+                r.headers.add(new String[]{name, value});
+            }
+        });
+        r.body = response.body();
+        return r;
+    }
+
+    private static int toArgoPort(Object port) {
+        if (port instanceof Number) {
+            double d = ((Number) port).doubleValue();
+            if (d == Math.rint(d) && d >= Integer.MIN_VALUE && d <= Integer.MAX_VALUE) {
+                return (int) d;
+            }
+            return -1;
+        }
+        if (port == null) {
+            return -1;
+        }
+        try {
+            return Integer.parseInt(String.valueOf(port).trim());
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+    // ==================== HTTP/2 客户端连接 (对齐 cftunnel-product.js 的 H2Connection) ====================
+    private static final class Frame {
+        final int frameType;
+        final int flags;
+        final int streamId;
+        final byte[] payload;
+
+        Frame(int frameType, int flags, int streamId, byte[] payload) {
+            this.frameType = frameType;
+            this.flags = flags;
+            this.streamId = streamId;
+            this.payload = payload;
+        }
+    }
+
+    private static final class StreamState {
+        String method = "GET";
+        String path = "/";
+        String authority = "";
+        final List<String[]> headers = new ArrayList<>();
+        final ByteArrayOutputStream body = new ByteArrayOutputStream();
+        String upgrade = "";
+        boolean websocket = false;
+        boolean ended = false;
+        boolean finished = false;
+        WebSocketProxy websocketProxy = null;
+    }
+
+    private static final class H2Connection {
+        private static final byte[] PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".getBytes(StandardCharsets.US_ASCII);
+
+        final kisama agent;
+        final javax.net.ssl.SSLSocket sock;
+        final InputStream in;
+        final OutputStream out;
+        final String origin;
+        final String accountTag;
+        final byte[] tunnelSecret;
+        final byte[] tunnelId;
+        final int connIndex;
+        final HpackDecoder decoder = new HpackDecoder();
+        long connectionWindow = 65535;
+        final Map<Integer, Long> streamWindows = new HashMap<>();
+        int peerMaxFrame = MAX_FRAME_SIZE;
+        final Map<Integer, StreamState> streams = new HashMap<>();
+        ControlStream control = null;
+        volatile boolean stopped = false;
+        volatile boolean registered = false;
+
+        H2Connection(kisama agent, javax.net.ssl.SSLSocket sock, String origin, String accountTag,
+                     byte[] tunnelSecret, byte[] tunnelId, int connIndex) throws IOException {
+            this.agent = agent;
+            this.sock = sock;
+            this.origin = origin;
+            this.accountTag = accountTag;
+            this.tunnelSecret = tunnelSecret;
+            this.tunnelId = tunnelId;
+            this.connIndex = connIndex;
+            this.in = sock.getInputStream();
+            this.out = sock.getOutputStream();
+        }
+
+        void sendFrame(int frameType, int flags, int streamId, byte[] payload) throws IOException {
+            if (payload.length > 0xFFFFFF) {
+                throw new IOException("HTTP/2 frame too large");
+            }
+            byte[] header = new byte[9];
+            header[0] = (byte) ((payload.length >> 16) & 0xFF);
+            header[1] = (byte) ((payload.length >> 8) & 0xFF);
+            header[2] = (byte) (payload.length & 0xFF);
+            header[3] = (byte) frameType;
+            header[4] = (byte) flags;
+            header[5] = (byte) ((streamId >> 24) & 0x7F);
+            header[6] = (byte) ((streamId >> 16) & 0xFF);
+            header[7] = (byte) ((streamId >> 8) & 0xFF);
+            header[8] = (byte) (streamId & 0xFF);
+            synchronized (out) {
+                out.write(header);
+                out.write(payload);
+                out.flush();
+            }
+        }
+
+        void sendHeaders(int streamId, List<String[]> headers, boolean endStream) throws IOException {
+            byte[] payload = encodeHeaders(headers);
+            int flags = 4 | (endStream ? 1 : 0);
+            sendFrame(1, flags, streamId, payload);
+        }
+
+        private void waitWindow(int streamId) throws InterruptedException {
+            synchronized (this) {
+                while (connectionWindow <= 0 || streamWindows.getOrDefault(streamId, 65535L) <= 0) {
+                    if (stopped) {
+                        return;
+                    }
+                    this.wait();
+                }
+            }
+        }
+
+        void sendData(int streamId, byte[] payload, boolean endStream) throws IOException {
+            int len = payload.length;
+            int offset = 0;
+            do {
+                try {
+                    waitWindow(streamId);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                if (stopped) {
+                    return;
+                }
+                synchronized (this) {
+                    long streamWindow = streamWindows.getOrDefault(streamId, 65535L);
+                    long amount = Math.min(len - offset, Math.min(connectionWindow, Math.min(streamWindow, peerMaxFrame)));
+                    boolean end = endStream && offset + amount >= len;
+                    byte[] chunk = Arrays.copyOfRange(payload, offset, offset + (int) amount);
+                    connectionWindow -= amount;
+                    streamWindows.put(streamId, streamWindow - amount);
+                    offset += (int) amount;
+                    sendFrame(0, end ? 1 : 0, streamId, chunk);
+                }
+            } while (offset < len);
+        }
+
+        void sendWindowUpdate(int streamId, int increment) throws IOException {
+            if (increment > 0) {
+                byte[] payload = new byte[4];
+                payload[0] = (byte) ((increment >> 24) & 0x7F);
+                payload[1] = (byte) ((increment >> 16) & 0xFF);
+                payload[2] = (byte) ((increment >> 8) & 0xFF);
+                payload[3] = (byte) (increment & 0xFF);
+                sendFrame(8, 0, streamId, payload);
+            }
+        }
+
+        private Frame readFrame() throws IOException {
+            byte[] header = in.readNBytes(9);
+            if (header.length < 9) {
+                throw new IOException("connection closed");
+            }
+            int length = ((header[0] & 0xFF) << 16) | ((header[1] & 0xFF) << 8) | (header[2] & 0xFF);
+            int frameType = header[3] & 0xFF;
+            int flags = header[4] & 0xFF;
+            int streamId = ((header[5] & 0x7F) << 24) | ((header[6] & 0xFF) << 16) | ((header[7] & 0xFF) << 8) | (header[8] & 0xFF);
+            byte[] payload = in.readNBytes(length);
+            if (payload.length < length) {
+                throw new IOException("connection closed");
+            }
+            return new Frame(frameType, flags, streamId, payload);
+        }
+
+        private List<String[]> readHeaders(int flags, int streamId, byte[] payload) throws IOException {
+            if ((flags & 8) != 0) {
+                int padLength = payload[0] & 0xFF;
+                payload = Arrays.copyOfRange(payload, 1, payload.length);
+                if (padLength > payload.length) {
+                    throw new IOException("invalid HTTP/2 padding");
+                }
+                payload = padLength > 0 ? Arrays.copyOfRange(payload, 0, payload.length - padLength) : payload;
+            }
+            if ((flags & 32) != 0) {
+                payload = Arrays.copyOfRange(payload, 5, payload.length);
+            }
+            ByteArrayOutputStream blocks = new ByteArrayOutputStream();
+            blocks.write(payload, 0, payload.length);
+            while ((flags & 4) == 0) {
+                Frame frame = readFrame();
+                if (frame.frameType != 9 || frame.streamId != streamId) {
+                    throw new IOException("expected CONTINUATION frame");
+                }
+                blocks.write(frame.payload, 0, frame.payload.length);
+                flags = frame.flags;
+            }
+            return decoder.decode(blocks.toByteArray());
+        }
+
+        private void openControl(int streamId) throws IOException {
+            if (control != null) {
+                return;
+            }
+            control = new ControlStream(this, streamId);
+            sendHeaders(streamId, List.<String[]>of(new String[]{":status", "200"}), false);
+            control.start(accountTag, tunnelSecret, tunnelId, connIndex);
+        }
+
+        private void updateConfig(int streamId, byte[] body) throws IOException {
+            int version = 0;
+            try {
+                String text = new String(body, StandardCharsets.UTF_8);
+                com.google.gson.JsonObject data = text.isBlank() ? new com.google.gson.JsonObject()
+                        : com.google.gson.JsonParser.parseString(text).getAsJsonObject();
+                if (data.has("version")) {
+                    try {
+                        version = Integer.parseInt(String.valueOf(data.get("version").getAsString()));
+                    } catch (Exception ignored) {
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+            byte[] response = agent.gson.toJson(Map.of("latestAppliedVersion", version)).getBytes(StandardCharsets.UTF_8);
+            List<String[]> outHeaders = new ArrayList<>();
+            outHeaders.add(new String[]{":status", "200"});
+            outHeaders.add(new String[]{"content-type", "application/json"});
+            outHeaders.add(new String[]{"content-length", String.valueOf(response.length)});
+            sendHeaders(streamId, outHeaders, false);
+            sendData(streamId, response, true);
+        }
+
+        private void requestFinished(int streamId, StreamState request) throws IOException {
+            if ("update-configuration".equals(request.upgrade)) {
+                updateConfig(streamId, request.body.toByteArray());
+                return;
+            }
+            if (request.websocket) {
+                return;
+            }
+            if (request.finished) {
+                return;
+            }
+            request.finished = true;
+            Thread t = new Thread(() -> {
+                try {
+                    proxyRequest(streamId, request);
+                } catch (Exception ignored) {
+                }
+            }, "argo-proxy-" + streamId);
+            t.setDaemon(true);
+            t.start();
+        }
+
+        private void proxyRequest(int streamId, StreamState request) {
+            try {
+                HttpProxyResponse response = proxyToOrigin(origin, request.method, request.path, request.headers,
+                        request.body.toByteArray());
+                List<String[]> userHeaders = new ArrayList<>();
+                List<String[]> directHeaders = new ArrayList<>();
+                for (String[] pair : response.headers) {
+                    String lower = pair[0].toLowerCase(Locale.ROOT);
+                    if ("content-length".equals(lower)) {
+                        directHeaders.add(new String[]{lower, pair[1]});
+                    }
+                    boolean internal = lower.startsWith("cf-int-") || lower.startsWith("cf-cloudflared-")
+                            || lower.startsWith("cf-proxy-") || lower.startsWith(":");
+                    if (!internal || "connection".equals(lower) || "upgrade".equals(lower) || "sec-websocket-accept".equals(lower)) {
+                        userHeaders.add(new String[]{lower, pair[1]});
+                    }
+                }
+                boolean hasContentType = false;
+                for (String[] pair : userHeaders) {
+                    if ("content-type".equals(pair[0])) {
+                        hasContentType = true;
+                        break;
+                    }
+                }
+                if (!hasContentType) {
+                    String inferred = inferContentType(request.path);
+                    if (!inferred.isEmpty()) {
+                        userHeaders.add(new String[]{"content-type", inferred});
+                    }
+                }
+                String serialized = serializeHeaders(userHeaders);
+                int status = response.status == 101 ? 200 : response.status;
+                List<String[]> outHeaders = new ArrayList<>();
+                outHeaders.add(new String[]{":status", String.valueOf(status)});
+                outHeaders.addAll(directHeaders);
+                outHeaders.add(new String[]{"cf-cloudflared-response-headers", serialized});
+                outHeaders.add(new String[]{"cf-cloudflared-response-meta", "{\"src\":\"origin\",\"flow_rate_limited\":false}"});
+                sendHeaders(streamId, outHeaders, false);
+                InputStream bodyStream = response.body;
+                byte[] buffer = new byte[16384];
+                int n;
+                while (!stopped && (n = bodyStream.read(buffer)) != -1) {
+                    sendData(streamId, Arrays.copyOf(buffer, n), false);
+                }
+                if (!stopped) {
+                    sendData(streamId, new byte[0], true);
+                }
+            } catch (Exception e) {
+                agent.log("[TRACE-ARGO] ⚠️ 流 " + streamId + " 代理失败: " + e.getMessage());
+                try {
+                    sendHeaders(streamId, List.<String[]>of(new String[]{":status", "502"}), true);
+                } catch (Exception ignored) {
+                }
+            }
+        }
+
+        void run() throws IOException {
+            byte[] preface = in.readNBytes(24);
+            if (!Arrays.equals(preface, PREFACE)) {
+                throw new IOException("edge did not send the HTTP/2 client preface");
+            }
+            byte[] settings = new byte[6];
+            settings[0] = 0;
+            settings[1] = 3;
+            settings[2] = 0;
+            settings[3] = 0;
+            settings[4] = 0;
+            settings[5] = 100;
+            sendFrame(4, 0, 0, settings);
+            try {
+                while (!stopped) {
+                    Frame frame = readFrame();
+                    if (frame.frameType == 4) {
+                        if ((frame.flags & 1) == 0) {
+                            if (frame.payload.length % 6 != 0) {
+                                throw new IOException("invalid SETTINGS payload");
+                            }
+                            for (int pos = 0; pos < frame.payload.length; pos += 6) {
+                                int setting = ((frame.payload[pos] & 0xFF) << 8) | (frame.payload[pos + 1] & 0xFF);
+                                long value = ((long) (frame.payload[pos + 2] & 0xFF) << 24)
+                                        | ((long) (frame.payload[pos + 3] & 0xFF) << 16)
+                                        | ((long) (frame.payload[pos + 4] & 0xFF) << 8)
+                                        | (frame.payload[pos + 5] & 0xFFL);
+                                if (setting == 4) {
+                                    long delta = value - 65535;
+                                    synchronized (this) {
+                                        for (Integer key : new ArrayList<>(streamWindows.keySet())) {
+                                            streamWindows.put(key, Math.max(0, streamWindows.get(key) + delta));
+                                        }
+                                    }
+                                } else if (setting == 5 && value >= 16384 && value <= 16777215) {
+                                    peerMaxFrame = (int) value;
+                                }
+                            }
+                            sendFrame(4, 1, 0, new byte[0]);
+                        }
+                        continue;
+                    }
+                    if (frame.frameType == 6) {
+                        if ((frame.flags & 1) == 0) {
+                            sendFrame(6, 1, 0, frame.payload);
+                        }
+                        continue;
+                    }
+                    if (frame.frameType == 8) {
+                        if (frame.payload.length != 4) {
+                            continue;
+                        }
+                        long increment = ((long) (frame.payload[0] & 0x7F) << 24)
+                                | ((long) (frame.payload[1] & 0xFF) << 16)
+                                | ((long) (frame.payload[2] & 0xFF) << 8)
+                                | (frame.payload[3] & 0xFFL);
+                        synchronized (this) {
+                            if (frame.streamId == 0) {
+                                connectionWindow += increment;
+                            } else {
+                                streamWindows.put(frame.streamId, streamWindows.getOrDefault(frame.streamId, 65535L) + increment);
+                            }
+                            notifyAll();
+                        }
+                        continue;
+                    }
+                    if (frame.frameType == 3) {
+                        synchronized (this) {
+                            streams.remove(frame.streamId);
+                        }
+                        continue;
+                    }
+                    if (frame.frameType == 7) {
+                        break;
+                    }
+                    if (frame.frameType == 1) {
+                        List<String[]> headers = readHeaders(frame.flags, frame.streamId, frame.payload);
+                        synchronized (this) {
+                            if (!streamWindows.containsKey(frame.streamId)) {
+                                streamWindows.put(frame.streamId, 65535L);
+                            }
+                        }
+                        handleHeaders(frame.streamId, frame.flags, headers);
+                        continue;
+                    }
+                    if (frame.frameType == 0) {
+                        handleData(frame.streamId, frame.flags, frame.payload);
+                        continue;
+                    }
+                }
+            } finally {
+                stopped = true;
+                synchronized (this) {
+                    notifyAll();
+                }
+                for (StreamState request : streams.values()) {
+                    if (request.websocketProxy != null) {
+                        request.websocketProxy.stop();
+                    }
+                }
+                try {
+                    sock.close();
+                } catch (Exception ignored) {
+                }
+            }
+        }
+
+        private void handleHeaders(int streamId, int flags, List<String[]> headers) throws IOException {
+            Map<String, String> headerMap = new LinkedHashMap<>();
+            for (String[] pair : headers) {
+                if (pair[0].startsWith(":")) {
+                    headerMap.put(pair[0], pair[1]);
+                } else {
+                    headerMap.put(pair[0].toLowerCase(Locale.ROOT), pair[1]);
+                }
+            }
+            String upgrade = headerMap.getOrDefault(CONTROL_HEADER, "").trim().toLowerCase(Locale.ROOT);
+            if (CONTROL_STREAM.equals(upgrade)) {
+                openControl(streamId);
+                if ((flags & 1) != 0) {
+                    if (control != null) {
+                        control.finished = true;
+                    }
+                }
+                return;
+            }
+            StreamState request = new StreamState();
+            request.method = headerMap.getOrDefault(":method", "GET");
+            request.path = headerMap.getOrDefault(":path", "/");
+            request.authority = headerMap.getOrDefault(":authority", "");
+            request.upgrade = upgrade;
+            request.websocket = "websocket".equals(upgrade)
+                    || "websocket".equals(headerMap.getOrDefault(":protocol", "").toLowerCase(Locale.ROOT));
+            request.ended = (flags & 1) != 0;
+            for (String[] pair : headers) {
+                if (!pair[0].startsWith(":")) {
+                    request.headers.add(pair);
+                }
+            }
+            streams.put(streamId, request);
+            if (request.websocket) {
+                request.websocketProxy = new WebSocketProxy(this, streamId, request);
+                request.websocketProxy.start();
+            } else if (request.ended) {
+                requestFinished(streamId, request);
+            }
+        }
+
+        private void handleData(int streamId, int flags, byte[] payload) throws IOException {
+            sendWindowUpdate(0, payload.length);
+            sendWindowUpdate(streamId, payload.length);
+            if (control != null && control.streamId == streamId) {
+                control.feed(payload);
+                if ((flags & 1) != 0) {
+                    control.finished = true;
+                }
+                return;
+            }
+            StreamState request = streams.get(streamId);
+            if (request == null) {
+                return;
+            }
+            if (request.websocketProxy != null) {
+                request.websocketProxy.feed(payload, (flags & 1) != 0);
+                return;
+            }
+            if (payload.length > 0) {
+                request.body.write(payload, 0, payload.length);
+            }
+            if ((flags & 1) != 0) {
+                request.ended = true;
+                requestFinished(streamId, request);
+            }
+        }
+    }
+
+    // ==================== 控制流: bootstrap + register (对齐 cftunnel-product.js) ====================
+    private static final class ControlStream {
+        final H2Connection connection;
+        final int streamId;
+        final ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        boolean finished = false;
+
+        ControlStream(H2Connection connection, int streamId) {
+            this.connection = connection;
+            this.streamId = streamId;
+        }
+
+        void start(String accountTag, byte[] secret, byte[] tunnelId, int connIndex) throws IOException {
+            connection.sendData(streamId, capnpBootstrap(0), false);
+            connection.sendData(streamId, capnpRegister(1, 0, accountTag, secret, tunnelId, connIndex), false);
+        }
+
+        void feed(byte[] payload) {
+            buffer.write(payload, 0, payload.length);
+            CapnpMessagesResult parsed = capnpMessages(buffer.toByteArray());
+            byte[] rest = parsed.rest;
+            buffer.reset();
+            buffer.write(rest, 0, rest.length);
+            for (byte[] message : parsed.messages) {
+                try {
+                    CapnpReturnResult result = capnpReturnResult(message);
+                    if (result.ok) {
+                        connection.agent.log("[TRACE-ARGO] ✅ 隧道连接已在边缘注册: "
+                                + (result.location != null ? result.location : "unknown"));
+                        connection.registered = true;
+                    } else {
+                        connection.agent.log("[TRACE-ARGO] ⚠️ 隧道注册失败: "
+                                + (result.error != null ? result.error : "unknown error"));
+                    }
+                } catch (Exception e) {
+                    connection.agent.log("[TRACE-ARGO] 忽略控制 RPC 消息: " + e.getMessage());
+                }
+            }
+        }
+    }
+
+    // ==================== WebSocket 双向代理 (对齐 cftunnel-product.js) ====================
+    private static final class WebSocketProxy {
+        private static final byte[] EOF = new byte[0];
+
+        final H2Connection connection;
+        final int streamId;
+        final StreamState request;
+        final LinkedBlockingQueue<byte[]> queue = new LinkedBlockingQueue<>();
+        volatile boolean stopped = false;
+        java.net.Socket sock = null;
+
+        WebSocketProxy(H2Connection connection, int streamId, StreamState request) {
+            this.connection = connection;
+            this.streamId = streamId;
+            this.request = request;
+        }
+
+        void start() {
+            Thread t = new Thread(() -> {
+                try {
+                    run();
+                } catch (Exception ignored) {
+                }
+            }, "argo-ws-" + streamId);
+            t.setDaemon(true);
+            t.start();
+        }
+
+        void feed(byte[] payload, boolean endStream) {
+            if (payload.length > 0) {
+                queue.offer(payload);
+            }
+            if (endStream) {
+                queue.offer(EOF);
+            }
+        }
+
+        void stop() {
+            if (stopped) {
+                return;
+            }
+            stopped = true;
+            queue.offer(EOF);
+            if (sock != null) {
+                try {
+                    sock.close();
+                } catch (Exception ignored) {
+                }
+            }
+        }
+
+        private void run() {
+            try {
+                sock = openOriginSocket(connection.origin);
+                sendHandshake();
+                Http1Response response = readHttp1Response(sock);
+                List<String[]> userHeaders = new ArrayList<>();
+                List<String[]> directHeaders = new ArrayList<>();
+                for (String[] pair : response.headers) {
+                    String lower = pair[0].toLowerCase(Locale.ROOT);
+                    if ("content-length".equals(lower)) {
+                        directHeaders.add(new String[]{lower, pair[1]});
+                    }
+                    boolean internal = lower.startsWith("cf-int-") || lower.startsWith("cf-cloudflared-")
+                            || lower.startsWith("cf-proxy-") || lower.startsWith(":");
+                    if (!internal || "connection".equals(lower) || "upgrade".equals(lower) || "sec-websocket-accept".equals(lower)) {
+                        userHeaders.add(new String[]{lower, pair[1]});
+                    }
+                }
+                String serialized = serializeHeaders(userHeaders);
+                int status = response.status == 101 ? 200 : response.status;
+                List<String[]> outHeaders = new ArrayList<>();
+                outHeaders.add(new String[]{":status", String.valueOf(status)});
+                outHeaders.addAll(directHeaders);
+                outHeaders.add(new String[]{"cf-cloudflared-response-headers", serialized});
+                outHeaders.add(new String[]{"cf-cloudflared-response-meta", "{\"src\":\"origin\",\"flow_rate_limited\":false}"});
+                connection.sendHeaders(streamId, outHeaders, false);
+                Thread writer = new Thread(this::writeToOrigin, "argo-ws-w-" + streamId);
+                writer.setDaemon(true);
+                writer.start();
+                pumpOrigin();
+            } catch (Exception e) {
+                connection.agent.log("[TRACE-ARGO] ⚠️ WebSocket 流 " + streamId + " 失败: " + e.getMessage());
+                try {
+                    connection.sendHeaders(streamId, List.<String[]>of(new String[]{":status", "502"}), true);
+                } catch (Exception ignored) {
+                }
+            } finally {
+                stop();
+            }
+        }
+
+        private void pumpOrigin() throws IOException {
+            InputStream in = sock.getInputStream();
+            byte[] buffer = new byte[16384];
+            int n;
+            while (!stopped && (n = in.read(buffer)) != -1) {
+                connection.sendData(streamId, Arrays.copyOf(buffer, n), false);
+            }
+            if (!stopped) {
+                connection.sendData(streamId, new byte[0], true);
+            }
+        }
+
+        private void writeToOrigin() {
+            while (!stopped) {
+                byte[] payload;
+                try {
+                    payload = queue.take();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                if (payload == EOF) {
+                    return;
+                }
+                try {
+                    OutputStream os = sock.getOutputStream();
+                    os.write(payload);
+                    os.flush();
+                } catch (Exception e) {
+                    stopped = true;
+                    return;
+                }
+            }
+        }
+
+        private void sendHandshake() throws IOException {
+            java.net.URI parsed = java.net.URI.create(connection.origin);
+            String target = request.path.startsWith("/") ? request.path : "/" + request.path;
+            StringBuilder sb = new StringBuilder("GET ").append(target).append(" HTTP/1.1\r\n");
+            boolean hasKey = false;
+            boolean hasVersion = false;
+            boolean hasOrigin = false;
+            for (String[] pair : request.headers) {
+                String lower = pair[0].toLowerCase(Locale.ROOT);
+                if ("host".equals(lower) || "connection".equals(lower) || "upgrade".equals(lower)
+                        || "content-length".equals(lower) || "transfer-encoding".equals(lower)) {
+                    continue;
+                }
+                if ("sec-websocket-key".equals(lower)) {
+                    hasKey = true;
+                } else if ("sec-websocket-version".equals(lower)) {
+                    hasVersion = true;
+                } else if ("origin".equals(lower)) {
+                    hasOrigin = true;
+                }
+                sb.append(pair[0]).append(": ").append(pair[1]).append("\r\n");
+            }
+            sb.append("Host: ").append(parsed.getHost());
+            if (parsed.getPort() > 0) {
+                sb.append(":").append(parsed.getPort());
+            }
+            sb.append("\r\n");
+            if (!hasOrigin && !request.authority.isEmpty()) {
+                sb.append("Origin: https://").append(request.authority).append("\r\n");
+            }
+            if (!hasKey) {
+                byte[] key = new byte[16];
+                new SecureRandom().nextBytes(key);
+                sb.append("Sec-WebSocket-Key: ").append(Base64.getEncoder().encodeToString(key)).append("\r\n");
+            }
+            if (!hasVersion) {
+                sb.append("Sec-WebSocket-Version: 13\r\n");
+            }
+            sb.append("Connection: Upgrade\r\n");
+            sb.append("Upgrade: websocket\r\n\r\n");
+            sock.getOutputStream().write(sb.toString().getBytes(StandardCharsets.ISO_8859_1));
+            sock.getOutputStream().flush();
+        }
+    }
+
+    // ==================== 🌟 Argo 临时隧道管理器 (与 js/agent.js 语义一致) ====================
+    private final class ArgoTunnelManager {
+        private final Map<Integer, List<TunnelEntry>> tunnels = new ConcurrentHashMap<>();
+
+        TunnelEntry create(int port, boolean duplicate) throws TunnelException {
+            synchronized (tunnels) {
+                List<TunnelEntry> existing = tunnels.get(port);
+                if (existing != null && !existing.isEmpty() && !duplicate) {
+                    throw new TunnelException(409, port,
+                            "tunnel already exists on port " + port + ", set duplicate=true to force creation");
+                }
+            }
+            QuickTunnelInfo info;
+            try {
+                info = requestQuickTunnel(QUICK_SERVICE);
+            } catch (Exception e) {
+                throw new TunnelException(500, port, "failed to create tunnel: " + e.getMessage());
+            }
+            String tunnelDomain = info.hostname.startsWith("https://") ? info.hostname : "https://" + info.hostname;
+            TunnelEntry entry = new TunnelEntry(tunnelDomain, port,
+                    java.time.Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS).toString());
+            entry.runThread = new Thread(() -> runLoop(entry, info.accountTag, info.secret, info.tunnelId),
+                    "argo-tunnel-" + port);
+            entry.runThread.setDaemon(true);
+            entry.runThread.start();
+            synchronized (tunnels) {
+                tunnels.computeIfAbsent(port, k -> new ArrayList<>()).add(entry);
+            }
+            log("[TRACE-ARGO] 🚀 临时隧道创建成功: " + tunnelDomain + " -> 127.0.0.1:" + port);
+            return entry;
+        }
+
+        List<Map<String, Object>> list() {
+            List<Map<String, Object>> out = new ArrayList<>();
+            List<Integer> ports = new ArrayList<>(tunnels.keySet());
+            Collections.sort(ports);
+            for (int port : ports) {
+                for (TunnelEntry entry : tunnels.get(port)) {
+                    Map<String, Object> m = new LinkedHashMap<>();
+                    m.put("tunnel_domain", entry.tunnelDomain);
+                    m.put("port", entry.port);
+                    m.put("created_at", entry.createdAt);
+                    out.add(m);
+                }
+            }
+            return out;
+        }
+
+        RemoveResult remove(int port, String tunnelDomain) {
+            List<TunnelEntry> existing = tunnels.get(port);
+            if (existing == null || existing.isEmpty()) {
+                return new RemoveResult(404, 0, "no tunnel found on port " + port, null);
+            }
+            List<TunnelEntry> targets;
+            if (tunnelDomain == null || tunnelDomain.isEmpty()) {
+                if (existing.size() > 1) {
+                    return new RemoveResult(409, 0,
+                            "multiple tunnels exist on port " + port + ", specify tunnel_domain to disambiguate", null);
+                }
+                targets = new ArrayList<>(existing);
+            } else {
+                targets = new ArrayList<>();
+                for (TunnelEntry entry : existing) {
+                    if (tunnelDomain.equals(entry.tunnelDomain)) {
+                        targets.add(entry);
+                    }
+                }
+                if (targets.isEmpty()) {
+                    return new RemoveResult(404, 0,
+                            "no tunnel found on port " + port + " with domain " + tunnelDomain, null);
+                }
+            }
+            for (TunnelEntry entry : targets) {
+                entry.stopped = true;
+                if (entry.sock != null) {
+                    try {
+                        entry.sock.close();
+                    } catch (Exception ignored) {
+                    }
+                }
+                if (entry.runThread != null) {
+                    entry.runThread.interrupt();
+                    try {
+                        entry.runThread.join(3000);
+                    } catch (InterruptedException ignored) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            }
+            List<Map<String, Object>> deleted = new ArrayList<>();
+            for (TunnelEntry entry : targets) {
+                Map<String, Object> m = new LinkedHashMap<>();
+                m.put("tunnel_domain", entry.tunnelDomain);
+                m.put("port", entry.port);
+                m.put("created_at", entry.createdAt);
+                deleted.add(m);
+            }
+            List<TunnelEntry> remaining = new ArrayList<>();
+            for (TunnelEntry entry : existing) {
+                if (!entry.stopped) {
+                    remaining.add(entry);
+                }
+            }
+            if (remaining.isEmpty()) {
+                tunnels.remove(port);
+            } else {
+                tunnels.put(port, remaining);
+            }
+            for (TunnelEntry entry : targets) {
+                log("[TRACE-ARGO] 🗑️ 临时隧道已删除: " + entry.tunnelDomain);
+            }
+            return new RemoveResult(200, deleted.size(), null, deleted);
+        }
+
+        void shutdownAll() {
+            for (List<TunnelEntry> list : new ArrayList<>(tunnels.values())) {
+                for (TunnelEntry entry : list) {
+                    entry.stopped = true;
+                    if (entry.sock != null) {
+                        try {
+                            entry.sock.close();
+                        } catch (Exception ignored) {
+                        }
+                    }
+                    if (entry.runThread != null) {
+                        entry.runThread.interrupt();
+                    }
+                }
+            }
+            tunnels.clear();
+        }
+
+        private void runLoop(TunnelEntry entry, String accountTag, byte[] tunnelSecret, byte[] tunnelId) {
+            String origin = "http://127.0.0.1:" + entry.port;
+            while (!entry.stopped) {
+                javax.net.ssl.SSLSocket sock = null;
+                try {
+                    sock = connectEdge(kisama.this);
+                    if (entry.stopped) {
+                        try {
+                            sock.close();
+                        } catch (Exception ignored) {
+                        }
+                        break;
+                    }
+                    entry.sock = sock;
+                    new H2Connection(kisama.this, sock, origin, accountTag, tunnelSecret, tunnelId, 0).run();
+                } catch (Exception e) {
+                    if (!entry.stopped) {
+                        log("[TRACE-ARGO] ⚠️ 临时隧道连接中断: " + entry.tunnelDomain + " -> " + e.getMessage());
+                    }
+                } finally {
+                    if (sock != null) {
+                        try {
+                            sock.close();
+                        } catch (Exception ignored) {
+                        }
+                    }
+                    entry.sock = null;
+                }
+                if (!entry.stopped) {
+                    try {
+                        Thread.sleep(2000);
+                    } catch (InterruptedException e) {
+                        break;
+                    }
+                }
+            }
+        }
+
+        static final class TunnelEntry {
+            final String tunnelDomain;
+            final int port;
+            final String createdAt;
+            volatile boolean stopped = false;
+            volatile javax.net.ssl.SSLSocket sock = null;
+            volatile Thread runThread = null;
+
+            TunnelEntry(String tunnelDomain, int port, String createdAt) {
+                this.tunnelDomain = tunnelDomain;
+                this.port = port;
+                this.createdAt = createdAt;
+            }
+        }
+
+        static final class TunnelException extends Exception {
+            final int status;
+            final int port;
+
+            TunnelException(int status, int port, String message) {
+                super(message);
+                this.status = status;
+                this.port = port;
+            }
+        }
+
+        static final class RemoveResult {
+            final int status;
+            final int deleted;
+            final String message;
+            final List<Map<String, Object>> tunnels;
+
+            RemoveResult(int status, int deleted, String message, List<Map<String, Object>> tunnels) {
+                this.status = status;
+                this.deleted = deleted;
+                this.message = message;
+                this.tunnels = tunnels;
+            }
+        }
+    }}
