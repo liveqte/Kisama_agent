@@ -35,8 +35,8 @@ func (w *responseBufferWriter) WriteString(s string) (int, error) {
 func AuthEncryptMiddleware(cm *crypto.CryptoManager, cfg *config.Config, tk *tempkey.Manager) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Phase 0: Skip WebSocket, preflight and pure-forwarder (kisamaproxy) requests
+		// 仅按路径前缀 /api/ws/ 放行；不可依据 Upgrade 头判断，否则普通请求伪造该头即可绕过全部认证
 		if strings.HasPrefix(c.Request.URL.Path, "/api/ws/") ||
-			c.Request.Header.Get("Upgrade") == "websocket" ||
 			strings.HasPrefix(c.Request.URL.Path, "/kisamaproxy") {
 			c.Next()
 			return

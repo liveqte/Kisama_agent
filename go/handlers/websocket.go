@@ -38,6 +38,24 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
+// safeCwd 选择真实存在的目录作为终端工作目录，避免 HOME 等环境变量指向不存在路径时 chdir 失败 (如 Git Bash 下的 /home/kis)
+func safeCwd() string {
+	candidates := []string{
+		os.Getenv("HOME"),
+		os.Getenv("USERPROFILE"),
+		os.Getenv("PWD"),
+	}
+	for _, dir := range candidates {
+		if dir == "" {
+			continue
+		}
+		if info, err := os.Stat(dir); err == nil && info.IsDir() {
+			return dir
+		}
+	}
+	return "."
+}
+
 // WSIncomingMessage 对应 Node.js 前端发送的各种消息结构
 type WSIncomingMessage struct {
 	Type      string `json:"type"`
@@ -250,6 +268,14 @@ func WebSocketHandler(c *gin.Context) {
 	agentPrivateKey := cfg.NoiseKeys.Agent.PrivateB64
 	controlPublicKey := cfg.NoiseKeys.Control.PublicB64
 
+	// WSS 降级模式(token 认证)：非空 token 必须等于 agent 公钥 b64，伪造值直接拒绝 (对齐 Python 版)
+	if token != "" && token != cfg.NoiseKeys.Agent.PublicB64 {
+		logger.Warnf("[终端会话 %s] 认证失败，非法 Token！", requestID)
+		_ = conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(1008, "Authentication failed: Invalid Token"))
+		_ = conn.Close()
+		return
+	}
+
 	handler, err := NewTerminalSessionHandler(agentPrivateKey, controlPublicKey)
 	if err != nil {
 		logger.Errorf("[终端会话 %s] 初始化 Noise 状态机错误: %v", requestID, err)
@@ -374,13 +400,7 @@ func (h *TerminalSessionHandler) runTerminal() error {
 		}
 	}
 	cmd.Env = filteredEnv
-	cmd.Dir = os.Getenv("HOME")
-	if cmd.Dir == "" {
-		cmd.Dir = os.Getenv("USERPROFILE")
-	}
-	if cmd.Dir == "" {
-		cmd.Dir = "."
-	}
+	cmd.Dir = safeCwd()
 
 	term, err := newTerminalSession(cmd, 24, 80)
 	if err != nil {

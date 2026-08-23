@@ -138,6 +138,24 @@ func getConfigValue(envKey, filePath string) string {
 	return ""
 }
 
+// resolveFileRoot 校验 FILE_ROOT 候选目录真实存在，全部无效时降级到当前工作目录 (不自动创建)；
+// 同时避免 UserHomeDir 失败时产生空 FileRoot 导致路径前缀防护失效
+func resolveFileRoot() string {
+	home, _ := os.UserHomeDir()
+	candidates := []string{os.Getenv("FILE_ROOT"), home}
+	for _, dir := range candidates {
+		if dir == "" {
+			continue
+		}
+		if info, err := os.Stat(dir); err == nil && info.IsDir() {
+			return dir
+		}
+		logger.Warnf("FILE_ROOT 候选目录不存在, 已跳过: %s", dir)
+	}
+	logger.Warnf("FILE_ROOT 全部候选无效, 降级到当前工作目录")
+	return "."
+}
+
 // New creates and returns a new Config instance
 func New() (*Config, error) {
 	// Generate Noise keys
@@ -236,7 +254,7 @@ func New() (*Config, error) {
 
 	agentVersion := os.Getenv("AGENT_VERSION")
 	if agentVersion == "" {
-		agentVersion = "0.4.5-go"
+		agentVersion = "0.4.6-go"
 	}
 
 	tempKeyDefaultTTL := 24
@@ -253,11 +271,7 @@ func New() (*Config, error) {
 		}
 	}
 
-	fileRoot := os.Getenv("FILE_ROOT")
-	if fileRoot == "" {
-		home, _ := os.UserHomeDir()
-		fileRoot = home
-	}
+	fileRoot := resolveFileRoot()
 
 	cfg := &Config{
 		ExecTimeout:       execTimeout,

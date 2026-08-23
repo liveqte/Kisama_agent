@@ -9,7 +9,7 @@ import os
 import base64
 import subprocess
 from ecdsa import SigningKey, NIST256p
-import coincurve  # eciespy 底层依赖，必装
+from kisama_crypto import generate_ecies_keypair, pub_to_compressed  # 兼容层: coincurve 优先, 缺失自动回退
 
 
 def _convert_private_key_to_pkcs8(raw_pem: str) -> str:
@@ -54,11 +54,11 @@ def generate_ecies_keys():
     """生成 ECIES 密钥对 (加密用, secp256k1)"""
     print("\n🔐 生成 ECIES 密钥对 (secp256k1)...")
     
-    # 使用 coincurve 直接生成 (eciespy 原生支持)
-    private_key = coincurve.PrivateKey()
-    public_key_bytes = private_key.public_key.format(compressed=True)  # 33字节压缩格式
-    
-    control_private_hex = private_key.to_hex()
+    # 兼容层生成 (原生 coincurve 优先, 缺失时纯 Python 回退, 输出格式与旧版完全一致)
+    private_key_bytes, public_key_bytes = generate_ecies_keypair()
+    public_key_bytes = pub_to_compressed(public_key_bytes)  # 33字节压缩格式
+
+    control_private_hex = private_key_bytes.hex()
     agent_public_b64 = base64.b64encode(public_key_bytes).decode('utf-8')
     
     print(f"\n✅ 控制端私钥 (Hex格式, 保存为 control_ecies.hex):\n{control_private_hex}")

@@ -20,14 +20,14 @@ import shutil
 from http.client import HTTPMessage
 from typing import List, Dict, Optional, Any, Callable
 
-# 加密依赖
+# 加密依赖 (ECIES/AES 兼容层: 原生 coincurve/eciespy/pycryptodome 优先,
+# 缺失时(如 Python 3.14 无 wheel、无编译工具链)自动回退 ecdsa + cryptography 实现)
 from ecdsa import SigningKey
 from ecdsa.util import sigencode_der
-from ecies import decrypt as ecies_decrypt, encrypt as ecies_encrypt
-import coincurve
-## aes
-from Crypto.Cipher import AES
-from Crypto.Random import get_random_bytes
+from kisama_crypto import (
+    ecies_decrypt, ecies_encrypt, ECIESKey,
+    aes_gcm_seal, aes_gcm_open, random_bytes,
+)
 
 ## shell工作目录支持
 import re
@@ -162,7 +162,7 @@ def load_control_keys():
         raise ValueError("无法加载 control_ecdsa.pem 私钥：文件内容格式不受支持")
 
     with open(ecies_path, "r") as f:
-        ecies_sk = coincurve.PrivateKey(bytes.fromhex(f.read().strip()))
+        ecies_sk = ECIESKey(bytes.fromhex(f.read().strip()))
 
     return ecdsa_sk, ecies_sk
 
@@ -245,19 +245,12 @@ def process_response(body_bytes: bytes, resp_headers, ecies_sk, label: str = "�
 
 def encrypt_data(plaintext: str, key: bytes):
     """
-    使用 AES-256-GCM 加密
+    使用 AES-256-GCM 加密 (兼容层: 原生 pycryptodome 优先, 缺失时回退 cryptography)
     :param plaintext: 明文字符串
     :param key: 32字节(256位)密钥
     :return: 包含 nonce, tag, ciphertext 的 Base64 字符串
     """
-    # 1. 创建加密器 (GCM 模式需要一个 12 字节的随机 nonce)
-    nonce = get_random_bytes(12)
-    cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
-    
-    # 2. 执行加密并生成认证标签 (MAC Tag)
-    ciphertext, tag = cipher.encrypt_and_digest(plaintext.encode('utf-8'))
-    
-    # 3. 将 nonce, tag, ciphertext 打包发送 (通常需要 Base64 编码)
+    nonce, tag, ciphertext = aes_gcm_seal(key, plaintext.encode('utf-8'))
     result = {
         "nonce": base64.b64encode(nonce).decode('utf-8'),
         "tag": base64.b64encode(tag).decode('utf-8'),
@@ -461,6 +454,14 @@ def file_move(move_map: Dict[str, str], skip_print: bool = False):
                         ecies_sk=ecies_sk, label="move", skip_print=skip_print)
 
 
+def file_copy(copy_map: Dict[str, str], skip_print: bool = False):
+    """POST /api/file/cp - 批量复制"""
+    _, ecies_sk = load_control_keys()
+    return _make_request("POST", "/api/file/cp",
+                        params=copy_map,
+                        ecies_sk=ecies_sk, label="copy", skip_print=skip_print)
+
+
 def file_mkdir(path: str, skip_print: bool = False):
     """POST /api/file/new - 创建目录"""
     _, ecies_sk = load_control_keys()
@@ -517,8 +518,9 @@ def test_baseinfo():
         cpu = result.get("cpu_name", "N/A")[:30]
         mem_gb = (result.get("mem_total") or 0) / 1024 / 1024 / 1024
         version = result.get("version", "N/A")
-        global IS_PHP_SERVER
+        global IS_PHP_SERVER, IS_WINDOWS_AGENT
         IS_PHP_SERVER = "php" in version.lower()
+        IS_WINDOWS_AGENT = "windows" in str(result.get("os", "")).lower()
         
         return _test_result("baseinfo 返回基础字段", True, 
                            f"{arch} | {cpu}... | {mem_gb:.1f}GB | v{version}")
@@ -584,9 +586,9 @@ def test_exec():
         _test_result("exec: sleep 短命令", False, f"result={result}")
         tests_passed = False
     
-    # 测试3: 错误命令
+    # 测试3: 错误命令 (Windows cmd 返回 1, Unix sh 返回 127, 均为合法失败)
     result = exec_command("nonexistent_cmd_xyz_123", skip_print=True)
-    if result and result.get("exitcode") in [127, -1]:
+    if result and result.get("exitcode") not in (0, None):
         _test_result("exec: 不存在命令", True)
     else:
         _test_result("exec: 不存在命令", False, f"result={result}")
@@ -637,7 +639,7 @@ def test_file_ops():
         try:
             result = file_list(".", skip_print=True)
             if result and result.get("status") == "ok":
-                names = [f.get("name") for f in result.get("files", [])]
+                names = [f.get("name") for f in (result.get("files") or [])]
                 if test_prefix in str(names):
                     _test_result("file: list 包含新目录", True)
                 else:
@@ -723,6 +725,26 @@ def test_file_ops():
             _test_result("file: move", False, f"异常: {e}")
             tests_passed = False
         
+        # ========== 7.5 批量复制 ==========
+        print("  ├─ 7.5/10 copy...")
+        try:
+            copy_dest = f"{test_dir}/copied.txt"
+            result = file_copy({test_file: copy_dest}, skip_print=True)
+            if result and result.get("status") == "ok" and result.get("success", 0) > 0:
+                # 通过 cat 验证副本内容一致
+                cat_result = file_cat(copy_dest, skip_print=True)
+                if cat_result and test_content in cat_result.get("content", ""):
+                    _test_result("file: copy 批量复制", True)
+                else:
+                    _test_result("file: copy 批量复制", False, "副本内容不一致")
+                    tests_passed = False
+            else:
+                _test_result("file: copy 批量复制", False, f"result={result}")
+                tests_passed = False
+        except Exception as e:
+            _test_result("file: copy", False, f"异常: {e}")
+            tests_passed = False
+
         # ========== 8. 下载文件 ==========
         print("  ├─ 8/10 download...")
         try:
@@ -771,7 +793,7 @@ def test_file_ops():
         try:
             result = file_list(".", skip_print=True)
             if result and result.get("status") == "ok":
-                names = [f.get("name") for f in result.get("files", [])]
+                names = [f.get("name") for f in (result.get("files") or [])]
                 if test_prefix not in str(names):
                     _test_result("file: 清理验证", True, "测试文件已清除")
                 else:
@@ -841,7 +863,10 @@ def run_all_tests():
         test_task_onetime()
         test_task_cron()
         test_task_logs()
-    
+
+    # 🔹 超级终端接口 (模块 24: Noise 加密 / token 认证 / 非法 token 拒绝)
+    test_ws_terminal()
+
     # 输出报告
     _print_test_report()
     
@@ -950,11 +975,20 @@ def task_get_log_summary(skip_print: bool = False):
 # 📋 任务模块测试函数
 # ============================================================================
 
+IS_WINDOWS_AGENT = False  # 由 baseinfo 探测: os 字段含 "windows" 时使用 Windows 安全命令
+
+def _agent_safe_commands():
+    """按代理端操作系统返回测试命令 (避免 Unix 方言命令在 cmd.exe 上挂死, 如 date +%s)"""
+    if IS_WINDOWS_AGENT:
+        return ["echo 'onetime_test_fixed'", "ver", "cd"]
+    return ["echo 'onetime_test_fixed'", "date +%s", "pwd"]
+
+
 def test_task_onetime():
     """测试启动任务接口: GET/POST /api/task/onetime"""
     print("\n🔹 测试: 启动任务 (/api/task/onetime)")
     tests_passed = True
-    
+
     # 1. 获取初始状态 (应为空)
     result = task_get_onetime(skip_print=True)
     if result and result.get("status") == "ok" and result.get("count", -1) >= 0:
@@ -962,13 +996,9 @@ def test_task_onetime():
     else:
         _test_result("task: onetime GET 初始状态", False, f"result={result}")
         tests_passed = False
-    
-    # 2. 设置启动任务 (多条) - 使用固定前缀便于日志匹配
-    test_tasks = [
-        "echo 'onetime_test_fixed'",  # ✅ 固定字符串
-        "date +%s",
-        "pwd"
-    ]
+
+    # 2. 设置启动任务 (多条) - 使用固定前缀便于日志匹配 (命令按代理端 OS 自适应)
+    test_tasks = _agent_safe_commands()
     result = task_set_onetime(test_tasks, skip_print=True)
     if result and result.get("status") == "ok" and result.get("count") == len(test_tasks):
         _test_result("task: onetime POST 设置任务", True, f"{result.get('count')} tasks")
@@ -1014,22 +1044,28 @@ def test_task_onetime():
         # 查询失败宽松处理
         _test_result("task: onetime 执行验证", True, "日志查询宽松通过")
     
-    # 4. 设置空列表清空任务
+    # 4. 设置空列表清空任务 (Java 系版本生命周期内仅允许设置一次, 400 属语义差异放行)
+    lifecycle_locked = False
     result = task_set_onetime([], skip_print=True)
     if result and result.get("status") == "ok" and result.get("count") == 0:
         _test_result("task: onetime POST 清空任务", True)
+    elif result and result.get("_http_error") == 400 and "lifecycle" in str(result.get("_body", "")).lower():
+        lifecycle_locked = True
+        _test_result("task: onetime POST 清空任务", True, "Java 生命周期单次语义, 拒绝重设 (符合 API.MD 14)")
     else:
         _test_result("task: onetime POST 清空任务", False, f"result={result}")
         tests_passed = False
-    
+
     # 5. 验证已清空
     result = task_get_onetime(skip_print=True)
-    if result and result.get("count") == 0:
+    if lifecycle_locked:
+        _test_result("task: onetime GET 验证清空", True, "生命周期锁定期任务保留供审计 (Java 语义)")
+    elif result and result.get("count") == 0:
         _test_result("task: onetime GET 验证清空", True)
     else:
         _test_result("task: onetime GET 验证清空", False, f"result={result}")
         tests_passed = False
-    
+
     return tests_passed
 
 
@@ -1169,6 +1205,234 @@ def test_task_logs():
         tests_passed = False
     
     return tests_passed
+# ============================================================================
+# 🔌 超级终端 WebSocket 支持 (/api/ws, API.MD 模块 24)
+# 纯标准库实现的极简 RFC6455 客户端 + Noise XX 发起端 (与代理端协议对齐)
+# ============================================================================
+import socket
+import struct
+
+try:
+    from noise.connection import NoiseConnection, Keypair
+    NOISE_LIB_OK = True
+except ImportError:
+    NOISE_LIB_OK = False
+
+
+class WsHandshakeError(ConnectionError):
+    """WebSocket 升级被服务端拒绝 (携带 HTTP 状态行)"""
+    def __init__(self, status_line: str):
+        super().__init__(f"WebSocket 握手失败: {status_line}")
+        self.status_line = status_line
+
+
+class WsClient:
+    """极简 RFC6455 WebSocket 客户端 (仅满足终端会话测试需求)"""
+
+    OP_TEXT, OP_BINARY, OP_CLOSE, OP_PING, OP_PONG = 0x1, 0x2, 0x8, 0x9, 0xA
+
+    def __init__(self, host: str, port: int, path: str, timeout: float = 20.0):
+        self.sock = socket.create_connection((host, port), timeout=timeout)
+        self.sock.settimeout(timeout)
+        key = base64.b64encode(os.urandom(16)).decode()
+        req = (f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+               "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+               f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
+        self.sock.sendall(req.encode())
+        resp = b""
+        while b"\r\n\r\n" not in resp:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("连接在握手阶段被服务端关闭")
+            resp += chunk
+        head, _, rest = resp.partition(b"\r\n\r\n")
+        status_line = head.split(b"\r\n")[0].decode(errors="replace")
+        if " 101 " not in status_line:
+            raise WsHandshakeError(status_line)
+        self._buffer = rest
+
+    def _read_exact(self, n: int) -> bytes:
+        while len(self._buffer) < n:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("连接已关闭")
+            self._buffer += chunk
+        data, self._buffer = self._buffer[:n], self._buffer[n:]
+        return data
+
+    def send(self, payload: bytes, opcode: int = OP_TEXT):
+        """发送客户端帧 (RFC6455 要求客户端帧必须掩码)"""
+        header = bytearray([0x80 | opcode])
+        length = len(payload)
+        if length < 126:
+            header.append(0x80 | length)
+        elif length < 65536:
+            header.append(0x80 | 126)
+            header += struct.pack(">H", length)
+        else:
+            header.append(0x80 | 127)
+            header += struct.pack(">Q", length)
+        mask = os.urandom(4)
+        header += mask
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        self.sock.sendall(bytes(header) + masked)
+
+    def recv(self):
+        """返回 (opcode, payload)；自动回复 ping；close 帧返回 (8, 前2字节为状态码)"""
+        while True:
+            head = self._read_exact(2)
+            opcode = head[0] & 0x0F
+            masked = bool(head[1] & 0x80)
+            length = head[1] & 0x7F
+            if length == 126:
+                length = struct.unpack(">H", self._read_exact(2))[0]
+            elif length == 127:
+                length = struct.unpack(">Q", self._read_exact(8))[0]
+            mask = self._read_exact(4) if masked else b""
+            payload = self._read_exact(length) if length else b""
+            if masked:
+                payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+            if opcode == self.OP_PING:
+                self.send(payload, self.OP_PONG)
+                continue
+            return opcode, payload
+
+    def close(self):
+        try:
+            self.send(struct.pack(">H", 1000), self.OP_CLOSE)
+        except Exception:
+            pass
+        finally:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+
+
+def _noise_initiator(ctrl_priv_b64: str, agent_pub_b64: str):
+    """构造 Noise XX 发起端: 静态私钥=控制端私钥, 预置对端=代理端公钥 (与各版本代理端协议一致)"""
+    proto = NoiseConnection.from_name(b'Noise_XX_25519_ChaChaPoly_BLAKE2s')
+    proto.set_as_initiator()
+    proto.set_keypair_from_private_bytes(Keypair.STATIC, base64.b64decode(ctrl_priv_b64))
+    proto.set_keypair_from_public_bytes(Keypair.REMOTE_STATIC, base64.b64decode(agent_pub_b64))
+    proto.set_prologue(b'kisama_terminal_v1')
+    proto.start_handshake()
+    return proto
+
+
+def _ws_host_port():
+    parsed = urllib.parse.urlparse(CONFIG["proxy_url"])
+    return parsed.hostname or "127.0.0.1", parsed.port or 80
+
+
+def _run_terminal_echo(ws: WsClient, use_noise: bool, proto, marker: str,
+                       deadline_seconds: float = 25.0) -> bool:
+    """向终端发送 echo <marker> 并等待回显出现 (5 秒未命中自动重发一次, 兼容 PTY 初始化丢首行)"""
+    command = f"echo {marker}\r\n"
+    payload = proto.encrypt(command.encode()) if use_noise else command.encode()
+    ws.send(payload, WsClient.OP_BINARY)
+
+    collected = b""
+    deadline = time.time() + deadline_seconds
+    resent = False
+    while time.time() < deadline:
+        if not resent and time.time() > deadline - deadline_seconds + 5 and marker.encode() not in collected:
+            ws.send(payload, WsClient.OP_BINARY)
+            resent = True
+        try:
+            opcode, data = ws.recv()
+        except (socket.timeout, TimeoutError, ConnectionError, OSError):
+            break
+        if opcode == WsClient.OP_CLOSE:
+            break
+        if not data:
+            continue
+        try:
+            plain = proto.decrypt(data) if use_noise else data
+        except Exception:
+            continue
+        collected += plain
+        if marker.encode() in collected:
+            return True
+    return marker.encode() in collected
+
+
+def test_ws_terminal():
+    """测试 /api/ws 超级终端 (模块 24): 非法 token 拒绝 + Noise 加密终端 + token 明文终端"""
+    print("\n🔹 测试: 超级终端 (/api/ws/*)")
+    tests_passed = True
+
+    if not NOISE_LIB_OK:
+        return _test_result("ws: noise 库可用", False, "缺少依赖: pip install noise")
+
+    info = fetch_baseinfo(skip_print=True)
+    if not info:
+        return _test_result("ws: 获取 noise_key", False, "baseinfo 不可用")
+    nk = info.get("noise_key") or {}
+    ctrl_priv = (nk.get("controller") or {}).get("private") if isinstance(nk, dict) else None
+    agent_pub = (nk.get("agent") or {}).get("public") if isinstance(nk, dict) else None
+    if not ctrl_priv or not agent_pub:
+        return _test_result("ws: 获取 noise_key", False, "baseinfo 未下发 noise_key (未认证?)")
+
+    host, port = _ws_host_port()
+    rid = int(time.time())
+
+    # ── 负向: 伪造 token 必须被拒绝 (回归校验: 修复前任意 token 可直连明文终端) ──
+    # 合规拒绝形态有两种: 升级后收到 close 帧 1008, 或 Python 版在 accept 前 close → HTTP 403
+    try:
+        ws = WsClient(host, port, f"/api/ws/terminal?request_id=wsneg{rid}&token=forged_token_{rid}")
+        opcode, payload = ws.recv()
+        close_code = struct.unpack(">H", payload[:2])[0] if opcode == 8 and len(payload) >= 2 else None
+        ok = opcode == 8 and close_code == 1008
+        _test_result("ws: 非法 token 被拒绝", ok,
+                     f"opcode={opcode} code={close_code}" if ok else f"期望 close 1008, 实际 opcode={opcode} code={close_code}")
+        if not ok:
+            tests_passed = False
+        ws.close()
+    except WsHandshakeError as e:
+        ok = " 403 " in e.status_line
+        _test_result("ws: 非法 token 被拒绝", ok,
+                     "HTTP 403 (accept 前拒绝)" if ok else f"握手被拒: {e.status_line}")
+        if not ok:
+            tests_passed = False
+    except Exception as e:
+        _test_result("ws: 非法 token 被拒绝", False, f"异常: {e}")
+        tests_passed = False
+
+    # ── 正向: Noise 端到端加密终端 (http 场景) ──
+    marker = f"WSNOISE{rid}"
+    try:
+        ws = WsClient(host, port, f"/api/ws/terminal?request_id=wsenc{rid}")
+        proto = _noise_initiator(ctrl_priv, agent_pub)
+        ws.send(proto.write_message(), WsClient.OP_BINARY)
+        _, msg2 = ws.recv()
+        proto.read_message(msg2)
+        ws.send(proto.write_message(), WsClient.OP_BINARY)
+        ok = _run_terminal_echo(ws, True, proto, marker)
+        _test_result("ws: Noise 加密终端回显", ok, "" if ok else f"输出未包含 {marker}")
+        if not ok:
+            tests_passed = False
+        ws.close()
+    except Exception as e:
+        _test_result("ws: Noise 加密终端回显", False, f"异常: {e}")
+        tests_passed = False
+
+    # ── 正向: token 认证明文终端 (WSS 降级场景, token=代理端公钥 b64) ──
+    marker = f"WSTOKEN{rid}"
+    try:
+        ws = WsClient(host, port,
+                      f"/api/ws/terminal?request_id=wstok{rid}&token={urllib.parse.quote(agent_pub)}")
+        ok = _run_terminal_echo(ws, False, None, marker)
+        _test_result("ws: token 认证终端回显", ok, "" if ok else f"输出未包含 {marker}")
+        if not ok:
+            tests_passed = False
+        ws.close()
+    except Exception as e:
+        _test_result("ws: token 认证终端回显", False, f"异常: {e}")
+        tests_passed = False
+
+    return tests_passed
+
 # ================= 主入口 =================
 
 def main():
@@ -1337,7 +1601,7 @@ def _print_help():
 
 📡 基本用法:
   python control2.py                    # 进入交互模式
-  python control2.py --test            # 运行全接口测试套件
+  python control2.py --test            # 运行全接口测试套件 (含 /api/ws 超级终端)
   python control2.py --status          # 查询代理状态
   python control2.py --exec <cmd>      # 执行单条命令
 

@@ -1,14 +1,14 @@
 {
   "name": "kisama-js",
-  "version": "0.4.4",
+  "version": "0.4.6",
   "description": "Kisama Agent - Node.js implementation",
-  "main": "agent.js",
+  "main": "index.js",
   "scripts": {
-    "start": "node agent.js",
-    "dev": "node agent.js"
+    "start": "node index.js",
+    "dev": "node index.js"
   },
   "bin": {
-    "start": "agent.js"
+    "start": "index.js"
   },
   "dependencies": {
     "@lydell/node-pty": "^1.1.0",
@@ -29,7 +29,7 @@
   "author": "liming",
   "license": "GPL-3.0",
   "files": [
-    "agent.js",
+    "index.js",
     "README.md"
   ],
   "overrides": {

@@ -21,8 +21,71 @@ from urllib.parse import unquote, urlsplit
 # 加密相关
 from ecdsa import SigningKey, VerifyingKey, BadSignatureError, NIST256p
 from ecdsa.util import sigdecode_der, sigdecode_string
-from ecies import encrypt as ecies_encrypt
 import binascii
+
+# ============================================================================
+# 🔐 原生加密库兼容层 (Python 3.14 等无 wheel 环境自动回退, 无需编译工具链)
+#    原生优先: eciespy(coincurve/libsecp256k1) + pycryptodome —— 快
+#    自动回退: ecdsa(纯Python 点运算) + cryptography(abi3 wheel) —— 全平台可装
+#    回退实现与 eciespy 线上格式逐字节兼容: eph_pub(65)+nonce(16)+tag(16)+ct
+# ============================================================================
+try:
+    from ecies import encrypt as ecies_encrypt
+except Exception:
+    # 回退实现 (模块级下划线 def 不参与混淆重命名; 规范名经赋值绑定, 与 import 路径同名)
+    import hmac as _hmac_mod
+
+    _SECP_P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+    _SECP_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+
+    def _secp_decompress_pub(pub: bytes):
+        from ecdsa import SECP256k1, VerifyingKey
+        from ecdsa.ellipticcurve import Point
+        if len(pub) == 65 and pub[0] == 0x04:
+            return VerifyingKey.from_string(pub[1:], curve=SECP256k1).pubkey.point
+        if len(pub) == 33 and pub[0] in (0x02, 0x03):
+            x = int.from_bytes(pub[1:], "big")
+            y_sq = (pow(x, 3, _SECP_P) + 7) % _SECP_P
+            y = pow(y_sq, (_SECP_P + 1) // 4, _SECP_P)
+            if y * y % _SECP_P != y_sq:
+                raise ValueError("invalid compressed public key")
+            if (y & 1) != (pub[0] - 0x02):
+                y = _SECP_P - y
+            return Point(SECP256k1.curve, x, y)
+        raise ValueError("unsupported public key format")
+
+    def _secp_point_bytes(point) -> bytes:
+        return b"\x04" + point.x().to_bytes(32, "big") + point.y().to_bytes(32, "big")
+
+    def _kisama_hkdf_sha256(master: bytes, length: int = 32) -> bytes:
+        # 与 pycryptodome HKDF(master, len, salt=b"", SHA256) 一致 (info=空)
+        prk = _hmac_mod.new(b"", master, hashlib.sha256).digest()
+        okm = b""
+        block = b""
+        counter = 1
+        while len(okm) < length:
+            block = _hmac_mod.new(prk, block + bytes([counter]), hashlib.sha256).digest()
+            okm += block
+            counter += 1
+        return okm[:length]
+
+    def _kisama_ecies_encrypt_fallback(receiver_pk: bytes, data: bytes) -> bytes:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        from ecdsa import SECP256k1, SigningKey as _EcdsaSigningKey
+        peer_point = _secp_decompress_pub(receiver_pk)
+        while True:
+            eph = secrets.token_bytes(32)
+            if 0 < int.from_bytes(eph, "big") < _SECP_N:
+                break
+        eph_pub = b"\x04" + _EcdsaSigningKey.from_string(eph, curve=SECP256k1).get_verifying_key().to_string()
+        shared = _secp_point_bytes(peer_point * int.from_bytes(eph, "big"))
+        key = _kisama_hkdf_sha256(eph_pub + shared)
+        nonce = secrets.token_bytes(16)
+        sealed = AESGCM(key).encrypt(nonce, data, None)
+        # 线上格式: eph_pub + nonce + tag + ciphertext
+        return eph_pub + nonce + sealed[-16:] + sealed[:-16]
+
+    ecies_encrypt = _kisama_ecies_encrypt_fallback
 
 # 服务启动
 import uvicorn
@@ -45,9 +108,39 @@ from contextlib import asynccontextmanager
 ## 数据类型
 from pydantic import BaseModel, Field, RootModel, ConfigDict
 from fastapi import Body,Depends,Query
-## AES有关库
-from Crypto.Cipher import AES
-from Crypto.Random import get_random_bytes
+## AES有关库 (pycryptodome 优先, 缺失时回退 cryptography 的 AES-GCM 兼容垫片;
+## 回退 def/class 均以下划线命名, 规范名经赋值绑定, 与 import 路径同名 —— 混淆器两条路径一致)
+try:
+    from Crypto.Cipher import AES
+    from Crypto.Random import get_random_bytes
+except Exception:
+    def _kisama_get_random_bytes(n: int) -> bytes:
+        return os.urandom(n)
+
+    class _KisamaAESGCMFallback:
+        def __init__(self, key: bytes, nonce: bytes):
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+            self._aesgcm = AESGCM(key)
+            self._nonce = nonce
+
+        def encrypt_and_digest(self, plaintext: bytes):
+            sealed = self._aesgcm.encrypt(self._nonce, plaintext, None)  # ct||tag
+            return sealed[:-16], sealed[-16:]
+
+        def decrypt_and_verify(self, ciphertext: bytes, tag: bytes) -> bytes:
+            return self._aesgcm.decrypt(self._nonce, ciphertext + tag, None)
+
+    class _KisamaAESFallback:
+        MODE_GCM = "gcm"
+
+        @staticmethod
+        def new(key: bytes, mode, nonce: bytes = None):
+            if nonce is None:
+                raise ValueError("兼容垫片仅支持 AES-GCM 且必须提供 nonce")
+            return _KisamaAESGCMFallback(key, nonce)
+
+    AES = _KisamaAESFallback
+    get_random_bytes = _kisama_get_random_bytes
 ## noise和超级终端相关库
 from noise.connection import NoiseConnection, Keypair
 from fastapi import WebSocket , WebSocketDisconnect
@@ -77,6 +170,25 @@ from dataclasses import dataclass, asdict
 from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives import serialization
 from typing import Tuple
+
+
+def _resolve_safe_cwd():
+    """选择真实存在的目录作为终端工作目录，避免 HOME 等环境变量指向不存在路径时 chdir 失败 (如 Git Bash 下的 /home/kis)"""
+    for d in (os.environ.get('USERPROFILE'), os.environ.get('HOME'), os.path.expanduser('~')):
+        if d and os.path.isdir(d):
+            return d
+    return '.'
+
+
+def _resolve_safe_file_root():
+    """FILE_ROOT 校验: 候选目录必须真实存在，全部无效时降级到当前工作目录 (不自动创建，避免文件接口逐请求报错)"""
+    for d in (os.getenv('FILE_ROOT'), os.path.expanduser('~')):
+        if d and os.path.isdir(d):
+            return d
+        if d:
+            print(f'[WARN] FILE_ROOT 候选目录不存在, 已跳过: {d}')
+    print(f'[WARN] FILE_ROOT 全部候选无效, 降级到当前工作目录: {os.getcwd()}')
+    return os.getcwd()
 
 # ============================================================================
 # 📦 Pydantic 响应模型定义 (用于生成文档示例和数据验证)
@@ -561,8 +673,8 @@ class Config:
     }
     # ================= 新增：文件模块配置 =================
     
-    # 文件操作根目录: 限制代理端只能访问此目录及其子目录 (防止路径遍历)
-    FILE_ROOT = os.getenv("FILE_ROOT", os.path.expanduser("~"))
+    # 文件操作根目录: 限制代理端只能访问此目录及其子目录 (防止路径遍历); 候选目录不存在时降级到当前工作目录
+    FILE_ROOT = _resolve_safe_file_root()
     
     # 单文件上传大小限制 (字节): 默认 100MB
     MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE", "104857600"))
@@ -623,7 +735,7 @@ class Config:
     PORT = int(os.getenv("KPORT") or os.getenv("PORT") or os.environ.get('SERVER_PORT') or 8000)
     
     # 代理版本信息
-    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.4.5-python")
+    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.4.6-python")
     
     # ================= 启动校验 =================
     
@@ -1022,6 +1134,17 @@ def _generate_ecies_keypair() -> Tuple[bytes, bytes]:
     生成 secp256k1 ECIES 密钥对，兼容 eciespy 各版本 API
     :return: (私钥 32 字节, 未压缩公钥 65 字节)
     """
+    try:
+        # 纯 Python 兜底 (ecdsa 库, 无需 coincurve/pycryptodome, 全平台可装)
+        from ecdsa import SECP256k1, SigningKey as _EcdsaSigningKey
+        _order = SECP256k1.order
+        while True:
+            secret = secrets.token_bytes(32)
+            if 0 < int.from_bytes(secret, "big") < _order:
+                pub = b"\x04" + _EcdsaSigningKey.from_string(secret, curve=SECP256k1).get_verifying_key().to_string()
+                return secret, pub
+    except Exception:
+        pass
     try:
         # eciespy >= 0.4.5 新 API
         from ecies.keys import PrivateKey as EciesPrivateKey
@@ -2851,7 +2974,7 @@ class TerminalSessionHandler:
             shell = self.get_available_shell()
             log(f"🐚 使用 Shell 路径: {shell}")
 
-            cwd = os.environ.get('USERPROFILE') or os.environ.get('HOME') or '.'
+            cwd = _resolve_safe_cwd()
             backend = _create_windows_backend(shell, env, 24, 80, cwd)
             backend.start()
             self.terminal = backend
@@ -4407,7 +4530,8 @@ async def get_baseinfo(request: Request):
         basic_info = Config._baseinfo_cache.copy()
     
     # 根据中间件标记的当前单次请求认证状态，动态决定是否下发敏感密钥
-    if getattr(request.state, "is_authenticated", True):
+    # 默认未认证：仅显式 true 才下发敏感密钥，防止中间件漏设状态导致越权泄露
+    if getattr(request.state, "is_authenticated", False):
         basic_info["session_key"] = Config.SESSION_KEY
         basic_info["noise_key"] = Config.NOISE_KEY
     else:

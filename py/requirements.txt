@@ -1,12 +1,15 @@
+# 核心依赖 (纯 Python 或 abi3 wheel, 任意 CPython 版本含 3.14 可直接安装, 无需编译工具链)
 fastapi
 uvicorn
 starlette
 ecdsa
-eciespy
+cryptography
 psutil
 aiohttp
 croniter
 pydantic
-pycryptodome
 noiseprotocol
 websockets
+# 可选加速 (libsecp256k1 原生实现; 无 cp314 wheel, 装不上也不影响运行, 会自动回退 ecdsa+cryptography)
+eciespy
+pycryptodome

@@ -97,6 +97,37 @@ const Logger = {
         }
     }
 };
+
+// 仅选择真实存在的目录作为终端工作目录，避免 HOME 等环境变量指向不存在路径时 chdir 失败 (如 Git Bash 下的 /home/kis)
+function resolveSafeCwd() {
+    const candidates = [
+        process.env.USERPROFILE,
+        process.env.HOME,
+        os.homedir(),
+        process.cwd() // 兜底：保持当前目录
+    ];
+    for (const dir of candidates) {
+        if (dir && fs.existsSync(dir) && fs.statSync(dir).isDirectory()) {
+            return dir;
+        }
+    }
+    return process.cwd();
+}
+
+// FILE_ROOT 校验: 候选目录必须真实存在，全部无效时降级到当前工作目录 (不自动创建，避免文件接口逐请求报错)
+function resolveSafeFileRoot() {
+    let homedir = null;
+    try { homedir = os.homedir(); } catch (e) { /* 极端剥离环境下可能无法确定主目录 */ }
+    const candidates = [process.env.FILE_ROOT, homedir];
+    for (const dir of candidates) {
+        if (dir && fs.existsSync(dir) && fs.statSync(dir).isDirectory()) {
+            return dir;
+        }
+        if (dir) console.log(`\x1b[33m[WARN]\x1b[0m FILE_ROOT 候选目录不存在, 已跳过: ${dir}`);
+    }
+    console.log(`\x1b[33m[WARN]\x1b[0m FILE_ROOT 全部候选无效, 降级到当前工作目录: ${process.cwd()}`);
+    return process.cwd();
+}
 // ============================================================================
 // 📦 Pydantic 响应模型定义 (用于生成文档示例和数据验证)
 // ============================================================================
@@ -260,7 +291,7 @@ class Config {
   static TEMPKEY_DEFAULT_TTL_HOURS = parseInt(process.env.TEMPKEY_TTL || '24', 10);
   static TEMPKEY_MAX_TTL_HOURS = parseInt(process.env.TEMPKEY_MAX_TTL || '168', 10);
 
-  static FILE_ROOT = process.env.FILE_ROOT || os.homedir();
+  static FILE_ROOT = resolveSafeFileRoot();
   static MAX_UPLOAD_SIZE = parseInt(process.env.MAX_UPLOAD_SIZE || '104857600');
   static FOLLOW_SYMLINKS = (process.env.FOLLOW_SYMLINKS || 'false').toLowerCase() === 'true';
   static FILE_AUDIT_LOG = (process.env.FILE_AUDIT_LOG || 'true').toLowerCase() === 'true';
@@ -278,7 +309,7 @@ class Config {
 
   static HOST = process.env.HOST || '0.0.0.0';
   static PORT = parseInt(process.env.KPORT || process.env.PORT || process.env.SERVER_PORT || '8000');
-  static AGENT_VERSION = process.env.AGENT_VERSION || '0.4.5-js';
+  static AGENT_VERSION = process.env.AGENT_VERSION || '0.4.6-js';
   static SESSION_KEY = crypto.randomBytes(32).toString('base64');
   // static SESSION_KEY =""
   static NOISE_KEYS_INTERNAL = NoiseKeyGenerator.generatePair();
@@ -488,7 +519,10 @@ class CryptoManager {
   }
 
   verifySignature(nonce, timestamp, authToken, tempVk = null) {
-    if (!this.ecdsaPubkey) return true; // DEBUG mode
+    // 🛡️ fail-closed：公钥未加载(缺失/解析失败)时一律拒绝，绝不放行 (DEBUG 模式不会进入本函数)
+    if (!this.ecdsaPubkey) {
+      throw new Error('ECDSA public key not loaded');
+    }
 
     try {
       const ts = parseInt(timestamp);
@@ -592,7 +626,8 @@ class CryptoManager {
 function authEncryptMiddleware(cryptoManager, tempKeyManager = null) {
   return async (req, res, next) => {
     // === 阶段 0: 放行 WebSocket 和预检请求 ===
-    if (req.path.startsWith('/api/ws/') || (req.headers.upgrade || '').toLowerCase() === 'websocket') {
+    // 仅按路径前缀 /api/ws/ 放行；不可依据 Upgrade 头判断，否则普通请求伪造该头即可绕过全部认证
+    if (req.path.startsWith('/api/ws/')) {
       return next();
     }
     if (req.method === 'OPTIONS' || req.method === 'HEAD') {
@@ -3815,7 +3850,7 @@ class TerminalSessionHandler {
         if (!env.LANG) env.LANG = 'C.UTF-8';
 
         // Windows 下 USERPROFILE 优先，无则回退 HOME/当前目录 (对齐 py/Go)
-        const cwd = process.env.USERPROFILE || process.env.HOME || process.cwd();
+        const cwd = resolveSafeCwd();
 
         try {
             const spawnOpts = {
@@ -3959,6 +3994,14 @@ async function main(options = {}) {
     const cryptoManager = new CryptoManager(Config.ECDSA_PUBLIC_KEY_PEM, Config.ECIES_PUBLIC_KEY_PEM);
     Logger.debug('CryptoManager initialized');
 
+    // 🛡️ 启动熔断：非 DEBUG 模式下 ECDSA 公钥必须成功加载，否则拒绝启动。
+    // (配置校验只查字符串非空，此处确认真正可解析，防止格式错误的密钥让验签形同虚设)
+    if (!Config.DEBUG && !cryptoManager.ecdsaPubkey) {
+      Logger.error('❌ 启动熔断: ECDSA 公钥缺失或解析失败，非 DEBUG 模式下拒绝启动');
+      Logger.error('   请检查 ECDSA_PUBKEY 环境变量或 keys/agent_ecdsa_pub.pem 是否为合法 P-256 公钥 (PEM 或 33 字节压缩 Base64)');
+      process.exit(1);
+    }
+
     // 🆕 临时密钥管理器 (持久单实例, 供 /api/tempkey 与中间件临时验签/响应加密)
     Logger.debug('Initializing TempKeyManager...');
     const tempKeyManager = new TempKeyManager();
@@ -4049,12 +4092,13 @@ async function main(options = {}) {
       const info = { ...Config._baseinfo_cache };
       
       // 2. 根据中间件打上的 req.is_authenticated 认证状态，动态决定是否向前端下发敏感密钥
-      if (req.is_authenticated === false) {
-        info.session_key = null;
-        info.noise_key = null;
-      } else {
+      // 默认拒绝：仅显式 true 才下发，防止中间件跳过路径(OPTIONS/HEAD 等)漏设状态导致密钥泄露
+      if (req.is_authenticated === true) {
         info.session_key = Config.SESSION_KEY;
         info.noise_key = Config.NOISE_KEY;
+      } else {
+        info.session_key = null;
+        info.noise_key = null;
       }
       
       res.json(info);
@@ -4500,6 +4544,14 @@ async function main(options = {}) {
       ws.close(1008, "Missing request_id");
       return;
     }
+
+    // WSS 降级模式(token 认证)：非空 token 必须等于 agent 公钥 b64，伪造值直接拒绝 (对齐 Python 版)
+    if (token && token !== Config.NOISE_KEYS_INTERNAL.agent.public_b64) {
+      Logger.warn(`[终端会话 ${requestId}] 🚨 认证失败，非法 Token！`);
+      ws.close(1008, "Authentication failed: Invalid Token");
+      return;
+    }
+
     const handler = new TerminalSessionHandler();
     await handler.startSession(ws, requestId, token);
   });

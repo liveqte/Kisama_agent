@@ -77,7 +77,7 @@ public class kisama {
     private static final long STATUS_CACHE_TTL_MS = 30 * 1000L;    // 实时状态缓存 30 秒 (毫秒)
     private static final int TEMPKEY_DEFAULT_TTL_HOURS = Integer.parseInt(System.getenv().getOrDefault("TEMPKEY_TTL", "24"));
     private static final int TEMPKEY_MAX_TTL_HOURS = Integer.parseInt(System.getenv().getOrDefault("TEMPKEY_MAX_TTL", "168"));
-    private static final String AGENT_VERSION = "0.4.4-java11";
+    private static final String AGENT_VERSION = "0.4.6-java11";
 
     private Map<String, Object> baseInfoCache = null;
     private long lastBaseInfoCacheTime = 0;
@@ -94,7 +94,7 @@ public class kisama {
         this.PORT = Integer.parseInt(System.getenv().getOrDefault("KPORT",
                 System.getenv().getOrDefault("PORT",
                         System.getenv().getOrDefault("SERVER_PORT", "8000"))));
-        this.FILE_ROOT = System.getenv().getOrDefault("FILE_ROOT", System.getProperty("user.dir"));
+        this.FILE_ROOT = resolveSafeFileRoot();
         this.KEYS_DIR = System.getenv().getOrDefault("KEYS_DIR", "./keys");
         this.ECDSA_PUBLIC_KEY_B64 = getKeyWithFallback("ECDSA_PUBKEY", "agent_ecdsa_pub.pem", "YOUR_HARDCODED_ECDSA_PUBLIC_KEY_HERE");
         this.ECIES_PUBLIC_KEY_B64 = getKeyWithFallback("ECIES_PUBKEY", "agent_ecies_pub.b64", "YOUR_HARDCODED_ECIES_PUBLIC_KEY_HERE");
@@ -111,7 +111,7 @@ public class kisama {
         // 其他值继续保持默认配置和环境变量提取
         this.DEBUG = Boolean.parseBoolean(System.getenv().getOrDefault("DEBUG", "false"));
         this.HOST = System.getenv().getOrDefault("HOST", "0.0.0.0");
-        this.FILE_ROOT = System.getenv().getOrDefault("FILE_ROOT", System.getProperty("user.dir"));
+        this.FILE_ROOT = resolveSafeFileRoot();
         this.KEYS_DIR = System.getenv().getOrDefault("KEYS_DIR", "./keys");
         this.LOG = Boolean.parseBoolean(System.getenv().getOrDefault("LOG", "false"));
     }
@@ -282,7 +282,8 @@ public class kisama {
             }
 
             // 2. 动态审查当前单次请求的认证标签状态，安全追加或剔除核心敏感凭证
-            boolean isAuthenticated = req.attribute("is_authenticated") == null || Boolean.TRUE.equals(req.attribute("is_authenticated"));
+            // 默认未认证：仅显式 true 才下发敏感密钥，防止 before 过滤器漏设属性导致越权泄露
+            boolean isAuthenticated = Boolean.TRUE.equals(req.attribute("is_authenticated"));
             if (isAuthenticated) {
                 clientResponseMap.put("session_key", Base64.getEncoder().encodeToString(this.SESSION_KEY));
                 Map<String, Object> noise = Map.of(
@@ -921,6 +922,22 @@ public class kisama {
             return fileValue;
         }
         return hardcodedDefault;
+    }
+
+    // FILE_ROOT 校验: 候选目录必须真实存在，全部无效时降级到 user.dir (不自动创建，避免文件接口逐请求报错)
+    private String resolveSafeFileRoot() {
+        String root = System.getenv("FILE_ROOT");
+        if (root != null && !root.isBlank()) {
+            if (Files.isDirectory(Path.of(root))) {
+                return root;
+            }
+            System.err.println("[WARN-INIT] ⚠️ FILE_ROOT 指向的目录不存在: " + root + ", 降级到工作目录");
+        }
+        String cwd = System.getProperty("user.dir");
+        if (cwd != null && Files.isDirectory(Path.of(cwd))) {
+            return cwd;
+        }
+        return ".";
     }
 
     private String bytesToHex(byte[] bytes) {
@@ -1647,7 +1664,15 @@ public class kisama {
         Map<String, Object> out = new HashMap<>();
         if (cmd == null) cmd = " ";
         try {
-            List<String> parts = Arrays.asList("/bin/sh", "-c", cmd);
+            // Windows 分支: cmd.exe /C (对齐 java17 版本); Unix 保持 /bin/sh -c
+            List<String> parts;
+            if (System.getProperty("os.name", "").toLowerCase().contains("win")) {
+                String comspec = System.getenv("COMSPEC");
+                if (comspec == null || comspec.isBlank()) comspec = "cmd.exe";
+                parts = Arrays.asList(comspec, "/C", cmd);
+            } else {
+                parts = Arrays.asList("/bin/sh", "-c", cmd);
+            }
             ProcessBuilder pb = new ProcessBuilder(parts);
             if (cwd != null && !cwd.isBlank()) pb.directory(new File(cwd));
             pb.redirectErrorStream(true);
@@ -2024,6 +2049,13 @@ public class kisama {
                 List<String> tokens = queryParams.get("token");
                 String token = (tokens != null && !tokens.isEmpty()) ? tokens.get(0) : null;
                 agent.log("[TRACE-WS] 收到超级终端连接请求, request_id: " + requestId);
+
+                // WSS 降级模式(token 认证)：非空 token 必须等于 agent 公钥 b64，伪造值直接拒绝 (对齐 Python 版)
+                if (token != null && !token.isBlank() && !token.equals(this.agent.AGENT_PUBLIC_KEY_B64)) {
+                    agent.log("[TRACE-WS] 🚨 [终端会话 " + requestId + "] 认证失败，非法 Token！");
+                    session.close(1008, "Authentication failed: Invalid Token");
+                    return;
+                }
                 
                 // 传入 agent 实例
                 TerminalSession terminalSession = new TerminalSession(this.agent, session, requestId, token);
@@ -2098,7 +2130,7 @@ public class kisama {
             this.token = token;
             this.useNoise = (token == null || token.isBlank());
             if (this.useNoise) {
-                this.noiseCipher = new NoiseSession(agent.AGENT_PRIVATE_KEY);
+                this.noiseCipher = new NoiseSession(agent.AGENT_PRIVATE_KEY, agent.CONTROL_PUBLIC_KEY);
             }
         }
         // 🚀 新增：依据优先级多维定位当前系统可用的最佳 Shell 进程
@@ -2301,10 +2333,13 @@ public class kisama {
         byte[] k_handshake = new byte[32];
         long n_handshake = 0;
         boolean hasKey = false;
+        byte[] expectedRemotePub = null;
 
-        public NoiseSession(byte[] localStaticPriv) {
+        public NoiseSession(byte[] localStaticPriv, byte[] expectedRemoteStaticPub) {
             System.arraycopy(localStaticPriv, 0, this.s_priv, 0, 32);
             org.bouncycastle.math.ec.rfc7748.X25519.generatePublicKey(this.s_priv, 0, this.s_pub, 0);
+            this.expectedRemotePub = new byte[32];
+            System.arraycopy(expectedRemoteStaticPub, 0, this.expectedRemotePub, 0, 32);
             initialize();
         }
 
@@ -2422,6 +2457,10 @@ public class kisama {
             System.arraycopy(msg3, 0, encS, 0, 48);
             byte[] decryptedS = decryptHandshake(encS);
             System.arraycopy(decryptedS, 0, rs, 0, 32);
+            // Noise XX 的认证边界：发起方静态公钥必须与预置控制端公钥一致 (常量时间比对)，不一致即视为未认证，中止握手
+            if (this.expectedRemotePub == null || !MessageDigest.isEqual(this.expectedRemotePub, rs)) {
+                throw new SecurityException("Noise handshake failed: remote static key mismatch");
+            }
             mixKey(dh(e_priv, rs));
             byte[] encPayload = new byte[msg3.length - 48];
             System.arraycopy(msg3, 48, encPayload, 0, encPayload.length);
