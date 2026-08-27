@@ -144,9 +144,12 @@ func TestProxyForwardsGET(t *testing.T) {
 		t.Errorf("upstream X-Forwarded-Proto = %q, want http (target scheme)", up.rec.xForwardedProto)
 	}
 
-	// 上游 CORS 头应被清理并替换为 kpng 配置
-	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "*" {
-		t.Errorf("response Access-Control-Allow-Origin = %q, want *", got)
+	// 带 Origin 的实际响应应回显该 Origin 并开启 Allow-Credentials（带凭据跨域不被拦）
+	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "http://client.example" {
+		t.Errorf("response Access-Control-Allow-Origin = %q, want Origin echo", got)
+	}
+	if got := resp.Header.Get("Access-Control-Allow-Credentials"); got != "true" {
+		t.Errorf("response Access-Control-Allow-Credentials = %q, want true", got)
 	}
 	if got := resp.Header.Get("Access-Control-Allow-Headers"); got != kisamaProxyCORSHeaders["Access-Control-Allow-Headers"] {
 		t.Errorf("response Access-Control-Allow-Headers = %q, want kpng value", got)
@@ -182,7 +185,7 @@ func TestProxyOptionsPreflight(t *testing.T) {
 	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "*" {
 		t.Errorf("Allow-Origin = %q, want *", got)
 	}
-	if got := resp.Header.Get("Access-Control-Allow-Methods"); got != "GET, POST, OPTIONS, PUT, DELETE" {
+	if got := resp.Header.Get("Access-Control-Allow-Methods"); got != "GET, POST, OPTIONS, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, COPY, MOVE, LOCK, UNLOCK, HEAD" {
 		t.Errorf("Allow-Methods = %q", got)
 	}
 	if got := resp.Header.Get("Access-Control-Max-Age"); got != "1728000" {
@@ -190,11 +193,15 @@ func TestProxyOptionsPreflight(t *testing.T) {
 	}
 }
 
-func TestProxyComplianceRejectsNonAPI(t *testing.T) {
+// TestProxyForwardsNonAPIPath 验证 /kisamaproxy 对不含 "api" 的路径同样放行转发——
+// 用于 WebDAV 等后端（GET/PUT/DELETE 访问 /dav/... 等），不再受 "api" 子串前置条件限制。
+func TestProxyForwardsNonAPIPath(t *testing.T) {
+	up := newUpstream(t, false)
 	r := newProxyRouter()
-	resp, _ := doProxyRequest(t, r, http.MethodGet, "/kisamaproxy/https://example.com/health", nil, nil)
-	if resp.StatusCode != 444 {
-		t.Fatalf("expected 444 for non-api URI, got %d", resp.StatusCode)
+	target := up.server.URL + "/dav/kisama/kisama.json"
+	resp, respBody := doProxyRequest(t, r, http.MethodGet, "/kisamaproxy/"+target, nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for non-api path, got %d body=%s", resp.StatusCode, respBody)
 	}
 }
 
@@ -266,5 +273,35 @@ func TestProxyGETNoBodySent(t *testing.T) {
 	defer up.rec.mu.Unlock()
 	if up.rec.body != "" {
 		t.Errorf("upstream body = %q, want empty for GET", up.rec.body)
+	}
+}
+// TestProxyRejectsUnauthorizedTraffic 验证不在白名单内的普通请求被 403 拒绝
+func TestProxyRejectsUnauthorizedTraffic(t *testing.T) {
+	r := newProxyRouter()
+	
+	// 既不含 "api"，也不含 "dav"，也没有 WebDAV 头部
+	target := "https://example.com/some/random/file.txt"
+	resp, respBody := doProxyRequest(t, r, http.MethodGet, "/kisamaproxy/"+target, nil, nil)
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden, got %d body=%s", resp.StatusCode, respBody)
+	}
+	if !strings.Contains(respBody, "Forbidden: Unauthorized traffic type") {
+		t.Errorf("unexpected body: %q", respBody)
+	}
+}
+
+// TestProxyAllowsWebDAVByHeader 验证不含 api/dav 关键字但带有 Depth 头部的 WebDAV 请求能被放行
+func TestProxyAllowsWebDAVByHeader(t *testing.T) {
+	up := newUpstream(t, false)
+	r := newProxyRouter()
+
+	target := up.server.URL + "/files/notes.txt"
+	resp, _ := doProxyRequest(t, r, http.MethodGet, "/kisamaproxy/"+target, nil, map[string]string{
+		"Depth": "0",
+	})
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for WebDAV header request, got %d", resp.StatusCode)
 	}
 }

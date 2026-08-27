@@ -288,9 +288,17 @@ func registerRoutes(router *gin.Engine, tk *tempkey.Manager, cfg *config.Config)
 	api.GET("/ws/:path", handlers.WebSocketHandler)
 
 	// /kisamaproxy 纯转发路由（与 kpng nginx/worker 实现对齐），裸路径与通配路径都注册，
-	// 避免 gin 对裸路径做 301 尾斜杠重定向导致转发语义被破坏
-	router.Any("/kisamaproxy", handlers.ProxyHandler)
-	router.Any("/kisamaproxy/*path", handlers.ProxyHandler)
+	// 避免 gin 对裸路径做 301 尾斜杠重定向导致转发语义被破坏。
+	// 注意：gin 的 Any() 只覆盖标准 HTTP 方法，WebDAV 方法（PROPFIND/MKCOL/COPY 等）不在
+	// 其中，未显式注册时会被 httprouter 以 404 拒绝、走不进 ProxyHandler，因此需逐方法补注。
+	proxyPaths := []string{"/kisamaproxy", "/kisamaproxy/*path"}
+	for _, p := range proxyPaths {
+		router.Any(p, handlers.ProxyHandler)
+		// WebDAV 扩展方法（RFC 4918）逐条注册到转发路由
+		for _, m := range []string{"PROPFIND", "PROPPATCH", "MKCOL", "COPY", "MOVE", "LOCK", "UNLOCK"} {
+			router.Handle(m, p, handlers.ProxyHandler)
+		}
+	}
 
 	router.GET("/health", func(c *gin.Context) {
 		c.JSON(200, gin.H{"status": "ok"})

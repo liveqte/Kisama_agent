@@ -735,7 +735,7 @@ class Config:
     PORT = int(os.getenv("KPORT") or os.getenv("PORT") or os.environ.get('SERVER_PORT') or 8000)
     
     # 代理版本信息
-    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.4.6-python")
+    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.4.7-python")
     
     # ================= 启动校验 =================
     
