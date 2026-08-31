@@ -2,7 +2,10 @@ package handlers
 
 import (
 	"bytes"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -177,11 +180,16 @@ func (n *NoiseSessionWrapper) splitAndFinish(cs0, cs1 *noise.CipherState) {
 	n.sendCipher = cs1
 	n.recvCipher = cs0
 
-	if len(n.expectedRemotePub) > 0 {
-		if !bytes.Equal(n.hsState.PeerStatic(), n.expectedRemotePub) {
-			logger.Errorf("Noise 握手校验失败: 远端公钥不匹配")
-			return
-		}
+	// 🔐 安全修复：fail-closed。预期的控制端公钥缺失或对端静态公钥不匹配时，
+	// 保持 handshakeFinished=false，doNoiseHandshake 会终止会话。
+	// XX 模式下若不校验，任何随机密钥的客户端都能完成握手取得终端。
+	if len(n.expectedRemotePub) == 0 {
+		logger.Errorf("Noise 握手校验失败: 未配置预期的控制端公钥")
+		return
+	}
+	if !bytes.Equal(n.hsState.PeerStatic(), n.expectedRemotePub) {
+		logger.Errorf("Noise 握手校验失败: 远端公钥不匹配")
+		return
 	}
 
 	n.handshakeFinished = true
@@ -243,6 +251,19 @@ func NewTerminalSessionHandler(agentPrivKey, controlPubKey string) (*TerminalSes
 	}, nil
 }
 
+// WsDowngradeToken 终端 WS 明文降级模式令牌: Base64(HMAC-SHA256(SESSION_KEY, "kisama-ws-token-v1"))。
+// 仅已认证客户端能从 baseinfo 取得 SESSION_KEY; 旧方案 token=agent 公钥可被任意 Noise
+// 握手发起方从 msg2 解出（XX 模式 msg2 的 s 仅用临时密钥 DH 加密），等于公开值。
+func WsDowngradeToken(sessionKeyB64 string) (string, error) {
+	raw, err := base64.StdEncoding.DecodeString(sessionKeyB64)
+	if err != nil {
+		return "", fmt.Errorf("decode session key failed: %w", err)
+	}
+	mac := hmac.New(sha256.New, raw)
+	mac.Write([]byte("kisama-ws-token-v1"))
+	return base64.StdEncoding.EncodeToString(mac.Sum(nil)), nil
+}
+
 // WebSocketHandler 路由入口
 func WebSocketHandler(c *gin.Context) {
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
@@ -268,12 +289,18 @@ func WebSocketHandler(c *gin.Context) {
 	agentPrivateKey := cfg.NoiseKeys.Agent.PrivateB64
 	controlPublicKey := cfg.NoiseKeys.Control.PublicB64
 
-	// WSS 降级模式(token 认证)：非空 token 必须等于 agent 公钥 b64，伪造值直接拒绝 (对齐 Python 版)
-	if token != "" && token != cfg.NoiseKeys.Agent.PublicB64 {
-		logger.Warnf("[终端会话 %s] 认证失败，非法 Token！", requestID)
-		_ = conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(1008, "Authentication failed: Invalid Token"))
-		_ = conn.Close()
-		return
+	// WSS 降级模式(token 认证)：token 必须等于 HMAC(SESSION_KEY) 降级令牌（常数时间比较）。
+	// 🔐 安全修复：不再接受"agent 公钥"作 token —— 该值可被任意 Noise 握手发起方从 msg2 解出。
+	if token != "" {
+		expect, tokErr := WsDowngradeToken(cfg.SessionKey)
+		tokOk := tokErr == nil &&
+			subtle.ConstantTimeCompare([]byte(token), []byte(expect)) == 1
+		if !tokOk {
+			logger.Warnf("[终端会话 %s] 认证失败，非法 Token！", requestID)
+			_ = conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(1008, "Authentication failed: Invalid Token"))
+			_ = conn.Close()
+			return
+		}
 	}
 
 	handler, err := NewTerminalSessionHandler(agentPrivateKey, controlPublicKey)

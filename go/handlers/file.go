@@ -19,6 +19,45 @@ import (
 )
 
 // ListFiles lists files in a directory
+// isPathInsideFileRoot 🔐 A-1 路径边界校验 (唯一权威实现): 基于 EvalSymlinks 判断目标
+// 是否位于 FileRoot 之内。防御: 兄弟目录逃逸(../sibling)、绝对路径、FileRoot 降级为
+// 相对路径、symlink 逃逸。对尚不存在的目标 (上传/新建), 校验其最深已存在祖先的
+// realpath, 剩余段为纯名称拼接 (filepath.Join/Join 已消除 ..)。
+func isPathInsideFileRoot(root, target string) bool {
+	rootReal, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return false
+	}
+	abs, err := filepath.Abs(target)
+	if err != nil {
+		return false
+	}
+	probe := abs
+	for {
+		if _, err := os.Stat(probe); err == nil {
+			break
+		}
+		parent := filepath.Dir(probe)
+		if parent == probe {
+			return false
+		}
+		probe = parent
+	}
+	realProbe, err := filepath.EvalSymlinks(probe)
+	if err != nil {
+		return false
+	}
+	relReal, err := filepath.Rel(rootReal, realProbe)
+	if err != nil || relReal == ".." || strings.HasPrefix(relReal, ".."+string(filepath.Separator)) {
+		return false
+	}
+	remainder, err := filepath.Rel(probe, abs)
+	if err != nil || remainder == ".." || strings.HasPrefix(remainder, ".."+string(filepath.Separator)) {
+		return false
+	}
+	return true
+}
+
 func ListFiles(c *gin.Context) {
 	cfg := config.Get()
 
@@ -30,7 +69,7 @@ func ListFiles(c *gin.Context) {
 
 	// Validate path
 	absPath := filepath.Join(cfg.FileRoot, req.Path)
-	if !strings.HasPrefix(absPath, cfg.FileRoot) {
+	if !isPathInsideFileRoot(cfg.FileRoot, absPath) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied"})
 		return
 	}
@@ -101,7 +140,7 @@ func QueryFileAuthority(c *gin.Context) {
 	var authorities []models.AuthorityInfo
 	for _, path := range req.Paths {
 		absPath := filepath.Join(cfg.FileRoot, path)
-		if !strings.HasPrefix(absPath, cfg.FileRoot) {
+		if !isPathInsideFileRoot(cfg.FileRoot, absPath) {
 			continue
 		}
 
@@ -156,7 +195,7 @@ func SetFileAuthority(c *gin.Context) {
 
 	for path, mode := range req.Permissions {
 		absPath := filepath.Join(cfg.FileRoot, path)
-		if !strings.HasPrefix(absPath, cfg.FileRoot) {
+		if !isPathInsideFileRoot(cfg.FileRoot, absPath) {
 			results = append(results, models.FileAuthoritySetResult{
 				Path:   path,
 				Status: "denied",
@@ -204,7 +243,7 @@ func ReadFileContent(c *gin.Context) {
 	}
 
 	absPath := filepath.Join(cfg.FileRoot, req.Path)
-	if !strings.HasPrefix(absPath, cfg.FileRoot) {
+	if !isPathInsideFileRoot(cfg.FileRoot, absPath) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied"})
 		return
 	}
@@ -261,7 +300,7 @@ func UploadFile(c *gin.Context) {
 
 	// Validate path security and boundaries
 	absDir := filepath.Join(cfg.FileRoot, req.Path)
-	if !strings.HasPrefix(absDir, cfg.FileRoot) {
+	if !isPathInsideFileRoot(cfg.FileRoot, absDir) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied"})
 		return
 	}
@@ -285,7 +324,7 @@ func UploadFile(c *gin.Context) {
 	}
 
 	absPath := filepath.Join(absDir, req.Filename)
-	if !strings.HasPrefix(absPath, cfg.FileRoot) {
+	if !isPathInsideFileRoot(cfg.FileRoot, absPath) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied"})
 		return
 	}
@@ -390,7 +429,7 @@ func DeleteFiles(c *gin.Context) {
 	var results []models.FileDeleteResult
 	for _, path := range req.Paths {
 		absPath := filepath.Join(cfg.FileRoot, path)
-		if !strings.HasPrefix(absPath, cfg.FileRoot) {
+		if !isPathInsideFileRoot(cfg.FileRoot, absPath) {
 			results = append(results, models.FileDeleteResult{
 				Path:   path,
 				Status: "denied",
@@ -436,7 +475,7 @@ func MoveFiles(c *gin.Context) {
 		absFrom := filepath.Join(cfg.FileRoot, from)
 		absTo := filepath.Join(cfg.FileRoot, to)
 
-		if !strings.HasPrefix(absFrom, cfg.FileRoot) || !strings.HasPrefix(absTo, cfg.FileRoot) {
+		if !isPathInsideFileRoot(cfg.FileRoot, absFrom) || !isPathInsideFileRoot(cfg.FileRoot, absTo) {
 			results = append(results, models.FileMoveResult{
 				From:   from,
 				To:     to,
@@ -488,7 +527,7 @@ func CopyFiles(c *gin.Context) {
 		absFrom := filepath.Join(cfg.FileRoot, from)
 		absTo := filepath.Join(cfg.FileRoot, to)
 
-		if !strings.HasPrefix(absFrom, cfg.FileRoot) || !strings.HasPrefix(absTo, cfg.FileRoot) {
+		if !isPathInsideFileRoot(cfg.FileRoot, absFrom) || !isPathInsideFileRoot(cfg.FileRoot, absTo) {
 			results = append(results, models.FileMoveResult{
 				From:   from,
 				To:     to,
@@ -534,7 +573,7 @@ func MkdirRecursive(c *gin.Context) {
 	}
 
 	absPath := filepath.Join(cfg.FileRoot, req.Path)
-	if !strings.HasPrefix(absPath, cfg.FileRoot) {
+	if !isPathInsideFileRoot(cfg.FileRoot, absPath) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied"})
 		return
 	}
@@ -595,7 +634,7 @@ func UploadFileRaw(c *gin.Context) {
 
 	// 2. 严格的安全边界与路径遍历校验
 	absDir := filepath.Join(cfg.FileRoot, filePath)
-	if !strings.HasPrefix(absDir, cfg.FileRoot) {
+	if !isPathInsideFileRoot(cfg.FileRoot, absDir) {
 		c.JSON(http.StatusForbidden, gin.H{"status": "error", "completed": false, "message": "Access denied"})
 		return
 	}
@@ -606,7 +645,7 @@ func UploadFileRaw(c *gin.Context) {
 	}
 
 	absPath := filepath.Join(absDir, fileName)
-	if !strings.HasPrefix(absPath, cfg.FileRoot) {
+	if !isPathInsideFileRoot(cfg.FileRoot, absPath) {
 		c.JSON(http.StatusForbidden, gin.H{"status": "error", "completed": false, "message": "Access denied"})
 		return
 	}

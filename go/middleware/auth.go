@@ -2,6 +2,8 @@ package middleware
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"math"
@@ -57,6 +59,25 @@ func AuthEncryptMiddleware(cm *crypto.CryptoManager, cfg *config.Config, tk *tem
 			// 如果为 true 则全量让其认证通过，赋予最高信任身份并跳过后续验证
 			c.Set("is_authenticated", true)
 		} else {
+			// 🔐 安全修复：提前读取请求体并计算 SHA256，将 method/path/body 摘要纳入签名消息，
+			// 防止捕获的签名头被改换请求体后重放。/api/fileraw (大文件裸流) 不在此缓冲，
+			// 客户端与服务端统一按空请求体计算摘要 (与下方 Phase 1.5 的 body 边界一致)。
+			requestBodyHash := ""
+			if c.Request.Body != nil && c.Request.URL.Path != "/api/fileraw" &&
+				(c.Request.Method == "POST" || c.Request.Method == "PUT" || c.Request.Method == "DELETE") {
+				bodyBytes, err := io.ReadAll(c.Request.Body)
+				if err != nil {
+					logger.Errorf("Failed to read body: %v", err)
+					c.JSON(400, gin.H{"error": "Failed to read body"})
+					c.Abort()
+					return
+				}
+				_ = c.Request.Body.Close()
+				c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+				sum := sha256.Sum256(bodyBytes)
+				requestBodyHash = hex.EncodeToString(sum[:])
+			}
+
 			// 生产模式：执行极度严苛的验证逻辑
 			nonce := c.GetHeader("x-nonce")
 			timestamp := c.GetHeader("x-timestamp")
@@ -71,7 +92,7 @@ func AuthEncryptMiddleware(cm *crypto.CryptoManager, cfg *config.Config, tk *tem
 				}
 			} else {
 				// 认证头完整，执行真正的密码学签名校验 (静态密钥优先, 无果再尝试有效期内临时密钥)
-				keySource, err := cm.IdentifySigner(nonce, timestamp, authToken, tk.ActiveEcdsaVK())
+				keySource, err := cm.IdentifySigner(c.Request.Method, path, requestBodyHash, nonce, timestamp, authToken, tk.ActiveEcdsaVK())
 				if err != nil {
 					logger.Debugf("Signature verification failed: %v", err)
 					// 如果验签失败且不是匿名白名单路由，直接打回拦截

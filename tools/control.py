@@ -167,12 +167,24 @@ def load_control_keys():
     return ecdsa_sk, ecies_sk
 
 
-def generate_auth_headers(ecdsa_sk):
-    """生成 ECDSA 签名认证请求头"""
+def build_signature_message(method: str, path: str, body: bytes, nonce: str, timestamp: str) -> str:
+    """组装签名消息 (五版本统一): method\\npath\\nsha256hex(body)\\nnonce\\ntimestamp
+
+    🔐 签名绑定 method/path/body 摘要，防止捕获的签名头被改换请求体后重放。
+    空请求体使用 sha256("")；/api/fileraw (大文件裸流) 客户端与服务端统一按空 body 计算。
+    """
+    if not body:
+        body = b""
+    body_hash = hashlib.sha256(body).hexdigest()
+    return f"{method}\n{path}\n{body_hash}\n{nonce}\n{timestamp}"
+
+
+def generate_auth_headers(ecdsa_sk, method: str = "", path: str = "", body: bytes = b""):
+    """生成 ECDSA 签名认证请求头 (签名绑定 method/path/body 摘要)"""
     nonce = base64.b64encode(os.urandom(16)).decode()
     timestamp = str(int(time.time()))
-    message = f"{nonce}{timestamp}".encode()
-    
+    message = build_signature_message(method, path, body, nonce, timestamp).encode()
+
     signature = ecdsa_sk.sign(message, hashfunc=hashlib.sha256, sigencode=sigencode_der)
     auth_token = base64.b64encode(signature).decode()
 
@@ -264,23 +276,26 @@ def _make_request(method: str, endpoint: str, params: dict = None,
     """通用请求辅助函数 - 极简加密集成版"""
     global SESSION_KEY
     
-    ecdsa_sk, _ = load_control_keys()
-    auth_headers = generate_auth_headers(ecdsa_sk)
-    auth_headers["Content-Type"] = "application/json"
-    if extra_headers:
-        auth_headers.update(extra_headers)
-    
-    # --- 简化加密逻辑 ---
+    # --- 先构造 body，再生成绑定 method/path/body 的签名 (R2 防重放) ---
     body = b''
+    aes_flag = False
     if params is not None:
         plaintext = json.dumps(params)
         # 只要有密钥就加密；握手接口因为没 params 所以会自动跳过
         if SESSION_KEY:
             body = encrypt_data(plaintext, SESSION_KEY).encode('utf-8')
-            auth_headers["X-AES-Encrypted"] = "true" 
+            aes_flag = True
         else:
             body = plaintext.encode('utf-8')
-    # -------------------
+
+    ecdsa_sk, _ = load_control_keys()
+    sign_path = endpoint.split('?', 1)[0]  # 签名覆盖路径本身，不含 query
+    auth_headers = generate_auth_headers(ecdsa_sk, method, sign_path, body)
+    auth_headers["Content-Type"] = "application/json"
+    if aes_flag:
+        auth_headers["X-AES-Encrypted"] = "true"
+    if extra_headers:
+        auth_headers.update(extra_headers)
     
     target_url = f"{CONFIG['proxy_url']}{endpoint}"
     request = urllib.request.Request(target_url, data=body, headers=auth_headers, method=method)
@@ -372,7 +387,8 @@ def file_upload(local_file: str, remote_path: str, remote_filename: str = None, 
     """POST /api/fileraw - 上传文件 (裸二进制流传输)"""
     try:
         ecdsa_sk, ecies_sk = load_control_keys()
-        auth_headers = generate_auth_headers(ecdsa_sk)
+        # 🔐 /api/fileraw 与服务端约定: 签名按空 body 计算摘要 (大文件不在中间件缓冲)
+        auth_headers = generate_auth_headers(ecdsa_sk, "POST", "/api/fileraw", b"")
     except Exception as e:
         if not skip_print: 
             print(f"❌ 密钥加载失败: {e}")
@@ -1357,8 +1373,16 @@ def _run_terminal_echo(ws: WsClient, use_noise: bool, proto, marker: str,
     return marker.encode() in collected
 
 
+def _ws_downgrade_token(session_key_b64: str) -> str:
+    """计算终端 WS 明文降级模式令牌: Base64(HMAC-SHA256(SESSION_KEY, "kisama-ws-token-v1"))。
+    与各语言代理端实现保持一致 (修复后不再接受 token=agent 公钥)。"""
+    import hmac as _hmac
+    raw = base64.b64decode(session_key_b64)
+    return base64.b64encode(_hmac.new(raw, b"kisama-ws-token-v1", hashlib.sha256).digest()).decode()
+
+
 def test_ws_terminal():
-    """测试 /api/ws 超级终端 (模块 24): 非法 token 拒绝 + Noise 加密终端 + token 明文终端"""
+    """测试 /api/ws 超级终端 (模块 24): 非法 token 拒绝 + 随机密钥 Noise 拒绝 + Noise 加密终端 + token 明文终端"""
     print("\n🔹 测试: 超级终端 (/api/ws/*)")
     tests_passed = True
 
@@ -1399,6 +1423,32 @@ def test_ws_terminal():
         _test_result("ws: 非法 token 被拒绝", False, f"异常: {e}")
         tests_passed = False
 
+    # ── 负向: 随机密钥 Noise 握手必须被拒绝 (回归校验: 修复前任意密钥可完成 XX 握手取得终端) ──
+    try:
+        rnd = NoiseConnection.from_name(b'Noise_XX_25519_ChaChaPoly_BLAKE2s')
+        rnd.set_as_initiator()
+        rnd.set_keypair_from_private_bytes(Keypair.STATIC, os.urandom(32))
+        rnd.set_prologue(b'kisama_terminal_v1')
+        rnd.start_handshake()
+        ws = WsClient(host, port, f"/api/ws/terminal?request_id=wsneg2{rid}")
+        ws.send(rnd.write_message(), WsClient.OP_BINARY)
+        _, msg2 = ws.recv()
+        rnd.read_message(msg2)
+        ws.send(rnd.write_message(), WsClient.OP_BINARY)
+        # 修复后: 服务端校验对端静态公钥失败 → 直接关闭会话, 不会进入终端回显
+        opcode, payload = ws.recv()
+        ok = opcode == WsClient.OP_CLOSE
+        _test_result("ws: 随机密钥 Noise 被拒绝", ok,
+                     "close 帧 (对端校验拒绝)" if ok else f"仍收到数据帧 opcode={opcode} (疑似未修复!)")
+        if not ok:
+            tests_passed = False
+        ws.close()
+    except (ConnectionError, socket.timeout) as e:
+        _test_result("ws: 随机密钥 Noise 被拒绝", True, f"连接被服务端断开 ({type(e).__name__})")
+    except Exception as e:
+        _test_result("ws: 随机密钥 Noise 被拒绝", False, f"异常: {e}")
+        tests_passed = False
+
     # ── 正向: Noise 端到端加密终端 (http 场景) ──
     marker = f"WSNOISE{rid}"
     try:
@@ -1417,19 +1467,25 @@ def test_ws_terminal():
         _test_result("ws: Noise 加密终端回显", False, f"异常: {e}")
         tests_passed = False
 
-    # ── 正向: token 认证明文终端 (WSS 降级场景, token=代理端公钥 b64) ──
+    # ── 正向: token 认证明文终端 (WSS 降级场景, token=HMAC(SESSION_KEY), 修复前为 agent 公钥) ──
     marker = f"WSTOKEN{rid}"
-    try:
-        ws = WsClient(host, port,
-                      f"/api/ws/terminal?request_id=wstok{rid}&token={urllib.parse.quote(agent_pub)}")
-        ok = _run_terminal_echo(ws, False, None, marker)
-        _test_result("ws: token 认证终端回显", ok, "" if ok else f"输出未包含 {marker}")
-        if not ok:
-            tests_passed = False
-        ws.close()
-    except Exception as e:
-        _test_result("ws: token 认证终端回显", False, f"异常: {e}")
+    session_key = info.get("session_key") if isinstance(info, dict) else None
+    if not session_key:
+        _test_result("ws: token 认证终端回显", False, "baseinfo 未下发 session_key (未认证?)")
         tests_passed = False
+    else:
+        try:
+            ws_token = _ws_downgrade_token(session_key)
+            ws = WsClient(host, port,
+                          f"/api/ws/terminal?request_id=wstok{rid}&token={urllib.parse.quote(ws_token)}")
+            ok = _run_terminal_echo(ws, False, None, marker)
+            _test_result("ws: token 认证终端回显", ok, "" if ok else f"输出未包含 {marker}")
+            if not ok:
+                tests_passed = False
+            ws.close()
+        except Exception as e:
+            _test_result("ws: token 认证终端回显", False, f"异常: {e}")
+            tests_passed = False
 
     return tests_passed
 

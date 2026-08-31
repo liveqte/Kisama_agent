@@ -31,6 +31,7 @@ const fs = require('fs');
 const fsp = require('fs').promises;
 const path = require('path');
 const os = require('os');
+const readline = require('readline');
 const { exec, spawn } = require('child_process');
 const cron = require('node-cron');
 const si = require('systeminformation');
@@ -309,10 +310,43 @@ class Config {
 
   static HOST = process.env.HOST || '0.0.0.0';
   static PORT = parseInt(process.env.KPORT || process.env.PORT || process.env.SERVER_PORT || '8000');
-  static AGENT_VERSION = process.env.AGENT_VERSION || '0.4.7-js';
+  // KMODE 启动模式: '1'=启动时自动创建临时隧道并开启 stdin /domain 指令监听;
+  // '2'=启动时自动创建临时隧道并把域名上报至 shz.al (全程静默) (详见 docs/API.MD 第九节)
+  static KMODE = (process.env.KMODE || '0').trim() || '0';
+  // KMODE=2: shz.al 自定义名 (可预测 URL 的组成部分); KNAME_KEY 缺省复用 KNAME
+  static KNAME = (process.env.KNAME || '').trim();
+  static KNAME_KEY = (process.env.KNAME_KEY || '').trim();
+  // 域名文件路径, 缺省 $HOME/domain.txt, 支持 $HOME / ~ 前缀
+  static KPATH = process.env.KPATH || '';
+  static AGENT_VERSION = process.env.AGENT_VERSION || '0.4.8-js';
   static SESSION_KEY = crypto.randomBytes(32).toString('base64');
   // static SESSION_KEY =""
   static NOISE_KEYS_INTERNAL = NoiseKeyGenerator.generatePair();
+
+  // 🔐 终端 WS 明文降级模式令牌: Base64(HMAC-SHA256(SESSION_KEY, "kisama-ws-token-v1"))。
+  // 仅已认证客户端能从 baseinfo 取得 SESSION_KEY; 旧方案 token=agent 公钥可被任意 Noise
+  // 握手发起方从 msg2 解出（XX 模式 msg2 的 s 仅用临时密钥 DH 加密），等于公开值。
+  static wsDowngradeToken() {
+    // 注意: HMAC 密钥必须是 SESSION_KEY 解码后的 32 字节原始值 (与其他语言版本一致)
+    return crypto.createHmac('sha256', Buffer.from(this.SESSION_KEY, 'base64')).update('kisama-ws-token-v1').digest('base64');
+  }
+
+  // 🔐 凭证生命周期：tempkey 过期后轮换会话级长期密钥。仅轮换 SESSION_KEY 与控制端 Noise
+  // 密钥对 (终端身份校验的预期对端)；agent Noise 密钥对保持稳定, 客户端缓存的 agent 公钥
+  // 继续有效。临时授权有效期内经 baseinfo 下发到外部的长期凭据由此全部失效。
+  static rotateOperationalSecrets() {
+    const fresh = NoiseKeyGenerator.generatePair();
+    this.NOISE_KEYS_INTERNAL.control = fresh.control;
+    this.NOISE_KEY.controller.private = fresh.control.private_b64;
+    this.SESSION_KEY = crypto.randomBytes(32).toString('base64');
+    // baseinfo/status 有最长 1h 缓存, 必须同步失效, 否则轮换后仍会吐出旧密钥
+    this._baseinfo_cache = null;
+    this._baseinfo_cache_time = 0;
+    this._status_cache = null;
+    this._status_cache_time = 0;
+    Logger.warn('🔄 [SECURITY] 临时密钥过期, 已轮换 SESSION_KEY 与控制端 Noise 密钥对 (合法控制端需重新认证获取 baseinfo 新密钥)');
+  }
+
   static NOISE_KEY = {
     controller: {
       private: this.NOISE_KEYS_INTERNAL.control.private_b64
@@ -404,10 +438,13 @@ class Config {
 class TempKeyManager {
   constructor() {
     this._key = null;
+    // 🔐 凭证生命周期钩子: tempkey 过期被检测到时触发一次长期密钥轮换
+    this.onExpired = null;
   }
 
   getOrCreate(ttlHours) {
-    if (this._key && !this._isExpired(this._key)) {
+    this._expireCurrent();
+    if (this._key) {
       return this._key;
     }
     this._key = this._generate(ttlHours);
@@ -416,13 +453,28 @@ class TempKeyManager {
   }
 
   getActiveEcdsaVk() {
-    if (this._key && !this._isExpired(this._key)) return this._key.ecdsa_vk;
+    this._expireCurrent();
+    if (this._key) return this._key.ecdsa_vk;
     return null;
   }
 
   getActiveEciesPub() {
-    if (this._key && !this._isExpired(this._key)) return this._key.ecies_pub;
+    this._expireCurrent();
+    if (this._key) return this._key.ecies_pub;
     return null;
+  }
+
+  // 🔐 tempkey 过期即作废, 并触发一次长期密钥轮换 (SESSION_KEY + 控制端 Noise 密钥对),
+  // 使临时授权有效期内经 baseinfo 下发到外部的长期凭据立即失效。仅在过期后触发一次。
+  _expireCurrent() {
+    if (this._key && this._isExpired(this._key)) {
+      const expiredId = this._key.key_id;
+      this._key = null;
+      Logger.warn(`🔄 [TempKey] 临时密钥已过期: key_id=${expiredId}`);
+      if (typeof this.onExpired === 'function') {
+        try { this.onExpired(); } catch (e) { Logger.error(`[TempKey] 过期轮换失败: ${e.message}`); }
+      }
+    }
   }
 
   _isExpired(key) {
@@ -518,7 +570,7 @@ class CryptoManager {
     }
   }
 
-  verifySignature(nonce, timestamp, authToken, tempVk = null) {
+  verifySignature(method, path, bodyHash, nonce, timestamp, authToken, tempVk = null) {
     // 🛡️ fail-closed：公钥未加载(缺失/解析失败)时一律拒绝，绝不放行 (DEBUG 模式不会进入本函数)
     if (!this.ecdsaPubkey) {
       throw new Error('ECDSA public key not loaded');
@@ -531,8 +583,12 @@ class CryptoManager {
         throw new Error(`Timestamp expired: diff=${Math.abs(now-ts)}s > ${Config.TIMESTAMP_WINDOW}s`);
       }
 
+      // 🔐 安全修复：签名绑定 method/path/body 摘要，捕获的签名头无法改换请求体后重放。
+      // 格式 (五版本一致): method\npath\nsha256hex(body)\nnonce\ntimestamp
+      // 空请求体使用 sha256("")；/api/fileraw (大文件裸流) 统一按空请求体计算。
+      const message = BuildSignatureMessage(method, path, bodyHash, nonce, timestamp);
+
       // 组合验签: 优先静态密钥, 无果再尝试当前有效临时密钥
-      const message = `${nonce}${timestamp}`;
       if (this._verifyWith(this.ecdsaPubkey, message, authToken)) {
         return 'static';
       }
@@ -623,6 +679,16 @@ class CryptoManager {
 // ============================================================================
 // 🛡️ 认证 + 加密中间件 (逻辑解耦修复版)
 // ============================================================================
+// 🔐 签名消息组装 (五版本统一): method\npath\nsha256hex(body)\nnonce\ntimestamp
+// 空请求体使用 sha256("")；/api/fileraw (大文件裸流) 客户端与服务端统一按空请求体计算，
+// 避免中间件整体缓冲大文件 (与 express.text 对 fileraw 的排除边界一致)。
+function BuildSignatureMessage(method, path, bodyHash, nonce, timestamp) {
+  if (!bodyHash) {
+    bodyHash = crypto.createHash('sha256').update(Buffer.alloc(0)).digest('hex');
+  }
+  return `${method}\n${path}\n${bodyHash}\n${nonce}\n${timestamp}`;
+}
+
 function authEncryptMiddleware(cryptoManager, tempKeyManager = null) {
   return async (req, res, next) => {
     // === 阶段 0: 放行 WebSocket 和预检请求 ===
@@ -660,8 +726,16 @@ function authEncryptMiddleware(cryptoManager, tempKeyManager = null) {
 
     // 🌟 3. 核心修复：直接执行真验签 (静态 + 有效期内临时密钥), 不再套用 if(req.is_authenticated) 的死锁外壳
     try {
+      // 🔐 签名绑定 method/path/body 摘要：req.body 已由前置 express.text/urlencoded 解析
+      // (fileraw 除外，其 body 在路由层才消费，统一按空 body 计算摘要)
+      let bodyBuf = Buffer.alloc(0);
+      if (req.path !== '/api/fileraw') {
+        if (Buffer.isBuffer(req.body)) bodyBuf = req.body;
+        else if (typeof req.body === 'string') bodyBuf = Buffer.from(req.body, 'utf-8');
+      }
+      const bodyHash = bodyBuf.length > 0 ? crypto.createHash('sha256').update(bodyBuf).digest('hex') : '';
       const tempVk = tempKeyManager ? tempKeyManager.getActiveEcdsaVk() : null;
-      const keySource = cryptoManager.verifySignature(nonce, timestamp, authToken, tempVk);
+      const keySource = cryptoManager.verifySignature(req.method, req.path, bodyHash, nonce, timestamp, authToken, tempVk);
       
       // ✨ 唯一步骤：只有成功熬过高强度数字签名核验的请求，才配在这行将身份洗白为 true
       req.is_authenticated = true;
@@ -1150,13 +1224,39 @@ class CommandExecutor {
 }
 
 // ============================================================================
+// 🔐 A-1 路径边界校验 (唯一权威实现): 基于 realpath 判断目标是否位于 FILE_ROOT 之内。
+// 防御: 兄弟目录逃逸(../sibling)、绝对路径/盘符、FileRoot 降级为相对路径、symlink 逃逸。
+// 对尚不存在的目标 (上传/新建), 校验其最深已存在祖先的 realpath, 剩余段为纯名称拼接。
+// ============================================================================
+function isPathInsideFileRoot(p) {
+  try {
+    const rootReal = fs.realpathSync.native(path.resolve(Config.FILE_ROOT));
+    const abs = path.resolve(p);
+    let probe = abs;
+    while (!fs.existsSync(probe)) {
+      const parent = path.dirname(probe);
+      if (parent === probe) return false; // 已到文件系统根仍未命中 (盘符不存在等)
+      probe = parent;
+    }
+    const realProbe = fs.realpathSync.native(probe);
+    const relReal = path.relative(rootReal, realProbe);
+    if (relReal.startsWith('..') || path.isAbsolute(relReal)) return false;
+    const remainder = path.relative(probe, abs);
+    if (remainder && (remainder.startsWith('..') || path.isAbsolute(remainder))) return false;
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+// ============================================================================
 // 📁 文件管理器
 // ============================================================================
 class FileManager {
   static async listFiles(dirPath, recursive = false) {
     const fullPath = path.resolve(Config.FILE_ROOT, dirPath || '.');
 
-    if (!fullPath.startsWith(Config.FILE_ROOT)) {
+    if (!isPathInsideFileRoot(fullPath)) {
       throw new Error('Access denied: path outside root');
     }
 
@@ -1200,7 +1300,7 @@ class FileManager {
     for (const filePath of paths) {
       const fullPath = path.resolve(Config.FILE_ROOT, filePath);
 
-      if (!fullPath.startsWith(Config.FILE_ROOT)) {
+      if (!isPathInsideFileRoot(fullPath)) {
         continue;
       }
 
@@ -1272,7 +1372,7 @@ class FileManager {
 
     for (const [filePath, modeStr] of Object.entries(permissions)) {
       const fullPath = path.resolve(Config.FILE_ROOT, filePath);
-      if (!fullPath.startsWith(Config.FILE_ROOT)) {
+      if (!isPathInsideFileRoot(fullPath)) {
         results.push({ path: filePath, requested: String(modeStr), applied: '', mode_octal: '', status: 'access_denied' });
         continue;
       }
@@ -1320,7 +1420,7 @@ class FileManager {
   static async readFile(filePath) {
     const fullPath = path.resolve(Config.FILE_ROOT, filePath);
 
-    if (!fullPath.startsWith(Config.FILE_ROOT)) {
+    if (!isPathInsideFileRoot(fullPath)) {
       throw new Error('Access denied: path outside root');
     }
 
@@ -1358,7 +1458,7 @@ class FileManager {
       targetPath = path.join(fullPath, filename);
     }
 
-    if (!targetPath.startsWith(Config.FILE_ROOT)) {
+    if (!isPathInsideFileRoot(targetPath)) {
       throw new Error('Access denied: path outside root');
     }
 
@@ -1402,11 +1502,10 @@ class FileManager {
         }
         out.end();
 
-        // cleanup chunks
-        for (const partFile of fs.readdirSync(chunkDir)) {
-          fs.unlinkSync(path.join(chunkDir, partFile));
-        }
+        // cleanup chunks (rmdir fails silently while other uploads still use .upload_chunks)
+        const uploadRoot = path.dirname(chunkDir);
         fs.rmSync(chunkDir, { recursive: true, force: true });
+        try { fs.rmdirSync(uploadRoot); } catch (_) {}
       }
 
       return {
@@ -1435,7 +1534,7 @@ class FileManager {
       targetPath = path.join(fullPath, filename);
     }
 
-    if (!targetPath.startsWith(Config.FILE_ROOT)) {
+    if (!isPathInsideFileRoot(targetPath)) {
       throw new Error('Access denied: path outside root');
     }
 
@@ -1479,11 +1578,10 @@ class FileManager {
         }
         fs.writeFileSync(targetPath, Buffer.concat(chunks));
 
-        // 清理临时切片
-        for (const partFile of fs.readdirSync(chunkDir)) {
-          fs.unlinkSync(path.join(chunkDir, partFile));
-        }
+        // 清理临时切片 (rmdir fails silently while other uploads still use .upload_chunks)
+        const uploadRoot = path.dirname(chunkDir);
         fs.rmSync(chunkDir, { recursive: true, force: true });
+        try { fs.rmdirSync(uploadRoot); } catch (_) {}
 
         return {
           status: 'ok',
@@ -1516,7 +1614,7 @@ class FileManager {
   static async downloadFile(filePath) {
     const fullPath = path.resolve(Config.FILE_ROOT, filePath);
 
-    if (!fullPath.startsWith(Config.FILE_ROOT)) {
+    if (!isPathInsideFileRoot(fullPath)) {
       throw new Error('Access denied: path outside root');
     }
 
@@ -1541,7 +1639,7 @@ class FileManager {
     for (const filePath of paths) {
       const fullPath = path.resolve(Config.FILE_ROOT, filePath);
 
-      if (!fullPath.startsWith(Config.FILE_ROOT)) {
+      if (!isPathInsideFileRoot(fullPath)) {
         results.push({ path: filePath, status: 'access_denied' });
         continue;
       }
@@ -1573,7 +1671,7 @@ class FileManager {
       const srcPath = path.resolve(Config.FILE_ROOT, src);
       const destPath = path.resolve(Config.FILE_ROOT, dest);
 
-      if (!srcPath.startsWith(Config.FILE_ROOT) || !destPath.startsWith(Config.FILE_ROOT)) {
+      if (!isPathInsideFileRoot(srcPath) || !isPathInsideFileRoot(destPath)) {
         results.push({ from: src, to: dest, status: 'access_denied' });
         continue;
       }
@@ -1601,7 +1699,7 @@ class FileManager {
       const srcPath = path.resolve(Config.FILE_ROOT, src);
       const destPath = path.resolve(Config.FILE_ROOT, dest);
 
-      if (!srcPath.startsWith(Config.FILE_ROOT) || !destPath.startsWith(Config.FILE_ROOT)) {
+      if (!isPathInsideFileRoot(srcPath) || !isPathInsideFileRoot(destPath)) {
         results.push({ from: src, to: dest, status: 'access_denied' });
         continue;
       }
@@ -1650,7 +1748,7 @@ class FileManager {
   static async createDirectory(dirPath) {
     const fullPath = path.resolve(Config.FILE_ROOT, dirPath);
 
-    if (!fullPath.startsWith(Config.FILE_ROOT)) {
+    if (!isPathInsideFileRoot(fullPath)) {
       throw new Error('Access denied: path outside root');
     }
 
@@ -3473,7 +3571,9 @@ class ArgoTunnelManager {
     while (!entry.stopped) {
       let sock = null;
       try {
-        sock = await connectEdge(false, this.log);
+        // 🔐 A-2: 默认校验 Cloudflare edge 证书; 自定义链路确需豁免时 KISAMA_EDGE_INSECURE=true
+        const edgeVerifyCert = String(process.env.KISAMA_EDGE_INSECURE || '').toLowerCase() !== 'true';
+        sock = await connectEdge(edgeVerifyCert, this.log);
         if (entry.stopped) {
           try { sock.destroy(); } catch (ignored) {}
           break;
@@ -3497,6 +3597,148 @@ class ArgoTunnelManager {
         await new Promise((resolve) => setTimeout(resolve, argoRetrySeconds * 1000));
       }
     }
+  }
+}
+
+// ============================================================================
+// KMODE 启动模式 (docs/API.MD 第九节)
+// KMODE=1 时: 启动即建临时隧道并把域名写入 KPATH 文件 (缺省 $HOME/domain.txt);
+// 第一次 /api/baseinfo 成功响应后删除该文件; stdin 收到 /domain 指令时输出域名。
+// KMODE=2 时: 启动即建临时隧道并把域名上报至 shz.al (可预测 URL, 全程静默)。
+// ============================================================================
+class KModeController {
+  static _baseinfoHooked = false; // 域名文件只删一次
+  static _domain = null;          // 内存中最后已知域名 (文件删除后 /domain 仍可用)
+
+  // shz.al 自定义名规则: >=3 字符, 限字母数字及 +_-[]*$=@,;/
+  static _SHZAL_NAME_CHARS = /^[A-Za-z0-9+_\-*$=@,;[/\]]+$/;
+
+  static knameValid() {
+    const name = Config.KNAME || '';
+    return name.length >= 3 && this._SHZAL_NAME_CHARS.test(name);
+  }
+
+  // 上报隧道域名到 shz.al: POST 创建 (409 冲突则 PUT 覆盖), 全程静默 —
+  // 不输出域名 / 上报结果 / 平台 URL, 任何失败直接放弃, 不影响正常启动
+  static reportShzal(domain) {
+    return new Promise((resolve) => {
+      const name = Config.KNAME;
+      const key = Config.KNAME_KEY || Config.KNAME;
+      const boundary = '----kisama' + crypto.randomBytes(12).toString('hex');
+      const fields = [['c', domain], ['n', name], ['s', key], ['e', '7d']];
+      const buildBody = (list) => {
+        const parts = list.map(([k, v]) =>
+          Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${k}"\r\n\r\n${v}\r\n`));
+        parts.push(Buffer.from(`--${boundary}--\r\n`));
+        return Buffer.concat(parts);
+      };
+      const post = (url, list, method, cb) => {
+        const u = new URL(url);
+        const req = https.request({
+          hostname: u.hostname, port: u.port || 443, path: u.pathname + u.search, method,
+          headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}`, 'Content-Length': list ? list.length : 0,
+                     'User-Agent': 'curl/8.5.0' }   // Cloudflare 拦截无 UA / Python UA 请求
+        }, (res) => { res.resume(); res.on('end', () => cb(res.statusCode)); });
+        req.on('error', () => cb(0));
+        if (list) req.write(list);
+        req.end();
+      };
+      try {
+        post('https://shz.al/', buildBody(fields), 'POST', (code) => {
+          if (code === 409) {
+            // 名字已被占用 (上次粘贴未过期): PUT 覆盖更新
+            const putFields = fields.filter(([k]) => k !== 'n');
+            post(`https://shz.al/~${name}:${key}`, buildBody(putFields), 'PUT', () => resolve());
+          } else {
+            resolve();
+          }
+        });
+      } catch (e) { /* 静默 */ }
+    }).then(() => { this._domain = domain; }).catch(() => {});
+  }
+
+  static homeDir() {
+    const candidates = [process.env.USERPROFILE, process.env.HOME];
+    for (const dir of candidates) {
+      if (dir && fs.existsSync(dir) && fs.statSync(dir).isDirectory()) return dir;
+    }
+    try { return os.homedir(); } catch (e) { return process.cwd(); }
+  }
+
+  static resolveDomainFilePath() {
+    // KPATH 支持 $HOME 与 ~ 前缀; 缺省 $HOME/domain.txt
+    let raw = (Config.KPATH || '').trim();
+    if (!raw) return path.join(this.homeDir(), 'domain.txt');
+    if (raw.startsWith('$HOME')) {
+      raw = raw.length > 5 ? path.join(this.homeDir(), raw.slice(5).replace(/^[/\\]+/, '')) : this.homeDir();
+    } else if (raw.startsWith('~')) {
+      raw = path.resolve(raw.replace(/^~(?=[/\\]|$)/, this.homeDir()));
+    }
+    return raw;
+  }
+
+  static writeDomainFile(domain) {
+    this._domain = domain;
+    const file = this.resolveDomainFilePath();
+    try {
+      fs.mkdirSync(path.dirname(path.resolve(file)), { recursive: true });
+      fs.writeFileSync(file, domain);
+      Logger.info(`[KMODE] 📄 隧道域名已写入: ${file}`);
+    } catch (e) {
+      Logger.warn(`[KMODE] ⚠️ 域名文件写入失败 (${file}): ${e.message}`);
+    }
+  }
+
+  static deleteDomainFile() {
+    const file = this.resolveDomainFilePath();
+    try {
+      if (fs.existsSync(file) && fs.statSync(file).isFile()) {
+        fs.unlinkSync(file);
+        Logger.info(`[KMODE] 🗑️ 域名文件已删除: ${file}`);
+      }
+    } catch (e) {
+      Logger.warn(`[KMODE] ⚠️ 域名文件删除失败 (${file}): ${e.message}`);
+    }
+  }
+
+  // 第一次 /api/baseinfo 成功响应后删除域名文件 (仅触发一次)
+  static onBaseinfoSuccess() {
+    if (!this._baseinfoHooked) {
+      this._baseinfoHooked = true;
+      this.deleteDomainFile();
+    }
+  }
+
+  static startStdinListener() {
+    // /domain 指令输出: 直接 console.log, 不走 DEBUG/LOG 开关
+    try {
+      const rl = readline.createInterface({ input: process.stdin, terminal: false });
+      rl.on('line', (line) => {
+        if (line.trim() === '/domain') {
+          console.log(this._domain || '[KMODE] tunnel domain not ready');
+        }
+      });
+      rl.on('close', () => {}); // 无 stdin 环境 (服务化部署) 静默退出
+      rl.on('error', () => {});
+    } catch (e) { /* stdin 不可用时静默跳过 */ }
+  }
+
+  static activate(argoTunnelManager) {
+    // KMODE=1: 隧道 + 域名文件 + stdin 监听; KMODE=2: 隧道 + shz.al 静默上报
+    if (Config.KMODE === '2' && this.knameValid()) {
+      Logger.info('[KMODE] 🚀 KMODE=2: 隧道域名将上报至外部平台');
+      argoTunnelManager.create(Config.PORT)
+        .then((entry) => this.reportShzal(entry.tunnelDomain))
+        .catch(() => { /* 全程静默 */ });
+      return;
+    }
+    Logger.info('[KMODE] 🚀 KMODE=1: 启动时自动创建临时隧道');
+    argoTunnelManager.create(Config.PORT).then((entry) => {
+      this.writeDomainFile(entry.tunnelDomain);
+    }).catch((e) => {
+      Logger.warn(`[KMODE] ⚠️ 启动隧道创建失败: ${e.message}`);
+    });
+    this.startStdinListener();
   }
 }
 
@@ -3594,6 +3836,19 @@ class NoiseSessionWrapper {
     }
 
     _splitAndFinish() {
+        // 🔐 安全修复：握手完成后必须验证对端静态公钥与预期控制端公钥一致（fail-closed）。
+        // XX 模式下 noise-c 不会因为 Initialize 时传入 rs 而校验对端身份，任何随机密钥的
+        // 客户端都能完成握手；必须在 Split 释放状态机前显式比对，否则无法再取。
+        let remotePub = null;
+        try { remotePub = this.hs.GetRemotePublicKey(); } catch (e) { remotePub = null; }
+        const expectedPub = this.expectedRemotePubB64 ? Buffer.from(this.expectedRemotePubB64, 'base64') : null;
+        const peerOk = remotePub && expectedPub &&
+            remotePub.length === expectedPub.length &&
+            crypto.timingSafeEqual(Buffer.from(remotePub), expectedPub);
+        if (!peerOk) {
+            throw new Error("Noise peer static key verification failed");
+        }
+
         const ciphers = this.hs.Split();
         
         // noise-c 的 C 语言内核已经根据 Role 自动分配好了
@@ -4005,6 +4260,8 @@ async function main(options = {}) {
     // 🆕 临时密钥管理器 (持久单实例, 供 /api/tempkey 与中间件临时验签/响应加密)
     Logger.debug('Initializing TempKeyManager...');
     const tempKeyManager = new TempKeyManager();
+    // 🔐 凭证生命周期: tempkey 过期 → 轮换 SESSION_KEY 与控制端 Noise 密钥对
+    tempKeyManager.onExpired = () => Config.rotateOperationalSecrets();
     Logger.debug('TempKeyManager initialized');
     
     Logger.debug('Initializing SystemInfoCollector...');
@@ -4102,6 +4359,10 @@ async function main(options = {}) {
       }
       
       res.json(info);
+      // KMODE=1: 第一次 /api/baseinfo 成功响应后删除域名文件 (KMODE=2 无文件操作)
+      if (Config.KMODE === '1') {
+        KModeController.onBaseinfoSuccess();
+      }
     } catch (e) {
       res.status(500).json({ status: 'error', message: e.message });
     }
@@ -4545,11 +4806,18 @@ async function main(options = {}) {
       return;
     }
 
-    // WSS 降级模式(token 认证)：非空 token 必须等于 agent 公钥 b64，伪造值直接拒绝 (对齐 Python 版)
-    if (token && token !== Config.NOISE_KEYS_INTERNAL.agent.public_b64) {
-      Logger.warn(`[终端会话 ${requestId}] 🚨 认证失败，非法 Token！`);
-      ws.close(1008, "Authentication failed: Invalid Token");
-      return;
+    // WSS 降级模式(token 认证)：token 必须等于 HMAC(SESSION_KEY) 降级令牌（常数时间比较）。
+    // 🔐 安全修复：不再接受"agent 公钥"作 token —— 该值可被任意 Noise 握手发起方从 msg2 解出。
+    if (token) {
+      const expect = Config.wsDowngradeToken();
+      const tokBuf = Buffer.from(String(token), 'utf-8');
+      const expBuf = Buffer.from(expect, 'utf-8');
+      const tokOk = tokBuf.length === expBuf.length && crypto.timingSafeEqual(tokBuf, expBuf);
+      if (!tokOk) {
+        Logger.warn(`[终端会话 ${requestId}] 🚨 认证失败，非法 Token！`);
+        ws.close(1008, "Authentication failed: Invalid Token");
+        return;
+      }
     }
 
     const handler = new TerminalSessionHandler();
@@ -4562,6 +4830,11 @@ async function main(options = {}) {
   const server = app.listen(Config.PORT, Config.HOST, () => {
     Logger.debug(`🚀 Kisama Agent Node.js v${Config.AGENT_VERSION} started on ${Config.HOST}:${Config.PORT}`);
     Logger.debug('Server listening successfully');
+    // KMODE=1: 隧道 + 域名文件 + stdin 监听; KMODE=2: 隧道 + shz.al 静默上报 (docs/API.MD 第九节)
+    // KMODE=2 但 KNAME 缺失/非法时退化为普通启动 (等同 KMODE=0)
+    if (Config.KMODE === '1' || (Config.KMODE === '2' && KModeController.knameValid())) {
+      KModeController.activate(argoTunnelManager);
+    }
   });
 
   // 优雅关闭
@@ -4583,4 +4856,4 @@ if (require.main === module||require.main?.filename?.includes('ts-node')) {
   main().catch(Logger.error);
 }
 
-module.exports = { main,Config, CryptoManager, SystemInfoCollector, CommandExecutor, FileManager, TaskManager, ArgoTunnelManager };
+module.exports = { main,Config, CryptoManager, SystemInfoCollector, CommandExecutor, FileManager, TaskManager, ArgoTunnelManager, KModeController };

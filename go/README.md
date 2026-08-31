@@ -5,29 +5,44 @@
 ```
 go/
 ├── main.go                 # 主程序入口
-├── go.mod                  # Go模块定义
+├── go.mod / go.sum         # Go模块定义
+├── exports_cgo.go          # CGO导出接口（供C/其他语言嵌入调用）
+├── exports_nocgo.go        # 无CGO时的空实现
 ├── config/
-│   └── config.go          # 配置管理模块
+│   └── config.go           # 配置管理模块
 ├── crypto/
-│   └── crypto.go          # 加密/解密模块
+│   └── crypto.go           # 加密/解密模块
 ├── middleware/
-│   └── auth.go            # 认证和加密中间件
+│   └── auth.go             # 认证和加密中间件
 ├── handlers/
-│   ├── baseinfo.go        # 系统基础信息接口
-│   ├── exec.go            # 命令执行接口
-│   ├── file.go            # 文件管理接口
-│   ├── task.go            # 任务管理接口
-│   ├── websocket.go       # WebSocket超级终端
-│   └── download.go        # 文件下载接口
+│   ├── baseinfo.go         # 系统基础信息接口
+│   ├── exec.go             # 命令执行接口
+│   ├── shell.go            # 跨平台Shell命令构造（Unix/Windows）
+│   ├── file.go             # 文件管理接口
+│   ├── download.go         # 文件下载接口
+│   ├── task.go             # 任务管理接口
+│   ├── tempkey.go          # 临时密钥下发接口
+│   ├── proxy.go            # /kisamaproxy 纯转发路由
+│   ├── terminal.go         # 终端会话管理（PTY抽象层）
+│   ├── terminal_unix.go    # Unix PTY实现
+│   ├── terminal_windows.go # Windows ConPTY实现
+│   └── websocket.go        # WebSocket超级终端
+├── kisama/
+│   └── service.go          # Service生命周期与路由注册（含服务化封装）
+├── tempkey/
+│   └── tempkey.go          # 临时密钥生成与TTL管理
 ├── models/
-│   └── models.go          # 数据模型定义
+│   └── models.go           # 数据模型定义
 ├── logger/
-│   └── logger.go          # 日志工具
-├── utils/
-│   └── system.go          # 系统信息收集工具
-└── keys/                  # 密钥目录
-    └── agent_ecies_pub.b64  # ECIES公钥
+│   └── logger.go           # 日志工具
+└── utils/
+    ├── system.go           # 系统信息收集工具
+    ├── fileowner_unix.go   # 文件属主查询（Unix）
+    └── fileowner_windows.go# 文件属主查询（Windows）
 ```
+
+> 测试文件（`*_test.go`）与各源文件同目录，未在结构树中列出。
+> `keys/` 密钥目录为运行时生成，不入库。
 
 ## 模块说明
 
@@ -94,6 +109,18 @@ API端点的实现，分为多个文件按功能模块划分:
 #### websocket.go
 - `WS /api/ws/:path` - WebSocket终端连接
 
+#### proxy.go
+- `ANY /kisamaproxy/*path` - 纯转发路由（对齐kpng的nginx/worker实现：合规检查/CORS/OPTIONS预检/WebSocket隧道/502兜底）
+- 白名单机制：仅放行含 `api` 的路由、WebDAV请求（专有方法/请求头/URL特征）及WebSocket握手，其余流量403拒绝
+- 不参与本Agent的认证体系（纯转发语义）
+
+#### tempkey.go
+- `GET /api/tempkey` - 下发临时密钥对（带TTL，供短期接入使用）
+
+> shell.go / terminal.go / terminal_unix.go / terminal_windows.go 为内部实现：
+> shell.go 负责跨平台Shell构造（Unix用 `/bin/sh -c`，Windows用 `cmd.exe /C`）；
+> terminal 系列抽象PTY层，Windows优先ConPTY伪控制台，旧系统自动回退管道模式。
+
 ### 5. models (数据模型)
 定义了所有API的请求/响应数据结构:
 - 基础响应模型: `BaseResponse`, `CountResponse`
@@ -102,12 +129,25 @@ API端点的实现，分为多个文件按功能模块划分:
 - 文件操作: `FileListRequest`, `FileListResponse`, 等
 - 任务管理: `OneTimeTaskResponse`, `CronTaskResponse`, 等
 
-### 6. logger (日志工具)
+### 6. kisama (服务化封装)
+- **关键类型**: `Service`, `Options`
+- **主要功能**:
+  - 组合 config/crypto/middleware/handlers，提供完整的Service生命周期管理
+  - 路由注册（`registerRoutes`），含 `/kisamaproxy` 转发路由与 `/api/tempkey`
+  - 优雅关停（信号处理）
+
+### 7. tempkey (临时密钥)
+- **关键类型**: `Manager`, `Entry`
+- **主要功能**:
+  - 生成带TTL的临时ECDSA/ECIES密钥对
+  - 过期自动清理（与Python/JS/Java版本语义一致）
+
+### 8. logger (日志工具)
 - 支持4个日志级别: DEBUG(0), INFO(1), WARN(2), ERROR(3)
 - 彩色输出
 - 动态日志级别配置
 
-### 7. utils (工具函数)
+### 9. utils (工具函数)
 - `GetSystemInfo()` - 收集基本系统信息
 - `GetSystemStatus()` - 获取实时系统状态
 - `GetPublicIPv4()` / `GetPublicIPv6()` - 获取IP地址
@@ -141,7 +181,7 @@ MAX_TASK_LOG=100         # 最大任务日志条数
 # 服务器
 HOST=0.0.0.0            # 绑定地址
 PORT=8000               # 监听端口
-AGENT_VERSION=0.1.2-go  # 代理版本
+AGENT_VERSION=0.4.7-go  # 代理版本
 
 # 加密
 ECDSA_PUBKEY=...        # ECDSA公钥(可选，或从文件读取)
@@ -154,6 +194,15 @@ ECIES_PUBKEY=...        # ECIES公钥(可选，或从文件读取)
 ```bash
 cd go
 go build -o agent main.go
+
+# 或使用构建脚本/Makefile（多平台产物，含UPX压缩与musl静态编译）
+./build.sh
+make
+```
+
+### Docker
+```bash
+docker-compose up -d
 ```
 
 ### 运行
@@ -213,8 +262,7 @@ curl -X POST http://localhost:8000/api/file/list \
 
 ## 扩展建议
 
-1. **PTY支持**: 使用 `github.com/creack/pty` 实现真正的终端支持
-2. **日志持久化**: 添加文件日志记录
-3. **指标收集**: 集成Prometheus metrics
-4. **分布式追踪**: 集成OpenTelemetry
-5. **性能优化**: 缓存和连接池
+1. **日志持久化**: 添加文件日志记录
+2. **指标收集**: 集成Prometheus metrics
+3. **分布式追踪**: 集成OpenTelemetry
+4. **性能优化**: 缓存和连接池

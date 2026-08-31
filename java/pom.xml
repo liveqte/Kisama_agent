@@ -20,6 +20,19 @@
     </repository>
   </repositories>
 
+  <dependencyManagement>
+    <dependencies>
+      <!-- A-6: spark-core 2.9.4 传递的 Jetty 9.4.4x 存在已知 CVE, 统一提升到 9.4.57 -->
+      <dependency>
+        <groupId>org.eclipse.jetty</groupId>
+        <artifactId>jetty-bom</artifactId>
+        <version>9.4.57.v20241219</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
   <dependencies>
     <dependency>
       <groupId>com.sparkjava</groupId>
@@ -33,8 +46,8 @@
     </dependency>
     <dependency>
       <groupId>org.bouncycastle</groupId>
-      <artifactId>bcprov-jdk15on</artifactId>
-      <version>1.70</version>
+      <artifactId>bcprov-jdk18on</artifactId>
+      <version>1.78.1</version>
     </dependency>
     <dependency>
       <groupId>org.jetbrains.pty4j</groupId>

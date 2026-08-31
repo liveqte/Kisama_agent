@@ -23,6 +23,16 @@ var (
 	statusMu        sync.Mutex // 实时监控互斥锁，防止并发击穿
 )
 
+// InvalidateSecretCaches 🔐 密钥轮换后失效 baseinfo/status 缓存, 防止轮换后仍返回旧密钥
+func InvalidateSecretCaches() {
+	baseInfoMu.Lock()
+	baseInfoCacheTime = 0
+	baseInfoMu.Unlock()
+	statusMu.Lock()
+	statusCacheTime = 0
+	statusMu.Unlock()
+}
+
 // GetBaseInfo retrieves basic system information (带 1 小时高性能缓存机制)
 func GetBaseInfo(c *gin.Context) {
 	cfg := config.Get()

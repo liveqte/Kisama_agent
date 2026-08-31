@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -172,7 +173,10 @@ func proxyErrorHandler(rw http.ResponseWriter, req *http.Request, err error) {
 }
 
 var kisamaProxyTransport = &http.Transport{
-	TLSClientConfig:       &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+	// 🔐 安全修复：默认校验上游 TLS 证书。修复前 InsecureSkipVerify 恒为 true，
+	// 中转的 HTTPS 流量 (含其携带的 Authorization 等凭证) 可被链路中间人截获/篡改。
+	// 中转节点确需使用自签/无效证书时，通过环境变量 KISAMA_PROXY_INSECURE=true 显式豁免。
+	TLSClientConfig:       &tls.Config{InsecureSkipVerify: strings.EqualFold(os.Getenv("KISAMA_PROXY_INSECURE"), "true")}, //nolint:gosec
 	ResponseHeaderTimeout: 600 * time.Second,
 	TLSHandshakeTimeout:   10 * time.Second,
 	ExpectContinueTimeout: 5 * time.Second,

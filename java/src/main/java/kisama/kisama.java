@@ -40,6 +40,10 @@ public class kisama {
     private final boolean DEBUG;
     private final String HOST;
     private final int PORT;
+    private final int KMODE;   // 0=普通启动 1=隧道+域名文件+stdin 2=隧道+shz.al 静默上报 (docs/API.MD 第九节)
+    private final String KPATH;
+    private final String KNAME;
+    private final String KNAME_KEY;
     private final String FILE_ROOT;
     private final String KEYS_DIR;
     private final String ECDSA_PUBLIC_KEY_B64;
@@ -47,6 +51,9 @@ public class kisama {
     private final boolean LOG;
 
     private final java.util.concurrent.atomic.AtomicBoolean ONETIME_EXECUTED = new java.util.concurrent.atomic.AtomicBoolean(false);
+    // KMODE 运行时状态: 域名文件只删一次 / 内存中最后已知域名 (文件删除后 /domain 仍可用)
+    private final java.util.concurrent.atomic.AtomicBoolean KMODE_BASEINFO_HOOKED = new java.util.concurrent.atomic.AtomicBoolean(false);
+    private volatile String kmodeDomain = null;
     private String CTRL_PRIVATE_KEY_B64 = " ";
     private String AGENT_PUBLIC_KEY_B64 = " ";
     private byte[] AGENT_PRIVATE_KEY = new byte[32];
@@ -55,6 +62,44 @@ public class kisama {
     private PublicKey ECDSA_PUBLIC_KEY = null;
     private byte[] ECIES_PUBLIC_KEY = null;
     private byte[] SESSION_KEY = null;
+
+    // 🔐 终端 WS 明文降级模式令牌: Base64(HMAC-SHA256(SESSION_KEY, "kisama-ws-token-v1"))。
+    // 仅已认证客户端能从 baseinfo 取得 SESSION_KEY; 旧方案 token=agent 公钥可被任意 Noise
+    // 握手发起方从 msg2 解出（XX 模式 msg2 的 s 仅用临时密钥 DH 加密），等于公开值。
+    String wsDowngradeToken() {
+        try {
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(this.SESSION_KEY, "HmacSHA256"));
+            return Base64.getEncoder().encodeToString(mac.doFinal("kisama-ws-token-v1".getBytes(StandardCharsets.UTF_8)));
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    // 🔐 凭证生命周期：tempkey 过期后轮换会话级长期密钥。仅轮换 SESSION_KEY 与控制端 Noise
+    // 密钥对 (终端身份校验的预期对端)；agent Noise 密钥对保持稳定, 客户端缓存的 agent 公钥
+    // 继续有效。临时授权有效期内经 baseinfo 下发到外部的长期凭据由此全部失效。
+    void rotateOperationalSecrets() {
+        try {
+            SecureRandom rand = new SecureRandom();
+            byte[] ctrlPriv = new byte[32];
+            byte[] ctrlPub = new byte[32];
+            org.bouncycastle.math.ec.rfc7748.X25519.generatePrivateKey(rand, ctrlPriv);
+            org.bouncycastle.math.ec.rfc7748.X25519.generatePublicKey(ctrlPriv, 0, ctrlPub, 0);
+            this.CTRL_PRIVATE_KEY_B64 = Base64.getEncoder().encodeToString(ctrlPriv);
+            this.CONTROL_PUBLIC_KEY = ctrlPub;
+            byte[] sk = new byte[32];
+            rand.nextBytes(sk);
+            this.SESSION_KEY = sk;
+            // baseinfo/status 有缓存, 必须同步失效, 否则轮换后仍会吐出旧密钥
+            synchronized (baseInfoCacheLock) { baseInfoCache = null; lastBaseInfoCacheTime = 0; }
+            synchronized (statusCacheLock) { statusCache = null; lastStatusCacheTime = 0; }
+            log("[SECURITY] 🔄 临时密钥过期, 已轮换 SESSION_KEY 与控制端 Noise 密钥对 (合法控制端需重新认证获取 baseinfo 新密钥)");
+        } catch (Exception e) {
+            log("[SECURITY] ❌ 密钥轮换失败: " + e.getMessage());
+        }
+    }
+
     private final TempKeyManager tempKeyManager = new TempKeyManager();
     private final ArgoTunnelManager argoTunnelManager = new ArgoTunnelManager();
 
@@ -78,7 +123,7 @@ public class kisama {
     private static final long STATUS_CACHE_TTL_MS = 30 * 1000L;    // 实时状态缓存 30 秒 (毫秒)
     private static final int TEMPKEY_DEFAULT_TTL_HOURS = Integer.parseInt(System.getenv().getOrDefault("TEMPKEY_TTL", "24"));
     private static final int TEMPKEY_MAX_TTL_HOURS = Integer.parseInt(System.getenv().getOrDefault("TEMPKEY_MAX_TTL", "168"));
-    private static final String AGENT_VERSION = "0.4.7-java";
+    private static final String AGENT_VERSION = "0.4.8-java";
 
     private Map<String, Object> baseInfoCache = null;
     private long lastBaseInfoCacheTime = 0;
@@ -95,6 +140,15 @@ public class kisama {
         this.PORT = Integer.parseInt(System.getenv().getOrDefault("KPORT",
                 System.getenv().getOrDefault("PORT",
                         System.getenv().getOrDefault("SERVER_PORT", "8000"))));
+        // KMODE 启动模式: "1"=隧道+域名文件+stdin 监听; "2"=隧道+shz.al 静默上报 (详见 docs/API.MD 第九节)
+        this.KMODE = parseKmode(System.getenv().getOrDefault("KMODE", "0"));
+        // KMODE=2: shz.al 自定义名 (可预测 URL 的组成部分); KNAME_KEY 缺省复用 KNAME
+        String kname = System.getenv("KNAME") == null ? "" : System.getenv("KNAME").trim();
+        String knameKey = System.getenv("KNAME_KEY") == null ? "" : System.getenv("KNAME_KEY").trim();
+        this.KNAME = kname;
+        this.KNAME_KEY = knameKey.isEmpty() ? kname : knameKey;
+        // 域名文件路径, 缺省 $HOME/domain.txt, 支持 $HOME / ~ 前缀
+        this.KPATH = System.getenv().getOrDefault("KPATH", "");
         this.FILE_ROOT = resolveSafeFileRoot();
         this.KEYS_DIR = System.getenv().getOrDefault("KEYS_DIR", "./keys");
         this.ECDSA_PUBLIC_KEY_B64 = getKeyWithFallback("ECDSA_PUBKEY", "agent_ecdsa_pub.pem", "YOUR_HARDCODED_ECDSA_PUBLIC_KEY_HERE");
@@ -112,6 +166,12 @@ public class kisama {
         // 其他值继续保持默认配置和环境变量提取
         this.DEBUG = Boolean.parseBoolean(System.getenv().getOrDefault("DEBUG", "false"));
         this.HOST = System.getenv().getOrDefault("HOST", "0.0.0.0");
+        this.KMODE = parseKmode(System.getenv().getOrDefault("KMODE", "0"));
+        String kname2 = System.getenv("KNAME") == null ? "" : System.getenv("KNAME").trim();
+        String knameKey2 = System.getenv("KNAME_KEY") == null ? "" : System.getenv("KNAME_KEY").trim();
+        this.KNAME = kname2;
+        this.KNAME_KEY = knameKey2.isEmpty() ? kname2 : knameKey2;
+        this.KPATH = System.getenv().getOrDefault("KPATH", "");
         this.FILE_ROOT = resolveSafeFileRoot();
         this.KEYS_DIR = System.getenv().getOrDefault("KEYS_DIR", "./keys");
         this.LOG = Boolean.parseBoolean(System.getenv().getOrDefault("LOG", "false"));
@@ -164,7 +224,7 @@ public class kisama {
             byte[] key = new byte[32];
             new SecureRandom().nextBytes(key);
             this.SESSION_KEY = key;
-            log("[TRACE-INIT] 自动生成全局动态 Session Key: " + bytesToHex(this.SESSION_KEY));
+            log("[TRACE-INIT] 全局动态 Session Key 已生成 (长度 " + (this.SESSION_KEY == null ? 0 : this.SESSION_KEY.length) + " 字节, 内容不落日志)");
         }
 
         before((req, res) -> {
@@ -225,8 +285,14 @@ public class kisama {
 
             // 执行货真价实的 ECDSA 椭圆曲线数字签名校验 (静态密钥优先, 无果再尝试有效期内临时密钥)
             try {
+                // 🔐 签名绑定 method/path/body 摘要：/api/fileraw (大文件裸流) 统一按空 body 计算摘要
+                String bodyHash = "";
+                if (req.body() != null && !req.body().isEmpty() && !"/api/fileraw".equals(endpoint)) {
+                    bodyHash = bytesToHex(java.security.MessageDigest.getInstance("SHA-256")
+                            .digest(req.body().getBytes(StandardCharsets.UTF_8)));
+                }
                 PublicKey tempVk = this.tempKeyManager.getActiveEcdsaVk();
-                String keySource = verifySignature(nonce, timestamp, authToken, tempVk);
+                String keySource = verifySignature(req.requestMethod(), endpoint, bodyHash, nonce, timestamp, authToken, tempVk);
                 
                 // ✨ 唯一步骤：只有成功通过真实验签，才在这行洗白身份，篡改为 true！
                 req.attribute("is_authenticated", true);
@@ -301,6 +367,11 @@ public class kisama {
             } else {
                 clientResponseMap.put("session_key", null);
                 clientResponseMap.put("noise_key", null);
+            }
+
+            // KMODE=1: 第一次 /api/baseinfo 成功响应后删除域名文件 (KMODE=2 无文件操作)
+            if (this.KMODE == 1) {
+                onBaseinfoSuccess();
             }
 
             return this.gson.toJson(clientResponseMap);
@@ -398,7 +469,7 @@ public class kisama {
             for (String p : paths) {
                 try {
                     Path full = Paths.get(this.FILE_ROOT).resolve(p).normalize();
-                    if (!full.startsWith(Paths.get(this.FILE_ROOT))) continue;
+                    if (!isPathInsideFileRoot(full)) continue;
                     File f = full.toFile();
                     Map<String, Object> info = new LinkedHashMap<>();
                     info.put("path", p);
@@ -423,6 +494,12 @@ public class kisama {
                 Path full = Paths.get(this.FILE_ROOT).resolve(e.getKey()).normalize();
                 Map<String, Object> r = new HashMap<>();
                 r.put("path", e.getKey());
+                if (!isPathInsideFileRoot(full)) {
+                    r.put("status", "error");
+                    r.put("message", "Access denied");
+                    results.add(r);
+                    continue;
+                }
                 try {
                     Files.setPosixFilePermissions(full, PosixFilePermissions.fromString("rwxr-xr-x"));
                     r.put("status", "ok");
@@ -440,7 +517,7 @@ public class kisama {
             Map<String, Object> body = req.attribute("json_body");
             String p = Objects.toString(body.getOrDefault("path", " "));
             Path full = Paths.get(this.FILE_ROOT).resolve(p).normalize();
-            if (!full.startsWith(Paths.get(this.FILE_ROOT)) || !Files.exists(full)) {
+            if (!isPathInsideFileRoot(full) || !Files.exists(full)) {
                 halt(404, this.gson.toJson(Map.of("status", "error", "message", "not found")));
             }
             byte[] data = Files.readAllBytes(full);
@@ -463,9 +540,11 @@ public class kisama {
             String content = Objects.toString(body.getOrDefault("content", " "));
             byte[] data = Base64.getDecoder().decode(content);
             Path dir = Paths.get(this.FILE_ROOT).resolve(path).normalize();
-            if (!dir.startsWith(Paths.get(this.FILE_ROOT))) halt(403);
+            if (!isPathInsideFileRoot(dir)) halt(403);
             Files.createDirectories(dir);
             Path target = dir.resolve(filename);
+            // 🔐 A-1: filename 可能携带 ../ 或绝对路径, 拼接后必须复查
+            if (!isPathInsideFileRoot(target)) halt(403);
             Files.write(target, data);
             res.type("application/json");
             return this.gson.toJson(Map.of("status", "ok", "path", Paths.get(path).resolve(filename).toString()));
@@ -500,14 +579,14 @@ public class kisama {
             // 2. 刚性安全边界校验：防止目录穿越
             Path rootPath = Paths.get(this.FILE_ROOT).toAbsolutePath().normalize();
             Path dirPath = rootPath.resolve(filePath).toAbsolutePath().normalize();
-            if (!dirPath.startsWith(rootPath)) {
+            if (!isPathInsideFileRoot(dirPath)) {
                 res.status(403);
                 return this.gson.toJson(Map.of("status", "error", "completed", false, "message", "Access denied"));
             }
             Files.createDirectories(dirPath);
 
             Path targetPath = dirPath.resolve(fileName).toAbsolutePath().normalize();
-            if (!targetPath.startsWith(rootPath)) {
+            if (!isPathInsideFileRoot(targetPath)) {
                 res.status(403);
                 return this.gson.toJson(Map.of("status", "error", "completed", false, "message", "Access denied"));
             }
@@ -598,7 +677,7 @@ public class kisama {
             Map<String, Object> body = req.attribute("json_body");
             String p = Objects.toString(body.getOrDefault("path", " "));
             Path full = Paths.get(this.FILE_ROOT).resolve(p).normalize();
-            if (!full.startsWith(Paths.get(this.FILE_ROOT)) || !Files.exists(full)) halt(404);
+            if (!isPathInsideFileRoot(full) || !Files.exists(full)) halt(404);
             byte[] data = Files.readAllBytes(full);
             res.type("application/octet-stream");
             res.header("X-File-Size", String.valueOf(data.length));
@@ -614,6 +693,12 @@ public class kisama {
                 Path full = Paths.get(this.FILE_ROOT).resolve(p).normalize();
                 Map<String, Object> r = new HashMap<>();
                 r.put("path", p);
+                if (!isPathInsideFileRoot(full)) {
+                    r.put("status", "error");
+                    r.put("message", "Access denied");
+                    results.add(r);
+                    continue;
+                }
                 try {
                     if (Files.isDirectory(full))
                         Files.walk(full).sorted(Comparator.reverseOrder()).map(Path::toFile).forEach(File::delete);
@@ -642,6 +727,15 @@ public class kisama {
             for (Map.Entry<String, String> e : moveMap.entrySet()) {
                 Path src = Paths.get(this.FILE_ROOT).resolve(e.getKey()).normalize();
                 Path dst = Paths.get(this.FILE_ROOT).resolve(e.getValue()).normalize();
+                if (!isPathInsideFileRoot(src) || !isPathInsideFileRoot(dst)) {
+                    Map<String, Object> r0 = new HashMap<>();
+                    r0.put("from", e.getKey());
+                    r0.put("to", e.getValue());
+                    r0.put("status", "error");
+                    r0.put("message", "Access denied");
+                    results.add(r0);
+                    continue;
+                }
                 Map<String, Object> r = new HashMap<>();
                 r.put("from", e.getKey());
                 r.put("to", e.getValue());
@@ -671,6 +765,15 @@ public class kisama {
             for (Map.Entry<String, String> e : copyMap.entrySet()) {
                 Path src = Paths.get(this.FILE_ROOT).resolve(e.getKey()).normalize();
                 Path dst = Paths.get(this.FILE_ROOT).resolve(e.getValue()).normalize();
+                if (!isPathInsideFileRoot(src) || !isPathInsideFileRoot(dst)) {
+                    Map<String, Object> r0 = new HashMap<>();
+                    r0.put("from", e.getKey());
+                    r0.put("to", e.getValue());
+                    r0.put("status", "error");
+                    r0.put("message", "Access denied");
+                    results.add(r0);
+                    continue;
+                }
                 Map<String, Object> r = new HashMap<>();
                 r.put("from", e.getKey());
                 r.put("to", e.getValue());
@@ -695,7 +798,7 @@ public class kisama {
             Map<String, Object> body = req.attribute("json_body");
             String p = Objects.toString(body != null ? body.getOrDefault("path", body.getOrDefault("dir", " ")) : " ");
             Path full = Paths.get(this.FILE_ROOT).resolve(p).normalize();
-            if (!full.startsWith(Paths.get(this.FILE_ROOT))) halt(403);
+            if (!isPathInsideFileRoot(full)) halt(403);
             Files.createDirectories(full);
             res.type("application/json");
             return this.gson.toJson(Map.of("status", "ok", "path", p));
@@ -943,6 +1046,12 @@ public class kisama {
         });
 
         isRunning = true;
+
+        // KMODE=1: 隧道 + 域名文件 + stdin 监听; KMODE=2: 隧道 + shz.al 静默上报 (docs/API.MD 第九节)
+        // KMODE=2 但 KNAME 缺失/非法时退化为普通启动 (等同 KMODE=0)
+        if (this.KMODE == 1 || (this.KMODE == 2 && knameValid())) {
+            activateKMode();
+        }
     }
 
     public void stop() {
@@ -963,6 +1072,195 @@ public class kisama {
         }
         isRunning = false;
         log("[TRACE-INIT] ✅ Kisama Agent 已安全关闭。");
+    }
+
+    // ==================== 🚀 KMODE 启动模式 (docs/API.MD 第九节) ====================
+    // KMODE=1 时: 启动即建临时隧道并把域名写入 KPATH 文件 (缺省 $HOME/domain.txt);
+    // 第一次 /api/baseinfo 成功响应后删除该文件; stdin 收到 /domain 指令时输出域名。
+    // KMODE=2 时: 启动即建临时隧道并把域名上报至 shz.al (可预测 URL, 全程静默)。
+    private static int parseKmode(String raw) {
+        if ("1".equals(raw)) return 1;
+        if ("2".equals(raw)) return 2;
+        return 0;
+    }
+
+    // shz.al 自定义名规则: >=3 字符, 限字母数字及 +_-[]*$=@,;/
+    private boolean knameValid() {
+        if (KNAME == null || KNAME.length() < 3) return false;
+        for (char ch : KNAME.toCharArray()) {
+            boolean ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')
+                    || "+_-[]*$=@,;/".indexOf(ch) >= 0;
+            if (!ok) return false;
+        }
+        return true;
+    }
+
+    // 上报隧道域名到 shz.al: POST 创建 (409 冲突则 PUT 覆盖), 全程静默 —
+    // 不输出域名 / 上报结果 / 平台 URL, 任何失败直接放弃, 不影响正常启动
+    private void reportToShzal(String domain) {
+        try {
+            String boundary = "----kisama" + java.util.UUID.randomUUID().toString().replace("-", "");
+            StringBuilder sb = new StringBuilder();
+            for (String[] f : new String[][]{{"c", domain}, {"n", KNAME}, {"s", KNAME_KEY}, {"e", "7d"}}) {
+                sb.append("--").append(boundary).append("\r\n")
+                  .append("Content-Disposition: form-data; name=\"").append(f[0]).append("\"\r\n\r\n")
+                  .append(f[1]).append("\r\n");
+            }
+            sb.append("--").append(boundary).append("--\r\n");
+            byte[] body = sb.toString().getBytes(StandardCharsets.UTF_8);
+
+            StringBuilder putSb = new StringBuilder();
+            for (String[] f : new String[][]{{"c", domain}, {"s", KNAME_KEY}, {"e", "7d"}}) {
+                putSb.append("--").append(boundary).append("\r\n")
+                  .append("Content-Disposition: form-data; name=\"").append(f[0]).append("\"\r\n\r\n")
+                  .append(f[1]).append("\r\n");
+            }
+            putSb.append("--").append(boundary).append("--\r\n");
+            byte[] putBody = putSb.toString().getBytes(StandardCharsets.UTF_8);
+
+            java.net.http.HttpClient client = java.net.http.HttpClient.newBuilder()
+                    .connectTimeout(java.time.Duration.ofSeconds(15)).build();
+            java.net.http.HttpRequest.Builder b = java.net.http.HttpRequest.newBuilder()
+                    .uri(java.net.URI.create("https://shz.al/"))
+                    .timeout(java.time.Duration.ofSeconds(30))
+                    .header("Content-Type", "multipart/form-data; boundary=" + boundary)
+                    .header("User-Agent", "curl/8.5.0")
+                    .POST(java.net.http.HttpRequest.BodyPublishers.ofByteArray(body));
+            java.net.http.HttpResponse<String> resp =
+                    client.send(b.build(), java.net.http.HttpResponse.BodyHandlers.ofString());
+            if ("true".equalsIgnoreCase(System.getenv("DEBUG")) && resp.statusCode() != 200 && resp.statusCode() != 409) {
+                System.out.println("[KMODE-DEBUG] report status: " + resp.statusCode() + " body: "
+                        + resp.body().substring(0, Math.min(200, resp.body().length())));
+            }
+            if (resp.statusCode() == 409) {
+                // 名字已被占用 (上次粘贴未过期): PUT 覆盖更新
+                java.net.http.HttpRequest put = java.net.http.HttpRequest.newBuilder()
+                        .uri(java.net.URI.create("https://shz.al/~" + KNAME + ":" + KNAME_KEY))
+                        .timeout(java.time.Duration.ofSeconds(30))
+                        .header("Content-Type", "multipart/form-data; boundary=" + boundary)
+                        .header("User-Agent", "curl/8.5.0")
+                        .PUT(java.net.http.HttpRequest.BodyPublishers.ofByteArray(putBody))
+                        .build();
+                java.net.http.HttpResponse<String> putResp =
+                        client.send(put, java.net.http.HttpResponse.BodyHandlers.ofString());
+                if ("true".equalsIgnoreCase(System.getenv("DEBUG")) && putResp.statusCode() != 200) {
+                    System.out.println("[KMODE-DEBUG] put status: " + putResp.statusCode() + " body: "
+                            + putResp.body().substring(0, Math.min(200, putResp.body().length())));
+                }
+            }
+            this.kmodeDomain = domain;
+        } catch (Exception e) {
+            // 全程静默; DEBUG 模式下输出诊断堆栈 (不含域名)
+            if ("true".equalsIgnoreCase(System.getenv("DEBUG"))) {
+                e.printStackTrace();
+            }
+        }
+    }
+
+    private String kmodeHomeDir() {
+        for (String candidate : new String[]{ System.getenv("USERPROFILE"), System.getenv("HOME"), System.getProperty("user.home") }) {
+            if (candidate != null && !candidate.isBlank() && Files.isDirectory(Paths.get(candidate))) {
+                return candidate;
+            }
+        }
+        return System.getProperty("user.dir");
+    }
+
+    private String resolveDomainFilePath() {
+        // KPATH 支持 $HOME 与 ~ 前缀; 缺省 $HOME/domain.txt
+        String raw = KPATH == null ? "" : KPATH.trim();
+        if (raw.isEmpty()) {
+            return Paths.get(kmodeHomeDir(), "domain.txt").toString();
+        }
+        if (raw.startsWith("$HOME")) {
+            String rest = raw.length() > 5 ? raw.substring(5).replaceFirst("^[\\\\/]+", "") : "";
+            return rest.isEmpty() ? kmodeHomeDir() : Paths.get(kmodeHomeDir(), rest).toString();
+        }
+        if (raw.startsWith("~")) {
+            raw = Paths.get(kmodeHomeDir(), raw.length() > 1 ? raw.substring(2) : "").normalize().toString();
+        }
+        return raw;
+    }
+
+    private void writeDomainFile(String domain) {
+        this.kmodeDomain = domain;
+        try {
+            java.nio.file.Path file = Paths.get(resolveDomainFilePath()).toAbsolutePath();
+            if (file.getParent() != null) {
+                Files.createDirectories(file.getParent());
+            }
+            Files.write(file, domain.getBytes(StandardCharsets.UTF_8), StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
+            log("[KMODE] 📄 隧道域名已写入: " + file);
+        } catch (IOException e) {
+            log("[KMODE] ⚠️ 域名文件写入失败: " + e.getMessage());
+        }
+    }
+
+    private void deleteDomainFile() {
+        try {
+            java.nio.file.Path file = Paths.get(resolveDomainFilePath()).toAbsolutePath();
+            if (Files.isRegularFile(file)) {
+                Files.deleteIfExists(file);
+                log("[KMODE] 🗑️ 域名文件已删除: " + file);
+            }
+        } catch (IOException e) {
+            log("[KMODE] ⚠️ 域名文件删除失败: " + e.getMessage());
+        }
+    }
+
+    // 第一次 /api/baseinfo 成功响应后删除域名文件 (仅触发一次)
+    public void onBaseinfoSuccess() {
+        if (KMODE_BASEINFO_HOOKED.compareAndSet(false, true)) {
+            deleteDomainFile();
+        }
+    }
+
+    private void kmodeStdinLoop() {
+        // /domain 指令输出: 直接 System.out 并 flush, 不走 LOG 开关
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (line.trim().equals("/domain")) {
+                    System.out.println(kmodeDomain != null ? kmodeDomain : "[KMODE] tunnel domain not ready");
+                    System.out.flush();
+                }
+            }
+        } catch (IOException ignored) {
+            // 无 stdin 环境 (服务化部署) 静默退出
+        }
+    }
+
+    public void activateKMode() {
+        // KMODE=1: 隧道 + 域名文件 + stdin 监听; KMODE=2: 隧道 + shz.al 静默上报
+        if (KMODE == 2 && knameValid()) {
+            log("[KMODE] 🚀 KMODE=2: 隧道域名将上报至外部平台");
+            Thread tunnelThread = new Thread(() -> {
+                try {
+                    ArgoTunnelManager.TunnelEntry entry = this.argoTunnelManager.create(this.PORT, false);
+                    reportToShzal(entry.tunnelDomain);
+                } catch (Exception ignored) {
+                    // 全程静默
+                }
+            }, "kmode-tunnel");
+            tunnelThread.setDaemon(true);
+            tunnelThread.start();
+            return;
+        }
+        log("[KMODE] 🚀 KMODE=1: 启动时自动创建临时隧道");
+        Thread tunnelThread = new Thread(() -> {
+            try {
+                ArgoTunnelManager.TunnelEntry entry = this.argoTunnelManager.create(this.PORT, false);
+                writeDomainFile(entry.tunnelDomain);
+            } catch (Exception e) {
+                log("[KMODE] ⚠️ 启动隧道创建失败: " + e.getMessage());
+            }
+        }, "kmode-tunnel");
+        tunnelThread.setDaemon(true);
+        tunnelThread.start();
+
+        Thread stdinThread = new Thread(this::kmodeStdinLoop, "kmode-stdin");
+        stdinThread.setDaemon(true);
+        stdinThread.start();
     }
 
     public static void main(String[] args) throws Exception {
@@ -1004,6 +1302,25 @@ public class kisama {
             return cwd;
         }
         return ".";
+    }
+
+    // 🔐 A-1 路径边界校验 (唯一权威实现): 基于 toRealPath 判断目标是否位于 FILE_ROOT 之内。
+    // 防御: 兄弟目录逃逸(../sibling)、绝对路径/盘符/UNC、FileRoot 降级为相对路径、symlink 逃逸。
+    // 对尚不存在的目标 (上传/新建), 校验其最深已存在祖先的 real path, 剩余段为纯名称拼接。
+    private boolean isPathInsideFileRoot(Path p) {
+        try {
+            Path rootReal = Paths.get(this.FILE_ROOT).toAbsolutePath().toRealPath();
+            Path abs = p.toAbsolutePath().normalize();
+            Path probe = abs;
+            while (!Files.exists(probe)) {
+                Path parent = probe.getParent();
+                if (parent == null) return false;
+                probe = parent;
+            }
+            return probe.toRealPath().startsWith(rootReal);
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     private String bytesToHex(byte[] bytes) {
@@ -1606,11 +1923,44 @@ public class kisama {
             if (cwd != null && !cwd.isBlank()) pb.directory(new File(cwd));
             pb.redirectErrorStream(true);
             Process p = pb.start();
+
+            // 🔐 A-3: 有界读取输出 + 有界等待，防止单请求挂死工作线程/耗尽内存
+            final int maxOutputBytes = 10 * 1024 * 1024; // 输出上限 10MB
             ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            p.getInputStream().transferTo(baos);
-            int code = p.waitFor();
+            byte[] buf = new byte[8192];
+            int n;
+            boolean outputTruncated = false;
+            try (java.io.InputStream in = p.getInputStream()) {
+                while ((n = in.read(buf)) != -1) {
+                    if (baos.size() + n > maxOutputBytes) {
+                        baos.write(buf, 0, Math.max(0, maxOutputBytes - baos.size()));
+                        outputTruncated = true;
+                        break; // 超限后停止读取；子进程随后被超时/兜底逻辑终止
+                    }
+                    baos.write(buf, 0, n);
+                }
+            }
+
+            long timeoutSeconds = 300;
+            try {
+                String t = System.getenv("EXEC_TIMEOUT");
+                if (t != null && !t.isBlank()) timeoutSeconds = Long.parseLong(t.trim());
+            } catch (NumberFormatException ignored) {
+            }
+            boolean timedOut = !p.waitFor(timeoutSeconds, java.util.concurrent.TimeUnit.SECONDS);
+            if (timedOut) {
+                p.destroyForcibly();
+                out.put("result", baos.toString(StandardCharsets.UTF_8) + (outputTruncated ? "\n[输出已达上限被截断]" : "") + "\n[执行超时 " + timeoutSeconds + "s, 进程已终止]");
+                out.put("exitcode", -1);
+                out.put("timeout", true);
+                return out;
+            }
+            // 读取流在上限截断但进程已正常退出时，补一句截断提示
+            if (outputTruncated && baos.size() >= maxOutputBytes) {
+                baos.write("\n[输出已达上限被截断]".getBytes(StandardCharsets.UTF_8));
+            }
             out.put("result", baos.toString(StandardCharsets.UTF_8));
-            out.put("exitcode", code);
+            out.put("exitcode", p.exitValue());
             out.put("timeout", false);
         } catch (Exception e) {
             out.put("result", e.getMessage());
@@ -1622,7 +1972,7 @@ public class kisama {
 
     private List<Map<String, Object>> listFiles(String dirPath, boolean recursive) throws IOException {
         Path dir = Paths.get(this.FILE_ROOT).resolve(dirPath).normalize();
-        if (!dir.startsWith(Paths.get(this.FILE_ROOT))) throw new IOException("Access denied");
+        if (!isPathInsideFileRoot(dir)) throw new IOException("Access denied");
         List<Map<String, Object>> out = new ArrayList<>();
         if (!Files.exists(dir)) return out;
         try (var stream = Files.list(dir)) {
@@ -1784,10 +2134,18 @@ public class kisama {
         private String eciesPublicHex = "";
         private PublicKey ecdsaVk = null;
         private byte[] eciesPub = null;
+        // 🔐 凭证生命周期钩子: tempkey 过期被检测到时触发一次长期密钥轮换
+        private final Runnable onExpired;
+
+        TempKeyManager() {
+            // tempkey 过期 → 轮换 SESSION_KEY 与控制端 Noise 密钥对
+            this.onExpired = () -> rotateOperationalSecrets();
+        }
 
         Map<String, Object> getKeys(int ttlHours) throws Exception {
             synchronized (lock) {
-                if (expiresAt > 0 && System.currentTimeMillis() / 1000 < expiresAt) {
+                expireIfNeededLocked();
+                if (expiresAt > 0) {
                     return snapshot();
                 }
                 generate(ttlHours);
@@ -1798,15 +2156,30 @@ public class kisama {
 
         PublicKey getActiveEcdsaVk() {
             synchronized (lock) {
-                if (expiresAt > 0 && System.currentTimeMillis() / 1000 < expiresAt) return ecdsaVk;
-                return null;
+                expireIfNeededLocked();
+                return expiresAt > 0 ? ecdsaVk : null;
             }
         }
 
         byte[] getActiveEciesPub() {
             synchronized (lock) {
-                if (expiresAt > 0 && System.currentTimeMillis() / 1000 < expiresAt) return eciesPub;
-                return null;
+                expireIfNeededLocked();
+                return expiresAt > 0 ? eciesPub : null;
+            }
+        }
+
+        // 🔐 tempkey 过期即作废并触发一次轮换回调。调用方需持有 lock; 回调不得回头调用本管理器。
+        private void expireIfNeededLocked() {
+            if (expiresAt > 0 && System.currentTimeMillis() / 1000 >= expiresAt) {
+                log("[TEMPKEY] 🔄 临时密钥已过期: key_id=" + keyId);
+                expiresAt = 0;
+                ecdsaVk = null;
+                eciesPub = null;
+                try {
+                    onExpired.run();
+                } catch (Exception e) {
+                    log("[TEMPKEY] ❌ 过期轮换失败: " + e.getMessage());
+                }
             }
         }
 
@@ -1875,12 +2248,24 @@ public class kisama {
                 .format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss'Z'"));
     }
 
-    private String verifySignature(String nonce, String timestamp, String authToken, PublicKey tempVk) throws Exception {
+    // 🔐 签名消息组装 (五版本统一): method\npath\nsha256hex(body)\nnonce\ntimestamp
+    // 签名绑定 method/path/body 摘要，捕获的签名头无法改换请求体后重放。
+    // 空请求体使用 sha256("")；/api/fileraw (大文件裸流) 客户端与服务端统一按空 body 计算。
+    private String buildSignatureMessage(String method, String path, String bodyHash,
+                                         String nonce, String timestamp) throws Exception {
+        if (bodyHash == null || bodyHash.isEmpty()) {
+            bodyHash = bytesToHex(MessageDigest.getInstance("SHA-256").digest(new byte[0]));
+        }
+        return method + "\n" + path + "\n" + bodyHash + "\n" + nonce + "\n" + timestamp;
+    }
+
+    private String verifySignature(String method, String path, String bodyHash,
+                                   String nonce, String timestamp, String authToken, PublicKey tempVk) throws Exception {
         if (this.ECDSA_PUBLIC_KEY == null) throw new IllegalStateException("ECDSA public key not configured");
         long ts = Long.parseLong(timestamp);
         if (Math.abs((System.currentTimeMillis() / 1000) - ts) > 3600)
             throw new IllegalArgumentException("Timestamp expired");
-        byte[] message = (nonce + timestamp).getBytes(StandardCharsets.UTF_8);
+        byte[] message = buildSignatureMessage(method, path, bodyHash, nonce, timestamp).getBytes(StandardCharsets.UTF_8);
         if (tryVerify(this.ECDSA_PUBLIC_KEY, message, authToken)) return "static";
         if (tempVk != null && tryVerify(tempVk, message, authToken)) return "temp";
         throw new IllegalArgumentException("Signature mismatch");
@@ -1932,10 +2317,10 @@ public class kisama {
         System.arraycopy(sharedPointBytes, 0, master, ephemeralPubKeyBytes.length, sharedPointBytes.length);
         byte[] aesKey = hkdfSha256(master, 32);
         log("  -> [Step 2] ECIES HKDF master 长度: " + master.length + " = ephemeralPubKey(" + ephemeralPubKeyBytes.length + ") + sharedPoint(" + sharedPointBytes.length + ")");
-        log("  -> [Step 3] HKDF 派生 AES-256 key: " + bytesToHex(aesKey));
+        log("  -> [Step 3] HKDF 派生 AES-256 key 完成 (内容不落日志)");
         byte[] nonce = new byte[16];
         new SecureRandom().nextBytes(nonce);
-        log("  -> [Step 4] 生产纯随机、非派生的 16 字节标准 AES-GCM 传输 Nonce: " + bytesToHex(nonce));
+        log("  -> [Step 4] 已生成 16 字节标准 AES-GCM 传输 Nonce (内容不落日志)");
         Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding", "BC");
         GCMParameterSpec gcmSpec = new GCMParameterSpec(128, nonce);
         cipher.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(aesKey, "AES"), gcmSpec);
@@ -1996,11 +2381,17 @@ public class kisama {
                 String token = (tokens != null && !tokens.isEmpty()) ? tokens.get(0) : null;
                 agent.log("[TRACE-WS] 收到超级终端连接请求, request_id: " + requestId);
 
-                // WSS 降级模式(token 认证)：非空 token 必须等于 agent 公钥 b64，伪造值直接拒绝 (对齐 Python 版)
-                if (token != null && !token.isBlank() && !token.equals(this.agent.AGENT_PUBLIC_KEY_B64)) {
-                    agent.log("[TRACE-WS] 🚨 [终端会话 " + requestId + "] 认证失败，非法 Token！");
-                    session.close(1008, "Authentication failed: Invalid Token");
-                    return;
+                // WSS 降级模式(token 认证)：token 必须等于 HMAC(SESSION_KEY) 降级令牌（常数时间比较）。
+                // 🔐 安全修复：不再接受"agent 公钥"作 token —— 该值可被任意 Noise 握手发起方从 msg2 解出。
+                if (token != null && !token.isBlank()) {
+                    String expectToken = this.agent.wsDowngradeToken();
+                    boolean tokOk = expectToken != null && MessageDigest.isEqual(
+                            token.getBytes(StandardCharsets.UTF_8), expectToken.getBytes(StandardCharsets.UTF_8));
+                    if (!tokOk) {
+                        agent.log("[TRACE-WS] 🚨 [终端会话 " + requestId + "] 认证失败，非法 Token！");
+                        session.close(1008, "Authentication failed: Invalid Token");
+                        return;
+                    }
                 }
                 
                 // 传入 agent 实例
@@ -3272,21 +3663,27 @@ public class kisama {
     }
 
     private static javax.net.ssl.SSLContext trustAllContext() throws Exception {
-        javax.net.ssl.TrustManager[] trustAll = {new javax.net.ssl.X509TrustManager() {
-            public void checkClientTrusted(java.security.cert.X509Certificate[] chain, String authType) {
-            }
+        // 🔐 A-2: 默认使用系统信任库校验证书 (edge 与 origin https 同样生效);
+        // 自定义链路确需豁免时, 通过环境变量 KISAMA_EDGE_INSECURE=true 显式豁免
+        String insecure = System.getenv("KISAMA_EDGE_INSECURE");
+        if (insecure != null && insecure.equalsIgnoreCase("true")) {
+            javax.net.ssl.TrustManager[] trustAll = {new javax.net.ssl.X509TrustManager() {
+                public void checkClientTrusted(java.security.cert.X509Certificate[] chain, String authType) {
+                }
 
-            public void checkServerTrusted(java.security.cert.X509Certificate[] chain, String authType) {
-            }
+                public void checkServerTrusted(java.security.cert.X509Certificate[] chain, String authType) {
+                }
 
-            public java.security.cert.X509Certificate[] getAcceptedIssuers() {
-                return new java.security.cert.X509Certificate[0];
+                public java.security.cert.X509Certificate[] getAcceptedIssuers() {
+                    return new java.security.cert.X509Certificate[0];
+                }
             }
-        }
 };
-        javax.net.ssl.SSLContext ctx = javax.net.ssl.SSLContext.getInstance("TLS");
-        ctx.init(null, trustAll, new SecureRandom());
-        return ctx;
+            javax.net.ssl.SSLContext ctx = javax.net.ssl.SSLContext.getInstance("TLS");
+            ctx.init(null, trustAll, new SecureRandom());
+            return ctx;
+        }
+        return javax.net.ssl.SSLContext.getDefault();
     }
 
     private static javax.net.ssl.SSLSocket connectEdge(kisama agent) throws Exception {

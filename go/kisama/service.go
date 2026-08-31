@@ -86,6 +86,15 @@ func NewService(opts Options) (*Service, error) {
 	}
 
 	tk := tempkey.New()
+	// 🔐 凭证生命周期: tempkey 过期 → 轮换 SESSION_KEY 与控制端 Noise 密钥对, 并失效 baseinfo/status 缓存
+	tk.OnExpired = func() {
+		if err := cfg.RotateOperationalSecrets(); err != nil {
+			logger.Errorf("🔄 [SECURITY] 临时密钥过期轮换失败: %v", err)
+			return
+		}
+		handlers.InvalidateSecretCaches()
+		logger.Warnf("🔄 [SECURITY] 临时密钥过期, 已轮换 SESSION_KEY 与控制端 Noise 密钥对 (合法控制端需重新认证获取 baseinfo 新密钥)")
+	}
 	router := newRouter(cfg, cm, tk)
 
 	return &Service{

@@ -4,11 +4,17 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/pem"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/liveqte/kisama_agent/go/config"
@@ -18,6 +24,11 @@ import (
 
 // newAuthTestRouter 构造生产模式(非DEBUG)下的最小认证环境
 func newAuthTestRouter(t *testing.T) *gin.Engine {
+	router, _ := newAuthTestRouterWithKey(t)
+	return router
+}
+
+func newAuthTestRouterWithKey(t *testing.T) (*gin.Engine, *ecdsa.PrivateKey) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 
@@ -43,7 +54,7 @@ func newAuthTestRouter(t *testing.T) *gin.Engine {
 	router.Use(AuthEncryptMiddleware(cm, cfg, tk))
 	router.POST("/api/exec", func(c *gin.Context) { c.JSON(200, gin.H{"ok": true}) })
 	router.GET("/api/baseinfo", func(c *gin.Context) { c.JSON(200, gin.H{"ok": true}) })
-	return router
+	return router, priv
 }
 
 // 回归测试：伪造 Upgrade: websocket 头不得绕过认证中间件 (历史漏洞: 任意请求带该头即全量放行)
@@ -59,6 +70,40 @@ func TestUpgradeHeaderCannotBypassAuth(t *testing.T) {
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("POST /api/exec with forged Upgrade header: got status %d, want 401", w.Code)
 	}
+}
+
+// 回归测试：签名消息必须绑定 method+path+body 摘要 (R2)。
+// 合法签名 + 原请求体 → 200；同一签名头 + 被替换的请求体 → 401。
+func TestSignatureBindsMethodPathBody(t *testing.T) {
+	router, priv := newAuthTestRouterWithKey(t)
+
+	const origBody = `{"cmd":"echo hi"}`
+	ts := fmt.Sprintf("%d", time.Now().Unix())
+	nonce := base64.StdEncoding.EncodeToString([]byte("0123456789abcdef"))
+	bodySum := sha256.Sum256([]byte(origBody))
+	message := fmt.Sprintf("POST\n/api/exec\n%s\n%s\n%s", hex.EncodeToString(bodySum[:]), nonce, ts)
+	digest := sha256.Sum256([]byte(message))
+	sig, err := ecdsa.SignASN1(rand.Reader, priv, digest[:])
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	authToken := base64.StdEncoding.EncodeToString(sig)
+
+	send := func(body string, want int, label string) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/api/exec", strings.NewReader(body))
+		req.Header.Set("x-nonce", nonce)
+		req.Header.Set("x-timestamp", ts)
+		req.Header.Set("x-auth-token", authToken)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != want {
+			t.Fatalf("%s: got status %d, want %d", label, w.Code, want)
+		}
+	}
+
+	send(origBody, http.StatusOK, "合法签名+原请求体")
+	send(`{"cmd":"evil"}`, http.StatusUnauthorized, "同签名头+被替换请求体必须 401")
 }
 
 // 回归测试：普通未认证请求仍被拦截

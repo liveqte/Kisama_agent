@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -121,6 +122,24 @@ func GenerateSessionKey() (string, error) {
 		return "", err
 	}
 	return base64.StdEncoding.EncodeToString(key), nil
+}
+
+// RotateOperationalSecrets 🔐 凭证生命周期: tempkey 过期后轮换会话级长期密钥。
+// 仅轮换 SESSION_KEY 与控制端 Noise 密钥对 (终端身份校验的预期对端)；agent Noise
+// 密钥对保持稳定, 客户端缓存的 agent 公钥继续有效。临时授权有效期内经 baseinfo
+// 下发到外部的长期凭据由此全部失效。注意: 读取方未加锁, 轮换为低频一次性操作。
+func (c *Config) RotateOperationalSecrets() error {
+	control, err := GenerateNoiseKeyPair()
+	if err != nil {
+		return fmt.Errorf("rotate control noise keypair: %w", err)
+	}
+	sk, err := GenerateSessionKey()
+	if err != nil {
+		return fmt.Errorf("rotate session key: %w", err)
+	}
+	c.NoiseKeys.Control = control
+	c.SessionKey = sk
+	return nil
 }
 
 // getConfigValue gets a config value from env or file
@@ -254,7 +273,7 @@ func New() (*Config, error) {
 
 	agentVersion := os.Getenv("AGENT_VERSION")
 	if agentVersion == "" {
-		agentVersion = "0.4.7-go"
+		agentVersion = "0.4.8-go"
 	}
 
 	tempKeyDefaultTTL := 24

@@ -3,6 +3,9 @@
 ## 默认端口
 通过环境变量KPORT、PORT、SERVER_PORT指定，优先级从高到低，若都没有为8000。
 
+## KMODE 启动模式
+通过环境变量KMODE控制，用于在启动时自动创建临时隧道，并以文件/stdin（KMODE=1）或 shz.al 静默上报（KMODE=2）的方式交付隧道域名，详见「九、KMODE 启动模式」一节。
+
 【安全说明】
 除了/api/baseinfo、/api/status 以及 /kisamaproxy 转发器（纯转发，不参与认证）外，
 其他所有接口均受 AuthEncryptMiddleware 保护。
@@ -639,6 +642,74 @@ GET /kisamaproxy/https://host:8443/api/exec
 
 生产环境建议：保持 DEBUG=false，此时 /docs 将返回 404，防止接口结构泄露。
 可通过 curl http://<host>:<port>/openapi.json | jq 获取完整路由定义。
+
+
+## 九、KMODE 启动模式（环境变量）
+
+KMODE 是代理端的一个启动模式开关，通过环境变量取值，用于控制代理启动时是否自动创建临时隧道（trycloudflare），以及以何种方式交付隧道域名（文件 + stdin 监听 / 匿名文本平台静默上报）。
+
+### 环境变量说明
+| 环境变量 | 默认值 | 说明 |
+| :--- | :--- | :--- |
+| KMODE | `0` | 启动模式开关：`0`=普通启动；`1`=自动创建临时隧道 + 写域名文件 + stdin 指令监听；`2`=自动创建临时隧道 + 上报域名至 shz.al（全程静默） |
+| KPATH | `$HOME/domain.txt` | 仅 KMODE=1 有效：隧道域名文件的写入路径，支持相对 HOME 的子目录写法（如 `$HOME/.cache/domain.txt`） |
+| KNAME | 无 | 仅 KMODE=2 有效：shz.al 自定义名（≥3 字符，限字母、数字及 `+_-[]*$=@,;/`），同时是可预测访问 URL 的组成部分；未设置时 KMODE=2 退化为普通启动（等同 KMODE=0），不报错 |
+| KNAME_KEY | `$KNAME` | 仅 KMODE=2 有效：上报的管理/修改密钥（即 shz.al 的密码）；缺省复用 KNAME 本身 |
+
+### KMODE=0（默认）
+与正常启动完全一致，不会在启动时创建临时隧道，也不会开启标准流输入监听。
+
+### KMODE=1 行为说明
+1. **自动创建临时隧道**：代理启动时自动创建一条临时隧道（trycloudflare），转发端口为 agent 自身监听端口（与「默认端口」一节一致）。
+2. **写入域名文件**：隧道创建成功后，将临时隧道的域名写入 KPATH 指定的文件（默认为 `$HOME/domain.txt`）。若 KPATH 设置为 `$HOME/.cache/domain.txt`，则会在 `$HOME/.cache` 目录下生成 `domain.txt`（目录不存在时自动创建）。
+3. **域名文件自动删除**：当代理收到**第一次** `/api/baseinfo` 请求并成功响应后，该域名文件即被删除。此机制可用于判断控制端已成功通过隧道连上代理（外部程序可轮询该文件是否存在来确认隧道是否已被使用）。
+4. **标准流输入监听**：开启 stdin 监听，识别到指令 `/domain` 时，向标准输出打印当前临时隧道的域名。该指令用于在无法读取文件的环境（如交互式终端）中获取隧道域名。
+
+### 使用示例
+```bash
+# 以 KMODE=1 启动，域名写入默认路径 $HOME/domain.txt
+KMODE=1 python agent.py
+
+# 以 KMODE=1 启动，域名写入 $HOME/.cache/domain.txt
+KMODE=1 KPATH=$HOME/.cache/domain.txt python agent.py
+```
+
+### KMODE=2 行为说明（shz.al 静默上报）
+设计目标：控制端预先约定 KNAME（每环境唯一），即可通过固定的预测 URL 拿到该环境的隧道域名，无需读文件、无需 stdin、控制台不泄露任何域名信息。
+
+1. **自动创建临时隧道**：与 KMODE=1 相同，代理启动时自动创建 trycloudflare 临时隧道，转发 agent 自身监听端口。
+2. **上报域名至 shz.al**：隧道创建成功后，代理端向 `POST https://shz.al/`（multipart/form-data）发起一次上报：
+   - `c` = 临时隧道完整域名（如 `https://xxx.trycloudflare.com`）
+   - `n` = `$KNAME`（自定义名）
+   - `s` = `$KNAME_KEY`（管理密码，缺省为 KNAME 本身）
+   - `e` = `7d`（固定过期时间，无需配置）
+   - 若返回 409（该名字已被占用，如上次运行的粘贴未过期），自动改用 `PUT https://shz.al/~$KNAME:$KNAME_KEY` 覆盖更新，保证同一 KNAME 反复重启仍可上报成功。
+3. **全程静默**：不写任何文件、不开启 stdin 监听、不向 stdout/stderr 输出隧道域名、上报结果或平台 URL；上报成败均不影响代理正常启动。
+4. **控制端读取（可预测 URL）**：直接 `GET https://shz.al/~$KNAME`（纯文本，响应体即隧道域名）；未上报时返回 404，控制端可轮询直至 200。
+5. **修改语义**：代理端每次启动上报都会覆盖同一预测 URL 下的值；控制端持有 KNAME_KEY 时也可自行 `PUT https://shz.al/~$KNAME:$KNAME_KEY` 改写该值（字段同上，不允许 `n`），或 `DELETE` 主动清除。
+6. **平台固定为 shz.al**：不提供平台切换变量。Rentry.co 因需 CSRF 会话流程、`/raw/` 端点已封锁（只能解析 HTML）、且不支持过期时间，不适合静默自动化上报，暂不接入。
+
+配置示例：
+```bash
+# 最简配置：仅 2 个变量，密钥复用 KNAME
+KMODE=2 KNAME=env01a python agent.py
+
+# KNAME 不够唯一（如通用名）或需与读值分离时，显式指定密钥
+KMODE=2 KNAME=env01a KNAME_KEY=s3cret-key python agent.py
+```
+
+控制端典型流程：
+```bash
+# 1. 轮询预测 URL 直到拿到上报的隧道域名
+curl -s https://shz.al/~env01a        # -> https://xxxx.trycloudflare.com
+# 2. 通过该域名连接代理（认证链路不变）
+# 3. 代理重启后会自动覆盖更新，重新 GET 同一 URL 即得新域名；
+#    控制端也可用密钥主动改写/清除：
+curl -X PUT "https://shz.al/~env01a:s3cret-key" -F "c=new-value"
+```
+
+安全提示：预测 URL 无认证即可读（shz.al 平台特性），其暴露的仅是隧道域名本身；隧道背后的 agent 接口仍有完整认证与加密，风险面与 KMODE=1 写本地域名文件相当。
+
 
 # Proxy Agent API 接口速查表
 

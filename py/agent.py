@@ -8,6 +8,7 @@ import json
 import time
 import base64
 import hashlib
+import hmac
 import secrets
 import threading
 from datetime import datetime, timezone
@@ -671,6 +672,33 @@ class Config:
             'public': keys['agent'].public_b64
         }
     }
+
+    # 🔐 终端 WS 明文降级模式令牌: Base64(HMAC-SHA256(SESSION_KEY, "kisama-ws-token-v1"))。
+    # 仅已认证客户端能从 baseinfo 取得 SESSION_KEY; 旧方案 token=agent 公钥可被任意 Noise
+    # 握手发起方从 msg2 解出（XX 模式 msg2 的 s 仅用临时密钥 DH 加密），等于公开值。
+    @staticmethod
+    def ws_downgrade_token() -> str:
+        raw_key = base64.b64decode(Config.SESSION_KEY)
+        digest = hmac.new(raw_key, b'kisama-ws-token-v1', hashlib.sha256).digest()
+        return base64.b64encode(digest).decode('utf-8')
+
+    # 🔐 凭证生命周期：tempkey 过期后轮换会话级长期密钥。仅轮换 SESSION_KEY 与控制端 Noise
+    # 密钥对 (终端身份校验的预期对端)；agent Noise 密钥对保持稳定, 客户端缓存的 agent 公钥
+    # 继续有效。临时授权有效期内经 baseinfo 下发到外部的长期凭据由此全部失效。
+    @classmethod
+    def rotate_operational_secrets(cls):
+        fresh = NoiseKeyGenerator.generate_pair()
+        cls.keys['control'] = fresh['control']
+        cls.NOISE_KEY['controller']['private'] = fresh['control'].private_b64
+        cls._raw_key = get_random_bytes(32)
+        cls.SESSION_KEY = base64.b64encode(cls._raw_key).decode('utf-8')
+        # baseinfo/status 有缓存, 必须同步失效, 否则轮换后仍会吐出旧密钥
+        cls._baseinfo_cache = None
+        cls._baseinfo_cache_time = 0.0
+        cls._status_cache = None
+        cls._status_cache_time = 0.0
+        Logger.warning('🔄 [SECURITY] 临时密钥过期, 已轮换 SESSION_KEY 与控制端 Noise 密钥对 (合法控制端需重新认证获取 baseinfo 新密钥)')
+
     # ================= 新增：文件模块配置 =================
     
     # 文件操作根目录: 限制代理端只能访问此目录及其子目录 (防止路径遍历); 候选目录不存在时降级到当前工作目录
@@ -733,9 +761,18 @@ class Config:
     # 服务监听配置
     HOST = os.getenv("HOST", "0.0.0.0")
     PORT = int(os.getenv("KPORT") or os.getenv("PORT") or os.environ.get('SERVER_PORT') or 8000)
-    
+
+    # KMODE 启动模式: 1=启动时自动创建临时隧道并开启 stdin /domain 指令监听;
+    # 2=启动时自动创建临时隧道并把域名上报至 shz.al (全程静默) (详见 docs/API.MD 第九节)
+    KMODE = (os.getenv("KMODE", "0").strip() or "0")
+    # KMODE=2: shz.al 自定义名 (可预测 URL 的组成部分); KNAME_KEY 缺省复用 KNAME
+    KNAME = os.getenv("KNAME", "").strip()
+    KNAME_KEY = os.getenv("KNAME_KEY", "").strip()
+    # 域名文件路径, 缺省 $HOME/domain.txt, 支持 $HOME / ~ 前缀
+    KPATH = os.getenv("KPATH", "")
+
     # 代理版本信息
-    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.4.7-python")
+    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.4.8-python")
     
     # ================= 启动校验 =================
     
@@ -820,6 +857,18 @@ class Logger:
 # ============================================================================
 # 🔐 加密模块: ECDSA签名验证 + ECIES加密
 # ============================================================================
+def build_signature_message(method: str, path: str, body_hash: str,
+                            nonce: str, timestamp: str) -> str:
+    """组装签名消息 (五版本统一): method\\npath\\nsha256hex(body)\\nnonce\\ntimestamp
+
+    🔐 签名绑定 method/path/body 摘要，捕获的签名头无法改换请求体后重放。
+    空请求体使用 sha256("")；/api/fileraw (大文件裸流) 客户端与服务端统一按空 body 计算。
+    """
+    if not body_hash:
+        body_hash = hashlib.sha256(b"").hexdigest()
+    return f"{method}\n{path}\n{body_hash}\n{nonce}\n{timestamp}"
+
+
 class CryptoManager:
     """
     加密管理器 - 代理端专用
@@ -923,9 +972,13 @@ class CryptoManager:
 
         return key_bytes
 
-    def verify_signature(self, nonce: str, timestamp: str, auth_token: str) -> bool:
+    def verify_signature(self, method: str, path: str, body_hash: str,
+                         nonce: str, timestamp: str, auth_token: str) -> bool:
         """
         验证请求签名
+        :param method: HTTP 方法
+        :param path: 请求路径 (不含 query)
+        :param body_hash: 请求体 SHA256 hex (空请求体用 sha256("")；/api/fileraw 统一按空 body)
         :param nonce: 单次随机值 (防重放)
         :param timestamp: UTC时间戳字符串
         :param auth_token: Base64编码的ECDSA签名
@@ -944,12 +997,12 @@ class CryptoManager:
             )
 
 
-        
-        # 2. 签名校验: message = nonce + timestamp
-        message = f"{nonce}{timestamp}".encode('utf-8')
+        # 2. 签名校验: message = method\npath\nsha256hex(body)\nnonce\ntimestamp
+        # 🔐 安全修复：签名绑定 method/path/body 摘要，捕获的签名头无法改换请求体后重放
+        message = build_signature_message(method, path, body_hash, nonce, timestamp).encode('utf-8')
         #测试
         hash_obj = hashlib.sha256(message)
-        Logger.debug(f"[Backend] message: {nonce}{timestamp}")
+        Logger.debug(f"[Backend] message: {message!r}")
         Logger.debug(f"[Backend] SHA256: {hash_obj.hexdigest()}")
         try:
             # 将 Base64 字符串解码为原始字节
@@ -993,11 +1046,15 @@ class CryptoManager:
         
         return True
 
-    def identify_signer(self, nonce: str, timestamp: str, auth_token: str,
+    def identify_signer(self, method: str, path: str, body_hash: str,
+                        nonce: str, timestamp: str, auth_token: str,
                         temp_vk: Optional[VerifyingKey] = None) -> str:
         """
         验证请求签名并识别密钥来源
         优先级: 控制端静态密钥 > 有效期内临时密钥
+        :param method: HTTP 方法
+        :param path: 请求路径 (不含 query)
+        :param body_hash: 请求体 SHA256 hex (空请求体用 sha256("")；/api/fileraw 统一按空 body)
         :param temp_vk: 当前有效临时密钥的 ECDSA 公钥 (无则跳过临时校验)
         :return: "static" (静态密钥) 或 "temp" (临时密钥)
         :raises HTTPException 401: 时间戳非法或签名均不匹配
@@ -1014,10 +1071,11 @@ class CryptoManager:
                 detail=f"Invalid timestamp: {str(e)}"
             )
 
-        # 2. 签名校验: message = nonce + timestamp
-        message = f"{nonce}{timestamp}".encode('utf-8')
+        # 2. 签名校验: message = method\npath\nsha256hex(body)\nnonce\ntimestamp
+        # 🔐 安全修复：签名绑定 method/path/body 摘要，捕获的签名头无法改换请求体后重放
+        message = build_signature_message(method, path, body_hash, nonce, timestamp).encode('utf-8')
         hash_obj = hashlib.sha256(message)
-        Logger.debug(f"[Backend] message: {nonce}{timestamp}")
+        Logger.debug(f"[Backend] message: {message!r}")
         Logger.debug(f"[Backend] SHA256: {hash_obj.hexdigest()}")
 
         # 3. 依次尝试静态密钥 → 临时密钥
@@ -1202,13 +1260,16 @@ class TempKeyManager:
     def __init__(self):
         self._lock = threading.Lock()
         self._key: Optional[Dict[str, Any]] = None
+        # 🔐 凭证生命周期钩子: tempkey 过期被检测到时触发一次长期密钥轮换
+        self.on_expired = None
 
     # ================= 对外接口 =================
 
     def get_or_create(self, ttl_hours: int) -> Dict[str, Any]:
         """获取临时密钥: 有效期内幂等返回同一密钥, 过期/不存在则重新生成"""
         with self._lock:
-            if self._key and not self._is_expired(self._key):
+            self._expire_current_locked()
+            if self._key:
                 return self._key
             self._key = self._generate(ttl_hours)
             Logger.info(
@@ -1220,18 +1281,37 @@ class TempKeyManager:
     def get_active_ecdsa_vk(self) -> Optional[VerifyingKey]:
         """当前有效临时密钥的 ECDSA 验签公钥 (供中间件验签, 无密钥时返回 None)"""
         with self._lock:
-            if self._key and not self._is_expired(self._key):
+            self._expire_current_locked()
+            if self._key:
                 return self._key.get("ecdsa_vk")
             return None
 
     def get_active_ecies_pub(self) -> Optional[bytes]:
         """当前有效临时密钥的 ECIES 公钥 (供中间件加密响应, 无密钥时返回 None)"""
         with self._lock:
-            if self._key and not self._is_expired(self._key):
+            self._expire_current_locked()
+            if self._key:
                 return self._key.get("ecies_pub")
             return None
 
     # ================= 内部实现 =================
+
+    def _expire_current_locked(self):
+        """🔐 tempkey 过期即作废, 并触发一次长期密钥轮换 (SESSION_KEY + 控制端 Noise 密钥对)。
+
+        使临时授权有效期内经 baseinfo 下发到外部的长期凭据立即失效。仅在过期后触发一次。
+        调用方必须已持有 self._lock; 回调不得再回头调用本管理器 (避免死锁)。
+        """
+        if self._key and self._is_expired(self._key):
+            expired_id = self._key["key_id"]
+            self._key = None
+            Logger.warning(f"🔄 [TempKey] 临时密钥已过期: key_id={expired_id}")
+            cb = self.on_expired
+            if cb:
+                try:
+                    cb()
+                except Exception as e:
+                    Logger.error(f"💥 [TempKey] 过期轮换失败: {e}")
 
     def _is_expired(self, key: Dict[str, Any]) -> bool:
         return int(time.time()) >= key["expires_at"]
@@ -1291,11 +1371,19 @@ class AuthEncryptMiddleware(BaseHTTPMiddleware):
         if request.method in ["OPTIONS", "HEAD"]:
             return await call_next(request)
 
+        # 🔐 安全修复：提前读取请求体，将 method/path/body 摘要纳入签名消息，
+        # 防止捕获的签名头被改换请求体后重放。/api/fileraw (大文件裸流) 统一按空
+        # body 计算摘要，避免中间件整体缓冲大文件。
+        raw_request_body = await request.body()
+        body_hash = ""
+        if raw_request_body and path != "/api/fileraw":
+            body_hash = hashlib.sha256(raw_request_body).hexdigest()
+
         # 生产环境：强制执行严格签名校验
         nonce = headers.get("x-nonce")
-        timestamp = headers.get("x-timestamp") 
+        timestamp = headers.get("x-timestamp")
         auth_token = headers.get("x-auth-token")
-        
+
         # 检查是否缺失认证头
         if not all([nonce, timestamp, auth_token]):
             if path in bypass_paths:
@@ -1305,7 +1393,7 @@ class AuthEncryptMiddleware(BaseHTTPMiddleware):
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     content={"error": "Missing auth headers"}
                 )
-        
+
         # 🌟 核心修复 3：直接进行密码学签名校验，剥离原先导致死锁的 if 判断外壳
         try:
             # 🔑 组合验签: 优先静态密钥, 无果再尝试当前有效临时密钥
@@ -1314,7 +1402,8 @@ class AuthEncryptMiddleware(BaseHTTPMiddleware):
             if tkm is not None:
                 temp_vk = tkm.get_active_ecdsa_vk()
 
-            key_source = crypto.identify_signer(nonce, timestamp, auth_token, temp_vk)
+            key_source = crypto.identify_signer(request.method, path, body_hash,
+                                                nonce, timestamp, auth_token, temp_vk)
 
             # ✨ 唯一步骤：只有当椭圆曲线点乘验签彻底通过时，才在此处将身份显式改为 True
             request.state.is_authenticated = True
@@ -1334,10 +1423,10 @@ class AuthEncryptMiddleware(BaseHTTPMiddleware):
         if headers.get("x-aes-encrypted") == "true":
             # 🌟 安全边界：只有通过认证(True)的请求才允许解密，防止未授权恶意探测
             if request.state.is_authenticated:
-                original_body = await request.body()
-                if original_body:
+                # raw_request_body 已在签名校验前读取，无需再次 await request.body()
+                if raw_request_body:
                     try:
-                        encrypted_str = original_body.decode('utf-8')
+                        encrypted_str = raw_request_body.decode('utf-8')
                         decrypted_json_str = CryptoManager.decrypt_data(encrypted_str, Config._raw_key)
                         if Config.DEBUG:
                             Logger.debug(f" [AES Decrypt] Success: {decrypted_json_str[:100]}...")
@@ -1356,7 +1445,6 @@ class AuthEncryptMiddleware(BaseHTTPMiddleware):
                     content={"error": "Decryption rejected for unauthenticated requests"}
                 )
                     
-        original_receive = request.receive
         has_returned_body = False
         
         async def wrapped_receive():
@@ -1368,7 +1456,11 @@ class AuthEncryptMiddleware(BaseHTTPMiddleware):
                 else:
                     return {"type": "http.request", "body": b"", "more_body": False}
             else:
-                return await original_receive()
+                # 🔐 body 已在签名校验阶段预读，这里原样回放，下游路由仍能拿到完整请求体
+                if not has_returned_body:
+                    has_returned_body = True
+                    return {"type": "http.request", "body": raw_request_body, "more_body": False}
+                return {"type": "http.request", "body": b"", "more_body": False}
 
         request._receive = wrapped_receive
 
@@ -2070,6 +2162,9 @@ class FileManager:
             if not filename:
                 raise HTTPException(400, "filename required for directory upload")
             target = target / filename
+        # 🔐 A-1: filename 可能携带 ../ 或绝对路径, 拼接后必须复查
+        # (Path / "/etc/x" 会直接取绝对路径; _safe_path 用 resolve()+relative_to, 可拦截)
+        target = self._safe_path(str(target))
         
         # 完整上传模式的大小检查
         if len(file_content) > self.max_upload and chunk_id is None:
@@ -2398,6 +2493,13 @@ class NoiseSessionWrapper:
             # This tells the library: "I expect the remote party to have this static key"
             # It will automatically fail the handshake if it doesn't match.
             self.noise.set_keypair_from_public_bytes(Keypair.REMOTE_STATIC, pub_bytes)
+            # 🔐 安全修复：库本身不会用预置的 REMOTE_STATIC 校验对端（msg3 处理时直接覆写 rs），
+            # 这里保存预期值，握手完成后由 _do_noise_handshake 显式比对。
+            self.expected_remote_pub = pub_bytes
+        else:
+            self.expected_remote_pub = None
+        # 握手处理期间从 keypair_class.from_public_bytes 截获的对端静态公钥
+        self.captured_remote_pub: Optional[bytes] = None
         
         # 可选：设置序言，防止跨协议重放攻击
         self.noise.set_prologue(b"kisama_terminal_v1")
@@ -2414,14 +2516,41 @@ class NoiseSessionWrapper:
         如果返回空 bytes (b'')，说明不需要回包。
         """
         if payload:
-            self.noise.read_message(payload)
-            
+            self._read_message_capture_rs(payload)
+
         if not self.noise.handshake_finished:
             # 必须写出回包
             return self.noise.write_message(b'')
         else:
             # 握手完成，验证客户端身份 (XX 模式下，客户端会在最后一步发来它的公钥)
             return b''
+
+    def _read_message_capture_rs(self, payload: bytes) -> None:
+        """读取握手消息并截获对端静态公钥。
+
+        noiseprotocol 在握手完成时直接删除内部握手状态机 (NoiseProtocol.handshake_done 中
+        `del self.handshake_state`)，预置的 REMOTE_STATIC 也不参与任何比对；因此只能在
+        msg3 处理期间通过 keypair_class.from_public_bytes 截获对端静态公钥，
+        供握手完成后显式校验（见 _do_noise_handshake）。
+        """
+        proto = self.noise.noise_protocol
+        orig_cls = proto.keypair_class
+        captured: Dict[str, bytes] = {}
+
+        class _CapturingKeyPair(orig_cls):
+            @classmethod
+            def from_public_bytes(cls, data):
+                captured['pub'] = bytes(data)
+                return super().from_public_bytes(data)
+
+        proto.keypair_class = _CapturingKeyPair
+        try:
+            self.noise.read_message(payload)
+        finally:
+            # handshake_done 会删除 keypair_class 属性，恢复前先探测
+            if hasattr(proto, 'keypair_class'):
+                proto.keypair_class = orig_cls
+        self.captured_remote_pub = captured.get('pub')
 
     def encrypt(self, plaintext: bytes) -> bytes:
         if not self.is_established:
@@ -2767,9 +2896,8 @@ class TerminalSessionHandler:
         # self.AGENT_PRIVATE_KEY = self._read_key_file("noise_keys/agent_private.key")
         # self.CONTROL_PUBLIC_KEY = self._read_key_file("noise_keys/control_public.key")
         self.AGENT_PRIVATE_KEY=Config.keys['agent'].private_b64
-        Logger.debug(self.AGENT_PRIVATE_KEY)
         self.CONTROL_PUBLIC_KEY=Config.keys['control'].public_b64
-        Logger.debug(self.CONTROL_PUBLIC_KEY)
+        # 🔐 A-5: 密钥材料不再落入 DEBUG 日志
         self.cipher = NoiseSessionWrapper(
             is_initiator=False,  # 服务端是 Responder
             local_priv_b64=self.AGENT_PRIVATE_KEY,
@@ -2845,7 +2973,19 @@ class TerminalSessionHandler:
             # 3. 接收客户端的最后一个握手包 (-> s, se)
             msg3 = await websocket.receive_bytes()
             self.cipher.process_handshake(msg3)
-            
+
+            # 🔐 安全修复：显式校验对端静态公钥 == 预期控制端公钥 (fail-closed)。
+            # XX 模式下任何随机密钥的客户端都能完成握手，库不会比对预置的 REMOTE_STATIC。
+            expected_pub = self.cipher.expected_remote_pub
+            remote_pub = self.cipher.captured_remote_pub
+            if not expected_pub or not remote_pub or not hmac.compare_digest(remote_pub, expected_pub):
+                log("🚨 终端 Noise 握手对端身份校验失败, 拒绝会话")
+                try:
+                    await websocket.close(code=1008, reason="Noise peer verification failed")
+                except Exception:
+                    pass
+                raise PermissionError("Noise peer static key verification failed")
+
             log("✅ Noise 握手完成，端到端加密通道已建立！")
         except PermissionError as e:
             log(f"🚨 拒绝访问: {e}")
@@ -4111,13 +4251,17 @@ class CloudflareQuickTunnel:
     # 1. start(): 向 api.trycloudflare.com 注册, 拿到临时公网域名并启动守护线程
     # 2. 守护线程维护与 Cloudflare Edge 的 HTTP/2 长连接, 断线自动重连
     # 3. stop(): 断开当前连接并退出守护线程
-    def __init__(self, port, logger=None, quick_service=QUICK_SERVICE, retry_seconds=2.0, verify_certificate=False):
+    def __init__(self, port, logger=None, quick_service=QUICK_SERVICE, retry_seconds=2.0, verify_certificate=None, silent=False):
+        # 🔐 A-2: 默认校验 Cloudflare edge 证书; 自定义链路确需豁免时 KISAMA_EDGE_INSECURE=true
+        if verify_certificate is None:
+            verify_certificate = os.getenv("KISAMA_EDGE_INSECURE", "").strip().lower() != "true"
         self.port = port
         self.origin = "http://127.0.0.1:%d" % port
         self.log = logger if logger is not None else _ArgoLogAdapter()
         self.quick_service = quick_service
         self.retry_seconds = retry_seconds
         self.verify_certificate = verify_certificate
+        self.silent = silent              # KMODE=2 静默模式: 不向 stdout 打印隧道域名
         self.hostname = None              # 临时公网域名 (含 https:// 前缀)
         self.created_at = None            # 注册成功时间戳 (int)
         self._stop = threading.Event()
@@ -4158,7 +4302,7 @@ class CloudflareQuickTunnel:
                     0,
                     self.log,
                     self.hostname,
-                    True,
+                    not self.silent,
                     self._tunnel_state,
                 ).run()
             except KeyboardInterrupt:
@@ -4227,7 +4371,7 @@ class ArgoTunnelManager:
                 if tunnel.hostname is not None
             ]
 
-    def create_tunnel(self, port, duplicate=False):
+    def create_tunnel(self, port, duplicate=False, silent=False):
         # 重复策略: 同端口已有隧道且未声明 duplicate 时拒绝 (409)
         with self._lock:
             if self._by_port.get(port) and not duplicate:
@@ -4236,7 +4380,7 @@ class ArgoTunnelManager:
                     "tunnel already exists on port %d, set duplicate=true to force creation" % port,
                 )
         # 注册 + 建连属于网络操作, 放在锁外执行, 避免长时间阻塞查询接口
-        tunnel = CloudflareQuickTunnel(port=port, logger=self.log)
+        tunnel = CloudflareQuickTunnel(port=port, logger=self.log, silent=silent)
         try:
             tunnel.start()
         except Exception as exc:
@@ -4302,6 +4446,160 @@ class ArgoTunnelManager:
             self._by_port.clear()
         for tunnel in tunnels:
             tunnel.stop()
+
+
+# ----------------------------------------------------------------------------
+# KMODE 启动模式 (docs/API.MD 第九节)
+# KMODE=1 时: 启动即建临时隧道并把域名写入 KPATH 文件 (缺省 $HOME/domain.txt);
+# 第一次 /api/baseinfo 成功响应后删除该文件; stdin 收到 /domain 指令时输出域名。
+# KMODE=2 时: 启动即建临时隧道并把域名上报至 shz.al (可预测 URL, 全程静默)。
+# ----------------------------------------------------------------------------
+class KModeController:
+    _baseinfo_hooked = False    # 域名文件只删一次
+    _domain = None              # 内存中最后已知域名 (文件删除后 /domain 仍可用)
+
+    # shz.al 自定义名规则: >=3 字符, 限字母数字及 +_-[]*$=@,;/
+    _SHZAL_NAME_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+_-[]*$=@,;/")
+
+    @classmethod
+    def kname_valid(cls):
+        name = Config.KNAME
+        return len(name) >= 3 and set(name) <= cls._SHZAL_NAME_CHARS
+
+    @classmethod
+    def report_shzal(cls, domain):
+        # 上报隧道域名到 shz.al: POST 创建 (409 冲突则 PUT 覆盖), 全程静默 —
+        # 不输出域名 / 上报结果 / 平台 URL, 任何失败直接放弃, 不影响正常启动
+        name, key = Config.KNAME, (Config.KNAME_KEY or Config.KNAME)
+        import urllib.error
+        import urllib.request
+        import uuid
+        boundary = "----kisama" + uuid.uuid4().hex
+
+        def body(fields):
+            chunks = []
+            for fname, fvalue in fields:
+                chunks.append(
+                    f"--{boundary}\r\nContent-Disposition: form-data; name=\"{fname}\"\r\n\r\n{fvalue}\r\n".encode("utf-8"))
+            chunks.append(f"--{boundary}--\r\n".encode("utf-8"))
+            return b"".join(chunks)
+
+        def post(url, fields, method="POST"):
+            req = urllib.request.Request(url, data=body(fields), method=method)
+            req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+            # Cloudflare 会拦截默认 Python-urllib UA (403), 显式声明自定义 UA
+            req.add_header("User-Agent", "curl/8.5.0")
+            return urllib.request.urlopen(req, timeout=30)
+
+        try:
+            fields = [("c", domain), ("n", name), ("s", key), ("e", "7d")]
+            try:
+                post("https://shz.al/", fields)
+            except urllib.error.HTTPError as exc:
+                if exc.code == 409:
+                    # 名字已被占用 (上次粘贴未过期): PUT 覆盖更新
+                    post(f"https://shz.al/~{name}:{key}", [f for f in fields if f[0] != "n"], method="PUT")
+                else:
+                    raise
+            cls._domain = domain
+        except Exception:
+            pass
+
+    @staticmethod
+    def _home_dir():
+        for d in (os.environ.get('USERPROFILE'), os.environ.get('HOME'), os.path.expanduser('~')):
+            if d and os.path.isdir(d):
+                return d
+        return os.getcwd()
+
+    @classmethod
+    def resolve_domain_file_path(cls):
+        # KPATH 支持 $HOME 与 ~ 前缀; 缺省 $HOME/domain.txt
+        raw = Config.KPATH.strip()
+        if not raw:
+            return os.path.join(cls._home_dir(), "domain.txt")
+        if raw.startswith("$HOME"):
+            raw = os.path.join(cls._home_dir(), raw[5:].lstrip("/\\")) if len(raw) > 5 else cls._home_dir()
+        elif raw.startswith("~"):
+            raw = os.path.expanduser(raw)
+        return raw
+
+    @classmethod
+    def write_domain_file(cls, domain):
+        cls._domain = domain
+        path = cls.resolve_domain_file_path()
+        try:
+            parent = os.path.dirname(os.path.abspath(path))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(domain)
+            Logger.info(f"[KMODE] 📄 隧道域名已写入: {path}")
+        except OSError as exc:
+            Logger.warning(f"[KMODE] ⚠️ 域名文件写入失败 ({path}): {exc}")
+
+    @classmethod
+    def delete_domain_file(cls):
+        path = cls.resolve_domain_file_path()
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+                Logger.info(f"[KMODE] 🗑️ 域名文件已删除: {path}")
+        except OSError as exc:
+            Logger.warning(f"[KMODE] ⚠️ 域名文件删除失败 ({path}): {exc}")
+
+    @classmethod
+    def on_baseinfo_success(cls):
+        # 第一次 /api/baseinfo 成功响应后删除域名文件 (仅触发一次)
+        if not cls._baseinfo_hooked:
+            cls._baseinfo_hooked = True
+            cls.delete_domain_file()
+
+    @classmethod
+    def _stdin_loop(cls):
+        # /domain 指令输出: 直接 print 并 flush, 不走 DEBUG/LOG 开关
+        while True:
+            try:
+                line = sys.stdin.readline()
+            except Exception:
+                return
+            if not line:
+                return
+            if line.strip() == "/domain":
+                if cls._domain:
+                    print(cls._domain, flush=True)
+                else:
+                    print("[KMODE] tunnel domain not ready", flush=True)
+
+    @classmethod
+    def _tunnel_task(cls, manager, after_domain=None, silent=False):
+        try:
+            manager.create_tunnel(Config.PORT, silent=silent)
+        except Exception as exc:
+            if not silent:
+                Logger.warning(f"[KMODE] ⚠️ 启动隧道创建失败: {exc}")
+            return
+        tunnels = manager.list_tunnels()
+        if not tunnels:
+            return
+        domain = tunnels[-1]["tunnel_domain"]
+        if after_domain:
+            after_domain(domain)
+        else:
+            cls.write_domain_file(domain)
+
+    @classmethod
+    def activate(cls, manager):
+        # KMODE=1: 隧道 + 域名文件 + stdin 监听; KMODE=2: 隧道 + shz.al 静默上报
+        if Config.KMODE == "2" and cls.kname_valid():
+            Logger.info("[KMODE] 🚀 KMODE=2: 隧道域名将上报至外部平台")
+            threading.Thread(target=cls._tunnel_task, args=(manager,),
+                             kwargs={"after_domain": cls.report_shzal, "silent": True},
+                             daemon=True, name="kmode-tunnel").start()
+            return
+        Logger.info("[KMODE] 🚀 KMODE=1: 启动时自动创建临时隧道")
+        threading.Thread(target=cls._tunnel_task, args=(manager,), daemon=True, name="kmode-tunnel").start()
+        threading.Thread(target=cls._stdin_loop, daemon=True, name="kmode-stdin").start()
 
 
 # ----------------------------------------------------------------------------
@@ -4379,8 +4677,15 @@ async def lifespan(app: FastAPI):
     )
     
     app.state.temp_key_manager = TempKeyManager()
+    # 🔐 凭证生命周期: tempkey 过期 → 轮换 SESSION_KEY 与控制端 Noise 密钥对
+    app.state.temp_key_manager.on_expired = Config.rotate_operational_secrets
 
     app.state.argo_tunnel_manager = ArgoTunnelManager()
+
+    # KMODE=1: 隧道 + 域名文件 + stdin 监听; KMODE=2: 隧道 + shz.al 静默上报 (docs/API.MD 第九节)
+    # KMODE=2 但 KNAME 缺失/非法时退化为普通启动 (等同 KMODE=0)
+    if Config.KMODE == "1" or (Config.KMODE == "2" and KModeController.kname_valid()):
+        KModeController.activate(app.state.argo_tunnel_manager)
     
     if Config.DEBUG:
         Logger.debug(f"✅ 管理器已挂载到 app.state")
@@ -4537,7 +4842,11 @@ async def get_baseinfo(request: Request):
     else:
         basic_info["session_key"] = None
         basic_info["noise_key"] = None
-        
+
+    # KMODE=1: 第一次 /api/baseinfo 成功响应后删除域名文件 (KMODE=2 无文件操作)
+    if Config.KMODE == "1":
+        KModeController.on_baseinfo_success()
+
     return basic_info
 
 
@@ -5473,11 +5782,10 @@ async def terminal_websocket(websocket: WebSocket, path: str, request_id: str = 
     
     if token is not None:
         use_noise = False
-        # 🔥 认证逻辑：校验传来的 token 是否等于服务端的 AGENT_PUBLIC_KEY
-        expected_token = Config.keys['agent'].public_b64
-        Logger.debug(f"expected_token{expected_token}")
-        Logger.debug(f"token:{token}")
-        if token != expected_token:
+        # 🔐 安全修复：token 必须等于 HMAC(SESSION_KEY) 降级令牌（常数时间比较）。
+        # 不再接受"agent 公钥"作 token —— 该值可被任意 Noise 握手发起方从 msg2 解出。
+        expected_token = Config.ws_downgrade_token()
+        if not hmac.compare_digest(token.encode('utf-8'), expected_token.encode('utf-8')):
             await websocket.close(code=1008, reason="Authentication failed: Invalid Token")
             Logger.warning(f"🚨 [终端会话 {request_id}] 认证失败，非法 Token！")
             return

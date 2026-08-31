@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -110,15 +111,27 @@ func parseECDSAPublicKey(keyStr string) (*ecdsa.PublicKey, error) {
 }
 
 // VerifySignature verifies ECDSA signature (simplified for now)
-func (cm *CryptoManager) VerifySignature(nonce, timestamp, authToken string) error {
-	_, err := cm.IdentifySigner(nonce, timestamp, authToken, nil)
+func (cm *CryptoManager) VerifySignature(method, path, bodyHash, nonce, timestamp, authToken string) error {
+	_, err := cm.IdentifySigner(method, path, bodyHash, nonce, timestamp, authToken, nil)
 	return err
+}
+
+// BuildSignatureMessage 组装签名消息: method + "\n" + path + "\n" + bodySha256 + "\n" + nonce + "\n" + timestamp
+// 🔐 安全修复：签名绑定 method/path/body 摘要，捕获的签名头无法改换请求体后重放。
+// bodyHash 为请求体原始字节的 SHA256 hex (小写)；空请求体使用 sha256("")；
+// /api/fileraw (大文件裸流) 客户端与服务端统一按空请求体计算，避免中间件整体缓冲。
+func BuildSignatureMessage(method, path, bodyHash, nonce, timestamp string) string {
+	if bodyHash == "" {
+		empty := sha256.Sum256(nil)
+		bodyHash = hex.EncodeToString(empty[:])
+	}
+	return fmt.Sprintf("%s\n%s\n%s\n%s\n%s", method, path, bodyHash, nonce, timestamp)
 }
 
 // IdentifySigner 验证请求签名并识别密钥来源 (与 Python/JS/Java 版一致)
 // 优先级: 控制端静态密钥 > 有效期内临时密钥
 // 返回 "static" (静态密钥) 或 "temp" (临时密钥)
-func (cm *CryptoManager) IdentifySigner(nonce, timestamp, authToken string, tempVk *ecdsa.PublicKey) (string, error) {
+func (cm *CryptoManager) IdentifySigner(method, path, bodyHash, nonce, timestamp, authToken string, tempVk *ecdsa.PublicKey) (string, error) {
 	if nonce == "" || timestamp == "" || authToken == "" {
 		return "", fmt.Errorf("missing signature components")
 	}
@@ -129,7 +142,7 @@ func (cm *CryptoManager) IdentifySigner(nonce, timestamp, authToken string, temp
 	}
 
 	// 1. 组装原始消息并计算 SHA256 哈希
-	message := fmt.Sprintf("%s%s", nonce, timestamp)
+	message := BuildSignatureMessage(method, path, bodyHash, nonce, timestamp)
 	hash := sha256.Sum256([]byte(message))
 
 	// 2. 将前端传来的 Base64 字符串解码为原始字节流

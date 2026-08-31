@@ -59,6 +59,8 @@ func newUpstream(t *testing.T, tls bool) *upstream {
 	var srv *httptest.Server
 	if tls {
 		srv = httptest.NewTLSServer(http.HandlerFunc(handler))
+		// 🔐 生产默认已开启上游 TLS 证书校验；测试上游为自签证书，此处显式豁免
+		kisamaProxyTransport.TLSClientConfig.InsecureSkipVerify = true
 	} else {
 		srv = httptest.NewServer(http.HandlerFunc(handler))
 	}

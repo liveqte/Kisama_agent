@@ -37,17 +37,33 @@ type Entry struct {
 type Manager struct {
 	mu  sync.Mutex
 	key *Entry
+
+	// OnExpired 🔐 凭证生命周期钩子: tempkey 过期被检测到时触发一次长期密钥轮换
+	// (SESSION_KEY + 控制端 Noise 密钥对)。回调在管理器锁内执行, 不得回头调用本管理器。
+	OnExpired func()
 }
 
 func New() *Manager {
 	return &Manager{}
 }
 
+// expireLockedIfNeeded tempkey 过期即作废并触发轮换回调。调用方需持有 m.mu。
+func (m *Manager) expireLockedIfNeeded() {
+	if m.key != nil && time.Now().Unix() >= m.key.ExpiresAt {
+		logger.Infof("🔄 [TempKey] 临时密钥已过期: key_id=%s", m.key.KeyID)
+		m.key = nil
+		if m.OnExpired != nil {
+			m.OnExpired()
+		}
+	}
+}
+
 // GetOrCreate 有效期内幂等返回同一密钥对; 过期或不存在则重新生成
 func (m *Manager) GetOrCreate(ttlHours int) (*Entry, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.key != nil && time.Now().Unix() < m.key.ExpiresAt {
+	m.expireLockedIfNeeded()
+	if m.key != nil {
 		return m.key, nil
 	}
 	entry, err := generate(ttlHours)
@@ -63,7 +79,8 @@ func (m *Manager) GetOrCreate(ttlHours int) (*Entry, error) {
 func (m *Manager) ActiveEcdsaVK() *ecdsa.PublicKey {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.key != nil && time.Now().Unix() < m.key.ExpiresAt {
+	m.expireLockedIfNeeded()
+	if m.key != nil {
 		return m.key.EcdsaVK
 	}
 	return nil
@@ -73,7 +90,8 @@ func (m *Manager) ActiveEcdsaVK() *ecdsa.PublicKey {
 func (m *Manager) ActiveEciesPub() *ecies.PublicKey {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.key != nil && time.Now().Unix() < m.key.ExpiresAt {
+	m.expireLockedIfNeeded()
+	if m.key != nil {
 		return m.key.EciesPub
 	}
 	return nil
