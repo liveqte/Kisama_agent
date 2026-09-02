@@ -173,6 +173,39 @@ from cryptography.hazmat.primitives import serialization
 from typing import Tuple
 
 
+def _load_dotenv():
+    """加载脚本同目录下的 .env (与 keys/ 回退文件同路径约定)，真实环境变量优先，.env 只填补空缺。
+
+    不处理行内注释 (保护含 # 的值，如域名 x-target-host 反代语法)；文件不存在或解析异常时静默跳过。
+    必须在本模块任何环境变量求值 (Config 类体等) 之前调用。
+    """
+    try:
+        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+        if not os.path.isfile(env_path):
+            return
+        with open(env_path, 'r', encoding='utf-8') as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith('#'):
+                    continue
+                if line.startswith('export '):
+                    line = line[len('export '):].lstrip()
+                if '=' not in line:
+                    continue
+                key, _, value = line.partition('=')
+                key = key.strip()
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                    value = value[1:-1]
+                if key:
+                    os.environ.setdefault(key, value)
+    except Exception:
+        pass
+
+
+_load_dotenv()
+
+
 def _resolve_safe_cwd():
     """选择真实存在的目录作为终端工作目录，避免 HOME 等环境变量指向不存在路径时 chdir 失败 (如 Git Bash 下的 /home/kis)"""
     for d in (os.environ.get('USERPROFILE'), os.environ.get('HOME'), os.path.expanduser('~')):
@@ -772,7 +805,7 @@ class Config:
     KPATH = os.getenv("KPATH", "")
 
     # 代理版本信息
-    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.4.8-python")
+    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.4.9-python")
     
     # ================= 启动校验 =================
     
@@ -4194,6 +4227,50 @@ def read_exact(sock, count):
     return b"".join(chunks)
 
 
+def _edge_san_covers_h2(dns_names):
+    # SAN 需覆盖 SNI 名 h2.cftunnel.com (精确名或 *.cftunnel.com 通配)
+    for name in dns_names:
+        name = str(name).lower()
+        if name in {"h2.cftunnel.com", "cftunnel.com"}:
+            return True
+        if name.startswith("*.") and "h2.cftunnel.com".endswith(name[1:]):
+            return True
+    return False
+
+
+def verify_edge_certificate(sock):
+    # 🔐 A-2 折中校验: Cloudflare edge (7844) 的证书由其私有 "CloudFlare Origin SSL" CA 签发,
+    # 不在公共信任库 (cf. cloudflared tlsconfig/cloudflare_ca.go 内置固定根), 系统根证书永远验不过。
+    # 因此不固定证书, 握手后校验对端确为 Cloudflare Origin SSL 体系签发且域名匹配, 失败即断开。
+    der = sock.getpeercert(binary_form=True)
+    if not der:
+        raise OSError("edge certificate verification failed: no peer certificate")
+    from cryptography import x509
+
+    cert = x509.load_der_x509_certificate(der)
+
+    def _attr(name, oid):
+        attrs = name.get_attributes_for_oid(oid)
+        return attrs[0].value if attrs else None
+
+    issuer_o = _attr(cert.issuer, x509.oid.NameOID.ORGANIZATION_NAME)
+    issuer_ou = _attr(cert.issuer, x509.oid.NameOID.ORGANIZATIONAL_UNIT_NAME)
+    subject_cn = _attr(cert.subject, x509.oid.NameOID.COMMON_NAME)
+    if issuer_o != "CloudFlare, Inc.":
+        raise OSError("edge certificate verification failed: issuer O mismatch: %r" % issuer_o)
+    if not str(issuer_ou or "").startswith("CloudFlare Origin SSL"):
+        raise OSError("edge certificate verification failed: issuer OU mismatch: %r" % issuer_ou)
+    if subject_cn != "CloudFlare Origin Certificate":
+        raise OSError("edge certificate verification failed: subject CN mismatch: %r" % subject_cn)
+    try:
+        san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+        dns_names = san.get_values_for_type(x509.DNSName)
+    except x509.ExtensionNotFound:
+        dns_names = []
+    if not _edge_san_covers_h2(dns_names):
+        raise OSError("edge certificate verification failed: SAN does not cover h2.cftunnel.com")
+
+
 def connect_edge(verify_certificate, logger):
     candidates = list(EDGE_HOSTS)
     secrets.SystemRandom().shuffle(candidates)
@@ -4203,9 +4280,13 @@ def connect_edge(verify_certificate, logger):
         sock = None
         try:
             raw = socket.create_connection((host, EDGE_PORT), timeout=10)
-            context = ssl.create_default_context() if verify_certificate else ssl._create_unverified_context()
+            # edge 证书是 Cloudflare 私有 CA 签发, 走系统信任库必然失败, 统一由
+            # verify_edge_certificate 在握手后做签发方校验 (KISAMA_EDGE_INSECURE=true 时跳过)
+            context = ssl._create_unverified_context()
             context.set_alpn_protocols(["h2"])
             sock = context.wrap_socket(raw, server_hostname="h2.cftunnel.com")
+            if verify_certificate:
+                verify_edge_certificate(sock)
             if sock.selected_alpn_protocol() not in {None, "h2"}:
                 raise OSError("edge did not negotiate h2")
             sock.settimeout(None)

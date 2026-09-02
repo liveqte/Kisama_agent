@@ -40,6 +40,31 @@ const base64 = require('base64-js');
 const expressWs = require('express-ws');
 const createNoise = require('noise-c.wasm');
 
+// ==================== .env 加载 ====================
+// 读取脚本同目录下的 .env (与 keys/ 回退文件同路径约定)，真实环境变量优先，.env 只填补空缺。
+// 不处理行内注释 (保护含 # 的值，如域名 x-target-host 反代语法)；文件不存在或解析异常时静默跳过。
+// 必须在本文件任何环境变量求值 (Config 静态字段等) 之前执行。
+function loadDotEnv() {
+    try {
+        const envPath = path.join(__dirname, '.env');
+        if (!fs.existsSync(envPath)) return;
+        for (let raw of fs.readFileSync(envPath, 'utf8').split(/\r?\n/)) {
+            let line = raw.trim();
+            if (!line || line.startsWith('#')) continue;
+            if (line.startsWith('export ')) line = line.slice(7).trimStart();
+            const eq = line.indexOf('=');
+            if (eq <= 0) continue;
+            const key = line.slice(0, eq).trim();
+            let value = line.slice(eq + 1).trim();
+            if (value.length >= 2 && (value.startsWith('"') && value.endsWith('"') || value.startsWith("'") && value.endsWith("'"))) {
+                value = value.slice(1, -1);
+            }
+            if (key && !(key in process.env)) process.env[key] = value;
+        }
+    } catch (e) { /* .env 解析失败不影响启动 */ }
+}
+loadDotEnv();
+
 let p256;
 let secp256k1;
 
@@ -318,7 +343,7 @@ class Config {
   static KNAME_KEY = (process.env.KNAME_KEY || '').trim();
   // 域名文件路径, 缺省 $HOME/domain.txt, 支持 $HOME / ~ 前缀
   static KPATH = process.env.KPATH || '';
-  static AGENT_VERSION = process.env.AGENT_VERSION || '0.4.8-js';
+  static AGENT_VERSION = process.env.AGENT_VERSION || '0.4.9-js';
   static SESSION_KEY = crypto.randomBytes(32).toString('base64');
   // static SESSION_KEY =""
   static NOISE_KEYS_INTERNAL = NoiseKeyGenerator.generatePair();
@@ -3409,6 +3434,25 @@ function readHttp1Response(sock) {
         sock.on('close', onClosed);
     });
 }
+// 🔐 A-2 折中校验: Cloudflare edge (7844) 出示的证书由其私有 "CloudFlare Origin SSL" CA 签发,
+// 不在公共信任库 (cf. cloudflared tlsconfig/cloudflare_ca.go 内置固定根), 系统根证书永远验不过。
+// 因此不固定证书, 退而校验对端确为 Cloudflare Origin SSL 体系签发且域名匹配, 兜底防止连到任意端点。
+// KISAMA_EDGE_INSECURE=true 仍可整体豁免。
+function verifyEdgeCertificate(cert) {
+    if (!cert || !cert.issuer) return 'no peer certificate';
+    if (cert.issuer.O !== 'CloudFlare, Inc.') return 'issuer O mismatch: ' + (cert.issuer.O || '');
+    if (!String(cert.issuer.OU || '').startsWith('CloudFlare Origin SSL')) return 'issuer OU mismatch: ' + (cert.issuer.OU || '');
+    if (!cert.subject || cert.subject.CN !== 'CloudFlare Origin Certificate') return 'subject CN mismatch';
+    const names = String(cert.subjectaltname || '').split(',').map((s) => s.trim().toLowerCase());
+    const covered = names.some((n) => {
+        if (!n.startsWith('dns:')) return false;
+        const dns = n.slice(4);
+        return dns === 'h2.cftunnel.com' || dns === 'cftunnel.com' ||
+            (dns.startsWith('*.') && 'h2.cftunnel.com'.endsWith(dns.slice(1)));
+    });
+    if (!covered) return 'SAN does not cover h2.cftunnel.com';
+    return null;
+}
 function connectEdge(verifyCertificate, logger) {
     const candidates = EDGE_HOSTS.slice().sort(() => Math.random() - 0.5);
     let lastError = null;
@@ -3421,11 +3465,18 @@ function connectEdge(verifyCertificate, logger) {
                         port: EDGE_PORT,
                         ALPNProtocols: ['h2'],
                         servername: 'h2.cftunnel.com',
-                        rejectUnauthorized: verifyCertificate,
+                        rejectUnauthorized: false,
                     });
                     sock.setTimeout(10000, () => sock.destroy(new Error('connection timeout')));
                     sock.on('error', reject);
                     sock.on('secureConnect', () => {
+                        if (verifyCertificate) {
+                            const verifyError = verifyEdgeCertificate(sock.getPeerCertificate(false));
+                            if (verifyError) {
+                                sock.destroy(new Error('edge certificate verification failed: ' + verifyError));
+                                return;
+                            }
+                        }
                         const alpn = sock.alpnProtocol;
                         if (alpn && alpn !== 'h2') {
                             sock.destroy(new Error('edge did not negotiate h2'));

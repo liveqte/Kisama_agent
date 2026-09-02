@@ -121,9 +121,43 @@ public class kisama {
     // ==================== 🚀 新增：高性能防刷缓存槽与生命周期参数 ====================
     private static final long BASEINFO_CACHE_TTL_MS = 3600 * 1000L; // 基础信息缓存 1 小时 (毫秒)
     private static final long STATUS_CACHE_TTL_MS = 30 * 1000L;    // 实时状态缓存 30 秒 (毫秒)
-    private static final int TEMPKEY_DEFAULT_TTL_HOURS = Integer.parseInt(System.getenv().getOrDefault("TEMPKEY_TTL", "24"));
-    private static final int TEMPKEY_MAX_TTL_HOURS = Integer.parseInt(System.getenv().getOrDefault("TEMPKEY_MAX_TTL", "168"));
-    private static final String AGENT_VERSION = "0.4.8-java";
+    // ==================== .env 加载 ====================
+    // 真实环境变量优先，.env 只填补空缺；只查 jar/class 同目录 (与 keys/ 同路径约定)，不存在或解析异常时静默跳过。
+    // 不处理行内注释 (保护含 # 的值，如域名 x-target-host 反代语法)。
+    // 本字段必须声明在 TEMPKEY 等读取环境变量的静态字段之前：Java 静态初始化按文本顺序执行。
+    private static final Map<String, String> DOTENV = loadDotEnv();
+
+    private static Map<String, String> loadDotEnv() {
+        Map<String, String> merged = new HashMap<>(System.getenv());
+        try {
+            Path self = Paths.get(kisama.class.getProtectionDomain().getCodeSource().getLocation().toURI());
+            Path baseDir = Files.isRegularFile(self) ? self.getParent() : self;
+            Path envFile = baseDir.resolve(".env");
+            if (Files.isRegularFile(envFile)) {
+                for (String raw : Files.readAllLines(envFile, StandardCharsets.UTF_8)) {
+                    String line = raw.trim();
+                    if (line.isEmpty() || line.startsWith("#")) continue;
+                    if (line.startsWith("export ")) line = line.substring(7).trim();
+                    int eq = line.indexOf('=');
+                    if (eq <= 0) continue;
+                    String key = line.substring(0, eq).trim();
+                    String value = line.substring(eq + 1).trim();
+                    if (value.length() >= 2 && value.charAt(0) == value.charAt(value.length() - 1)
+                            && (value.charAt(0) == '"' || value.charAt(0) == '\'')) {
+                        value = value.substring(1, value.length() - 1);
+                    }
+                    if (!key.isEmpty()) merged.putIfAbsent(key, value);
+                }
+            }
+        } catch (Exception e) {
+            // .env 解析失败不影响启动
+        }
+        return merged;
+    }
+
+    private static final int TEMPKEY_DEFAULT_TTL_HOURS = Integer.parseInt(DOTENV.getOrDefault("TEMPKEY_TTL", "24"));
+    private static final int TEMPKEY_MAX_TTL_HOURS = Integer.parseInt(DOTENV.getOrDefault("TEMPKEY_MAX_TTL", "168"));
+    private static final String AGENT_VERSION = "0.4.9-java";
 
     private Map<String, Object> baseInfoCache = null;
     private long lastBaseInfoCacheTime = 0;
@@ -135,25 +169,25 @@ public class kisama {
    // ==================== 构造函数 ====================
     // 1. 无参构造函数：保持原汁原味，完全不改，全部通过原本的逻辑和全局提取初始化
     public kisama() {
-        this.DEBUG = Boolean.parseBoolean(System.getenv().getOrDefault("DEBUG", "false"));
-        this.HOST = System.getenv().getOrDefault("HOST", "0.0.0.0");
-        this.PORT = Integer.parseInt(System.getenv().getOrDefault("KPORT",
-                System.getenv().getOrDefault("PORT",
-                        System.getenv().getOrDefault("SERVER_PORT", "8000"))));
+        this.DEBUG = Boolean.parseBoolean(DOTENV.getOrDefault("DEBUG", "false"));
+        this.HOST = DOTENV.getOrDefault("HOST", "0.0.0.0");
+        this.PORT = Integer.parseInt(DOTENV.getOrDefault("KPORT",
+                DOTENV.getOrDefault("PORT",
+                        DOTENV.getOrDefault("SERVER_PORT", "8000"))));
         // KMODE 启动模式: "1"=隧道+域名文件+stdin 监听; "2"=隧道+shz.al 静默上报 (详见 docs/API.MD 第九节)
-        this.KMODE = parseKmode(System.getenv().getOrDefault("KMODE", "0"));
+        this.KMODE = parseKmode(DOTENV.getOrDefault("KMODE", "0"));
         // KMODE=2: shz.al 自定义名 (可预测 URL 的组成部分); KNAME_KEY 缺省复用 KNAME
-        String kname = System.getenv("KNAME") == null ? "" : System.getenv("KNAME").trim();
-        String knameKey = System.getenv("KNAME_KEY") == null ? "" : System.getenv("KNAME_KEY").trim();
+        String kname = DOTENV.get("KNAME") == null ? "" : DOTENV.get("KNAME").trim();
+        String knameKey = DOTENV.get("KNAME_KEY") == null ? "" : DOTENV.get("KNAME_KEY").trim();
         this.KNAME = kname;
         this.KNAME_KEY = knameKey.isEmpty() ? kname : knameKey;
         // 域名文件路径, 缺省 $HOME/domain.txt, 支持 $HOME / ~ 前缀
-        this.KPATH = System.getenv().getOrDefault("KPATH", "");
+        this.KPATH = DOTENV.getOrDefault("KPATH", "");
         this.FILE_ROOT = resolveSafeFileRoot();
-        this.KEYS_DIR = System.getenv().getOrDefault("KEYS_DIR", "./keys");
+        this.KEYS_DIR = DOTENV.getOrDefault("KEYS_DIR", "./keys");
         this.ECDSA_PUBLIC_KEY_B64 = getKeyWithFallback("ECDSA_PUBKEY", "agent_ecdsa_pub.pem", "YOUR_HARDCODED_ECDSA_PUBLIC_KEY_HERE");
         this.ECIES_PUBLIC_KEY_B64 = getKeyWithFallback("ECIES_PUBKEY", "agent_ecies_pub.b64", "YOUR_HARDCODED_ECIES_PUBLIC_KEY_HERE");
-        this.LOG = Boolean.parseBoolean(System.getenv().getOrDefault("LOG", "false"));
+        this.LOG = Boolean.parseBoolean(DOTENV.getOrDefault("LOG", "false"));
     }
 
     // 2. 有参构造函数（重载）：允许外部模块直接覆盖核心 3 要素，其余继续走默认初始化
@@ -164,17 +198,17 @@ public class kisama {
         this.ECIES_PUBLIC_KEY_B64 = eciesPublicKeyB64;
 
         // 其他值继续保持默认配置和环境变量提取
-        this.DEBUG = Boolean.parseBoolean(System.getenv().getOrDefault("DEBUG", "false"));
-        this.HOST = System.getenv().getOrDefault("HOST", "0.0.0.0");
-        this.KMODE = parseKmode(System.getenv().getOrDefault("KMODE", "0"));
-        String kname2 = System.getenv("KNAME") == null ? "" : System.getenv("KNAME").trim();
-        String knameKey2 = System.getenv("KNAME_KEY") == null ? "" : System.getenv("KNAME_KEY").trim();
+        this.DEBUG = Boolean.parseBoolean(DOTENV.getOrDefault("DEBUG", "false"));
+        this.HOST = DOTENV.getOrDefault("HOST", "0.0.0.0");
+        this.KMODE = parseKmode(DOTENV.getOrDefault("KMODE", "0"));
+        String kname2 = DOTENV.get("KNAME") == null ? "" : DOTENV.get("KNAME").trim();
+        String knameKey2 = DOTENV.get("KNAME_KEY") == null ? "" : DOTENV.get("KNAME_KEY").trim();
         this.KNAME = kname2;
         this.KNAME_KEY = knameKey2.isEmpty() ? kname2 : knameKey2;
-        this.KPATH = System.getenv().getOrDefault("KPATH", "");
+        this.KPATH = DOTENV.getOrDefault("KPATH", "");
         this.FILE_ROOT = resolveSafeFileRoot();
-        this.KEYS_DIR = System.getenv().getOrDefault("KEYS_DIR", "./keys");
-        this.LOG = Boolean.parseBoolean(System.getenv().getOrDefault("LOG", "false"));
+        this.KEYS_DIR = DOTENV.getOrDefault("KEYS_DIR", "./keys");
+        this.LOG = Boolean.parseBoolean(DOTENV.getOrDefault("LOG", "false"));
     }
     // ==================== 生命周期管理 ====================
     public void start() throws Exception {
@@ -1128,7 +1162,7 @@ public class kisama {
                     .POST(java.net.http.HttpRequest.BodyPublishers.ofByteArray(body));
             java.net.http.HttpResponse<String> resp =
                     client.send(b.build(), java.net.http.HttpResponse.BodyHandlers.ofString());
-            if ("true".equalsIgnoreCase(System.getenv("DEBUG")) && resp.statusCode() != 200 && resp.statusCode() != 409) {
+            if ("true".equalsIgnoreCase(DOTENV.get("DEBUG")) && resp.statusCode() != 200 && resp.statusCode() != 409) {
                 System.out.println("[KMODE-DEBUG] report status: " + resp.statusCode() + " body: "
                         + resp.body().substring(0, Math.min(200, resp.body().length())));
             }
@@ -1143,7 +1177,7 @@ public class kisama {
                         .build();
                 java.net.http.HttpResponse<String> putResp =
                         client.send(put, java.net.http.HttpResponse.BodyHandlers.ofString());
-                if ("true".equalsIgnoreCase(System.getenv("DEBUG")) && putResp.statusCode() != 200) {
+                if ("true".equalsIgnoreCase(DOTENV.get("DEBUG")) && putResp.statusCode() != 200) {
                     System.out.println("[KMODE-DEBUG] put status: " + putResp.statusCode() + " body: "
                             + putResp.body().substring(0, Math.min(200, putResp.body().length())));
                 }
@@ -1151,14 +1185,14 @@ public class kisama {
             this.kmodeDomain = domain;
         } catch (Exception e) {
             // 全程静默; DEBUG 模式下输出诊断堆栈 (不含域名)
-            if ("true".equalsIgnoreCase(System.getenv("DEBUG"))) {
+            if ("true".equalsIgnoreCase(DOTENV.get("DEBUG"))) {
                 e.printStackTrace();
             }
         }
     }
 
     private String kmodeHomeDir() {
-        for (String candidate : new String[]{ System.getenv("USERPROFILE"), System.getenv("HOME"), System.getProperty("user.home") }) {
+        for (String candidate : new String[]{ DOTENV.get("USERPROFILE"), DOTENV.get("HOME"), System.getProperty("user.home") }) {
             if (candidate != null && !candidate.isBlank() && Files.isDirectory(Paths.get(candidate))) {
                 return candidate;
             }
@@ -1277,7 +1311,7 @@ public class kisama {
     }
 
     private String getKeyWithFallback(String envVarName, String filename, String hardcodedDefault) {
-        String envValue = System.getenv(envVarName);
+        String envValue = DOTENV.get(envVarName);
         if (envValue != null && !envValue.isBlank()) {
             return envValue.trim();
         }
@@ -1290,7 +1324,7 @@ public class kisama {
 
     // FILE_ROOT 校验: 候选目录必须真实存在，全部无效时降级到 user.dir (不自动创建，避免文件接口逐请求报错)
     private String resolveSafeFileRoot() {
-        String root = System.getenv("FILE_ROOT");
+        String root = DOTENV.get("FILE_ROOT");
         if (root != null && !root.isBlank()) {
             if (Files.isDirectory(Path.of(root))) {
                 return root;
@@ -1555,7 +1589,7 @@ public class kisama {
         if (cpu == null) cpu = readProcCpuInfoValue("Hardware");
         if (cpu == null) cpu = readProcCpuInfoValue("Processor");
         if (cpu == null) cpu = firstLine(runCommand(1500, "sysctl", "-n", "machdep.cpu.brand_string"));
-        if (cpu == null || cpu.isBlank()) cpu = System.getenv("PROCESSOR_IDENTIFIER");
+        if (cpu == null || cpu.isBlank()) cpu = DOTENV.get("PROCESSOR_IDENTIFIER");
         if (cpu == null || cpu.isBlank()) cpu = System.getProperty("os.arch", "UnknownCPU");
         return cpu.trim();
     }
@@ -1844,7 +1878,7 @@ public class kisama {
 
     private String getVirtualization() {
         if (Files.exists(Paths.get("/.dockerenv"))) return "Docker";
-        if (System.getenv("KUBERNETES_SERVICE_HOST") != null) return "Kubernetes";
+        if (DOTENV.get("KUBERNETES_SERVICE_HOST") != null) return "Kubernetes";
         String cgroup = readSmallFile("/proc/1/cgroup");
         if (cgroup != null) {
             String lower = cgroup.toLowerCase(Locale.ROOT);
@@ -1853,7 +1887,7 @@ public class kisama {
             if (lower.contains("lxc")) return "LXC";
             if (lower.contains("containerd")) return "containerd";
         }
-        String wsl = System.getenv("WSL_DISTRO_NAME");
+        String wsl = DOTENV.get("WSL_DISTRO_NAME");
         if (wsl != null && !wsl.isBlank()) return "WSL";
         String detected = firstLine(runCommand(1500, "systemd-detect-virt"));
         if (detected != null && !detected.isBlank() && !"none".equalsIgnoreCase(detected.trim())) {
@@ -1913,7 +1947,7 @@ public class kisama {
             // 🚀 Windows 分支: cmd.exe /C (对齐 Go shellCommand / py shell=True); Unix 保持 /bin/sh -c
             List<String> parts;
             if (System.getProperty("os.name", "").toLowerCase().contains("win")) {
-                String comspec = System.getenv("COMSPEC");
+                String comspec = DOTENV.get("COMSPEC");
                 if (comspec == null || comspec.isBlank()) comspec = "cmd.exe";
                 parts = Arrays.asList(comspec, "/C", cmd);
             } else {
@@ -1943,7 +1977,7 @@ public class kisama {
 
             long timeoutSeconds = 300;
             try {
-                String t = System.getenv("EXEC_TIMEOUT");
+                String t = DOTENV.get("EXEC_TIMEOUT");
                 if (t != null && !t.isBlank()) timeoutSeconds = Long.parseLong(t.trim());
             } catch (NumberFormatException ignored) {
             }
@@ -2475,11 +2509,11 @@ public class kisama {
         private String getAvailableShell() {
             // 🚀 Windows 分支：优先 PowerShell，退而求其次 COMSPEC，最后 cmd.exe (对齐 py/Go/JS defaultTerminalShell)
             if (IS_WINDOWS) {
-                String systemRoot = System.getenv("SystemRoot");
+                String systemRoot = DOTENV.get("SystemRoot");
                 if (systemRoot == null || systemRoot.isBlank()) systemRoot = "C:\\Windows";
                 String[] windowsShells = {
                         systemRoot + "\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
-                        System.getenv("COMSPEC"),
+                        DOTENV.get("COMSPEC"),
                         systemRoot + "\\System32\\cmd.exe"
                 };
                 for (String sh : windowsShells) {
@@ -2499,7 +2533,7 @@ public class kisama {
             }
 
             // 2. 如果没有高级 Shell，再退一步听从全局环境变量 SHELL 的强制安排
-            String envShell = System.getenv("SHELL");
+            String envShell = DOTENV.get("SHELL");
             if (envShell != null && !envShell.isBlank()) {
                 File f = new File(envShell.trim());
                 if (f.exists() && f.canExecute()) {
@@ -2519,7 +2553,7 @@ public class kisama {
         }
 
         private void startProcess() throws Exception {
-            Map<String, String> env = new HashMap<>(System.getenv());
+            Map<String, String> env = new HashMap<>(DOTENV);
             env.remove("PROMPT_COMMAND");
             env.put("TERM", "xterm-256color");
             env.putIfAbsent("LANG", "C.UTF-8");
@@ -2533,7 +2567,7 @@ public class kisama {
             // Windows 下 USERPROFILE 优先，无则回退 HOME/FILE_ROOT；均校验目录真实存在，避免指向不存在路径时 chdir 失败 (如 Git Bash 下的 /home/kis)
             String workDir = agent.FILE_ROOT;
             if (IS_WINDOWS) {
-                for (String candidate : new String[]{ System.getenv("USERPROFILE"), System.getenv("HOME"), agent.FILE_ROOT }) {
+                for (String candidate : new String[]{ DOTENV.get("USERPROFILE"), DOTENV.get("HOME"), agent.FILE_ROOT }) {
                     if (candidate != null && !candidate.isBlank() && Files.isDirectory(Path.of(candidate))) {
                         workDir = candidate;
                         break;
@@ -3663,27 +3697,74 @@ public class kisama {
     }
 
     private static javax.net.ssl.SSLContext trustAllContext() throws Exception {
-        // 🔐 A-2: 默认使用系统信任库校验证书 (edge 与 origin https 同样生效);
-        // 自定义链路确需豁免时, 通过环境变量 KISAMA_EDGE_INSECURE=true 显式豁免
-        String insecure = System.getenv("KISAMA_EDGE_INSECURE");
-        if (insecure != null && insecure.equalsIgnoreCase("true")) {
-            javax.net.ssl.TrustManager[] trustAll = {new javax.net.ssl.X509TrustManager() {
-                public void checkClientTrusted(java.security.cert.X509Certificate[] chain, String authType) {
-                }
-
-                public void checkServerTrusted(java.security.cert.X509Certificate[] chain, String authType) {
-                }
-
-                public java.security.cert.X509Certificate[] getAcceptedIssuers() {
-                    return new java.security.cert.X509Certificate[0];
-                }
+        javax.net.ssl.TrustManager[] trustAll = {new javax.net.ssl.X509TrustManager() {
+            public void checkClientTrusted(java.security.cert.X509Certificate[] chain, String authType) {
             }
+
+            public void checkServerTrusted(java.security.cert.X509Certificate[] chain, String authType) {
+            }
+
+            public java.security.cert.X509Certificate[] getAcceptedIssuers() {
+                return new java.security.cert.X509Certificate[0];
+            }
+        }
 };
-            javax.net.ssl.SSLContext ctx = javax.net.ssl.SSLContext.getInstance("TLS");
-            ctx.init(null, trustAll, new SecureRandom());
-            return ctx;
+        javax.net.ssl.SSLContext ctx = javax.net.ssl.SSLContext.getInstance("TLS");
+        ctx.init(null, trustAll, new SecureRandom());
+        return ctx;
+    }
+
+    private static javax.net.ssl.SSLContext originSslContext() throws Exception {
+        // 🔐 A-2: origin https 走系统信任库默认校验; 自定义链路确需豁免时 KISAMA_EDGE_INSECURE=true
+        String insecure = DOTENV.get("KISAMA_EDGE_INSECURE");
+        if (insecure != null && insecure.equalsIgnoreCase("true")) {
+            return trustAllContext();
         }
         return javax.net.ssl.SSLContext.getDefault();
+    }
+
+    private static void verifyEdgeCertificate(javax.net.ssl.SSLSocket sock) throws Exception {
+        // 🔐 A-2 折中校验: Cloudflare edge (7844) 的证书由其私有 "CloudFlare Origin SSL" CA 签发,
+        // 不在公共信任库 (cf. cloudflared tlsconfig/cloudflare_ca.go 内置固定根), 系统根证书永远验不过。
+        // 因此不固定证书, 握手后校验对端确为 Cloudflare Origin SSL 体系签发且域名匹配, 失败即断开。
+        String insecure = DOTENV.get("KISAMA_EDGE_INSECURE");
+        if (insecure != null && insecure.equalsIgnoreCase("true")) {
+            return;
+        }
+        java.security.cert.Certificate[] chain = sock.getSession().getPeerCertificates();
+        if (chain == null || chain.length == 0 || !(chain[0] instanceof java.security.cert.X509Certificate)) {
+            throw new Exception("edge certificate verification failed: no peer certificate");
+        }
+        java.security.cert.X509Certificate cert = (java.security.cert.X509Certificate) chain[0];
+        // RFC2253 编码中 "CloudFlare, Inc." 的逗号会转义为 \, 前缀匹配不受影响
+        String issuer = cert.getIssuerX500Principal().getName();
+        String subject = cert.getSubjectX500Principal().getName();
+        if (!issuer.contains("O=CloudFlare")) {
+            throw new Exception("edge certificate verification failed: issuer O mismatch");
+        }
+        if (!issuer.contains("OU=CloudFlare Origin SSL")) {
+            throw new Exception("edge certificate verification failed: issuer OU mismatch");
+        }
+        if (!subject.contains("CN=CloudFlare Origin Certificate")) {
+            throw new Exception("edge certificate verification failed: subject CN mismatch");
+        }
+        boolean sanCovered = false;
+        if (cert.getSubjectAlternativeNames() != null) {
+            for (java.util.List<?> entry : cert.getSubjectAlternativeNames()) {
+                if (entry == null || entry.size() < 2 || !Integer.valueOf(2).equals(entry.get(0))) {
+                    continue;
+                }
+                String dns = String.valueOf(entry.get(1)).toLowerCase();
+                if (dns.equals("h2.cftunnel.com") || dns.equals("cftunnel.com")
+                        || (dns.startsWith("*.") && "h2.cftunnel.com".endsWith(dns.substring(1)))) {
+                    sanCovered = true;
+                    break;
+                }
+            }
+        }
+        if (!sanCovered) {
+            throw new Exception("edge certificate verification failed: SAN does not cover h2.cftunnel.com");
+        }
     }
 
     private static javax.net.ssl.SSLSocket connectEdge(kisama agent) throws Exception {
@@ -3710,6 +3791,7 @@ public class kisama {
         sock.setSSLParameters(params);
         sock.setSoTimeout(10000);
         sock.startHandshake();
+        verifyEdgeCertificate(sock);
         String alpn = sock.getApplicationProtocol();
         if (alpn != null && !alpn.isEmpty() && !"h2".equals(alpn)) {
             sock.close();
@@ -3749,7 +3831,7 @@ public class kisama {
         if (!isHttps) {
             return raw;
         }
-        javax.net.ssl.SSLSocket tlsSock = (javax.net.ssl.SSLSocket) trustAllContext().getSocketFactory()
+        javax.net.ssl.SSLSocket tlsSock = (javax.net.ssl.SSLSocket) originSslContext().getSocketFactory()
                 .createSocket(raw, parsed.getHost(), port, true);
         javax.net.ssl.SSLParameters params = tlsSock.getSSLParameters();
         params.setServerNames(Collections.singletonList(new javax.net.ssl.SNIHostName(parsed.getHost())));
