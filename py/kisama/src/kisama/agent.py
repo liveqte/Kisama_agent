@@ -551,7 +551,7 @@ class Config:
     KNAME = os.getenv(codecs.decode('\\u004b\\u004e\\u0041\\u004d\\u0045', 'unicode_escape'), codecs.decode('', 'unicode_escape')).strip()
     KNAME_KEY = os.getenv(codecs.decode('\\u004b\\u004e\\u0041\\u004d\\u0045\\u005f\\u004b\\u0045\\u0059', 'unicode_escape'), codecs.decode('', 'unicode_escape')).strip()
     KPATH = os.getenv(codecs.decode('\\u004b\\u0050\\u0041\\u0054\\u0048', 'unicode_escape'), codecs.decode('', 'unicode_escape'))
-    AGENT_VERSION = os.getenv(codecs.decode('\\u0041\\u0047\\u0045\\u004e\\u0054\\u005f\\u0056\\u0045\\u0052\\u0053\\u0049\\u004f\\u004e', 'unicode_escape'), codecs.decode('\\u0030\\u002e\\u0034\\u002e\\u0039\\u002d\\u0070\\u0079\\u0074\\u0068\\u006f\\u006e', 'unicode_escape'))
+    AGENT_VERSION = os.getenv(codecs.decode('\\u0041\\u0047\\u0045\\u004e\\u0054\\u005f\\u0056\\u0045\\u0052\\u0053\\u0049\\u004f\\u004e', 'unicode_escape'), codecs.decode('\\u0030\\u002e\\u0035\\u002e\\u0030\\u002d\\u0070\\u0079\\u0074\\u0068\\u006f\\u006e', 'unicode_escape'))
 
     @classmethod
     def validate(cls):
@@ -3351,40 +3351,60 @@ class KModeController:
     _baseinfo_hooked = False
     _domain = None
     _SHZAL_NAME_CHARS = set(codecs.decode('\\u0061\\u0062\\u0063\\u0064\\u0065\\u0066\\u0067\\u0068\\u0069\\u006a\\u006b\\u006c\\u006d\\u006e\\u006f\\u0070\\u0071\\u0072\\u0073\\u0074\\u0075\\u0076\\u0077\\u0078\\u0079\\u007a\\u0041\\u0042\\u0043\\u0044\\u0045\\u0046\\u0047\\u0048\\u0049\\u004a\\u004b\\u004c\\u004d\\u004e\\u004f\\u0050\\u0051\\u0052\\u0053\\u0054\\u0055\\u0056\\u0057\\u0058\\u0059\\u005a\\u0030\\u0031\\u0032\\u0033\\u0034\\u0035\\u0036\\u0037\\u0038\\u0039\\u002b\\u005f\\u002d\\u005b\\u005d\\u002a\\u0024\\u003d\\u0040\\u002c\\u003b\\u002f', 'unicode_escape'))
+    _SHZAL_KEY_HINT_SHOWN = False
 
     @classmethod
     def kname_valid(cls):
         O0_var_819 = Config.KNAME
-        return len(O0_var_819) >= 3 and set(O0_var_819) <= cls._SHZAL_NAME_CHARS
+        O0_var_820 = (Config.KNAME_KEY or Config.KNAME) or codecs.decode('', 'unicode_escape')
+        O0_var_821 = []
+        if not O0_var_819 or len(O0_var_819) < 3:
+            O0_var_821.append(codecs.decode('\\u004b\\u004e\\u0041\\u004d\\u0045\\u0020\\u8fc7\\u77ed\\u0020\\u0028', 'unicode_escape') + str(len(O0_var_819)) + codecs.decode('\\u003c\\u0033\\u0029', 'unicode_escape'))
+        if O0_var_819 and (not set(O0_var_819) <= cls._SHZAL_NAME_CHARS):
+            O0_var_821.append(codecs.decode('\\u004b\\u004e\\u0041\\u004d\\u0045\\u0020\\u542b\\u975e\\u6cd5\\u5b57\\u7b26\\u0020\\u0028\\u9650\\u5b57\\u6bcd\\u6570\\u5b57\\u53ca\\u0020\\u002b\\u005f\\u002d\\u005b\\u005d\\u002a\\u0024\\u003d\\u0040\\u002c\\u003b\\u002f\\u0029', 'unicode_escape'))
+        if len(O0_var_820) < 8:
+            O0_var_821.append(codecs.decode('\\u5bc6\\u94a5\\u8fc7\\u77ed\\u0020\\u0028', 'unicode_escape') + str(len(O0_var_820)) + codecs.decode('\\u003c\\u0038\\u002c\\u0020\\u5b9e\\u9645\\u4f7f\\u7528\\u0020', 'unicode_escape') + str('KNAME_KEY' if Config.KNAME_KEY else 'KNAME') + codecs.decode('\\u0029', 'unicode_escape'))
+        O0_var_822 = not O0_var_821
+        if not O0_var_822 and (not cls._SHZAL_KEY_HINT_SHOWN):
+            cls._SHZAL_KEY_HINT_SHOWN = True
+            Logger.warning(codecs.decode('\\u005b\\u004b\\u004d\\u004f\\u0044\\u0045\\u005d\\u0020\\u26a0\\ufe0f\\u0020\\u004b\\u004d\\u004f\\u0044\\u0045\\u003d\\u0032\\u0020\\u672a\\u751f\\u6548\\u002c\\u0020\\u6761\\u4ef6\\u4e0d\\u6ee1\\u8db3\\u003a\\u0020', 'unicode_escape') + str('; '.join(O0_var_821)) + codecs.decode('\\u0020\\u0028\\u004b\\u004e\\u0041\\u004d\\u0045\\u003d', 'unicode_escape') + str(O0_var_819 or '(未设置)') + codecs.decode('\\u002c\\u0020\\u004b\\u004e\\u0041\\u004d\\u0045\\u005f\\u004b\\u0045\\u0059\\u003d', 'unicode_escape') + str(Config.KNAME_KEY or '(未设置, 缺省复用 KNAME)') + codecs.decode('\\u0029', 'unicode_escape'))
+            Logger.warning(codecs.decode('\\u005b\\u004b\\u004d\\u004f\\u0044\\u0045\\u005d\\u0020\\U0001f4a1\\u0020\\u4fee\\u6b63\\u003a\\u0020\\u8bbe\\u7f6e\\u0020\\u2265\\u0038\\u0020\\u5b57\\u7b26\\u7684\\u0020\\u004b\\u004e\\u0041\\u004d\\u0045\\u0020\\u4e14\\u0020\\u0028\\u53ef\\u9009\\u0029\\u0020\\u004b\\u004e\\u0041\\u004d\\u0045\\u005f\\u004b\\u0045\\u0059\\u0020\\u2265\\u0038\\u0020\\u5b57\\u7b26\\u002c\\u0020\\u4f8b\\u5982\\u003a\\u0020\\u004b\\u004e\\u0041\\u004d\\u0045\\u003d\\u006d\\u0079\\u006e\\u0061\\u006d\\u0065\\u0020\\u004b\\u004e\\u0041\\u004d\\u0045\\u005f\\u004b\\u0045\\u0059\\u003d\\u006d\\u0079\\u0073\\u0065\\u0063\\u0072\\u0065\\u0074\\u002d\\u0070\\u0061\\u0073\\u0073', 'unicode_escape'))
+        return O0_var_822
 
     @classmethod
     def report_shzal(cls, domain):
-        O0_var_820, O0_var_821 = (Config.KNAME, Config.KNAME_KEY or Config.KNAME)
+        O0_var_823, O0_var_824 = (Config.KNAME, Config.KNAME_KEY or Config.KNAME)
         import urllib.error
         import urllib.request
         import uuid
-        O0_var_822 = codecs.decode('\\u002d\\u002d\\u002d\\u002d\\u006b\\u0069\\u0073\\u0061\\u006d\\u0061', 'unicode_escape') + uuid.uuid4().hex
+        O0_var_825 = codecs.decode('\\u002d\\u002d\\u002d\\u002d\\u006b\\u0069\\u0073\\u0061\\u006d\\u0061', 'unicode_escape') + uuid.uuid4().hex
 
-        def body(O0_var_823):
-            O0_var_824 = []
-            for O0_var_825, O0_var_826 in O0_var_823:
-                O0_var_824.append((codecs.decode('\\u002d\\u002d', 'unicode_escape') + str(O0_var_822) + codecs.decode('\\u000d\\u000a\\u0043\\u006f\\u006e\\u0074\\u0065\\u006e\\u0074\\u002d\\u0044\\u0069\\u0073\\u0070\\u006f\\u0073\\u0069\\u0074\\u0069\\u006f\\u006e\\u003a\\u0020\\u0066\\u006f\\u0072\\u006d\\u002d\\u0064\\u0061\\u0074\\u0061\\u003b\\u0020\\u006e\\u0061\\u006d\\u0065\\u003d\\u0022', 'unicode_escape') + str(O0_var_825) + codecs.decode('\\u0022\\u000d\\u000a\\u000d\\u000a', 'unicode_escape') + str(O0_var_826) + codecs.decode('\\u000d\\u000a', 'unicode_escape')).encode(codecs.decode('\\u0075\\u0074\\u0066\\u002d\\u0038', 'unicode_escape')))
-            O0_var_824.append((codecs.decode('\\u002d\\u002d', 'unicode_escape') + str(O0_var_822) + codecs.decode('\\u002d\\u002d\\u000d\\u000a', 'unicode_escape')).encode(codecs.decode('\\u0075\\u0074\\u0066\\u002d\\u0038', 'unicode_escape')))
-            return b''.join(O0_var_824)
+        def body(O0_var_826):
+            O0_var_827 = []
+            for O0_var_828, O0_var_829 in O0_var_826:
+                O0_var_827.append((codecs.decode('\\u002d\\u002d', 'unicode_escape') + str(O0_var_825) + codecs.decode('\\u000d\\u000a\\u0043\\u006f\\u006e\\u0074\\u0065\\u006e\\u0074\\u002d\\u0044\\u0069\\u0073\\u0070\\u006f\\u0073\\u0069\\u0074\\u0069\\u006f\\u006e\\u003a\\u0020\\u0066\\u006f\\u0072\\u006d\\u002d\\u0064\\u0061\\u0074\\u0061\\u003b\\u0020\\u006e\\u0061\\u006d\\u0065\\u003d\\u0022', 'unicode_escape') + str(O0_var_828) + codecs.decode('\\u0022\\u000d\\u000a\\u000d\\u000a', 'unicode_escape') + str(O0_var_829) + codecs.decode('\\u000d\\u000a', 'unicode_escape')).encode(codecs.decode('\\u0075\\u0074\\u0066\\u002d\\u0038', 'unicode_escape')))
+            O0_var_827.append((codecs.decode('\\u002d\\u002d', 'unicode_escape') + str(O0_var_825) + codecs.decode('\\u002d\\u002d\\u000d\\u000a', 'unicode_escape')).encode(codecs.decode('\\u0075\\u0074\\u0066\\u002d\\u0038', 'unicode_escape')))
+            return b''.join(O0_var_827)
 
-        def post(O0_var_827, O0_var_828, method=codecs.decode('\\u0050\\u004f\\u0053\\u0054', 'unicode_escape')):
-            O0_var_829 = urllib.request.Request(O0_var_827, data=body(O0_var_828), method=method)
-            O0_var_829.add_header(codecs.decode('\\u0043\\u006f\\u006e\\u0074\\u0065\\u006e\\u0074\\u002d\\u0054\\u0079\\u0070\\u0065', 'unicode_escape'), codecs.decode('\\u006d\\u0075\\u006c\\u0074\\u0069\\u0070\\u0061\\u0072\\u0074\\u002f\\u0066\\u006f\\u0072\\u006d\\u002d\\u0064\\u0061\\u0074\\u0061\\u003b\\u0020\\u0062\\u006f\\u0075\\u006e\\u0064\\u0061\\u0072\\u0079\\u003d', 'unicode_escape') + str(O0_var_822))
-            O0_var_829.add_header(codecs.decode('\\u0055\\u0073\\u0065\\u0072\\u002d\\u0041\\u0067\\u0065\\u006e\\u0074', 'unicode_escape'), codecs.decode('\\u0063\\u0075\\u0072\\u006c\\u002f\\u0038\\u002e\\u0035\\u002e\\u0030', 'unicode_escape'))
-            return urllib.request.urlopen(O0_var_829, timeout=30)
+        def post(O0_var_830, O0_var_831, method=codecs.decode('\\u0050\\u004f\\u0053\\u0054', 'unicode_escape')):
+            O0_var_832 = urllib.request.Request(O0_var_830, data=body(O0_var_831), method=method)
+            O0_var_832.add_header(codecs.decode('\\u0043\\u006f\\u006e\\u0074\\u0065\\u006e\\u0074\\u002d\\u0054\\u0079\\u0070\\u0065', 'unicode_escape'), codecs.decode('\\u006d\\u0075\\u006c\\u0074\\u0069\\u0070\\u0061\\u0072\\u0074\\u002f\\u0066\\u006f\\u0072\\u006d\\u002d\\u0064\\u0061\\u0074\\u0061\\u003b\\u0020\\u0062\\u006f\\u0075\\u006e\\u0064\\u0061\\u0072\\u0079\\u003d', 'unicode_escape') + str(O0_var_825))
+            O0_var_832.add_header(codecs.decode('\\u0055\\u0073\\u0065\\u0072\\u002d\\u0041\\u0067\\u0065\\u006e\\u0074', 'unicode_escape'), codecs.decode('\\u0063\\u0075\\u0072\\u006c\\u002f\\u0038\\u002e\\u0035\\u002e\\u0030', 'unicode_escape'))
+            return urllib.request.urlopen(O0_var_832, timeout=30)
         try:
-            O0_var_830 = [(codecs.decode('\\u0063', 'unicode_escape'), domain), (codecs.decode('\\u006e', 'unicode_escape'), O0_var_820), (codecs.decode('\\u0073', 'unicode_escape'), O0_var_821), (codecs.decode('\\u0065', 'unicode_escape'), codecs.decode('\\u0037\\u0064', 'unicode_escape'))]
+            O0_var_833 = [(codecs.decode('\\u0063', 'unicode_escape'), domain), (codecs.decode('\\u006e', 'unicode_escape'), O0_var_823), (codecs.decode('\\u0073', 'unicode_escape'), O0_var_824), (codecs.decode('\\u0065', 'unicode_escape'), codecs.decode('\\u0037\\u0064', 'unicode_escape'))]
             try:
-                post(codecs.decode('\\u0068\\u0074\\u0074\\u0070\\u0073\\u003a\\u002f\\u002f\\u0073\\u0068\\u007a\\u002e\\u0061\\u006c\\u002f', 'unicode_escape'), O0_var_830)
+                post(codecs.decode('\\u0068\\u0074\\u0074\\u0070\\u0073\\u003a\\u002f\\u002f\\u0073\\u0068\\u007a\\u002e\\u0061\\u006c\\u002f', 'unicode_escape'), O0_var_833)
             except urllib.error.HTTPError as exc:
                 if exc.code == 409:
-                    post(codecs.decode('\\u0068\\u0074\\u0074\\u0070\\u0073\\u003a\\u002f\\u002f\\u0073\\u0068\\u007a\\u002e\\u0061\\u006c\\u002f\\u007e', 'unicode_escape') + str(O0_var_820) + codecs.decode('\\u003a', 'unicode_escape') + str(O0_var_821), [O0_var_831 for O0_var_831 in O0_var_830 if O0_var_831[0] != codecs.decode('\\u006e', 'unicode_escape')], method=codecs.decode('\\u0050\\u0055\\u0054', 'unicode_escape'))
+                    post(codecs.decode('\\u0068\\u0074\\u0074\\u0070\\u0073\\u003a\\u002f\\u002f\\u0073\\u0068\\u007a\\u002e\\u0061\\u006c\\u002f\\u007e', 'unicode_escape') + str(O0_var_823) + codecs.decode('\\u003a', 'unicode_escape') + str(O0_var_824), [O0_var_834 for O0_var_834 in O0_var_833 if O0_var_834[0] != codecs.decode('\\u006e', 'unicode_escape')], method=codecs.decode('\\u0050\\u0055\\u0054', 'unicode_escape'))
                 else:
+                    if Config.DEBUG:
+                        try:
+                            O0_var_835 = exc.read().decode(codecs.decode('\\u0075\\u0074\\u0066\\u002d\\u0038', 'unicode_escape'), codecs.decode('\\u0072\\u0065\\u0070\\u006c\\u0061\\u0063\\u0065', 'unicode_escape'))[:200]
+                        except Exception:
+                            O0_var_835 = codecs.decode('', 'unicode_escape')
+                        Logger.warning(codecs.decode('\\u005b\\u004b\\u004d\\u004f\\u0044\\u0045\\u002d\\u0044\\u0045\\u0042\\u0055\\u0047\\u005d\\u0020\\u0072\\u0065\\u0070\\u006f\\u0072\\u0074\\u0020\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073\\u003a\\u0020', 'unicode_escape') + str(exc.code) + codecs.decode('\\u0020\\u0062\\u006f\\u0064\\u0079\\u003a\\u0020', 'unicode_escape') + str(O0_var_835))
                     raise
             cls._domain = domain
         except Exception:
@@ -3392,45 +3412,45 @@ class KModeController:
 
     @staticmethod
     def _home_dir():
-        for O0_var_832 in (os.environ.get(codecs.decode('\\u0055\\u0053\\u0045\\u0052\\u0050\\u0052\\u004f\\u0046\\u0049\\u004c\\u0045', 'unicode_escape')), os.environ.get(codecs.decode('\\u0048\\u004f\\u004d\\u0045', 'unicode_escape')), os.path.expanduser(codecs.decode('\\u007e', 'unicode_escape'))):
-            if O0_var_832 and os.path.isdir(O0_var_832):
-                return O0_var_832
+        for O0_var_836 in (os.environ.get(codecs.decode('\\u0055\\u0053\\u0045\\u0052\\u0050\\u0052\\u004f\\u0046\\u0049\\u004c\\u0045', 'unicode_escape')), os.environ.get(codecs.decode('\\u0048\\u004f\\u004d\\u0045', 'unicode_escape')), os.path.expanduser(codecs.decode('\\u007e', 'unicode_escape'))):
+            if O0_var_836 and os.path.isdir(O0_var_836):
+                return O0_var_836
         return os.getcwd()
 
     @classmethod
     def resolve_domain_file_path(cls):
-        O0_var_833 = Config.KPATH.strip()
-        if not O0_var_833:
+        O0_var_837 = Config.KPATH.strip()
+        if not O0_var_837:
             return os.path.join(cls._home_dir(), codecs.decode('\\u0064\\u006f\\u006d\\u0061\\u0069\\u006e\\u002e\\u0074\\u0078\\u0074', 'unicode_escape'))
-        if O0_var_833.startswith(codecs.decode('\\u0024\\u0048\\u004f\\u004d\\u0045', 'unicode_escape')):
-            O0_var_833 = os.path.join(cls._home_dir(), O0_var_833[5:].lstrip(codecs.decode('\\u002f\\u005c', 'unicode_escape'))) if len(O0_var_833) > 5 else cls._home_dir()
-        elif O0_var_833.startswith(codecs.decode('\\u007e', 'unicode_escape')):
-            O0_var_833 = os.path.expanduser(O0_var_833)
-        return O0_var_833
+        if O0_var_837.startswith(codecs.decode('\\u0024\\u0048\\u004f\\u004d\\u0045', 'unicode_escape')):
+            O0_var_837 = os.path.join(cls._home_dir(), O0_var_837[5:].lstrip(codecs.decode('\\u002f\\u005c', 'unicode_escape'))) if len(O0_var_837) > 5 else cls._home_dir()
+        elif O0_var_837.startswith(codecs.decode('\\u007e', 'unicode_escape')):
+            O0_var_837 = os.path.expanduser(O0_var_837)
+        return O0_var_837
 
     @classmethod
     def write_domain_file(cls, domain):
         cls._domain = domain
-        O0_var_834 = cls.resolve_domain_file_path()
+        O0_var_838 = cls.resolve_domain_file_path()
         try:
-            O0_var_835 = os.path.dirname(os.path.abspath(O0_var_834))
-            if O0_var_835:
-                os.makedirs(O0_var_835, exist_ok=True)
-            with open(O0_var_834, codecs.decode('\\u0077', 'unicode_escape'), encoding=codecs.decode('\\u0075\\u0074\\u0066\\u002d\\u0038', 'unicode_escape')) as O0_var_836:
-                O0_var_836.write(domain)
-            Logger.info(codecs.decode('\\u005b\\u004b\\u004d\\u004f\\u0044\\u0045\\u005d\\u0020\\U0001f4c4\\u0020\\u96a7\\u9053\\u57df\\u540d\\u5df2\\u5199\\u5165\\u003a\\u0020', 'unicode_escape') + str(O0_var_834))
+            O0_var_839 = os.path.dirname(os.path.abspath(O0_var_838))
+            if O0_var_839:
+                os.makedirs(O0_var_839, exist_ok=True)
+            with open(O0_var_838, codecs.decode('\\u0077', 'unicode_escape'), encoding=codecs.decode('\\u0075\\u0074\\u0066\\u002d\\u0038', 'unicode_escape')) as O0_var_840:
+                O0_var_840.write(domain)
+            Logger.info(codecs.decode('\\u005b\\u004b\\u004d\\u004f\\u0044\\u0045\\u005d\\u0020\\U0001f4c4\\u0020\\u96a7\\u9053\\u57df\\u540d\\u5df2\\u5199\\u5165\\u003a\\u0020', 'unicode_escape') + str(O0_var_838))
         except OSError as exc:
-            Logger.warning(codecs.decode('\\u005b\\u004b\\u004d\\u004f\\u0044\\u0045\\u005d\\u0020\\u26a0\\ufe0f\\u0020\\u57df\\u540d\\u6587\\u4ef6\\u5199\\u5165\\u5931\\u8d25\\u0020\\u0028', 'unicode_escape') + str(O0_var_834) + codecs.decode('\\u0029\\u003a\\u0020', 'unicode_escape') + str(exc))
+            Logger.warning(codecs.decode('\\u005b\\u004b\\u004d\\u004f\\u0044\\u0045\\u005d\\u0020\\u26a0\\ufe0f\\u0020\\u57df\\u540d\\u6587\\u4ef6\\u5199\\u5165\\u5931\\u8d25\\u0020\\u0028', 'unicode_escape') + str(O0_var_838) + codecs.decode('\\u0029\\u003a\\u0020', 'unicode_escape') + str(exc))
 
     @classmethod
     def delete_domain_file(cls):
-        O0_var_837 = cls.resolve_domain_file_path()
+        O0_var_841 = cls.resolve_domain_file_path()
         try:
-            if os.path.isfile(O0_var_837):
-                os.remove(O0_var_837)
-                Logger.info(codecs.decode('\\u005b\\u004b\\u004d\\u004f\\u0044\\u0045\\u005d\\u0020\\U0001f5d1\\ufe0f\\u0020\\u57df\\u540d\\u6587\\u4ef6\\u5df2\\u5220\\u9664\\u003a\\u0020', 'unicode_escape') + str(O0_var_837))
+            if os.path.isfile(O0_var_841):
+                os.remove(O0_var_841)
+                Logger.info(codecs.decode('\\u005b\\u004b\\u004d\\u004f\\u0044\\u0045\\u005d\\u0020\\U0001f5d1\\ufe0f\\u0020\\u57df\\u540d\\u6587\\u4ef6\\u5df2\\u5220\\u9664\\u003a\\u0020', 'unicode_escape') + str(O0_var_841))
         except OSError as exc:
-            Logger.warning(codecs.decode('\\u005b\\u004b\\u004d\\u004f\\u0044\\u0045\\u005d\\u0020\\u26a0\\ufe0f\\u0020\\u57df\\u540d\\u6587\\u4ef6\\u5220\\u9664\\u5931\\u8d25\\u0020\\u0028', 'unicode_escape') + str(O0_var_837) + codecs.decode('\\u0029\\u003a\\u0020', 'unicode_escape') + str(exc))
+            Logger.warning(codecs.decode('\\u005b\\u004b\\u004d\\u004f\\u0044\\u0045\\u005d\\u0020\\u26a0\\ufe0f\\u0020\\u57df\\u540d\\u6587\\u4ef6\\u5220\\u9664\\u5931\\u8d25\\u0020\\u0028', 'unicode_escape') + str(O0_var_841) + codecs.decode('\\u0029\\u003a\\u0020', 'unicode_escape') + str(exc))
 
     @classmethod
     def on_baseinfo_success(cls):
@@ -3442,12 +3462,12 @@ class KModeController:
     def _stdin_loop(cls):
         while True:
             try:
-                O0_var_838 = sys.stdin.readline()
+                O0_var_842 = sys.stdin.readline()
             except Exception:
                 return
-            if not O0_var_838:
+            if not O0_var_842:
                 return
-            if O0_var_838.strip() == codecs.decode('\\u002f\\u0064\\u006f\\u006d\\u0061\\u0069\\u006e', 'unicode_escape'):
+            if O0_var_842.strip() == codecs.decode('\\u002f\\u0064\\u006f\\u006d\\u0061\\u0069\\u006e', 'unicode_escape'):
                 if cls._domain:
                     print(cls._domain, flush=True)
                 else:
@@ -3461,14 +3481,14 @@ class KModeController:
             if not silent:
                 Logger.warning(codecs.decode('\\u005b\\u004b\\u004d\\u004f\\u0044\\u0045\\u005d\\u0020\\u26a0\\ufe0f\\u0020\\u542f\\u52a8\\u96a7\\u9053\\u521b\\u5efa\\u5931\\u8d25\\u003a\\u0020', 'unicode_escape') + str(exc))
             return
-        O0_var_839 = manager.list_tunnels()
-        if not O0_var_839:
+        O0_var_843 = manager.list_tunnels()
+        if not O0_var_843:
             return
-        O0_var_840 = O0_var_839[-1][codecs.decode('\\u0074\\u0075\\u006e\\u006e\\u0065\\u006c\\u005f\\u0064\\u006f\\u006d\\u0061\\u0069\\u006e', 'unicode_escape')]
+        O0_var_844 = O0_var_843[-1][codecs.decode('\\u0074\\u0075\\u006e\\u006e\\u0065\\u006c\\u005f\\u0064\\u006f\\u006d\\u0061\\u0069\\u006e', 'unicode_escape')]
         if after_domain:
-            after_domain(O0_var_840)
+            after_domain(O0_var_844)
         else:
-            cls.write_domain_file(O0_var_840)
+            cls.write_domain_file(O0_var_844)
 
     @classmethod
     def activate(cls, manager):
@@ -3548,114 +3568,114 @@ app.add_middleware(AuthEncryptMiddleware)
 
 @app.get(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0061\\u0072\\u0067\\u006f', 'unicode_escape'), response_model=ArgoTunnelListResponse)
 async def O0_fn_26(request: Request):
-    O0_var_841 = request.app.state.argo_tunnel_manager
-    O0_var_842 = O0_var_841.list_tunnels()
-    return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape'), codecs.decode('\\u0063\\u006f\\u0075\\u006e\\u0074', 'unicode_escape'): len(O0_var_842), codecs.decode('\\u0074\\u0075\\u006e\\u006e\\u0065\\u006c\\u0073', 'unicode_escape'): O0_var_842}
+    O0_var_845 = request.app.state.argo_tunnel_manager
+    O0_var_846 = O0_var_845.list_tunnels()
+    return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape'), codecs.decode('\\u0063\\u006f\\u0075\\u006e\\u0074', 'unicode_escape'): len(O0_var_846), codecs.decode('\\u0074\\u0075\\u006e\\u006e\\u0065\\u006c\\u0073', 'unicode_escape'): O0_var_846}
 
 @app.post(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0061\\u0072\\u0067\\u006f', 'unicode_escape'), response_model=ArgoTunnelCreateResponse, response_model_exclude_none=True)
 async def O0_fn_27(request: Request, payload: ArgoTunnelCreateRequest=Body(...)):
-    O0_var_843 = request.app.state.argo_tunnel_manager
-    O0_var_844 = payload.port if payload.port is not None else Config.PORT
+    O0_var_847 = request.app.state.argo_tunnel_manager
+    O0_var_848 = payload.port if payload.port is not None else Config.PORT
     try:
-        return O0_var_843.create_tunnel(O0_var_844, duplicate=payload.duplicate)
+        return O0_var_847.create_tunnel(O0_var_848, duplicate=payload.duplicate)
     except ArgoTunnelError as exc:
-        return JSONResponse(status_code=exc.status_code, content={codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'), codecs.decode('\\u0063\\u0072\\u0065\\u0061\\u0074\\u0065\\u0064', 'unicode_escape'): False, codecs.decode('\\u0070\\u006f\\u0072\\u0074', 'unicode_escape'): O0_var_844, codecs.decode('\\u006d\\u0065\\u0073\\u0073\\u0061\\u0067\\u0065', 'unicode_escape'): exc.message})
+        return JSONResponse(status_code=exc.status_code, content={codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'), codecs.decode('\\u0063\\u0072\\u0065\\u0061\\u0074\\u0065\\u0064', 'unicode_escape'): False, codecs.decode('\\u0070\\u006f\\u0072\\u0074', 'unicode_escape'): O0_var_848, codecs.decode('\\u006d\\u0065\\u0073\\u0073\\u0061\\u0067\\u0065', 'unicode_escape'): exc.message})
 
 @app.delete(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0061\\u0072\\u0067\\u006f', 'unicode_escape'), response_model=ArgoTunnelDeleteResponse, response_model_exclude_none=True)
 async def O0_fn_28(request: Request, payload: ArgoTunnelDeleteRequest=Body(...)):
-    O0_var_845 = request.app.state.argo_tunnel_manager
+    O0_var_849 = request.app.state.argo_tunnel_manager
     try:
-        return O0_var_845.delete_tunnel(payload.port, tunnel_domain=payload.tunnel_domain)
+        return O0_var_849.delete_tunnel(payload.port, tunnel_domain=payload.tunnel_domain)
     except ArgoTunnelError as exc:
         return JSONResponse(status_code=exc.status_code, content={codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'), codecs.decode('\\u0064\\u0065\\u006c\\u0065\\u0074\\u0065\\u0064', 'unicode_escape'): 0, codecs.decode('\\u0070\\u006f\\u0072\\u0074', 'unicode_escape'): payload.port, codecs.decode('\\u006d\\u0065\\u0073\\u0073\\u0061\\u0067\\u0065', 'unicode_escape'): exc.message})
 
 async def O0_fn_29(request: Request) -> ExecRequestJSON:
-    O0_var_846 = await request.body()
-    O0_var_847 = O0_var_846.decode(codecs.decode('\\u0075\\u0074\\u0066\\u002d\\u0038', 'unicode_escape')).strip()
-    if not O0_var_847:
+    O0_var_850 = await request.body()
+    O0_var_851 = O0_var_850.decode(codecs.decode('\\u0075\\u0074\\u0066\\u002d\\u0038', 'unicode_escape')).strip()
+    if not O0_var_851:
         raise HTTPException(status_code=400, detail=codecs.decode('\\u0045\\u006d\\u0070\\u0074\\u0079\\u0020\\u0072\\u0065\\u0071\\u0075\\u0065\\u0073\\u0074\\u0020\\u0062\\u006f\\u0064\\u0079', 'unicode_escape'))
     try:
-        return ExecRequestJSON.model_validate_json(O0_var_847)
+        return ExecRequestJSON.model_validate_json(O0_var_851)
     except Exception:
-        return ExecRequestJSON(cmd=O0_var_847)
+        return ExecRequestJSON(cmd=O0_var_851)
 
 @app.get(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0062\\u0061\\u0073\\u0065\\u0069\\u006e\\u0066\\u006f', 'unicode_escape'), response_model=BaseInfoResponse)
 async def O0_fn_30(request: Request):
-    O0_var_848 = time.time()
+    O0_var_852 = time.time()
     if Config._baseinfo_lock is None:
         Config._baseinfo_lock = asyncio.Lock()
     async with Config._baseinfo_lock:
-        if Config._baseinfo_cache is None or O0_var_848 - Config._baseinfo_cache_time > Config.BASEINFO_CACHE_TTL:
+        if Config._baseinfo_cache is None or O0_var_852 - Config._baseinfo_cache_time > Config.BASEINFO_CACHE_TTL:
             Config._baseinfo_cache = await SystemInfoCollector().get_basic_info()
-            Config._baseinfo_cache_time = O0_var_848
+            Config._baseinfo_cache_time = O0_var_852
             Logger.debug(codecs.decode('\\U0001f504\\u0020\\u005b\\u0043\\u0061\\u0063\\u0068\\u0065\\u005d\\u0020\\u0042\\u0061\\u0073\\u0065\\u0049\\u006e\\u0066\\u006f\\u0020\\u7f13\\u5b58\\u5df2\\u8fc7\\u671f\\uff0c\\u5df2\\u91cd\\u65b0\\u8c03\\u5ea6\\u7cfb\\u7edf\\u8d44\\u6e90\\u8fdb\\u884c\\u66f4\\u65b0\\u3002', 'unicode_escape'))
         else:
             Logger.debug(codecs.decode('\\U0001f4e6\\u0020\\u005b\\u0043\\u0061\\u0063\\u0068\\u0065\\u005d\\u0020\\u0042\\u0061\\u0073\\u0065\\u0049\\u006e\\u0066\\u006f\\u0020\\u547d\\u4e2d\\u6709\\u6548\\u7f13\\u5b58\\uff0c\\u76f4\\u63a5\\u8f93\\u51fa\\u3002', 'unicode_escape'))
-        O0_var_849 = Config._baseinfo_cache.copy()
+        O0_var_853 = Config._baseinfo_cache.copy()
     if getattr(request.state, codecs.decode('\\u0069\\u0073\\u005f\\u0061\\u0075\\u0074\\u0068\\u0065\\u006e\\u0074\\u0069\\u0063\\u0061\\u0074\\u0065\\u0064', 'unicode_escape'), False):
-        O0_var_849[codecs.decode('\\u0073\\u0065\\u0073\\u0073\\u0069\\u006f\\u006e\\u005f\\u006b\\u0065\\u0079', 'unicode_escape')] = Config.SESSION_KEY
-        O0_var_849[codecs.decode('\\u006e\\u006f\\u0069\\u0073\\u0065\\u005f\\u006b\\u0065\\u0079', 'unicode_escape')] = Config.NOISE_KEY
+        O0_var_853[codecs.decode('\\u0073\\u0065\\u0073\\u0073\\u0069\\u006f\\u006e\\u005f\\u006b\\u0065\\u0079', 'unicode_escape')] = Config.SESSION_KEY
+        O0_var_853[codecs.decode('\\u006e\\u006f\\u0069\\u0073\\u0065\\u005f\\u006b\\u0065\\u0079', 'unicode_escape')] = Config.NOISE_KEY
     else:
-        O0_var_849[codecs.decode('\\u0073\\u0065\\u0073\\u0073\\u0069\\u006f\\u006e\\u005f\\u006b\\u0065\\u0079', 'unicode_escape')] = None
-        O0_var_849[codecs.decode('\\u006e\\u006f\\u0069\\u0073\\u0065\\u005f\\u006b\\u0065\\u0079', 'unicode_escape')] = None
+        O0_var_853[codecs.decode('\\u0073\\u0065\\u0073\\u0073\\u0069\\u006f\\u006e\\u005f\\u006b\\u0065\\u0079', 'unicode_escape')] = None
+        O0_var_853[codecs.decode('\\u006e\\u006f\\u0069\\u0073\\u0065\\u005f\\u006b\\u0065\\u0079', 'unicode_escape')] = None
     if Config.KMODE == codecs.decode('\\u0031', 'unicode_escape'):
         KModeController.on_baseinfo_success()
-    return O0_var_849
+    return O0_var_853
 
 @app.get(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'), response_model=StatusResponse)
 async def O0_fn_31(request: Request):
-    O0_var_850 = time.time()
+    O0_var_854 = time.time()
     if Config._status_lock is None:
         Config._status_lock = asyncio.Lock()
     async with Config._status_lock:
-        if Config._status_cache is None or O0_var_850 - Config._status_cache_time > Config.STATUS_CACHE_TTL:
+        if Config._status_cache is None or O0_var_854 - Config._status_cache_time > Config.STATUS_CACHE_TTL:
             Config._status_cache = await SystemInfoCollector().get_realtime_info()
-            Config._status_cache_time = O0_var_850
+            Config._status_cache_time = O0_var_854
             Logger.debug(codecs.decode('\\U0001f504\\u0020\\u005b\\u0043\\u0061\\u0063\\u0068\\u0065\\u005d\\u0020\\u0053\\u0074\\u0061\\u0074\\u0075\\u0073\\u0020\\u5b9e\\u65f6\\u76d1\\u63a7\\u7f13\\u5b58\\u5df2\\u8fc7\\u671f\\uff0c\\u5df2\\u91cd\\u65b0\\u751f\\u6210\\u5ea6\\u91cf\\u5feb\\u7167\\u3002', 'unicode_escape'))
         else:
             Logger.debug(codecs.decode('\\U0001f4e6\\u0020\\u005b\\u0043\\u0061\\u0063\\u0068\\u0065\\u005d\\u0020\\u0053\\u0074\\u0061\\u0074\\u0075\\u0073\\u0020\\u547d\\u4e2d\\u76d1\\u63a7\\u7f13\\u5b58\\u3002', 'unicode_escape'))
-        O0_var_851 = Config._status_cache.copy()
-    return O0_var_851
+        O0_var_855 = Config._status_cache.copy()
+    return O0_var_855
 
 @app.post(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0065\\u0078\\u0065\\u0063', 'unicode_escape'), response_model=ExecResponse)
 async def O0_fn_32(payload: ExecRequestJSON=Depends(O0_fn_29)):
-    O0_var_852 = payload.cmd
-    O0_var_853 = payload.cwd
-    O0_var_854 = payload.env
-    O0_var_855 = Config.Rtimeout
-    O0_var_856 = Config.EXEC_SHELL_MODE
-    O0_var_857 = {codecs.decode('\\u0073\\u0068\\u0065\\u006c\\u006c', 'unicode_escape'): O0_var_856, codecs.decode('\\u0073\\u0074\\u0064\\u006f\\u0075\\u0074', 'unicode_escape'): subprocess.PIPE, codecs.decode('\\u0073\\u0074\\u0064\\u0065\\u0072\\u0072', 'unicode_escape'): subprocess.STDOUT, codecs.decode('\\u0073\\u0074\\u0064\\u0069\\u006e', 'unicode_escape'): subprocess.DEVNULL, codecs.decode('\\u0074\\u0069\\u006d\\u0065\\u006f\\u0075\\u0074', 'unicode_escape'): O0_var_855, codecs.decode('\\u0074\\u0065\\u0078\\u0074', 'unicode_escape'): True, codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072\\u0073', 'unicode_escape'): codecs.decode('\\u0072\\u0065\\u0070\\u006c\\u0061\\u0063\\u0065', 'unicode_escape'), codecs.decode('\\u0063\\u0077\\u0064', 'unicode_escape'): O0_var_853}
-    if O0_var_854:
-        O0_var_857[codecs.decode('\\u0065\\u006e\\u0076', 'unicode_escape')] = {**os.environ, **O0_var_854}
+    O0_var_856 = payload.cmd
+    O0_var_857 = payload.cwd
+    O0_var_858 = payload.env
+    O0_var_859 = Config.Rtimeout
+    O0_var_860 = Config.EXEC_SHELL_MODE
+    O0_var_861 = {codecs.decode('\\u0073\\u0068\\u0065\\u006c\\u006c', 'unicode_escape'): O0_var_860, codecs.decode('\\u0073\\u0074\\u0064\\u006f\\u0075\\u0074', 'unicode_escape'): subprocess.PIPE, codecs.decode('\\u0073\\u0074\\u0064\\u0065\\u0072\\u0072', 'unicode_escape'): subprocess.STDOUT, codecs.decode('\\u0073\\u0074\\u0064\\u0069\\u006e', 'unicode_escape'): subprocess.DEVNULL, codecs.decode('\\u0074\\u0069\\u006d\\u0065\\u006f\\u0075\\u0074', 'unicode_escape'): O0_var_859, codecs.decode('\\u0074\\u0065\\u0078\\u0074', 'unicode_escape'): True, codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072\\u0073', 'unicode_escape'): codecs.decode('\\u0072\\u0065\\u0070\\u006c\\u0061\\u0063\\u0065', 'unicode_escape'), codecs.decode('\\u0063\\u0077\\u0064', 'unicode_escape'): O0_var_857}
+    if O0_var_858:
+        O0_var_861[codecs.decode('\\u0065\\u006e\\u0076', 'unicode_escape')] = {**os.environ, **O0_var_858}
     try:
-        O0_var_858 = subprocess.run(O0_var_852, **O0_var_857)
-        return {codecs.decode('\\u0072\\u0065\\u0073\\u0075\\u006c\\u0074', 'unicode_escape'): O0_var_858.stdout, codecs.decode('\\u0065\\u0078\\u0069\\u0074\\u0063\\u006f\\u0064\\u0065', 'unicode_escape'): O0_var_858.returncode, codecs.decode('\\u0074\\u0069\\u006d\\u0065\\u006f\\u0075\\u0074', 'unicode_escape'): False, codecs.decode('\\u0063\\u006d\\u0064', 'unicode_escape'): O0_var_852}
+        O0_var_862 = subprocess.run(O0_var_856, **O0_var_861)
+        return {codecs.decode('\\u0072\\u0065\\u0073\\u0075\\u006c\\u0074', 'unicode_escape'): O0_var_862.stdout, codecs.decode('\\u0065\\u0078\\u0069\\u0074\\u0063\\u006f\\u0064\\u0065', 'unicode_escape'): O0_var_862.returncode, codecs.decode('\\u0074\\u0069\\u006d\\u0065\\u006f\\u0075\\u0074', 'unicode_escape'): False, codecs.decode('\\u0063\\u006d\\u0064', 'unicode_escape'): O0_var_856}
     except subprocess.TimeoutExpired as e:
-        return {codecs.decode('\\u0072\\u0065\\u0073\\u0075\\u006c\\u0074', 'unicode_escape'): codecs.decode('\\u005b\\u0054\\u0049\\u004d\\u0045\\u004f\\u0055\\u0054\\u005d\\u000a', 'unicode_escape') + str(e.output or ''), codecs.decode('\\u0065\\u0078\\u0069\\u0074\\u0063\\u006f\\u0064\\u0065', 'unicode_escape'): 124, codecs.decode('\\u0074\\u0069\\u006d\\u0065\\u006f\\u0075\\u0074', 'unicode_escape'): True, codecs.decode('\\u0063\\u006d\\u0064', 'unicode_escape'): O0_var_852}
+        return {codecs.decode('\\u0072\\u0065\\u0073\\u0075\\u006c\\u0074', 'unicode_escape'): codecs.decode('\\u005b\\u0054\\u0049\\u004d\\u0045\\u004f\\u0055\\u0054\\u005d\\u000a', 'unicode_escape') + str(e.output or ''), codecs.decode('\\u0065\\u0078\\u0069\\u0074\\u0063\\u006f\\u0064\\u0065', 'unicode_escape'): 124, codecs.decode('\\u0074\\u0069\\u006d\\u0065\\u006f\\u0075\\u0074', 'unicode_escape'): True, codecs.decode('\\u0063\\u006d\\u0064', 'unicode_escape'): O0_var_856}
     except Exception as e:
-        return {codecs.decode('\\u0072\\u0065\\u0073\\u0075\\u006c\\u0074', 'unicode_escape'): codecs.decode('\\u005b\\u0045\\u0052\\u0052\\u004f\\u0052\\u005d\\u0020', 'unicode_escape') + str(str(e)), codecs.decode('\\u0065\\u0078\\u0069\\u0074\\u0063\\u006f\\u0064\\u0065', 'unicode_escape'): -1, codecs.decode('\\u0074\\u0069\\u006d\\u0065\\u006f\\u0075\\u0074', 'unicode_escape'): False, codecs.decode('\\u0063\\u006d\\u0064', 'unicode_escape'): O0_var_852}
+        return {codecs.decode('\\u0072\\u0065\\u0073\\u0075\\u006c\\u0074', 'unicode_escape'): codecs.decode('\\u005b\\u0045\\u0052\\u0052\\u004f\\u0052\\u005d\\u0020', 'unicode_escape') + str(str(e)), codecs.decode('\\u0065\\u0078\\u0069\\u0074\\u0063\\u006f\\u0064\\u0065', 'unicode_escape'): -1, codecs.decode('\\u0074\\u0069\\u006d\\u0065\\u006f\\u0075\\u0074', 'unicode_escape'): False, codecs.decode('\\u0063\\u006d\\u0064', 'unicode_escape'): O0_var_856}
 
 @app.get(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0074\\u0065\\u006d\\u0070\\u006b\\u0065\\u0079', 'unicode_escape'), response_model=TempKeyResponse)
 async def O0_fn_33(request: Request, ttl: int=Query(Config.TEMPKEY_DEFAULT_TTL_HOURS, ge=1, le=Config.TEMPKEY_MAX_TTL_HOURS)):
-    O0_var_859 = request.app.state.temp_key_manager
-    O0_var_860 = O0_var_859.get_or_create(ttl)
-    return TempKeyResponse(status=codecs.decode('\\u006f\\u006b', 'unicode_escape'), key_id=O0_var_860[codecs.decode('\\u006b\\u0065\\u0079\\u005f\\u0069\\u0064', 'unicode_escape')], ttl_seconds=O0_var_860[codecs.decode('\\u0074\\u0074\\u006c\\u005f\\u0073\\u0065\\u0063\\u006f\\u006e\\u0064\\u0073', 'unicode_escape')], created_at=datetime.utcfromtimestamp(O0_var_860[codecs.decode('\\u0063\\u0072\\u0065\\u0061\\u0074\\u0065\\u0064\\u005f\\u0061\\u0074', 'unicode_escape')]).isoformat() + codecs.decode('\\u005a', 'unicode_escape'), expires_at=datetime.utcfromtimestamp(O0_var_860[codecs.decode('\\u0065\\u0078\\u0070\\u0069\\u0072\\u0065\\u0073\\u005f\\u0061\\u0074', 'unicode_escape')]).isoformat() + codecs.decode('\\u005a', 'unicode_escape'), ecdsa=TempKeyEcdsaPair(private_key=O0_var_860[codecs.decode('\\u0065\\u0063\\u0064\\u0073\\u0061\\u005f\\u0070\\u0072\\u0069\\u0076\\u0061\\u0074\\u0065\\u005f\\u006b\\u0065\\u0079', 'unicode_escape')].strip(), public_key=O0_var_860[codecs.decode('\\u0065\\u0063\\u0064\\u0073\\u0061\\u005f\\u0070\\u0075\\u0062\\u006c\\u0069\\u0063\\u005f\\u006b\\u0065\\u0079', 'unicode_escape')].strip()), ecies=TempKeyEciesPair(private_key=O0_var_860[codecs.decode('\\u0065\\u0063\\u0069\\u0065\\u0073\\u005f\\u0070\\u0072\\u0069\\u0076\\u0061\\u0074\\u0065\\u005f\\u006b\\u0065\\u0079', 'unicode_escape')], public_key=O0_var_860[codecs.decode('\\u0065\\u0063\\u0069\\u0065\\u0073\\u005f\\u0070\\u0075\\u0062\\u006c\\u0069\\u0063\\u005f\\u006b\\u0065\\u0079', 'unicode_escape')]))
+    O0_var_863 = request.app.state.temp_key_manager
+    O0_var_864 = O0_var_863.get_or_create(ttl)
+    return TempKeyResponse(status=codecs.decode('\\u006f\\u006b', 'unicode_escape'), key_id=O0_var_864[codecs.decode('\\u006b\\u0065\\u0079\\u005f\\u0069\\u0064', 'unicode_escape')], ttl_seconds=O0_var_864[codecs.decode('\\u0074\\u0074\\u006c\\u005f\\u0073\\u0065\\u0063\\u006f\\u006e\\u0064\\u0073', 'unicode_escape')], created_at=datetime.utcfromtimestamp(O0_var_864[codecs.decode('\\u0063\\u0072\\u0065\\u0061\\u0074\\u0065\\u0064\\u005f\\u0061\\u0074', 'unicode_escape')]).isoformat() + codecs.decode('\\u005a', 'unicode_escape'), expires_at=datetime.utcfromtimestamp(O0_var_864[codecs.decode('\\u0065\\u0078\\u0070\\u0069\\u0072\\u0065\\u0073\\u005f\\u0061\\u0074', 'unicode_escape')]).isoformat() + codecs.decode('\\u005a', 'unicode_escape'), ecdsa=TempKeyEcdsaPair(private_key=O0_var_864[codecs.decode('\\u0065\\u0063\\u0064\\u0073\\u0061\\u005f\\u0070\\u0072\\u0069\\u0076\\u0061\\u0074\\u0065\\u005f\\u006b\\u0065\\u0079', 'unicode_escape')].strip(), public_key=O0_var_864[codecs.decode('\\u0065\\u0063\\u0064\\u0073\\u0061\\u005f\\u0070\\u0075\\u0062\\u006c\\u0069\\u0063\\u005f\\u006b\\u0065\\u0079', 'unicode_escape')].strip()), ecies=TempKeyEciesPair(private_key=O0_var_864[codecs.decode('\\u0065\\u0063\\u0069\\u0065\\u0073\\u005f\\u0070\\u0072\\u0069\\u0076\\u0061\\u0074\\u0065\\u005f\\u006b\\u0065\\u0079', 'unicode_escape')], public_key=O0_var_864[codecs.decode('\\u0065\\u0063\\u0069\\u0065\\u0073\\u005f\\u0070\\u0075\\u0062\\u006c\\u0069\\u0063\\u005f\\u006b\\u0065\\u0079', 'unicode_escape')]))
 
 class TaskManager:
     codecs.decode('\\u000a\\u0020\\u0020\\u0020\\u0020\\u4efb\\u52a1\\u7ba1\\u7406\\u5668\\u0020\\u002d\\u0020\\u7eaf\\u5185\\u5b58\\u5b58\\u50a8\\uff0c\\u52a8\\u6001\\u6267\\u884c\\u000a\\u0020\\u0020\\u0020\\u0020\\u002d\\u0020\\u542f\\u52a8\\u4efb\\u52a1\\u003a\\u0020\\u4e00\\u6b21\\u6027\\u6267\\u884c\\uff0c\\u6267\\u884c\\u540e\\u81ea\\u52a8\\u6e05\\u9664\\u000a\\u0020\\u0020\\u0020\\u0020\\u002d\\u0020\\u5b9a\\u65f6\\u4efb\\u52a1\\u003a\\u0020\\u0043\\u0072\\u006f\\u006e\\u0074\\u0061\\u0062\\u0020\\u8868\\u8fbe\\u5f0f\\u8c03\\u5ea6\\uff0c\\u540e\\u53f0\\u5faa\\u73af\\u68c0\\u67e5\\u000a\\u0020\\u0020\\u0020\\u0020', 'unicode_escape')
 
-    def __init__(self, timeout: int=300, check_interval: int=30, O0_var_861: int=None):
+    def __init__(self, timeout: int=300, check_interval: int=30, O0_var_865: int=None):
         self.timeout = timeout
         self.check_interval = check_interval
-        self.max_log_size = O0_var_861 or Config.MAX_TASK_LOG_SIZE
+        self.max_log_size = O0_var_865 or Config.MAX_TASK_LOG_SIZE
         Config.onetimetasks_log = deque(Config.onetimetasks_log, maxlen=self.max_log_size)
         Config.crontasks_log = deque(Config.crontasks_log, maxlen=self.max_log_size)
         self._cron_task: Optional[asyncio.Task] = None
         self._running = False
         self._executed_crons: set = set()
 
-    def set_onetime_tasks(self, O0_var_862: List[str]) -> dict:
-        Config.onetasks = O0_var_862 if O0_var_862 else []
+    def set_onetime_tasks(self, O0_var_866: List[str]) -> dict:
+        Config.onetasks = O0_var_866 if O0_var_866 else []
         return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape'), codecs.decode('\\u0063\\u006f\\u0075\\u006e\\u0074', 'unicode_escape'): len(Config.onetasks), codecs.decode('\\u0074\\u0061\\u0073\\u006b\\u0073', 'unicode_escape'): Config.onetasks}
 
     def get_onetime_tasks(self) -> dict:
@@ -3664,108 +3684,108 @@ class TaskManager:
     def run_onetime_tasks(self) -> List[dict]:
         if not Config.InitTask or not Config.onetasks:
             return []
-        O0_var_863 = []
-        O0_var_864 = Config.onetasks.copy()
-        for O0_var_865, O0_var_866 in enumerate(O0_var_864):
-            O0_var_867 = datetime.utcnow()
+        O0_var_867 = []
+        O0_var_868 = Config.onetasks.copy()
+        for O0_var_869, O0_var_870 in enumerate(O0_var_868):
+            O0_var_871 = datetime.utcnow()
             try:
                 if Config.DEBUG:
-                    Logger.debug(codecs.decode('\\U0001f680\\u0020\\u005b\\u004f\\u006e\\u0065\\u0054\\u0069\\u006d\\u0065\\u002d', 'unicode_escape') + str(O0_var_865 + 1) + codecs.decode('\\u005d\\u0020\\u0045\\u0078\\u0065\\u0063\\u0075\\u0074\\u0069\\u006e\\u0067\\u003a\\u0020', 'unicode_escape') + str(O0_var_866[:100]) + codecs.decode('\\u002e\\u002e\\u002e', 'unicode_escape'))
-                O0_var_868 = subprocess.run(O0_var_866, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, timeout=self.timeout, text=True, errors=codecs.decode('\\u0072\\u0065\\u0070\\u006c\\u0061\\u0063\\u0065', 'unicode_escape'))
-                O0_var_869 = O0_var_868.stdout[:2000]
-                O0_var_870 = O0_var_868.returncode
-                O0_var_871 = self._format_log_entry(O0_var_866, O0_var_869, O0_var_870, codecs.decode('\\u006f\\u006e\\u0065\\u0074\\u0069\\u006d\\u0065', 'unicode_escape'))
-                Config.onetimetasks_log = self._append_task_log(Config.onetimetasks_log, O0_var_871, self.max_log_size)
-                O0_var_863.append({codecs.decode('\\u0069\\u006e\\u0064\\u0065\\u0078', 'unicode_escape'): O0_var_865, codecs.decode('\\u0063\\u006d\\u0064', 'unicode_escape'): O0_var_866[:200], codecs.decode('\\u0065\\u0078\\u0069\\u0074\\u0063\\u006f\\u0064\\u0065', 'unicode_escape'): O0_var_870, codecs.decode('\\u006f\\u0075\\u0074\\u0070\\u0075\\u0074', 'unicode_escape'): O0_var_869[:500], codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape')})
+                    Logger.debug(codecs.decode('\\U0001f680\\u0020\\u005b\\u004f\\u006e\\u0065\\u0054\\u0069\\u006d\\u0065\\u002d', 'unicode_escape') + str(O0_var_869 + 1) + codecs.decode('\\u005d\\u0020\\u0045\\u0078\\u0065\\u0063\\u0075\\u0074\\u0069\\u006e\\u0067\\u003a\\u0020', 'unicode_escape') + str(O0_var_870[:100]) + codecs.decode('\\u002e\\u002e\\u002e', 'unicode_escape'))
+                O0_var_872 = subprocess.run(O0_var_870, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, timeout=self.timeout, text=True, errors=codecs.decode('\\u0072\\u0065\\u0070\\u006c\\u0061\\u0063\\u0065', 'unicode_escape'))
+                O0_var_873 = O0_var_872.stdout[:2000]
+                O0_var_874 = O0_var_872.returncode
+                O0_var_875 = self._format_log_entry(O0_var_870, O0_var_873, O0_var_874, codecs.decode('\\u006f\\u006e\\u0065\\u0074\\u0069\\u006d\\u0065', 'unicode_escape'))
+                Config.onetimetasks_log = self._append_task_log(Config.onetimetasks_log, O0_var_875, self.max_log_size)
+                O0_var_867.append({codecs.decode('\\u0069\\u006e\\u0064\\u0065\\u0078', 'unicode_escape'): O0_var_869, codecs.decode('\\u0063\\u006d\\u0064', 'unicode_escape'): O0_var_870[:200], codecs.decode('\\u0065\\u0078\\u0069\\u0074\\u0063\\u006f\\u0064\\u0065', 'unicode_escape'): O0_var_874, codecs.decode('\\u006f\\u0075\\u0074\\u0070\\u0075\\u0074', 'unicode_escape'): O0_var_873[:500], codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape')})
             except subprocess.TimeoutExpired as e:
-                O0_var_869 = codecs.decode('\\u005b\\u0054\\u0049\\u004d\\u0045\\u004f\\u0055\\u0054\\u005d\\u0020', 'unicode_escape') + str(e.output[:500] if e.output else '')
-                O0_var_870 = 124
-                O0_var_871 = self._format_log_entry(O0_var_866, O0_var_869, O0_var_870, codecs.decode('\\u006f\\u006e\\u0065\\u0074\\u0069\\u006d\\u0065', 'unicode_escape'))
-                Config.onetimetasks_log = self._append_task_log(Config.onetimetasks_log, O0_var_871, self.max_log_size)
-                O0_var_863.append({codecs.decode('\\u0069\\u006e\\u0064\\u0065\\u0078', 'unicode_escape'): O0_var_865, codecs.decode('\\u0063\\u006d\\u0064', 'unicode_escape'): O0_var_866[:200], codecs.decode('\\u0065\\u0078\\u0069\\u0074\\u0063\\u006f\\u0064\\u0065', 'unicode_escape'): O0_var_870, codecs.decode('\\u006f\\u0075\\u0074\\u0070\\u0075\\u0074', 'unicode_escape'): O0_var_869[:500], codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0074\\u0069\\u006d\\u0065\\u006f\\u0075\\u0074', 'unicode_escape')})
+                O0_var_873 = codecs.decode('\\u005b\\u0054\\u0049\\u004d\\u0045\\u004f\\u0055\\u0054\\u005d\\u0020', 'unicode_escape') + str(e.output[:500] if e.output else '')
+                O0_var_874 = 124
+                O0_var_875 = self._format_log_entry(O0_var_870, O0_var_873, O0_var_874, codecs.decode('\\u006f\\u006e\\u0065\\u0074\\u0069\\u006d\\u0065', 'unicode_escape'))
+                Config.onetimetasks_log = self._append_task_log(Config.onetimetasks_log, O0_var_875, self.max_log_size)
+                O0_var_867.append({codecs.decode('\\u0069\\u006e\\u0064\\u0065\\u0078', 'unicode_escape'): O0_var_869, codecs.decode('\\u0063\\u006d\\u0064', 'unicode_escape'): O0_var_870[:200], codecs.decode('\\u0065\\u0078\\u0069\\u0074\\u0063\\u006f\\u0064\\u0065', 'unicode_escape'): O0_var_874, codecs.decode('\\u006f\\u0075\\u0074\\u0070\\u0075\\u0074', 'unicode_escape'): O0_var_873[:500], codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0074\\u0069\\u006d\\u0065\\u006f\\u0075\\u0074', 'unicode_escape')})
             except Exception as e:
-                O0_var_869 = codecs.decode('\\u005b\\u0045\\u0052\\u0052\\u004f\\u0052\\u005d\\u0020', 'unicode_escape') + str(type(e).__name__) + codecs.decode('\\u003a\\u0020', 'unicode_escape') + str(str(e))
-                O0_var_870 = -1
-                O0_var_871 = self._format_log_entry(O0_var_866, O0_var_869, O0_var_870, codecs.decode('\\u006f\\u006e\\u0065\\u0074\\u0069\\u006d\\u0065', 'unicode_escape'))
-                Config.onetimetasks_log = self._append_task_log(Config.onetimetasks_log, O0_var_871, self.max_log_size)
-                O0_var_863.append({codecs.decode('\\u0069\\u006e\\u0064\\u0065\\u0078', 'unicode_escape'): O0_var_865, codecs.decode('\\u0063\\u006d\\u0064', 'unicode_escape'): O0_var_866[:200], codecs.decode('\\u0065\\u0078\\u0069\\u0074\\u0063\\u006f\\u0064\\u0065', 'unicode_escape'): O0_var_870, codecs.decode('\\u006f\\u0075\\u0074\\u0070\\u0075\\u0074', 'unicode_escape'): O0_var_869, codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape')})
+                O0_var_873 = codecs.decode('\\u005b\\u0045\\u0052\\u0052\\u004f\\u0052\\u005d\\u0020', 'unicode_escape') + str(type(e).__name__) + codecs.decode('\\u003a\\u0020', 'unicode_escape') + str(str(e))
+                O0_var_874 = -1
+                O0_var_875 = self._format_log_entry(O0_var_870, O0_var_873, O0_var_874, codecs.decode('\\u006f\\u006e\\u0065\\u0074\\u0069\\u006d\\u0065', 'unicode_escape'))
+                Config.onetimetasks_log = self._append_task_log(Config.onetimetasks_log, O0_var_875, self.max_log_size)
+                O0_var_867.append({codecs.decode('\\u0069\\u006e\\u0064\\u0065\\u0078', 'unicode_escape'): O0_var_869, codecs.decode('\\u0063\\u006d\\u0064', 'unicode_escape'): O0_var_870[:200], codecs.decode('\\u0065\\u0078\\u0069\\u0074\\u0063\\u006f\\u0064\\u0065', 'unicode_escape'): O0_var_874, codecs.decode('\\u006f\\u0075\\u0074\\u0070\\u0075\\u0074', 'unicode_escape'): O0_var_873, codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape')})
         Config.InitTask = False
         if Config.DEBUG:
-            Logger.debug(codecs.decode('\\u2705\\u0020\\u005b\\u004f\\u006e\\u0065\\u0054\\u0069\\u006d\\u0065\\u005d\\u0020\\u0043\\u006f\\u006d\\u0070\\u006c\\u0065\\u0074\\u0065\\u0064\\u0020', 'unicode_escape') + str(len(O0_var_863)) + codecs.decode('\\u0020\\u0074\\u0061\\u0073\\u006b\\u0073\\u002c\\u0020\\u006c\\u006f\\u0067\\u0067\\u0065\\u0064\\u0020\\u0074\\u006f\\u0020\\u006f\\u006e\\u0065\\u0074\\u0069\\u006d\\u0065\\u0074\\u0061\\u0073\\u006b\\u0073\\u005f\\u006c\\u006f\\u0067', 'unicode_escape'))
-        return O0_var_863
+            Logger.debug(codecs.decode('\\u2705\\u0020\\u005b\\u004f\\u006e\\u0065\\u0054\\u0069\\u006d\\u0065\\u005d\\u0020\\u0043\\u006f\\u006d\\u0070\\u006c\\u0065\\u0074\\u0065\\u0064\\u0020', 'unicode_escape') + str(len(O0_var_867)) + codecs.decode('\\u0020\\u0074\\u0061\\u0073\\u006b\\u0073\\u002c\\u0020\\u006c\\u006f\\u0067\\u0067\\u0065\\u0064\\u0020\\u0074\\u006f\\u0020\\u006f\\u006e\\u0065\\u0074\\u0069\\u006d\\u0065\\u0074\\u0061\\u0073\\u006b\\u0073\\u005f\\u006c\\u006f\\u0067', 'unicode_escape'))
+        return O0_var_867
 
     async def _check_and_run_cron(self):
         if not Config.crontasks:
             return
-        O0_var_872 = datetime.now()
-        for O0_var_873, O0_var_874 in Config.crontasks.items():
+        O0_var_876 = datetime.now()
+        for O0_var_877, O0_var_878 in Config.crontasks.items():
             try:
-                O0_var_875 = croniter(O0_var_873, O0_var_872)
-                O0_var_876 = O0_var_875.get_prev(datetime)
-                O0_var_877 = (O0_var_872 - O0_var_876).total_seconds()
-                if 0 <= O0_var_877 <= self.check_interval + 5:
-                    O0_var_878 = O0_var_876.strftime(codecs.decode('\\u0025\\u0059\\u0025\\u006d\\u0025\\u0064\\u0025\\u0048\\u0025\\u004d', 'unicode_escape'))
-                    O0_var_879 = str(O0_var_873) + codecs.decode('\\u003a', 'unicode_escape') + str(O0_var_874) + codecs.decode('\\u003a', 'unicode_escape') + str(O0_var_878)
-                    O0_var_880 = hashlib.md5(O0_var_879.encode()).hexdigest()[:10]
-                    if O0_var_880 in self._executed_crons:
+                O0_var_879 = croniter(O0_var_877, O0_var_876)
+                O0_var_880 = O0_var_879.get_prev(datetime)
+                O0_var_881 = (O0_var_876 - O0_var_880).total_seconds()
+                if 0 <= O0_var_881 <= self.check_interval + 5:
+                    O0_var_882 = O0_var_880.strftime(codecs.decode('\\u0025\\u0059\\u0025\\u006d\\u0025\\u0064\\u0025\\u0048\\u0025\\u004d', 'unicode_escape'))
+                    O0_var_883 = str(O0_var_877) + codecs.decode('\\u003a', 'unicode_escape') + str(O0_var_878) + codecs.decode('\\u003a', 'unicode_escape') + str(O0_var_882)
+                    O0_var_884 = hashlib.md5(O0_var_883.encode()).hexdigest()[:10]
+                    if O0_var_884 in self._executed_crons:
                         continue
                     if Config.DEBUG:
-                        Logger.info(codecs.decode('\\u23f0\\u0020\\u005b\\u0043\\u0072\\u006f\\u006e\\u005d\\u0020\\u0054\\u0072\\u0069\\u0067\\u0067\\u0065\\u0072\\u0065\\u0064\\u003a\\u0020', 'unicode_escape') + str(O0_var_873) + codecs.decode('\\u0020\\u2192\\u0020', 'unicode_escape') + str(O0_var_874[:50]) + codecs.decode('\\u002e\\u002e\\u002e\\u0020\\u0028\\u004c\\u0061\\u0067\\u003a\\u0020', 'unicode_escape') + format(O0_var_877, codecs.decode('\\u002e\\u0032\\u0066', 'unicode_escape')) + codecs.decode('\\u0073\\u0029', 'unicode_escape'))
-                    O0_var_881 = await asyncio.create_subprocess_shell(O0_var_874, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, stdin=asyncio.subprocess.DEVNULL)
+                        Logger.info(codecs.decode('\\u23f0\\u0020\\u005b\\u0043\\u0072\\u006f\\u006e\\u005d\\u0020\\u0054\\u0072\\u0069\\u0067\\u0067\\u0065\\u0072\\u0065\\u0064\\u003a\\u0020', 'unicode_escape') + str(O0_var_877) + codecs.decode('\\u0020\\u2192\\u0020', 'unicode_escape') + str(O0_var_878[:50]) + codecs.decode('\\u002e\\u002e\\u002e\\u0020\\u0028\\u004c\\u0061\\u0067\\u003a\\u0020', 'unicode_escape') + format(O0_var_881, codecs.decode('\\u002e\\u0032\\u0066', 'unicode_escape')) + codecs.decode('\\u0073\\u0029', 'unicode_escape'))
+                    O0_var_885 = await asyncio.create_subprocess_shell(O0_var_878, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, stdin=asyncio.subprocess.DEVNULL)
                     try:
-                        O0_var_882, O0_var_883 = await asyncio.wait_for(O0_var_881.communicate(), timeout=self.timeout)
-                        O0_var_884 = O0_var_882.decode(codecs.decode('\\u0075\\u0074\\u0066\\u002d\\u0038', 'unicode_escape'), errors=codecs.decode('\\u0072\\u0065\\u0070\\u006c\\u0061\\u0063\\u0065', 'unicode_escape'))[:2000]
-                        O0_var_885 = O0_var_881.returncode
+                        O0_var_886, O0_var_887 = await asyncio.wait_for(O0_var_885.communicate(), timeout=self.timeout)
+                        O0_var_888 = O0_var_886.decode(codecs.decode('\\u0075\\u0074\\u0066\\u002d\\u0038', 'unicode_escape'), errors=codecs.decode('\\u0072\\u0065\\u0070\\u006c\\u0061\\u0063\\u0065', 'unicode_escape'))[:2000]
+                        O0_var_889 = O0_var_885.returncode
                     except asyncio.TimeoutError:
                         try:
-                            O0_var_881.kill()
+                            O0_var_885.kill()
                         except:
                             pass
-                        O0_var_884 = codecs.decode('\\u005b\\u0054\\u0049\\u004d\\u0045\\u004f\\u0055\\u0054\\u005d', 'unicode_escape')
-                        O0_var_885 = 124
+                        O0_var_888 = codecs.decode('\\u005b\\u0054\\u0049\\u004d\\u0045\\u004f\\u0055\\u0054\\u005d', 'unicode_escape')
+                        O0_var_889 = 124
                     except Exception as inner_e:
-                        O0_var_884 = codecs.decode('\\u005b\\u0052\\u0055\\u004e\\u0054\\u0049\\u004d\\u0045\\u005f\\u0045\\u0052\\u0052\\u004f\\u0052\\u005d\\u0020', 'unicode_escape') + str(str(inner_e))
-                        O0_var_885 = -1
-                    O0_var_886 = self._format_log_entry(O0_var_874, O0_var_884, O0_var_885, codecs.decode('\\u0063\\u0072\\u006f\\u006e', 'unicode_escape'), O0_var_873)
-                    Config.crontasks_log = self._append_task_log(Config.crontasks_log, O0_var_886, self.max_log_size)
-                    self._executed_crons.add(O0_var_880)
-                    asyncio.get_event_loop().call_later(120, self._executed_crons.discard, O0_var_880)
+                        O0_var_888 = codecs.decode('\\u005b\\u0052\\u0055\\u004e\\u0054\\u0049\\u004d\\u0045\\u005f\\u0045\\u0052\\u0052\\u004f\\u0052\\u005d\\u0020', 'unicode_escape') + str(str(inner_e))
+                        O0_var_889 = -1
+                    O0_var_890 = self._format_log_entry(O0_var_878, O0_var_888, O0_var_889, codecs.decode('\\u0063\\u0072\\u006f\\u006e', 'unicode_escape'), O0_var_877)
+                    Config.crontasks_log = self._append_task_log(Config.crontasks_log, O0_var_890, self.max_log_size)
+                    self._executed_crons.add(O0_var_884)
+                    asyncio.get_event_loop().call_later(120, self._executed_crons.discard, O0_var_884)
             except Exception as e:
                 if Config.DEBUG:
-                    Logger.error(codecs.decode('\\u274c\\u0020\\u005b\\u0043\\u0072\\u006f\\u006e\\u005d\\u0020\\u0053\\u0063\\u0068\\u0065\\u0064\\u0075\\u006c\\u0065\\u0072\\u0020\\u0045\\u0072\\u0072\\u006f\\u0072\\u0020\\u0066\\u006f\\u0072\\u0020\\u0027', 'unicode_escape') + str(O0_var_873) + codecs.decode('\\u0027\\u003a\\u0020', 'unicode_escape') + str(e))
-                O0_var_884 = codecs.decode('\\u005b\\u0053\\u0043\\u0048\\u0045\\u0044\\u0055\\u004c\\u0045\\u0052\\u005f\\u0045\\u0052\\u0052\\u004f\\u0052\\u005d\\u0020', 'unicode_escape') + str(type(e).__name__) + codecs.decode('\\u003a\\u0020', 'unicode_escape') + str(str(e))
-                O0_var_886 = self._format_log_entry(O0_var_874, O0_var_884, -1, codecs.decode('\\u0063\\u0072\\u006f\\u006e', 'unicode_escape'), O0_var_873)
-                Config.crontasks_log = self._append_task_log(Config.crontasks_log, O0_var_886, self.max_log_size)
+                    Logger.error(codecs.decode('\\u274c\\u0020\\u005b\\u0043\\u0072\\u006f\\u006e\\u005d\\u0020\\u0053\\u0063\\u0068\\u0065\\u0064\\u0075\\u006c\\u0065\\u0072\\u0020\\u0045\\u0072\\u0072\\u006f\\u0072\\u0020\\u0066\\u006f\\u0072\\u0020\\u0027', 'unicode_escape') + str(O0_var_877) + codecs.decode('\\u0027\\u003a\\u0020', 'unicode_escape') + str(e))
+                O0_var_888 = codecs.decode('\\u005b\\u0053\\u0043\\u0048\\u0045\\u0044\\u0055\\u004c\\u0045\\u0052\\u005f\\u0045\\u0052\\u0052\\u004f\\u0052\\u005d\\u0020', 'unicode_escape') + str(type(e).__name__) + codecs.decode('\\u003a\\u0020', 'unicode_escape') + str(str(e))
+                O0_var_890 = self._format_log_entry(O0_var_878, O0_var_888, -1, codecs.decode('\\u0063\\u0072\\u006f\\u006e', 'unicode_escape'), O0_var_877)
+                Config.crontasks_log = self._append_task_log(Config.crontasks_log, O0_var_890, self.max_log_size)
 
-    def get_onetime_log(self, O0_var_887: int=None) -> list:
-        O0_var_888 = list(Config.onetimetasks_log)
-        if O0_var_887 and O0_var_887 > 0:
-            return O0_var_888[-O0_var_887:]
-        return O0_var_888
+    def get_onetime_log(self, O0_var_891: int=None) -> list:
+        O0_var_892 = list(Config.onetimetasks_log)
+        if O0_var_891 and O0_var_891 > 0:
+            return O0_var_892[-O0_var_891:]
+        return O0_var_892
 
-    def get_cron_log(self, O0_var_889: int=None) -> list:
-        O0_var_890 = list(Config.crontasks_log)
-        if O0_var_889 and O0_var_889 > 0:
-            return O0_var_890[-O0_var_889:]
-        return O0_var_890
+    def get_cron_log(self, O0_var_893: int=None) -> list:
+        O0_var_894 = list(Config.crontasks_log)
+        if O0_var_893 and O0_var_893 > 0:
+            return O0_var_894[-O0_var_893:]
+        return O0_var_894
 
-    def clear_logs(self, O0_var_891: str=codecs.decode('\\u0061\\u006c\\u006c', 'unicode_escape')):
-        if O0_var_891 in [codecs.decode('\\u006f\\u006e\\u0065\\u0074\\u0069\\u006d\\u0065', 'unicode_escape'), codecs.decode('\\u0061\\u006c\\u006c', 'unicode_escape')]:
+    def clear_logs(self, O0_var_895: str=codecs.decode('\\u0061\\u006c\\u006c', 'unicode_escape')):
+        if O0_var_895 in [codecs.decode('\\u006f\\u006e\\u0065\\u0074\\u0069\\u006d\\u0065', 'unicode_escape'), codecs.decode('\\u0061\\u006c\\u006c', 'unicode_escape')]:
             Config.onetimetasks_log.clear()
-        if O0_var_891 in [codecs.decode('\\u0063\\u0072\\u006f\\u006e', 'unicode_escape'), codecs.decode('\\u0061\\u006c\\u006c', 'unicode_escape')]:
+        if O0_var_895 in [codecs.decode('\\u0063\\u0072\\u006f\\u006e', 'unicode_escape'), codecs.decode('\\u0061\\u006c\\u006c', 'unicode_escape')]:
             Config.crontasks_log.clear()
-        return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape'), codecs.decode('\\u0063\\u006c\\u0065\\u0061\\u0072\\u0065\\u0064', 'unicode_escape'): O0_var_891}
+        return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape'), codecs.decode('\\u0063\\u006c\\u0065\\u0061\\u0072\\u0065\\u0064', 'unicode_escape'): O0_var_895}
 
-    def set_cron_tasks(self, O0_var_892: Dict[str, str]) -> dict:
-        O0_var_893 = []
-        for O0_var_894 in O0_var_892.keys():
+    def set_cron_tasks(self, O0_var_896: Dict[str, str]) -> dict:
+        O0_var_897 = []
+        for O0_var_898 in O0_var_896.keys():
             try:
-                croniter(O0_var_894, datetime.now())
+                croniter(O0_var_898, datetime.now())
             except Exception:
-                O0_var_893.append(O0_var_894)
-        if O0_var_893:
-            return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'), codecs.decode('\\u006d\\u0065\\u0073\\u0073\\u0061\\u0067\\u0065', 'unicode_escape'): codecs.decode('\\u0049\\u006e\\u0076\\u0061\\u006c\\u0069\\u0064\\u0020\\u0063\\u0072\\u006f\\u006e\\u0020\\u0065\\u0078\\u0070\\u0072\\u0065\\u0073\\u0073\\u0069\\u006f\\u006e\\u0073\\u003a\\u0020', 'unicode_escape') + str(O0_var_893), codecs.decode('\\u0076\\u0061\\u006c\\u0069\\u0064\\u005f\\u0063\\u006f\\u0075\\u006e\\u0074', 'unicode_escape'): len(O0_var_892) - len(O0_var_893)}
-        Config.crontasks = O0_var_892 if O0_var_892 else {}
+                O0_var_897.append(O0_var_898)
+        if O0_var_897:
+            return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'), codecs.decode('\\u006d\\u0065\\u0073\\u0073\\u0061\\u0067\\u0065', 'unicode_escape'): codecs.decode('\\u0049\\u006e\\u0076\\u0061\\u006c\\u0069\\u0064\\u0020\\u0063\\u0072\\u006f\\u006e\\u0020\\u0065\\u0078\\u0070\\u0072\\u0065\\u0073\\u0073\\u0069\\u006f\\u006e\\u0073\\u003a\\u0020', 'unicode_escape') + str(O0_var_897), codecs.decode('\\u0076\\u0061\\u006c\\u0069\\u0064\\u005f\\u0063\\u006f\\u0075\\u006e\\u0074', 'unicode_escape'): len(O0_var_896) - len(O0_var_897)}
+        Config.crontasks = O0_var_896 if O0_var_896 else {}
         if Config.crontasks and (not Config.cronloop):
             self.start_cron_loop()
         elif not Config.crontasks and Config.cronloop:
@@ -3782,14 +3802,14 @@ class TaskManager:
         self._running = True
         self._executed_crons.clear()
         try:
-            O0_var_895 = asyncio.get_event_loop()
-            self._cron_task = O0_var_895.create_task(self._cron_loop_worker())
+            O0_var_899 = asyncio.get_event_loop()
+            self._cron_task = O0_var_899.create_task(self._cron_loop_worker())
             if Config.DEBUG:
                 Logger.info(codecs.decode('\\U0001f504\\u0020\\u005b\\u0043\\u0072\\u006f\\u006e\\u005d\\u0020\\u004c\\u006f\\u006f\\u0070\\u0020\\u0073\\u0074\\u0061\\u0072\\u0074\\u0065\\u0064\\u002c\\u0020\\u0069\\u006e\\u0074\\u0065\\u0072\\u0076\\u0061\\u006c\\u003d', 'unicode_escape') + str(self.check_interval) + codecs.decode('\\u0073', 'unicode_escape'))
         except RuntimeError:
             import threading
-            O0_var_896 = threading.Thread(target=self._run_cron_sync, daemon=True)
-            O0_var_896.start()
+            O0_var_900 = threading.Thread(target=self._run_cron_sync, daemon=True)
+            O0_var_900.start()
             if Config.DEBUG:
                 Logger.info(codecs.decode('\\U0001f504\\u0020\\u005b\\u0043\\u0072\\u006f\\u006e\\u005d\\u0020\\u004c\\u006f\\u006f\\u0070\\u0020\\u0073\\u0074\\u0061\\u0072\\u0074\\u0065\\u0064\\u0020\\u0069\\u006e\\u0020\\u0074\\u0068\\u0072\\u0065\\u0061\\u0064\\u002c\\u0020\\u0069\\u006e\\u0074\\u0065\\u0072\\u0076\\u0061\\u006c\\u003d', 'unicode_escape') + str(self.check_interval) + codecs.decode('\\u0073', 'unicode_escape'))
         return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape'), codecs.decode('\\u006d\\u0065\\u0073\\u0073\\u0061\\u0067\\u0065', 'unicode_escape'): codecs.decode('\\u0043\\u0072\\u006f\\u006e\\u0020\\u006c\\u006f\\u006f\\u0070\\u0020\\u0073\\u0074\\u0061\\u0072\\u0074\\u0065\\u0064', 'unicode_escape')}
@@ -3840,136 +3860,136 @@ class TaskManager:
 
 @app.post(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0066\\u0069\\u006c\\u0065\\u002f\\u006c\\u0069\\u0073\\u0074', 'unicode_escape'), response_model=FileListResponse)
 async def O0_fn_34(request: Request, body: FileListRequest=Body(...)):
-    O0_var_897 = request.app.state.file_manager
-    O0_var_898 = O0_var_897.list_files(base_path=body.path, recursive=body.recursive)
-    return O0_var_898
+    O0_var_901 = request.app.state.file_manager
+    O0_var_902 = O0_var_901.list_files(base_path=body.path, recursive=body.recursive)
+    return O0_var_902
 
 @app.post(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0066\\u0069\\u006c\\u0065\\u002f\\u0061\\u0075\\u0074\\u0068\\u006f\\u0072\\u0069\\u0074\\u0079', 'unicode_escape'), response_model=AuthorityQueryResponse)
 async def O0_fn_35(request: Request, body: AuthorityQueryRequest=Body(...)):
     if not body.paths:
         return JSONResponse(status_code=400, content={codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073\\u003a', 'unicode_escape'): codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'), codecs.decode('\\u0066\\u0069\\u006c\\u0065\\u0073', 'unicode_escape'): []})
-    O0_var_899 = request.app.state.file_manager
-    O0_var_900 = O0_var_899.get_authority(body.paths)
-    return O0_var_900
+    O0_var_903 = request.app.state.file_manager
+    O0_var_904 = O0_var_903.get_authority(body.paths)
+    return O0_var_904
 
 @app.put(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0066\\u0069\\u006c\\u0065\\u002f\\u0061\\u0075\\u0074\\u0068\\u006f\\u0072\\u0069\\u0074\\u0079', 'unicode_escape'), response_model=AuthoritySetResponse)
 async def O0_fn_36(request: Request, body: AuthoritySetRequest=Body(...)):
-    O0_var_901 = body.permissions
-    O0_var_902 = body.recursive
-    if not O0_var_901:
+    O0_var_905 = body.permissions
+    O0_var_906 = body.recursive
+    if not O0_var_905:
         return JSONResponse(status_code=400, content={codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'), codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c', 'unicode_escape'): 0, codecs.decode('\\u0073\\u0075\\u0063\\u0063\\u0065\\u0073\\u0073', 'unicode_escape'): 0, codecs.decode('\\u0072\\u0065\\u0073\\u0075\\u006c\\u0074\\u0073', 'unicode_escape'): []})
-    O0_var_903 = request.app.state.file_manager
-    O0_var_904 = O0_var_903.set_authority(O0_var_901, O0_var_902)
-    return O0_var_904
+    O0_var_907 = request.app.state.file_manager
+    O0_var_908 = O0_var_907.set_authority(O0_var_905, O0_var_906)
+    return O0_var_908
 
 @app.post(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0066\\u0069\\u006c\\u0065\\u002f\\u0063\\u0061\\u0074', 'unicode_escape'), response_model=FileCatResponse)
 async def O0_fn_37(request: Request, body: FileCatRequest=Body(...)):
     if not body.path:
         return JSONResponse(status_code=400, content={codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'), codecs.decode('\\u0070\\u0061\\u0074\\u0068', 'unicode_escape'): codecs.decode('', 'unicode_escape'), codecs.decode('\\u0063\\u006f\\u006e\\u0074\\u0065\\u006e\\u0074', 'unicode_escape'): codecs.decode('', 'unicode_escape'), codecs.decode('\\u0065\\u006e\\u0063\\u006f\\u0064\\u0069\\u006e\\u0067', 'unicode_escape'): codecs.decode('', 'unicode_escape'), codecs.decode('\\u0069\\u0073\\u005f\\u0062\\u0069\\u006e\\u0061\\u0072\\u0079', 'unicode_escape'): False, codecs.decode('\\u0073\\u0069\\u007a\\u0065', 'unicode_escape'): 0})
-    O0_var_905 = request.app.state.file_manager
-    O0_var_906 = O0_var_905.cat_file(body.path)
-    return O0_var_906
+    O0_var_909 = request.app.state.file_manager
+    O0_var_910 = O0_var_909.cat_file(body.path)
+    return O0_var_910
 
 @app.post(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0066\\u0069\\u006c\\u0065', 'unicode_escape'), response_model=FileUploadResponse)
 async def O0_fn_38(request: Request, body: FileUploadRequest=Body(...)):
     if not body.content:
         return JSONResponse(status_code=400, content={codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0063\\u006f\\u006e\\u0074\\u0065\\u006e\\u0074\\u0020\\u0028\\u0062\\u0061\\u0073\\u0065\\u0036\\u0034\\u0029\\u0020\\u0072\\u0065\\u0071\\u0075\\u0069\\u0072\\u0065\\u0064', 'unicode_escape'), codecs.decode('\\u0070\\u0061\\u0074\\u0068', 'unicode_escape'): None, codecs.decode('\\u0072\\u0065\\u0063\\u0065\\u0069\\u0076\\u0065\\u0064', 'unicode_escape'): None, codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c', 'unicode_escape'): None, codecs.decode('\\u0063\\u0068\\u0075\\u006e\\u006b\\u0065\\u0064', 'unicode_escape'): None})
     try:
-        O0_var_907 = base64.b64decode(body.content)
+        O0_var_911 = base64.b64decode(body.content)
     except Exception:
         return JSONResponse(status_code=400, content={codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0049\\u006e\\u0076\\u0061\\u006c\\u0069\\u0064\\u0020\\u0062\\u0061\\u0073\\u0065\\u0036\\u0034\\u0020\\u0063\\u006f\\u006e\\u0074\\u0065\\u006e\\u0074', 'unicode_escape'), codecs.decode('\\u0070\\u0061\\u0074\\u0068', 'unicode_escape'): None, codecs.decode('\\u0072\\u0065\\u0063\\u0065\\u0069\\u0076\\u0065\\u0064', 'unicode_escape'): None, codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c', 'unicode_escape'): None, codecs.decode('\\u0063\\u0068\\u0075\\u006e\\u006b\\u0065\\u0064', 'unicode_escape'): None})
-    O0_var_908 = request.app.state.file_manager
-    O0_var_909 = O0_var_908.upload_file(file_content=O0_var_907, target_path=body.path, filename=body.filename, chunk_id=body.chunk_id, total_chunks=body.total_chunks)
-    return O0_var_909
+    O0_var_912 = request.app.state.file_manager
+    O0_var_913 = O0_var_912.upload_file(file_content=O0_var_911, target_path=body.path, filename=body.filename, chunk_id=body.chunk_id, total_chunks=body.total_chunks)
+    return O0_var_913
 
 @app.post(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0066\\u0069\\u006c\\u0065\\u0072\\u0061\\u0077', 'unicode_escape'), response_model=FileUploadRawResponse)
 async def O0_fn_39(request: Request):
-    O0_var_910 = request.headers
-    O0_var_911 = unquote(O0_var_910.get(codecs.decode('\\u0058\\u002d\\u0046\\u0069\\u006c\\u0065\\u002d\\u0050\\u0061\\u0074\\u0068', 'unicode_escape'), codecs.decode('', 'unicode_escape')))
-    O0_var_912 = unquote(O0_var_910.get(codecs.decode('\\u0058\\u002d\\u0046\\u0069\\u006c\\u0065\\u002d\\u004e\\u0061\\u006d\\u0065', 'unicode_escape'), codecs.decode('', 'unicode_escape')))
-    O0_var_913 = O0_var_910.get(codecs.decode('\\u0058\\u002d\\u0043\\u0068\\u0075\\u006e\\u006b\\u002d\\u0049\\u0064', 'unicode_escape'))
-    O0_var_914 = O0_var_910.get(codecs.decode('\\u0058\\u002d\\u0054\\u006f\\u0074\\u0061\\u006c\\u002d\\u0043\\u0068\\u0075\\u006e\\u006b\\u0073', 'unicode_escape'))
-    if not O0_var_911 or not O0_var_912:
+    O0_var_914 = request.headers
+    O0_var_915 = unquote(O0_var_914.get(codecs.decode('\\u0058\\u002d\\u0046\\u0069\\u006c\\u0065\\u002d\\u0050\\u0061\\u0074\\u0068', 'unicode_escape'), codecs.decode('', 'unicode_escape')))
+    O0_var_916 = unquote(O0_var_914.get(codecs.decode('\\u0058\\u002d\\u0046\\u0069\\u006c\\u0065\\u002d\\u004e\\u0061\\u006d\\u0065', 'unicode_escape'), codecs.decode('', 'unicode_escape')))
+    O0_var_917 = O0_var_914.get(codecs.decode('\\u0058\\u002d\\u0043\\u0068\\u0075\\u006e\\u006b\\u002d\\u0049\\u0064', 'unicode_escape'))
+    O0_var_918 = O0_var_914.get(codecs.decode('\\u0058\\u002d\\u0054\\u006f\\u0074\\u0061\\u006c\\u002d\\u0043\\u0068\\u0075\\u006e\\u006b\\u0073', 'unicode_escape'))
+    if not O0_var_915 or not O0_var_916:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=codecs.decode('\\u004d\\u0069\\u0073\\u0073\\u0069\\u006e\\u0067\\u0020\\u0072\\u0065\\u0071\\u0075\\u0069\\u0072\\u0065\\u0064\\u0020\\u0063\\u0075\\u0073\\u0074\\u006f\\u006d\\u0020\\u0068\\u0065\\u0061\\u0064\\u0065\\u0072\\u0073\\u003a\\u0020\\u0058\\u002d\\u0046\\u0069\\u006c\\u0065\\u002d\\u0050\\u0061\\u0074\\u0068\\u0020\\u0061\\u006e\\u0064\\u0020\\u0058\\u002d\\u0046\\u0069\\u006c\\u0065\\u002d\\u004e\\u0061\\u006d\\u0065', 'unicode_escape'))
-    O0_var_915 = int(O0_var_913) if O0_var_913 is not None else None
-    O0_var_916 = int(O0_var_914) if O0_var_914 is not None else None
-    O0_var_917 = await request.body()
-    O0_var_918 = request.app.state.file_manager
-    O0_var_919 = O0_var_918.upload_file(file_content=O0_var_917, target_path=O0_var_911, filename=O0_var_912, chunk_id=O0_var_915, total_chunks=O0_var_916)
-    if O0_var_919.get(codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape')) == codecs.decode('\\u006f\\u006b', 'unicode_escape'):
-        return FileUploadRawResponse(status=codecs.decode('\\u006f\\u006b', 'unicode_escape'), path=O0_var_919.get(codecs.decode('\\u0070\\u0061\\u0074\\u0068', 'unicode_escape')), chunk_id=O0_var_915, completed=True, message=codecs.decode('\\u0041\\u006c\\u006c\\u0020\\u0063\\u0068\\u0075\\u006e\\u006b\\u0073\\u0020\\u0072\\u0065\\u0063\\u0065\\u0069\\u0076\\u0065\\u0064\\u002e\\u0020\\u0046\\u0069\\u006c\\u0065\\u0020\\u006d\\u0065\\u0072\\u0067\\u0065\\u0064\\u0020\\u0073\\u0075\\u0063\\u0063\\u0065\\u0073\\u0073\\u0066\\u0075\\u006c\\u006c\\u0079\\u002e', 'unicode_escape') if O0_var_919.get(codecs.decode('\\u0063\\u0068\\u0075\\u006e\\u006b\\u0065\\u0064', 'unicode_escape')) else codecs.decode('\\u0046\\u0069\\u006c\\u0065\\u0020\\u0075\\u0070\\u006c\\u006f\\u0061\\u0064\\u0065\\u0064\\u0020\\u0073\\u0075\\u0063\\u0063\\u0065\\u0073\\u0073\\u0066\\u0075\\u006c\\u006c\\u0079\\u002e', 'unicode_escape'))
-    elif O0_var_919.get(codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape')) == codecs.decode('\\u0070\\u0065\\u006e\\u0064\\u0069\\u006e\\u0067', 'unicode_escape'):
-        return FileUploadRawResponse(status=codecs.decode('\\u006f\\u006b', 'unicode_escape'), path=os.path.join(O0_var_911, O0_var_912), chunk_id=O0_var_915, completed=False, message=codecs.decode('\\u0043\\u0068\\u0075\\u006e\\u006b\\u0020', 'unicode_escape') + str(O0_var_915) + codecs.decode('\\u0020\\u0075\\u0070\\u006c\\u006f\\u0061\\u0064\\u0065\\u0064\\u002e\\u0020\\u0057\\u0061\\u0069\\u0074\\u0069\\u006e\\u0067\\u0020\\u0066\\u006f\\u0072\\u0020\\u0072\\u0065\\u006d\\u0061\\u0069\\u006e\\u0069\\u006e\\u0067\\u0020\\u0062\\u006c\\u006f\\u0063\\u006b\\u0073\\u002e', 'unicode_escape'))
-    return FileUploadRawResponse(status=codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'), completed=False, message=O0_var_919.get(codecs.decode('\\u006d\\u0065\\u0073\\u0073\\u0061\\u0067\\u0065', 'unicode_escape'), codecs.decode('\\u0055\\u006e\\u006b\\u006e\\u006f\\u0077\\u006e\\u0020\\u0075\\u0070\\u006c\\u006f\\u0061\\u0064\\u0020\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape')))
+    O0_var_919 = int(O0_var_917) if O0_var_917 is not None else None
+    O0_var_920 = int(O0_var_918) if O0_var_918 is not None else None
+    O0_var_921 = await request.body()
+    O0_var_922 = request.app.state.file_manager
+    O0_var_923 = O0_var_922.upload_file(file_content=O0_var_921, target_path=O0_var_915, filename=O0_var_916, chunk_id=O0_var_919, total_chunks=O0_var_920)
+    if O0_var_923.get(codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape')) == codecs.decode('\\u006f\\u006b', 'unicode_escape'):
+        return FileUploadRawResponse(status=codecs.decode('\\u006f\\u006b', 'unicode_escape'), path=O0_var_923.get(codecs.decode('\\u0070\\u0061\\u0074\\u0068', 'unicode_escape')), chunk_id=O0_var_919, completed=True, message=codecs.decode('\\u0041\\u006c\\u006c\\u0020\\u0063\\u0068\\u0075\\u006e\\u006b\\u0073\\u0020\\u0072\\u0065\\u0063\\u0065\\u0069\\u0076\\u0065\\u0064\\u002e\\u0020\\u0046\\u0069\\u006c\\u0065\\u0020\\u006d\\u0065\\u0072\\u0067\\u0065\\u0064\\u0020\\u0073\\u0075\\u0063\\u0063\\u0065\\u0073\\u0073\\u0066\\u0075\\u006c\\u006c\\u0079\\u002e', 'unicode_escape') if O0_var_923.get(codecs.decode('\\u0063\\u0068\\u0075\\u006e\\u006b\\u0065\\u0064', 'unicode_escape')) else codecs.decode('\\u0046\\u0069\\u006c\\u0065\\u0020\\u0075\\u0070\\u006c\\u006f\\u0061\\u0064\\u0065\\u0064\\u0020\\u0073\\u0075\\u0063\\u0063\\u0065\\u0073\\u0073\\u0066\\u0075\\u006c\\u006c\\u0079\\u002e', 'unicode_escape'))
+    elif O0_var_923.get(codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape')) == codecs.decode('\\u0070\\u0065\\u006e\\u0064\\u0069\\u006e\\u0067', 'unicode_escape'):
+        return FileUploadRawResponse(status=codecs.decode('\\u006f\\u006b', 'unicode_escape'), path=os.path.join(O0_var_915, O0_var_916), chunk_id=O0_var_919, completed=False, message=codecs.decode('\\u0043\\u0068\\u0075\\u006e\\u006b\\u0020', 'unicode_escape') + str(O0_var_919) + codecs.decode('\\u0020\\u0075\\u0070\\u006c\\u006f\\u0061\\u0064\\u0065\\u0064\\u002e\\u0020\\u0057\\u0061\\u0069\\u0074\\u0069\\u006e\\u0067\\u0020\\u0066\\u006f\\u0072\\u0020\\u0072\\u0065\\u006d\\u0061\\u0069\\u006e\\u0069\\u006e\\u0067\\u0020\\u0062\\u006c\\u006f\\u0063\\u006b\\u0073\\u002e', 'unicode_escape'))
+    return FileUploadRawResponse(status=codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'), completed=False, message=O0_var_923.get(codecs.decode('\\u006d\\u0065\\u0073\\u0073\\u0061\\u0067\\u0065', 'unicode_escape'), codecs.decode('\\u0055\\u006e\\u006b\\u006e\\u006f\\u0077\\u006e\\u0020\\u0075\\u0070\\u006c\\u006f\\u0061\\u0064\\u0020\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape')))
 
 @app.post(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0066\\u0069\\u006c\\u0065\\u002f\\u0064\\u006f\\u0077\\u006e\\u006c\\u006f\\u0061\\u0064', 'unicode_escape'))
 async def O0_fn_40(request: Request, body: FileDownloadRequest=Body(...)):
     if not body.path:
         return JSONResponse(400, {codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'): codecs.decode('\\u0070\\u0061\\u0074\\u0068\\u0020\\u0072\\u0065\\u0071\\u0075\\u0069\\u0072\\u0065\\u0064', 'unicode_escape')})
-    O0_var_920 = request.app.state.file_manager
-    O0_var_921, O0_var_922, O0_var_923 = O0_var_920.download_file(body.path)
+    O0_var_924 = request.app.state.file_manager
+    O0_var_925, O0_var_926, O0_var_927 = O0_var_924.download_file(body.path)
     from fastapi.responses import FileResponse
-    return FileResponse(path=str(O0_var_921), filename=O0_var_921.name, media_type=O0_var_922, headers={codecs.decode('\\u0078\\u002d\\u0066\\u0069\\u006c\\u0065\\u002d\\u0073\\u0069\\u007a\\u0065', 'unicode_escape'): str(O0_var_923), codecs.decode('\\u0078\\u002d\\u006f\\u0072\\u0069\\u0067\\u0069\\u006e\\u0061\\u006c\\u002d\\u0070\\u0061\\u0074\\u0068', 'unicode_escape'): str(O0_var_921.relative_to(Path(Config.FILE_ROOT)))})
+    return FileResponse(path=str(O0_var_925), filename=O0_var_925.name, media_type=O0_var_926, headers={codecs.decode('\\u0078\\u002d\\u0066\\u0069\\u006c\\u0065\\u002d\\u0073\\u0069\\u007a\\u0065', 'unicode_escape'): str(O0_var_927), codecs.decode('\\u0078\\u002d\\u006f\\u0072\\u0069\\u0067\\u0069\\u006e\\u0061\\u006c\\u002d\\u0070\\u0061\\u0074\\u0068', 'unicode_escape'): str(O0_var_925.relative_to(Path(Config.FILE_ROOT)))})
 
 @app.delete(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0066\\u0069\\u006c\\u0065', 'unicode_escape'), response_model=FileDeleteResponse)
 async def O0_fn_41(request: Request, body: FileDeleteRequest=Body(...)):
-    O0_var_924 = body.paths
-    if not O0_var_924:
-        O0_var_925 = await request.body()
-        O0_var_926 = json.loads(O0_var_925.decode()) if O0_var_925 else {}
-        O0_var_924 = [O0_var_928 for O0_var_927 in [codecs.decode('\\u0070\\u0061\\u0074\\u0068', 'unicode_escape'), codecs.decode('\\u0070\\u0061\\u0074\\u0068\\u0032', 'unicode_escape'), codecs.decode('\\u0070\\u0031', 'unicode_escape'), codecs.decode('\\u0070\\u0032', 'unicode_escape')] if (O0_var_928 := O0_var_926.get(O0_var_927))]
-    if not O0_var_924:
+    O0_var_928 = body.paths
+    if not O0_var_928:
+        O0_var_929 = await request.body()
+        O0_var_930 = json.loads(O0_var_929.decode()) if O0_var_929 else {}
+        O0_var_928 = [O0_var_932 for O0_var_931 in [codecs.decode('\\u0070\\u0061\\u0074\\u0068', 'unicode_escape'), codecs.decode('\\u0070\\u0061\\u0074\\u0068\\u0032', 'unicode_escape'), codecs.decode('\\u0070\\u0031', 'unicode_escape'), codecs.decode('\\u0070\\u0032', 'unicode_escape')] if (O0_var_932 := O0_var_930.get(O0_var_931))]
+    if not O0_var_928:
         return JSONResponse(status_code=400, content={codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'), codecs.decode('\\u0072\\u0065\\u0073\\u0075\\u006c\\u0074\\u0073', 'unicode_escape'): []})
-    O0_var_929 = request.app.state.file_manager
-    O0_var_930 = O0_var_929.delete_paths(O0_var_924)
-    return O0_var_930
+    O0_var_933 = request.app.state.file_manager
+    O0_var_934 = O0_var_933.delete_paths(O0_var_928)
+    return O0_var_934
 
 @app.put(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0066\\u0069\\u006c\\u0065', 'unicode_escape'), response_model=FileMoveResponse)
 async def O0_fn_42(request: Request, move_map: Dict[str, str]=Body(..., examples={codecs.decode('\\u002f\\u0074\\u006d\\u0070\\u002f\\u006f\\u006c\\u0064\\u002e\\u0074\\u0078\\u0074', 'unicode_escape'): codecs.decode('\\u002f\\u0061\\u0072\\u0063\\u0068\\u0069\\u0076\\u0065\\u002f\\u006f\\u006c\\u0064\\u002e\\u0074\\u0078\\u0074', 'unicode_escape')})):
     if not move_map:
         return JSONResponse(status_code=400, content={codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'): codecs.decode('\\u0041\\u0074\\u0020\\u006c\\u0065\\u0061\\u0073\\u0074\\u0020\\u006f\\u006e\\u0065\\u0020\\u0073\\u0072\\u0063\\u002d\\u003e\\u0064\\u0073\\u0074\\u0020\\u0070\\u0061\\u0069\\u0072\\u0020\\u0072\\u0065\\u0071\\u0075\\u0069\\u0072\\u0065\\u0064', 'unicode_escape')})
-    O0_var_931 = request.app.state.file_manager
-    O0_var_932 = O0_var_931.move_paths(move_map)
-    return O0_var_932
+    O0_var_935 = request.app.state.file_manager
+    O0_var_936 = O0_var_935.move_paths(move_map)
+    return O0_var_936
 
 @app.post(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0066\\u0069\\u006c\\u0065\\u002f\\u0063\\u0070', 'unicode_escape'), response_model=FileMoveResponse)
 async def O0_fn_43(request: Request, copy_map: Dict[str, str]=Body(..., description=codecs.decode('\\u6e90\\u8def\\u5f84\\u5230\\u76ee\\u6807\\u8def\\u5f84\\u7684\\u6620\\u5c04', 'unicode_escape'), examples=[{codecs.decode('\\u002f\\u0074\\u006d\\u0070\\u002f\\u006f\\u006c\\u0064\\u002e\\u0074\\u0078\\u0074', 'unicode_escape'): codecs.decode('\\u002f\\u0061\\u0072\\u0063\\u0068\\u0069\\u0076\\u0065\\u002f\\u006f\\u006c\\u0064\\u002e\\u0074\\u0078\\u0074', 'unicode_escape'), codecs.decode('\\u002f\\u0074\\u006d\\u0070\\u002f\\u006c\\u006f\\u0067\\u0073', 'unicode_escape'): codecs.decode('\\u002f\\u0062\\u0061\\u0063\\u006b\\u0075\\u0070\\u002f\\u006c\\u006f\\u0067\\u0073', 'unicode_escape')}])):
     if not copy_map:
         return JSONResponse(status_code=400, content={codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'): codecs.decode('\\u0041\\u0074\\u0020\\u006c\\u0065\\u0061\\u0073\\u0074\\u0020\\u006f\\u006e\\u0065\\u0020\\u0073\\u0072\\u0063\\u002d\\u003e\\u0064\\u0073\\u0074\\u0020\\u0070\\u0061\\u0069\\u0072\\u0020\\u0072\\u0065\\u0071\\u0075\\u0069\\u0072\\u0065\\u0064', 'unicode_escape')})
-    O0_var_933 = request.app.state.file_manager
-    O0_var_934 = O0_var_933.copy_paths(copy_map)
-    return O0_var_934
+    O0_var_937 = request.app.state.file_manager
+    O0_var_938 = O0_var_937.copy_paths(copy_map)
+    return O0_var_938
 
 @app.post(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0066\\u0069\\u006c\\u0065\\u002f\\u006e\\u0065\\u0077', 'unicode_escape'), response_model=FileMkdirResponse)
 async def O0_fn_44(request: Request, body: FileMkdirRequest=Body(...)):
     if not body.path:
         return JSONResponse(status_code=400, content={codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u0070\\u0061\\u0074\\u0068\\u0020\\u0072\\u0065\\u0071\\u0075\\u0069\\u0072\\u0065\\u0064', 'unicode_escape'), codecs.decode('\\u0070\\u0061\\u0074\\u0068', 'unicode_escape'): codecs.decode('', 'unicode_escape')})
-    O0_var_935 = request.app.state.file_manager
-    O0_var_936 = O0_var_935.create_directory(body.path)
-    return O0_var_936
+    O0_var_939 = request.app.state.file_manager
+    O0_var_940 = O0_var_939.create_directory(body.path)
+    return O0_var_940
 
 @app.get(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0074\\u0061\\u0073\\u006b\\u002f\\u006f\\u006e\\u0065\\u0074\\u0069\\u006d\\u0065', 'unicode_escape'), response_model=OneTimeTaskGetResponse)
 async def O0_fn_45(request: Request):
-    O0_var_937 = request.app.state.task_manager.get_onetime_tasks()
-    return O0_var_937
+    O0_var_941 = request.app.state.task_manager.get_onetime_tasks()
+    return O0_var_941
 
 @app.post(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0074\\u0061\\u0073\\u006b\\u002f\\u006f\\u006e\\u0065\\u0074\\u0069\\u006d\\u0065', 'unicode_escape'), response_model=OneTimeTaskResponse)
 async def O0_fn_46(request: Request, tasks: List[str]=Body(default=[])):
     request.app.state.task_manager.set_onetime_tasks(tasks)
-    O0_var_938 = {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape'), codecs.decode('\\u0063\\u006f\\u0075\\u006e\\u0074', 'unicode_escape'): len(tasks), codecs.decode('\\u0074\\u0061\\u0073\\u006b\\u0073', 'unicode_escape'): tasks}
+    O0_var_942 = {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape'), codecs.decode('\\u0063\\u006f\\u0075\\u006e\\u0074', 'unicode_escape'): len(tasks), codecs.decode('\\u0074\\u0061\\u0073\\u006b\\u0073', 'unicode_escape'): tasks}
     if Config.InitTask and tasks:
-        O0_var_938[codecs.decode('\\u0065\\u0078\\u0065\\u0063\\u0075\\u0074\\u0065\\u0064', 'unicode_escape')] = request.app.state.task_manager.run_onetime_tasks()
-    return O0_var_938
+        O0_var_942[codecs.decode('\\u0065\\u0078\\u0065\\u0063\\u0075\\u0074\\u0065\\u0064', 'unicode_escape')] = request.app.state.task_manager.run_onetime_tasks()
+    return O0_var_942
 
 @app.get(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0074\\u0061\\u0073\\u006b\\u002f\\u0063\\u0072\\u006f\\u006e', 'unicode_escape'), response_model=CronTasksResponse)
 async def O0_fn_47(request: Request):
-    O0_var_939 = request.app.state.task_manager.get_cron_tasks()
-    return O0_var_939
+    O0_var_943 = request.app.state.task_manager.get_cron_tasks()
+    return O0_var_943
 
 @app.post(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0074\\u0061\\u0073\\u006b\\u002f\\u0063\\u0072\\u006f\\u006e', 'unicode_escape'), response_model=CronTasksResponse)
 async def O0_fn_48(request: Request, tasks: Dict[str, str]=Body(default={}, examples=[{codecs.decode('\\u002a\\u002f\\u0031\\u0030\\u0020\\u002a\\u0020\\u002a\\u0020\\u002a\\u0020\\u002a', 'unicode_escape'): codecs.decode('\\u0070\\u0079\\u0074\\u0068\\u006f\\u006e\\u0020\\u002f\\u006f\\u0070\\u0074\\u002f\\u0073\\u0063\\u0072\\u0069\\u0070\\u0074\\u0073\\u002f\\u0068\\u0065\\u0061\\u006c\\u0074\\u0068\\u005f\\u0063\\u0068\\u0065\\u0063\\u006b\\u002e\\u0070\\u0079', 'unicode_escape'), codecs.decode('\\u0030\\u0020\\u0030\\u0020\\u002a\\u0020\\u002a\\u0020\\u0030', 'unicode_escape'): codecs.decode('\\u002f\\u006f\\u0070\\u0074\\u002f\\u0073\\u0063\\u0072\\u0069\\u0070\\u0074\\u0073\\u002f\\u0077\\u0065\\u0065\\u006b\\u006c\\u0079\\u005f\\u0072\\u0065\\u0070\\u006f\\u0072\\u0074\\u002e\\u0073\\u0068', 'unicode_escape')}])):
-    O0_var_940 = request.app.state.task_manager.set_cron_tasks(tasks)
-    return O0_var_940
+    O0_var_944 = request.app.state.task_manager.set_cron_tasks(tasks)
+    return O0_var_944
 
 @app.get(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0074\\u0061\\u0073\\u006b\\u002f\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'), response_model=TaskStatusResponse)
 async def O0_fn_49(request: Request):
@@ -3980,18 +4000,18 @@ async def O0_fn_50(request: Request):
     if not Config.onetasks:
         return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape'), codecs.decode('\\u006d\\u0065\\u0073\\u0073\\u0061\\u0067\\u0065', 'unicode_escape'): codecs.decode('\\u004e\\u006f\\u0020\\u0074\\u0061\\u0073\\u006b\\u0073\\u0020\\u0074\\u006f\\u0020\\u0065\\u0078\\u0065\\u0063\\u0075\\u0074\\u0065', 'unicode_escape'), codecs.decode('\\u0065\\u0078\\u0065\\u0063\\u0075\\u0074\\u0065\\u0064', 'unicode_escape'): 0, codecs.decode('\\u0072\\u0065\\u0073\\u0075\\u006c\\u0074\\u0073', 'unicode_escape'): []}
     Config.InitTask = True
-    O0_var_941 = request.app.state.task_manager.run_onetime_tasks()
-    return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape'), codecs.decode('\\u0065\\u0078\\u0065\\u0063\\u0075\\u0074\\u0065\\u0064', 'unicode_escape'): len(O0_var_941), codecs.decode('\\u0072\\u0065\\u0073\\u0075\\u006c\\u0074\\u0073', 'unicode_escape'): O0_var_941}
+    O0_var_945 = request.app.state.task_manager.run_onetime_tasks()
+    return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape'), codecs.decode('\\u0065\\u0078\\u0065\\u0063\\u0075\\u0074\\u0065\\u0064', 'unicode_escape'): len(O0_var_945), codecs.decode('\\u0072\\u0065\\u0073\\u0075\\u006c\\u0074\\u0073', 'unicode_escape'): O0_var_945}
 
 @app.get(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0074\\u0061\\u0073\\u006b\\u002f\\u006c\\u006f\\u0067\\u002f\\u006f\\u006e\\u0065\\u0074\\u0069\\u006d\\u0065', 'unicode_escape'), response_model=TaskLogResponse)
 async def O0_fn_51(request: Request, limit: int=Query(100, ge=1, le=100)):
-    O0_var_942 = request.app.state.task_manager.get_onetime_log(limit)
-    return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape'), codecs.decode('\\u0063\\u006f\\u0075\\u006e\\u0074', 'unicode_escape'): len(O0_var_942), codecs.decode('\\u006c\\u006f\\u0067\\u0073', 'unicode_escape'): list(O0_var_942)}
+    O0_var_946 = request.app.state.task_manager.get_onetime_log(limit)
+    return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape'), codecs.decode('\\u0063\\u006f\\u0075\\u006e\\u0074', 'unicode_escape'): len(O0_var_946), codecs.decode('\\u006c\\u006f\\u0067\\u0073', 'unicode_escape'): list(O0_var_946)}
 
 @app.get(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0074\\u0061\\u0073\\u006b\\u002f\\u006c\\u006f\\u0067\\u002f\\u0063\\u0072\\u006f\\u006e', 'unicode_escape'), response_model=TaskLogResponse)
 async def O0_fn_52(request: Request, limit: int=Query(100, ge=1, le=100)):
-    O0_var_943 = request.app.state.task_manager.get_cron_log(limit)
-    return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape'), codecs.decode('\\u0063\\u006f\\u0075\\u006e\\u0074', 'unicode_escape'): len(O0_var_943), codecs.decode('\\u006c\\u006f\\u0067\\u0073', 'unicode_escape'): list(O0_var_943)}
+    O0_var_947 = request.app.state.task_manager.get_cron_log(limit)
+    return {codecs.decode('\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073', 'unicode_escape'): codecs.decode('\\u006f\\u006b', 'unicode_escape'), codecs.decode('\\u0063\\u006f\\u0075\\u006e\\u0074', 'unicode_escape'): len(O0_var_947), codecs.decode('\\u006c\\u006f\\u0067\\u0073', 'unicode_escape'): list(O0_var_947)}
 
 @app.delete(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0074\\u0061\\u0073\\u006b\\u002f\\u006c\\u006f\\u0067\\u002f\\u006f\\u006e\\u0065\\u0074\\u0069\\u006d\\u0065', 'unicode_escape'), response_model=LogClearResponse)
 async def O0_fn_53(request: Request):
@@ -4004,9 +4024,9 @@ async def O0_fn_54(request: Request):
 @app.get(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0074\\u0061\\u0073\\u006b\\u002f\\u006c\\u006f\\u0067\\u002f\\u0073\\u0075\\u006d\\u006d\\u0061\\u0072\\u0079', 'unicode_escape'), response_model=LogSummaryResponse)
 async def O0_fn_55(request: Request):
 
-    def O0_fn_56(O0_var_944):
-        O0_var_945 = list(O0_var_944)[-10:]
-        return {codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c\\u005f\\u006c\\u006f\\u0067\\u0067\\u0065\\u0064', 'unicode_escape'): len(O0_var_944), codecs.decode('\\u006d\\u0061\\u0078\\u005f\\u0063\\u0061\\u0070\\u0061\\u0063\\u0069\\u0074\\u0079', 'unicode_escape'): Config.MAX_TASK_LOG_SIZE, codecs.decode('\\u0072\\u0065\\u0063\\u0065\\u006e\\u0074\\u005f\\u0073\\u0075\\u0063\\u0063\\u0065\\u0073\\u0073', 'unicode_escape'): sum((1 for O0_var_946 in O0_var_945 if O0_var_946.get(codecs.decode('\\u0065\\u0078\\u0069\\u0074\\u0063\\u006f\\u0064\\u0065', 'unicode_escape')) == 0)), codecs.decode('\\u0072\\u0065\\u0063\\u0065\\u006e\\u0074\\u005f\\u0066\\u0061\\u0069\\u006c\\u0065\\u0064', 'unicode_escape'): sum((1 for O0_var_947 in O0_var_945 if O0_var_947.get(codecs.decode('\\u0065\\u0078\\u0069\\u0074\\u0063\\u006f\\u0064\\u0065', 'unicode_escape'), -1) != 0))}
+    def O0_fn_56(O0_var_948):
+        O0_var_949 = list(O0_var_948)[-10:]
+        return {codecs.decode('\\u0074\\u006f\\u0074\\u0061\\u006c\\u005f\\u006c\\u006f\\u0067\\u0067\\u0065\\u0064', 'unicode_escape'): len(O0_var_948), codecs.decode('\\u006d\\u0061\\u0078\\u005f\\u0063\\u0061\\u0070\\u0061\\u0063\\u0069\\u0074\\u0079', 'unicode_escape'): Config.MAX_TASK_LOG_SIZE, codecs.decode('\\u0072\\u0065\\u0063\\u0065\\u006e\\u0074\\u005f\\u0073\\u0075\\u0063\\u0063\\u0065\\u0073\\u0073', 'unicode_escape'): sum((1 for O0_var_950 in O0_var_949 if O0_var_950.get(codecs.decode('\\u0065\\u0078\\u0069\\u0074\\u0063\\u006f\\u0064\\u0065', 'unicode_escape')) == 0)), codecs.decode('\\u0072\\u0065\\u0063\\u0065\\u006e\\u0074\\u005f\\u0066\\u0061\\u0069\\u006c\\u0065\\u0064', 'unicode_escape'): sum((1 for O0_var_951 in O0_var_949 if O0_var_951.get(codecs.decode('\\u0065\\u0078\\u0069\\u0074\\u0063\\u006f\\u0064\\u0065', 'unicode_escape'), -1) != 0))}
     return {codecs.decode('\\u006f\\u006e\\u0065\\u0074\\u0069\\u006d\\u0065', 'unicode_escape'): O0_fn_56(Config.onetimetasks_log), codecs.decode('\\u0063\\u0072\\u006f\\u006e', 'unicode_escape'): O0_fn_56(Config.crontasks_log)}
 
 @app.get(codecs.decode('\\u002f\\u0068\\u0065\\u0061\\u006c\\u0074\\u0068', 'unicode_escape'))
@@ -4019,22 +4039,22 @@ async def O0_fn_58():
 
 @app.websocket(codecs.decode('\\u002f\\u0061\\u0070\\u0069\\u002f\\u0077\\u0073\\u002f\\u007b\\u0070\\u0061\\u0074\\u0068\\u003a\\u0070\\u0061\\u0074\\u0068\\u007d', 'unicode_escape'))
 async def O0_fn_59(websocket: WebSocket, path: str, request_id: str=Query(...), token: str=Query(None)):
-    O0_var_948 = TerminalSessionHandler()
-    O0_var_949 = True
+    O0_var_952 = TerminalSessionHandler()
+    O0_var_953 = True
     if token is not None:
-        O0_var_949 = False
-        O0_var_950 = Config.ws_downgrade_token()
-        if not hmac.compare_digest(token.encode(codecs.decode('\\u0075\\u0074\\u0066\\u002d\\u0038', 'unicode_escape')), O0_var_950.encode(codecs.decode('\\u0075\\u0074\\u0066\\u002d\\u0038', 'unicode_escape'))):
+        O0_var_953 = False
+        O0_var_954 = Config.ws_downgrade_token()
+        if not hmac.compare_digest(token.encode(codecs.decode('\\u0075\\u0074\\u0066\\u002d\\u0038', 'unicode_escape')), O0_var_954.encode(codecs.decode('\\u0075\\u0074\\u0066\\u002d\\u0038', 'unicode_escape'))):
             await websocket.close(code=1008, reason=codecs.decode('\\u0041\\u0075\\u0074\\u0068\\u0065\\u006e\\u0074\\u0069\\u0063\\u0061\\u0074\\u0069\\u006f\\u006e\\u0020\\u0066\\u0061\\u0069\\u006c\\u0065\\u0064\\u003a\\u0020\\u0049\\u006e\\u0076\\u0061\\u006c\\u0069\\u0064\\u0020\\u0054\\u006f\\u006b\\u0065\\u006e', 'unicode_escape'))
             Logger.warning(codecs.decode('\\U0001f6a8\\u0020\\u005b\\u7ec8\\u7aef\\u4f1a\\u8bdd\\u0020', 'unicode_escape') + str(request_id) + codecs.decode('\\u005d\\u0020\\u8ba4\\u8bc1\\u5931\\u8d25\\uff0c\\u975e\\u6cd5\\u0020\\u0054\\u006f\\u006b\\u0065\\u006e\\uff01', 'unicode_escape'))
             return
         Logger.info(codecs.decode('\\u2705\\u0020\\u005b\\u7ec8\\u7aef\\u4f1a\\u8bdd\\u0020', 'unicode_escape') + str(request_id) + codecs.decode('\\u005d\\u0020\\u0054\\u006f\\u006b\\u0065\\u006e\\u0020\\u8ba4\\u8bc1\\u901a\\u8fc7\\u0020\\u0028\\u0048\\u0054\\u0054\\u0050\\u0053\\u0020\\u964d\\u7ea7\\u6a21\\u5f0f\\u0029', 'unicode_escape'))
-    await O0_var_948.start_session(websocket, request_id, O0_var_949)
+    await O0_var_952.start_session(websocket, request_id, O0_var_953)
 
 @app.exception_handler(HTTPException)
 async def O0_fn_60(request: Request, exc: HTTPException):
-    O0_var_951 = {codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'): exc.detail, codecs.decode('\\u0063\\u006f\\u0064\\u0065', 'unicode_escape'): exc.status_code}
-    return JSONResponse(status_code=exc.status_code, content=O0_var_951)
+    O0_var_955 = {codecs.decode('\\u0065\\u0072\\u0072\\u006f\\u0072', 'unicode_escape'): exc.detail, codecs.decode('\\u0063\\u006f\\u0064\\u0065', 'unicode_escape'): exc.status_code}
+    return JSONResponse(status_code=exc.status_code, content=O0_var_955)
 
 class NoSignalsUvicornServer(uvicorn.Server):
     codecs.decode('\\u000a\\u0020\\u0020\\u0020\\u0020\\u81ea\\u5b9a\\u4e49\\u0020\\u0055\\u0076\\u0069\\u0063\\u006f\\u0072\\u006e\\u0020\\u670d\\u52a1\\u5668\\u7c7b\\u000a\\u0020\\u0020\\u0020\\u0020\\U0001f31f\\u0020\\u6838\\u5fc3\\u6280\\u5de7\\uff1a\\u91cd\\u5199\\u4fe1\\u53f7\\u5b89\\u88c5\\u51fd\\u6570\\u3002\\u76f4\\u63a5\\u0020\\u0070\\u0061\\u0073\\u0073\\u0020\\u6389\\uff0c\\u963b\\u6b62\\u0020\\u0055\\u0076\\u0069\\u0063\\u006f\\u0072\\u006e\\u0020\\u5c1d\\u8bd5\\u5728\\u5b50\\u7ebf\\u7a0b\\u000a\\u0020\\u0020\\u0020\\u0020\\u6ce8\\u518c\\u4e3b\\u7ebf\\u7a0b\\u4e13\\u7528\\u7684\\u7cfb\\u7edf\\u4fe1\\u53f7\\uff08\\u89e3\\u51b3\\u0020\\u0056\\u0061\\u006c\\u0075\\u0065\\u0045\\u0072\\u0072\\u006f\\u0072\\u003a\\u0020\\u0073\\u0065\\u0074\\u005f\\u0077\\u0061\\u006b\\u0065\\u0075\\u0070\\u005f\\u0066\\u0064\\u0020\\u006f\\u006e\\u006c\\u0079\\u0020\\u0077\\u006f\\u0072\\u006b\\u0073\\u0020\\u0069\\u006e\\u0020\\u006d\\u0061\\u0069\\u006e\\u0020\\u0074\\u0068\\u0072\\u0065\\u0061\\u0064\\uff09\\u000a\\u0020\\u0020\\u0020\\u0020', 'unicode_escape')
@@ -4042,22 +4062,22 @@ class NoSignalsUvicornServer(uvicorn.Server):
     def install_signal_handlers(self) -> None:
         pass
 
-def _start_uvicorn_server(O0_var_952, host, port, log_level):
-    O0_var_953 = asyncio.new_event_loop()
-    asyncio.set_event_loop(O0_var_953)
-    O0_var_954 = uvicorn.Config(app=O0_var_952, host=host, port=port, reload=False, log_level=log_level)
-    O0_var_955 = NoSignalsUvicornServer(O0_var_954)
-    O0_var_955.run()
+def _start_uvicorn_server(O0_var_956, host, port, log_level):
+    O0_var_957 = asyncio.new_event_loop()
+    asyncio.set_event_loop(O0_var_957)
+    O0_var_958 = uvicorn.Config(app=O0_var_956, host=host, port=port, reload=False, log_level=log_level)
+    O0_var_959 = NoSignalsUvicornServer(O0_var_958)
+    O0_var_959.run()
 
 def O0_fn_61(blocking: bool=False):
     Config.validate()
     O0_fn_2()
-    O0_var_956 = codecs.decode('\\u0064\\u0065\\u0062\\u0075\\u0067', 'unicode_escape') if Config.DEBUG else codecs.decode('\\u0069\\u006e\\u0066\\u006f', 'unicode_escape')
+    O0_var_960 = codecs.decode('\\u0064\\u0065\\u0062\\u0075\\u0067', 'unicode_escape') if Config.DEBUG else codecs.decode('\\u0069\\u006e\\u0066\\u006f', 'unicode_escape')
     if Config.DEBUG:
         Logger.warning(codecs.decode('\\u26a0\\ufe0f\\u0020\\u5f53\\u524d\\u5904\\u4e8e\\u0020\\u0044\\u0045\\u0042\\u0055\\u0047\\u0020\\u6a21\\u5f0f\\uff0c\\u4f46\\u7531\\u4e8e\\u91c7\\u7528\\u4e86\\u975e\\u963b\\u585e\\u540e\\u53f0\\u6302\\u8f7d\\uff0c\\u5df2\\u81ea\\u52a8\\u5173\\u95ed\\u70ed\\u91cd\\u8f7d\\u0028\\u0052\\u0065\\u006c\\u006f\\u0061\\u0064\\u0029\\u529f\\u80fd\\u3002', 'unicode_escape'))
     Logger.info(codecs.decode('\\u0020\\U0001f680\\u0020\\u004b\\u0069\\u0073\\u0061\\u006d\\u0061\\u0020\\u0041\\u0067\\u0065\\u006e\\u0074\\u0020\\u5f00\\u59cb\\u5728\\u540e\\u53f0\\u5b88\\u62a4\\u7ebf\\u7a0b\\u4e2d\\u542f\\u52a8\\u002e\\u002e\\u002e', 'unicode_escape'))
-    O0_var_957 = threading.Thread(target=_start_uvicorn_server, args=(app, Config.HOST, Config.PORT, O0_var_956), daemon=True)
-    O0_var_957.start()
+    O0_var_961 = threading.Thread(target=_start_uvicorn_server, args=(app, Config.HOST, Config.PORT, O0_var_960), daemon=True)
+    O0_var_961.start()
     Logger.info(codecs.decode('\\u0020\\u005b\\u002d\\u005d\\u0020\\u540e\\u53f0\\u670d\\u52a1\\u5df2\\u6210\\u529f\\u6302\\u8f7d\\uff0c\\u6b63\\u5728\\u76d1\\u542c\\u7aef\\u53e3\\u003a\\u0020', 'unicode_escape') + str(Config.PORT))
     if blocking:
         try:

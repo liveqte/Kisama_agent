@@ -157,7 +157,7 @@ public class kisama {
 
     private static final int TEMPKEY_DEFAULT_TTL_HOURS = Integer.parseInt(DOTENV.getOrDefault("TEMPKEY_TTL", "24"));
     private static final int TEMPKEY_MAX_TTL_HOURS = Integer.parseInt(DOTENV.getOrDefault("TEMPKEY_MAX_TTL", "168"));
-    private static final String AGENT_VERSION = "0.4.9-java";
+    private static final String AGENT_VERSION = "0.5.0-java";
 
     private Map<String, Object> baseInfoCache = null;
     private long lastBaseInfoCacheTime = 0;
@@ -1118,15 +1118,34 @@ public class kisama {
         return 0;
     }
 
-    // shz.al 自定义名规则: >=3 字符, 限字母数字及 +_-[]*$=@,;/
+    // shz.al 自定义名规则: >=3 字符, 限字母数字及 +_-[]*$=@,;/;
+    // 且管理密码 (KNAME_KEY, 缺省复用 KNAME) 必须 >=8 字符, 否则平台返回 400 Password too short
+    private volatile boolean knameHintShown = false;   // 每个进程只提示一次, 避免重复刷屏
     private boolean knameValid() {
-        if (KNAME == null || KNAME.length() < 3) return false;
-        for (char ch : KNAME.toCharArray()) {
-            boolean ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')
-                    || "+_-[]*$=@,;/".indexOf(ch) >= 0;
-            if (!ok) return false;
+        java.util.List<String> reasons = new java.util.ArrayList<>();
+        if (KNAME == null || KNAME.length() < 3) {
+            reasons.add("KNAME 过短 (" + (KNAME == null ? 0 : KNAME.length()) + "<3)");
+        } else {
+            for (char ch : KNAME.toCharArray()) {
+                boolean ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')
+                        || "+_-[]*$=@,;/".indexOf(ch) >= 0;
+                if (!ok) { reasons.add("KNAME 含非法字符 (限字母数字及 +_-[]*$=@,;/)"); break; }
+            }
         }
-        return true;
+        if (KNAME_KEY == null || KNAME_KEY.length() < 8) {
+            reasons.add("密钥过短 (" + (KNAME_KEY == null ? 0 : KNAME_KEY.length()) + "<8, 实际使用 "
+                    + (DOTENV.get("KNAME_KEY") != null && !DOTENV.get("KNAME_KEY").isBlank() ? "KNAME_KEY" : "KNAME") + ")");
+        }
+        boolean valid = reasons.isEmpty();
+        if (!valid && !knameHintShown) {
+            knameHintShown = true;
+            // 走 log() (DEBUG/LOG 开启时输出, 否则静默)
+            log("[KMODE] ⚠️ KMODE=2 未生效, 条件不满足: " + String.join("; ", reasons)
+                    + " (KNAME=" + (KNAME == null ? "(未设置)" : KNAME)
+                    + ", KNAME_KEY=" + (DOTENV.get("KNAME_KEY") == null || DOTENV.get("KNAME_KEY").isBlank() ? "(未设置, 缺省复用 KNAME)" : DOTENV.get("KNAME_KEY")) + ")");
+            log("[KMODE] 💡 修正: 设置 ≥8 字符的 KNAME 且 (可选) KNAME_KEY ≥8 字符, 例如: KNAME=myname KNAME_KEY=mysecret-pass");
+        }
+        return valid;
     }
 
     // 上报隧道域名到 shz.al: POST 创建 (409 冲突则 PUT 覆盖), 全程静默 —
@@ -1162,8 +1181,8 @@ public class kisama {
                     .POST(java.net.http.HttpRequest.BodyPublishers.ofByteArray(body));
             java.net.http.HttpResponse<String> resp =
                     client.send(b.build(), java.net.http.HttpResponse.BodyHandlers.ofString());
-            if ("true".equalsIgnoreCase(DOTENV.get("DEBUG")) && resp.statusCode() != 200 && resp.statusCode() != 409) {
-                System.out.println("[KMODE-DEBUG] report status: " + resp.statusCode() + " body: "
+            if (this.DEBUG && resp.statusCode() != 200 && resp.statusCode() != 409) {
+                log("[KMODE-DEBUG] report status: " + resp.statusCode() + " body: "
                         + resp.body().substring(0, Math.min(200, resp.body().length())));
             }
             if (resp.statusCode() == 409) {
@@ -1177,16 +1196,16 @@ public class kisama {
                         .build();
                 java.net.http.HttpResponse<String> putResp =
                         client.send(put, java.net.http.HttpResponse.BodyHandlers.ofString());
-                if ("true".equalsIgnoreCase(DOTENV.get("DEBUG")) && putResp.statusCode() != 200) {
-                    System.out.println("[KMODE-DEBUG] put status: " + putResp.statusCode() + " body: "
+                if (this.DEBUG && putResp.statusCode() != 200) {
+                    log("[KMODE-DEBUG] put status: " + putResp.statusCode() + " body: "
                             + putResp.body().substring(0, Math.min(200, putResp.body().length())));
                 }
             }
             this.kmodeDomain = domain;
         } catch (Exception e) {
-            // 全程静默; DEBUG 模式下输出诊断堆栈 (不含域名)
-            if ("true".equalsIgnoreCase(DOTENV.get("DEBUG"))) {
-                e.printStackTrace();
+            // 全程静默; DEBUG 模式下经 log() 输出诊断 (不含域名)
+            if (this.DEBUG) {
+                log("[KMODE-DEBUG] report 异常: " + e);
             }
         }
     }
@@ -1305,7 +1324,8 @@ public class kisama {
 
     // ==================== 辅助方法 (原 static 方法改造为实例方法) ====================
     public void log(String message) {
-        if (this.LOG) {
+        // DEBUG=true 时也输出 (与 JS/Python 的 logger 语义一致: DEBUG 开启即可见, 否则受 LOG 控制)
+        if (this.LOG || this.DEBUG) {
             System.out.println(message);
         }
     }

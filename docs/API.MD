@@ -654,7 +654,7 @@ KMODE 是代理端的一个启动模式开关，通过环境变量取值，用�
 | KMODE | `0` | 启动模式开关：`0`=普通启动；`1`=自动创建临时隧道 + 写域名文件 + stdin 指令监听；`2`=自动创建临时隧道 + 上报域名至 shz.al（全程静默） |
 | KPATH | `$HOME/domain.txt` | 仅 KMODE=1 有效：隧道域名文件的写入路径，支持相对 HOME 的子目录写法（如 `$HOME/.cache/domain.txt`） |
 | KNAME | 无 | 仅 KMODE=2 有效：shz.al 自定义名（≥3 字符，限字母、数字及 `+_-[]*$=@,;/`），同时是可预测访问 URL 的组成部分；未设置时 KMODE=2 退化为普通启动（等同 KMODE=0），不报错 |
-| KNAME_KEY | `$KNAME` | 仅 KMODE=2 有效：上报的管理/修改密钥（即 shz.al 的密码）；缺省复用 KNAME 本身 |
+| KNAME_KEY | `$KNAME` | 仅 KMODE=2 有效：上报的管理/修改密钥（即 shz.al 的密码）；缺省复用 KNAME 本身。**注意：shz.al 平台要求密码 ≥8 字符，若最终生效的密钥（KNAME_KEY 或复用的 KNAME）短于 8 字符，上报会被平台以 `400 Password too short` 拒绝，粘贴不会创建（KMODE=2 可视为未生效）** |
 
 ### KMODE=0（默认）
 与正常启动完全一致，不会在启动时创建临时隧道，也不会开启标准流输入监听。
@@ -684,7 +684,9 @@ KMODE=1 KPATH=$HOME/.cache/domain.txt python agent.py
    - `s` = `$KNAME_KEY`（管理密码，缺省为 KNAME 本身）
    - `e` = `7d`（固定过期时间，无需配置）
    - 若返回 409（该名字已被占用，如上次运行的粘贴未过期），自动改用 `PUT https://shz.al/~$KNAME:$KNAME_KEY` 覆盖更新，保证同一 KNAME 反复重启仍可上报成功。
-3. **全程静默**：不写任何文件、不开启 stdin 监听、不向 stdout/stderr 输出隧道域名、上报结果或平台 URL；上报成败均不影响代理正常启动。
+   - ⚠️ 平台约束：`s` 字段（管理密码）必须 ≥8 字符，否则上报被拒（HTTP 400 `Password too short`），粘贴不会创建。生效密钥 = `KNAME_KEY`，未设置时 = `KNAME` 本身；两者都不足 8 字符则 KMODE=2 实际上报失败（但代理仍正常启动）。建议 KNAME / KNAME_KEY 均 ≥8 字符。
+3. **默认全程静默**：不写任何文件、不开启 stdin 监听、不向 stdout/stderr 输出隧道域名、上报结果或平台 URL；上报成败均不影响代理正常启动。
+   - 🔧 排查辅助：设置 `DEBUG=true`（或 `SHZAL_DEBUG=true`）时，代理会输出上报过程日志（上报开始、POST/PUT 状态码、上报成功/失败原因），便于确认上报是否到达平台及失败原因；默认不开启。
 4. **控制端读取（可预测 URL）**：直接 `GET https://shz.al/~$KNAME`（纯文本，响应体即隧道域名）；未上报时返回 404，控制端可轮询直至 200。
 5. **修改语义**：代理端每次启动上报都会覆盖同一预测 URL 下的值；控制端持有 KNAME_KEY 时也可自行 `PUT https://shz.al/~$KNAME:$KNAME_KEY` 改写该值（字段同上，不允许 `n`），或 `DELETE` 主动清除。
 6. **平台固定为 shz.al**：不提供平台切换变量。Rentry.co 因需 CSRF 会话流程、`/raw/` 端点已封锁（只能解析 HTML）、且不支持过期时间，不适合静默自动化上报，暂不接入。

@@ -805,7 +805,7 @@ class Config:
     KPATH = os.getenv("KPATH", "")
 
     # 代理版本信息
-    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.4.9-python")
+    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.5.0-python")
     
     # ================= 启动校验 =================
     
@@ -4540,12 +4540,29 @@ class KModeController:
     _domain = None              # 内存中最后已知域名 (文件删除后 /domain 仍可用)
 
     # shz.al 自定义名规则: >=3 字符, 限字母数字及 +_-[]*$=@,;/
+    # 且管理密码 (KNAME_KEY, 缺省复用 KNAME) 必须 >=8 字符, 否则平台返回 400 Password too short
     _SHZAL_NAME_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+_-[]*$=@,;/")
+    _SHZAL_KEY_HINT_SHOWN = False   # 每个进程只提示一次, 避免重复刷屏
 
     @classmethod
     def kname_valid(cls):
         name = Config.KNAME
-        return len(name) >= 3 and set(name) <= cls._SHZAL_NAME_CHARS
+        key = (Config.KNAME_KEY or Config.KNAME) or ""
+        reasons = []
+        if not name or len(name) < 3:
+            reasons.append(f"KNAME 过短 ({len(name)}<3)")
+        if name and not set(name) <= cls._SHZAL_NAME_CHARS:
+            reasons.append("KNAME 含非法字符 (限字母数字及 +_-[]*$=@,;/)")
+        if len(key) < 8:
+            reasons.append(f"密钥过短 ({len(key)}<8, 实际使用 {'KNAME_KEY' if Config.KNAME_KEY else 'KNAME'})")
+        valid = not reasons
+        if not valid and not cls._SHZAL_KEY_HINT_SHOWN:
+            cls._SHZAL_KEY_HINT_SHOWN = True
+            # 走 Logger: 非 DEBUG (log_level=0) 时 INFO/WARNING 被吞=静默, DEBUG=true 时输出
+            Logger.warning(f"[KMODE] ⚠️ KMODE=2 未生效, 条件不满足: {'; '.join(reasons)} "
+                           f"(KNAME={name or '(未设置)'}, KNAME_KEY={Config.KNAME_KEY or '(未设置, 缺省复用 KNAME)'})")
+            Logger.warning("[KMODE] 💡 修正: 设置 ≥8 字符的 KNAME 且 (可选) KNAME_KEY ≥8 字符, 例如: KNAME=myname KNAME_KEY=mysecret-pass")
+        return valid
 
     @classmethod
     def report_shzal(cls, domain):
@@ -4581,6 +4598,13 @@ class KModeController:
                     # 名字已被占用 (上次粘贴未过期): PUT 覆盖更新
                     post(f"https://shz.al/~{name}:{key}", [f for f in fields if f[0] != "n"], method="PUT")
                 else:
+                    # 非 409 的上报失败: DEBUG 模式下经 Logger 输出状态码与响应体 (不含密钥), 便于定位
+                    if Config.DEBUG:
+                        try:
+                            detail = exc.read().decode("utf-8", "replace")[:200]
+                        except Exception:
+                            detail = ""
+                        Logger.warning(f"[KMODE-DEBUG] report status: {exc.code} body: {detail}")
                     raise
             cls._domain = domain
         except Exception:

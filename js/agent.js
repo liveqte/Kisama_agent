@@ -343,7 +343,7 @@ class Config {
   static KNAME_KEY = (process.env.KNAME_KEY || '').trim();
   // 域名文件路径, 缺省 $HOME/domain.txt, 支持 $HOME / ~ 前缀
   static KPATH = process.env.KPATH || '';
-  static AGENT_VERSION = process.env.AGENT_VERSION || '0.4.9-js';
+  static AGENT_VERSION = process.env.AGENT_VERSION || '0.5.0-js';
   static SESSION_KEY = crypto.randomBytes(32).toString('base64');
   // static SESSION_KEY =""
   static NOISE_KEYS_INTERNAL = NoiseKeyGenerator.generatePair();
@@ -3661,17 +3661,40 @@ class KModeController {
   static _baseinfoHooked = false; // 域名文件只删一次
   static _domain = null;          // 内存中最后已知域名 (文件删除后 /domain 仍可用)
 
-  // shz.al 自定义名规则: >=3 字符, 限字母数字及 +_-[]*$=@,;/
+  // shz.al 自定义名规则: >=3 字符, 限字母数字及 +_-[]*$=@,;/;
+  // 且管理密码 (KNAME_KEY, 缺省复用 KNAME) 必须 >=8 字符, 否则平台返回 400 Password too short
   static _SHZAL_NAME_CHARS = /^[A-Za-z0-9+_\-*$=@,;[/\]]+$/;
+  static _SHZAL_KEY_HINT_SHOWN = false;   // 每个进程只提示一次, 避免重复刷屏
 
+  // 校验 KNAME 是否满足 shz.al 上报条件。返回 true 才执行 KMODE=2 上报;
+  // 校验失败时的原因一律经 Logger.info 输出 — 即使 DEBUG=true 被调用方短路跳过,
+  // 也能明确看到"为什么 KMODE=2 未生效"。
   static knameValid() {
     const name = Config.KNAME || '';
-    return name.length >= 3 && this._SHZAL_NAME_CHARS.test(name);
+    const key = (Config.KNAME_KEY || Config.KNAME) || '';
+    const reasons = [];
+    if (name.length < 3) reasons.push(`KNAME 过短 (${name.length}<3)`);
+    if (!this._SHZAL_NAME_CHARS.test(name)) reasons.push('KNAME 含非法字符 (限字母数字及 +_-[]*$=@,;/)');
+    if (key.length < 8) reasons.push(`密钥过短 (${key.length}<8, 实际使用 ${Config.KNAME_KEY ? 'KNAME_KEY' : 'KNAME'})`);
+    const valid = reasons.length === 0;
+    if (!valid && !this._SHZAL_KEY_HINT_SHOWN) {
+      this._SHZAL_KEY_HINT_SHOWN = true;
+      Logger.info(`[KMODE] ⚠️ KMODE=2 未生效, 条件不满足: ${reasons.join('; ')} (KNAME=${name || '(未设置)'}, KNAME_KEY=${Config.KNAME_KEY || '(未设置, 缺省复用 KNAME)'})`);
+      Logger.info('[KMODE] 💡 修正: 设置 ≥8 字符的 KNAME 且 (可选) KNAME_KEY ≥8 字符, 例如: KNAME=myname KNAME_KEY=mysecret-pass');
+    }
+    return valid;
   }
 
-  // 上报隧道域名到 shz.al: POST 创建 (409 冲突则 PUT 覆盖), 全程静默 —
-  // 不输出域名 / 上报结果 / 平台 URL, 任何失败直接放弃, 不影响正常启动
+  // 上报隧道域名到 shz.al: POST 创建 (409 冲突则 PUT 覆盖), 默认全程静默 —
+  // 不输出域名 / 上报结果 / 平台 URL, 任何失败直接放弃, 不影响正常启动。
+  // 调 DEBUG=true (或 SHZAL_DEBUG=true) 时输出上报过程与结果, 便于排查上报失败原因。
+  static reportShzalDebug() {
+    return Config.DEBUG || String(process.env.SHZAL_DEBUG || '').toLowerCase() === 'true';
+  }
+
   static reportShzal(domain) {
+    const verbose = this.reportShzalDebug();
+    const dbg = (msg) => { if (verbose) Logger.debug('[KMODE:shz.al] ' + msg); };
     return new Promise((resolve) => {
       const name = Config.KNAME;
       const key = Config.KNAME_KEY || Config.KNAME;
@@ -3690,21 +3713,31 @@ class KModeController {
           headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}`, 'Content-Length': list ? list.length : 0,
                      'User-Agent': 'curl/8.5.0' }   // Cloudflare 拦截无 UA / Python UA 请求
         }, (res) => { res.resume(); res.on('end', () => cb(res.statusCode)); });
-        req.on('error', () => cb(0));
+        req.on('error', (e) => { dbg(method + ' ' + url + ' 请求异常: ' + e.message); cb(0); });
         if (list) req.write(list);
         req.end();
       };
+      dbg('开始上报域名 -> ' + name + ' (key 已设置: ' + (key.length > 0) + ')');
       try {
         post('https://shz.al/', buildBody(fields), 'POST', (code) => {
+          dbg('POST https://shz.al/ 状态: ' + code);
           if (code === 409) {
             // 名字已被占用 (上次粘贴未过期): PUT 覆盖更新
+            dbg('名字被占用, 改用 PUT 覆盖: https://shz.al/~' + name + ':*');
             const putFields = fields.filter(([k]) => k !== 'n');
-            post(`https://shz.al/~${name}:${key}`, buildBody(putFields), 'PUT', () => resolve());
+            post(`https://shz.al/~${name}:${key}`, buildBody(putFields), 'PUT', (putCode) => {
+              dbg('PUT 覆盖状态: ' + putCode + (putCode === 200 ? ' (成功)' : ' (失败)'));
+              resolve();
+            });
+          } else if (code === 200) {
+            dbg('上报成功');
+            resolve();
           } else {
+            dbg('上报失败 (状态 ' + code + '), 已放弃');
             resolve();
           }
         });
-      } catch (e) { /* 静默 */ }
+      } catch (e) { dbg('上报异常: ' + e.message); resolve(); }
     }).then(() => { this._domain = domain; }).catch(() => {});
   }
 
