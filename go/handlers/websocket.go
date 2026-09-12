@@ -457,13 +457,8 @@ func (h *TerminalSessionHandler) runTerminal() error {
 				return
 			}
 
-			sendData := buf[:n]
-			if h.useNoise && h.handshakeFinished() {
-				sendData = h.encrypt(sendData)
-			}
-
-			err = h.writeMessage(websocket.BinaryMessage, sendData)
-			if err != nil {
+			// 加密与写入同锁原子完成，防止与心跳回包竞争导致 nonce 失序
+			if err := h.writeEncryptedMessage(websocket.BinaryMessage, buf[:n]); err != nil {
 				return
 			}
 		}
@@ -508,10 +503,8 @@ func (h *TerminalSessionHandler) processTerminalMessage(message []byte) {
 			switch msg.Type {
 			case "heartbeat":
 				reply, _ := json.Marshal(map[string]string{"type": "heartbeat"})
-				if h.useNoise {
-					reply = h.encrypt(reply)
-				}
-				_ = h.writeMessage(websocket.BinaryMessage, reply)
+				// 加密与写入同锁原子完成，与 PTY 输出 goroutine 竞争时保持 nonce 顺序
+				_ = h.writeEncryptedMessage(websocket.BinaryMessage, reply)
 
 			case "resize":
 				_ = h.term.Resize(msg.Rows, msg.Cols)
@@ -542,6 +535,24 @@ func (h *TerminalSessionHandler) writeMessage(messageType int, data []byte) erro
 	defer h.writeMu.Unlock()
 	if h.ws == nil {
 		return errors.New("websocket is nil")
+	}
+	if err := h.ws.SetWriteDeadline(time.Now().Add(terminalWriteTimeout)); err != nil {
+		return err
+	}
+	return h.ws.WriteMessage(messageType, data)
+}
+
+// writeEncryptedMessage 供终端传输层使用：在 writeMu 保护下完成 Noise 加密
+// （消耗发送 nonce）与帧写入两个步骤。PTY 输出 goroutine 与心跳回包并发时，
+// 若先加密后写 socket，nonce 顺序与线路帧顺序可能颠倒，客户端解密将永久失序。
+func (h *TerminalSessionHandler) writeEncryptedMessage(messageType int, data []byte) error {
+	h.writeMu.Lock()
+	defer h.writeMu.Unlock()
+	if h.ws == nil {
+		return errors.New("websocket is nil")
+	}
+	if h.useNoise && h.handshakeFinished() {
+		data = h.encrypt(data)
 	}
 	if err := h.ws.SetWriteDeadline(time.Now().Add(terminalWriteTimeout)); err != nil {
 		return err

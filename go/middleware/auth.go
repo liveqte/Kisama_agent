@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/http"
 	"strings"
 	"time"
 
@@ -45,6 +46,10 @@ func AuthEncryptMiddleware(cm *crypto.CryptoManager, cfg *config.Config, tk *tem
 		}
 
 		if c.Request.Method == "OPTIONS" || c.Request.Method == "HEAD" {
+			// 🌟 x-encrypted 模式位规范：DEBUG 模式预检响应也恒 false（生产不发送该头）
+			if cfg.Debug {
+				c.Writer.Header().Set("x-encrypted", "false")
+			}
 			c.Next()
 			return
 		}
@@ -233,12 +238,21 @@ func AuthEncryptMiddleware(cm *crypto.CryptoManager, cfg *config.Config, tk *tem
 					bufferWriter.ResponseWriter.Write([]byte(encrypted))
 					return
 				}
+				// 🌟 x-encrypted 模式位规范 (docs/API.MD 第十节)：生产加密失败禁止明文回退
+				// → 500 且不发送 x-encrypted（false 仅属于 DEBUG 模式）
 				logger.Errorf("Failed to encrypt response via ECIES: %v", err)
+				bufferWriter.ResponseWriter.Header().Del("x-encrypted")
+				bufferWriter.ResponseWriter.Header().Set("Content-Type", "application/json")
+				bufferWriter.ResponseWriter.Header().Set("Content-Length", "34")
+				bufferWriter.ResponseWriter.WriteHeader(http.StatusInternalServerError)
+				bufferWriter.ResponseWriter.Write([]byte(`{"error":"Response encryption failed"}`))
+				return
 			}
 		}
 
-		// 匿名免密白名单放行情况、DEBUG 模式开启或加密失败时：透传明文 JSON
-		if bufferWriter.Header().Get("x-encrypted") == "" {
+		// 🌟 x-encrypted 模式位规范：仅 DEBUG 模式补盖 false（生产模式未加密响应——
+		// 匿名免密白名单放行等——不发送该头，杜绝生产误报 debug）
+		if cfg.Debug && bufferWriter.Header().Get("x-encrypted") == "" {
 			bufferWriter.ResponseWriter.Header().Set("x-encrypted", "false")
 		}
 		bufferWriter.ResponseWriter.Write(bufferWriter.bodyBuffer.Bytes())

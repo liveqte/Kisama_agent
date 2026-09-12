@@ -157,7 +157,7 @@ public class kisama {
 
     private static final int TEMPKEY_DEFAULT_TTL_HOURS = Integer.parseInt(DOTENV.getOrDefault("TEMPKEY_TTL", "24"));
     private static final int TEMPKEY_MAX_TTL_HOURS = Integer.parseInt(DOTENV.getOrDefault("TEMPKEY_MAX_TTL", "168"));
-    private static final String AGENT_VERSION = "0.5.0-java";
+    private static final String AGENT_VERSION = "0.5.1-java";
 
     private Map<String, Object> baseInfoCache = null;
     private long lastBaseInfoCacheTime = 0;
@@ -1042,17 +1042,21 @@ public class kisama {
 
         after((req, res) -> {
             res.header("X-Agent-Version", AGENT_VERSION);
-            if ("OPTIONS".equalsIgnoreCase(req.requestMethod()) || "HEAD".equalsIgnoreCase(req.requestMethod())) {
+            // 🌟 x-encrypted 模式位规范 (docs/API.MD 第十节)：DEBUG 模式一切响应恒为 false
+            if (this.DEBUG) {
                 res.header("X-Encrypted", "false");
                 return;
-			}
-            
+            }
+            if ("OPTIONS".equalsIgnoreCase(req.requestMethod()) || "HEAD".equalsIgnoreCase(req.requestMethod())) {
+                return; // 生产模式：预检/探测响应不发送模式头（false 仅属于 DEBUG 模式）
+            }
+
 			if (res.body() != null && !res.body().isBlank()) {
                 // 安全提取当前请求在中间件入口最终确立的真伪身份标签
                 boolean isAuthenticated = Boolean.TRUE.equals(req.attribute("is_authenticated"));
 
-                // 🌟 只有非 DEBUG 且身份确实为已认证（true）状态，才在出口统一披上密文外衣
-                if (!this.DEBUG && isAuthenticated) {
+                // 🌟 只有身份确实为已认证（true）状态，才在出口统一披上密文外衣
+                if (isAuthenticated) {
                     try {
                         // 按验签来源选择对应 ECIES 公钥: 静态密钥->静态公钥, 临时密钥->临时公钥
                         byte[] targetPub = this.ECIES_PUBLIC_KEY;
@@ -1072,10 +1076,8 @@ public class kisama {
                         res.status(500);
                         res.body(this.gson.toJson(Map.of("error", "Crypto Exception: " + e.getMessage())));
                     }
-                } else {
-                    // 匿名免密白名单放行（false 状态）或开启 DEBUG 模式下，直接直下明文，不污染报文
-                    res.header("X-Encrypted", "false");
                 }
+                // 匿名免密白名单放行（false 状态）：明文直出，不发送模式头
 			}
         });
 
@@ -2514,6 +2516,8 @@ public class kisama {
         private OutputStream processStdin;
         private Thread pipeOutputThread;
         private volatile boolean isRunning = true;
+        // 终端帧发送锁：加密(消耗发送 nonce)与写 socket 必须原子完成
+        private final Object wsSendLock = new Object();
 
         public TerminalSession(kisama agent, Session wsSession, String requestId, String token) {
             this.agent = agent;
@@ -2523,6 +2527,22 @@ public class kisama {
             this.useNoise = (token == null || token.isBlank());
             if (this.useNoise) {
                 this.noiseCipher = new NoiseSession(agent.AGENT_PRIVATE_KEY, agent.CONTROL_PUBLIC_KEY);
+            }
+        }
+
+        /**
+         * 串行化终端帧发送：Noise 加密（消耗发送 nonce）与写 socket 必须原子完成。
+         * PTY 输出线程与 WebSocket 读线程（心跳回包）并发时，若先加密再发送，
+         * nonce 顺序与线路帧顺序可能颠倒，客户端解密将永久失序
+         * (NOISE_ERROR_MAC_FAILURE，超级终端假死)。与 py/go 版发送锁语义对齐。
+         */
+        private void sendEncryptedFrame(byte[] payload) throws java.io.IOException {
+            synchronized (wsSendLock) {
+                byte[] frame = payload;
+                if (useNoise && handshakePhase == 4) {
+                    frame = noiseCipher.encryptTransport(frame);
+                }
+                wsSession.getRemote().sendBytes(ByteBuffer.wrap(frame));
             }
         }
         // 🚀 新增：依据优先级多维定位当前系统可用的最佳 Shell 进程
@@ -2611,10 +2631,8 @@ public class kisama {
                         if (readBytes > 0) {
                             byte[] rawOutput = Arrays.copyOf(buffer, readBytes);
                             if (wsSession.isOpen()) {
-                                if (useNoise) {
-                                    rawOutput = noiseCipher.encryptTransport(rawOutput);
-                                }
-                                wsSession.getRemote().sendBytes(ByteBuffer.wrap(rawOutput));
+                                // 加密与发送原子化，防止与心跳回包线程竞争导致 nonce 失序
+                                sendEncryptedFrame(rawOutput);
                             }
                         }
                     }
@@ -2687,7 +2705,8 @@ public class kisama {
                         if (data != null && data.containsKey("type")) {
                             String frameType = Objects.toString(data.get("type"), "");
                             if ("heartbeat".equals(frameType)) {
-                                wsSession.getRemote().sendString(agent.gson.toJson(Map.of("type", "heartbeat")));
+                                // 经 sendEncryptedFrame 回包：修复明文泄漏 + 与 PTY 输出线程保持 nonce 顺序一致
+                                sendEncryptedFrame(agent.gson.toJson(Map.of("type", "heartbeat")).getBytes(StandardCharsets.UTF_8));
                                 return;
                             }
                             if ("resize".equals(frameType)) {
@@ -2829,11 +2848,12 @@ public class kisama {
             return res;
         }
 
-        public byte[] encryptTransport(byte[] plaintext) {
+        // synchronized：防止未来调用点跨线程并发导致发送/接收 nonce 字段竞争
+        public synchronized byte[] encryptTransport(byte[] plaintext) {
             return chacha20Poly1305(true, k_send, n_send++, new byte[0], plaintext);
         }
 
-        public byte[] decryptTransport(byte[] ciphertext) {
+        public synchronized byte[] decryptTransport(byte[] ciphertext) {
             return chacha20Poly1305(false, k_recv, n_recv++, new byte[0], ciphertext);
         }
 

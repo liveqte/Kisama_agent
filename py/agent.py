@@ -805,7 +805,7 @@ class Config:
     KPATH = os.getenv("KPATH", "")
 
     # 代理版本信息
-    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.5.0-python")
+    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.5.1-python")
     
     # ================= 启动校验 =================
     
@@ -1165,9 +1165,12 @@ class CryptoManager:
         """
         target_pubkey = pubkey or self.ecies_pubkey
 
-        if Config.DEBUG or not target_pubkey:
-            # 调试模式或无加密公钥: 明文返回
+        if Config.DEBUG:
+            # 调试模式: 明文返回 (模式头由中间件出口统一盖 x-encrypted: false)
             return json.dumps(data, ensure_ascii=False, default=str)
+        if not target_pubkey:
+            # 🌟 x-encrypted 模式位规范：生产模式禁止明文回退（防明文 body + true 出门），抛错转 500
+            raise RuntimeError("ECIES public key not initialized, cannot encrypt response")
         
         try:
             # ECIES加密: 自动协商临时AES密钥加密数据
@@ -1175,9 +1178,8 @@ class CryptoManager:
             ciphertext = ecies_encrypt(target_pubkey, plaintext)
             return base64.b64encode(ciphertext).decode('ascii')
         except Exception as e:
-            # 加密失败时返回错误标识(生产环境应记录日志)
-            error_data = {"_encrypt_error": str(e), "_raw": data if Config.DEBUG else None}
-            return json.dumps(error_data, ensure_ascii=False, default=str)
+            # 🌟 模式位规范：生产加密失败禁止明文回退，向上抛错由服务端转为 500（不发送 x-encrypted）
+            raise RuntimeError(f"ECIES response encryption failed: {e}") from e
     def decrypt_data(combined_payload: str, key: bytes):
         """
         使用 AES-256-GCM 解密
@@ -1395,10 +1397,13 @@ class AuthEncryptMiddleware(BaseHTTPMiddleware):
         # 🌟 核心修复 1：零信任原则，默认初始化认证状态为 False
         request.state.is_authenticated = False  
         
-        # 🌟 核心修复 2：优先判断 DEBUG 模式，如果为 True 直接拉满权限并提前放行
+        # 🌟 核心修复 2：优先判断 DEBUG 模式，如果为 True 直接拉满权限并放行
+        # 🌟 x-encrypted 模式位规范 (docs/API.MD 第十节)：DEBUG 模式一切响应恒为 false
         if Config.DEBUG:
-            request.state.is_authenticated = True 
-            return await call_next(request)
+            request.state.is_authenticated = True
+            response = await call_next(request)
+            response.headers["x-encrypted"] = "false"
+            return response
             
         # 放行预检请求和轻量探测
         if request.method in ["OPTIONS", "HEAD"]:
@@ -1528,8 +1533,10 @@ class AuthEncryptMiddleware(BaseHTTPMiddleware):
                         response.headers["x-agent-version"] = Config.AGENT_VERSION
                 else:
                     # 匿名放行路径（如未登录访问 baseinfo）直接透传明文 JSON 字符串
+                    # 🌟 x-encrypted 模式位规范：生产模式未加密响应不发送该头（false 仅属于 DEBUG 模式）
                     encoded = original_body
-                    response.headers["x-encrypted"] = "false"
+                    if "x-encrypted" in response.headers:
+                        del response.headers["x-encrypted"]
                 
                 response.body_iterator = self._async_iter([encoded])
                 response.headers["content-length"] = str(len(encoded))
@@ -3180,6 +3187,22 @@ class TerminalSessionHandler:
         else:
             target.write(data)
 
+    async def _send_ws_bytes(self, websocket: WebSocket, data: bytes):
+        """串行化终端帧发送：Noise 加密（消耗发送 nonce）与写 socket 必须原子完成。
+
+        PTY 输出任务与心跳回包任务并发时，若先加密再 await 发送，帧的
+        nonce 顺序与线路顺序可能颠倒（send_bytes 背压挂起时尤其如此），
+        客户端解密将永久失序 (NOISE_ERROR_MAC_FAILURE，超级终端假死)。
+        与 Go 版 writeMu 语义对齐；asyncio.Lock 惰性创建以绑定运行中的事件循环。
+        """
+        lock = getattr(self, '_ws_send_lock', None)
+        if lock is None:
+            lock = self._ws_send_lock = asyncio.Lock()
+        async with lock:
+            if self.use_noise:
+                data = self.cipher.encrypt(data)
+            await websocket.send_bytes(data)
+
     async def _handle_windows_output(self, websocket: WebSocket, backend, log):
         """Windows 输出循环: 阻塞读在工作线程, 数据经 asyncio 队列转发 WebSocket"""
         loop = asyncio.get_running_loop()
@@ -3209,11 +3232,8 @@ class TerminalSessionHandler:
                 data = await queue.get()
                 if data is None:
                     break
-                if self.use_noise:
-                    payload = self.cipher.encrypt(data)
-                else:
-                    payload = data
-                await websocket.send_bytes(payload)
+                # 加密与发送原子化，防止与心跳回包任务竞争导致 nonce 失序
+                await self._send_ws_bytes(websocket, data)
         except (WebSocketDisconnect, ConnectionResetError, OSError):
             pass
         finally:
@@ -3229,14 +3249,11 @@ class TerminalSessionHandler:
                     try:
                         data = os.read(master, 8192)
                         if not data: break
-                        
-                        # 🔥 发送前：使用 Noise 管道加密终端输出
-                        if self.use_noise:
-                            encrypted_data = self.cipher.encrypt(data)
-                            await websocket.send_bytes(encrypted_data)
-                        else:
-                            await websocket.send_bytes(data)
-                        
+
+                        # 🔥 发送前经 _send_ws_bytes 加密：加密与发送原子化，
+                        # 防止与心跳回包任务竞争导致客户端 nonce 失序
+                        await self._send_ws_bytes(websocket, data)
+
                     except BlockingIOError:
                         await asyncio.sleep(0.01)
                     except OSError as e:
@@ -3272,12 +3289,9 @@ class TerminalSessionHandler:
                         msg_type = data.get('type')
                         
                         if msg_type == 'heartbeat':
-                            # 回复心跳也要按模式区分
+                            # 回包经 _send_ws_bytes：与 PTY 输出任务竞争时保持 nonce 顺序 == 线路顺序
                             reply = json.dumps({"type": "heartbeat"}).encode()
-                            if self.use_noise:
-                                await websocket.send_bytes(self.cipher.encrypt(reply))
-                            else:
-                                await websocket.send_bytes(reply)
+                            await self._send_ws_bytes(websocket, reply)
                             continue
                             
                         if msg_type == 'resize':

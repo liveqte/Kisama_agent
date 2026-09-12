@@ -248,6 +248,8 @@ X-Total-Chunks: 1
 { "status": "ok", "results": [{ "path": "/tmp/old.log", "status": "deleted" }, { "path": "/tmp/cache", "status": "deleted" }] }
 ```
 
+**PHP 兼容路由（仅 PHP 版本提供）**：`POST /api/file/delete`。部分主机/网关（cPanel、Froxlor 共享环境等）会禁用或剥离 `DELETE` 方法的请求体，PHP 版本提供本路由作为 `DELETE /api/file` 的完全等价替代——请求体、处理逻辑（`SafeFileManager::deletePaths`）与返回结构完全相同，仅方法与路径不同。控制端检测到代理端 `version` 含 `php` 时应优先使用本路由（面板已内置该路由决策）。
+
 ### 11. 批量移动/重命名
 路径：PUT /api/file  
 用途：批量移动或重命名文件/目录  
@@ -713,6 +715,55 @@ curl -X PUT "https://shz.al/~env01a:s3cret-key" -F "c=new-value"
 安全提示：预测 URL 无认证即可读（shz.al 平台特性），其暴露的仅是隧道域名本身；隧道背后的 agent 接口仍有完整认证与加密，风险面与 KMODE=1 写本地域名文件相当。
 
 
+## 十、x-encrypted 响应模式头规范（0.5.x 起六端强制统一）
+
+### 语义定义
+
+`x-encrypted` 是**运行模式位**，不是"本响应体是否已加密"的状态位。控制端凭它**无需关心请求签名是否通过**，即可判定代理端运行模式（生产 / DEBUG）。
+
+### 取值规则（强制）
+
+| 运行模式 | 响应场景 | x-encrypted |
+| :--- | :--- | :--- |
+| `DEBUG=true`（调试模式） | **一切**响应：JSON、二进制、401/403/404/5xx、OPTIONS/HEAD 预检 | **必须为 `false`**（不得缺省、不得为 true） |
+| `DEBUG=false`（生产模式） | 已认证（验签通过）且响应体已 ECIES 加密 | **必须为 `true`** |
+| `DEBUG=false`（生产模式） | **生产明文认证模式**（`PLAIN_MODE=true`，**仅 PHP 版本提供**）：已认证，响应体明文 | **必须为 `plain`** |
+| `DEBUG=false`（生产模式） | 未认证 / 匿名白名单（/api/baseinfo、/api/status）/ 验签失败 / 40x / OPTIONS / HEAD / 非 JSON 二进制响应 | **不发送该头** |
+| `DEBUG=false`（生产模式） | ECIES 响应加密失败 | HTTP 500，**不发送该头**（严禁明文 body + `false` 出门） |
+
+核心不变式：
+
+1. **生产模式永不返回 `false`** —— 出现 `false` 即实现缺陷；
+2. **调试模式恒为 `false`** —— 不缺省、不为 `true`；
+3. `true` 不承诺 body 必为密文（二进制下载等非加密响应体也照发）—— 是否解密由客户端按响应类型自行决定（仅对 JSON 响应尝试 ECIES 解密）。
+
+### 生产明文认证模式（`x-encrypted: plain`，PHP 独有）
+
+PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，**请求方向与常规生产模式完全一致**——控制端照常发送 ECDSA 签名头 + AES-256-GCM 加密请求体（代理端验签、解密流程不变，控制端请求路径零改动）；仅**响应方向**不做 ECIES 加密，明文 JSON 直出并以 `x-encrypted: plain` 标识。
+
+- 适用场景：HTTPS 内传输（机密性由 TLS 承担，省去响应方向 ECIES 开销）及特殊场景；
+- 认证语义不变：未认证/验签失败/匿名白名单/40x 行为与常规生产模式完全一致（响应不带头、无 session_key）；
+- `session_key`/`noise_key` 照常经已认证的 baseinfo 下发（AES 请求加密与 WS 终端令牌依赖）；
+- 兼容性：即使控制端仍对响应尝试 ECIES 解密，因 `plain ≠ true` 不会触发解密，明文 JSON 直接可解析；
+- 优先级：`DEBUG=true` 时以 DEBUG 为准（一切响应 `false`），`PLAIN_MODE` 失效；
+- 风险提示：响应（含 `/api/tempkey` 私钥、命令输出）全程明文，必须确保部署在 HTTPS/TLS 链路内。
+
+### 控制端判定表
+
+| 观测 | 判定 | 客户端动作 |
+| :--- | :--- | :--- |
+| `x-encrypted: true` | 生产模式（该 JSON 响应体为 ECIES 密文） | ECIES 解密 |
+| `x-encrypted: plain` | **生产明文认证模式**（PHP 独有）：验签照常、请求 AES 照常，响应明文 | 照常签名 + AES 加密请求；响应按明文 JSON 解析，不得判为 DEBUG |
+| `x-encrypted: false` | **调试模式**（认证形同虚设，凭据经 baseinfo 明文下发） | 停止签名/加密通信，UI 显著警示 |
+| 头缺失 | 生产模式的未加密响应（匿名白名单 / 错误 / 预检），body 为明文 JSON | 按明文处理；**不得**判为调试模式 |
+
+判定"是否 DEBUG 模式"最简探针：匿名 `GET /api/baseinfo`，看响应头即可，与签名无关。
+
+### 违规即缺陷
+
+凡不符合上表的实现（例如：生产模式对匿名 baseinfo 回 `false`、调试模式响应缺头、加密失败回退 `false` + 明文、401/OPTIONS 在生产模式补 `false`），均视为该端实现缺陷，须按本规范改造。过渡期提示：旧版本 agent 的 `false` 不可信（匿名白名单、旧版静默验签失败均回 `false`），控制端在签名协议落定前不得仅凭 `false` 判定调试模式。
+
+
 # Proxy Agent API 接口速查表
 
 ### 图例说明
@@ -739,6 +790,7 @@ curl -X PUT "https://shz.al/~env01a:s3cret-key" -F "c=new-value"
 | **文件上传** | POST | `/api/file` | 上传文件 | ✅ | ✅ |
 | **文件下载** | POST | `/api/file/download` | 下载文件 | ✅ | ✅ |
 | **文件删除** | DELETE | `/api/file` | 批量删除 | ✅ | ✅ |
+| **文件删除(PHP兼容)** | POST | `/api/file/delete` | 批量删除（**仅 PHP**，与 DELETE /api/file 等价） | ✅ | ✅ |
 | **文件移动** | PUT | `/api/file` | 批量移动 | ✅ | ✅ |
 | **文件批量复制** | POST | `/api/file/cp` | 批量复制 | ✅ | ✅ |
 | **新建目录** | POST | `/api/file/new` | 创建目录 | ✅ | ✅ |
@@ -770,6 +822,8 @@ curl -X PUT "https://shz.al/~env01a:s3cret-key" -F "c=new-value"
 4. `Content-Type`: `application/json`
 
 签名密钥说明：`X-Auth-Token` 可由控制端**静态密钥**签名，也可由 `GET /api/tempkey` 获取的**有效临时密钥**签名（`ecdsa.private_key`）。代理端验签时自动切换，并据此选择对应的 ECIES 公钥加密响应（静态密钥请求→静态公钥，临时密钥请求→临时公钥）。
+
+响应模式判定头 `x-encrypted`（生产恒 `true` / 调试恒 `false` / 生产未加密态不发送）的完整取值规则见「十、x-encrypted 响应模式头规范」。
 
 ### 自动化文档地址
 * **交互式文档 (Swagger UI):** `/docs` (仅在 `DEBUG=true` 时可用，仅python版本有此文档)

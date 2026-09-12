@@ -343,7 +343,7 @@ class Config {
   static KNAME_KEY = (process.env.KNAME_KEY || '').trim();
   // 域名文件路径, 缺省 $HOME/domain.txt, 支持 $HOME / ~ 前缀
   static KPATH = process.env.KPATH || '';
-  static AGENT_VERSION = process.env.AGENT_VERSION || '0.5.0-js';
+  static AGENT_VERSION = process.env.AGENT_VERSION || '0.5.1-js';
   static SESSION_KEY = crypto.randomBytes(32).toString('base64');
   // static SESSION_KEY =""
   static NOISE_KEYS_INTERNAL = NoiseKeyGenerator.generatePair();
@@ -646,25 +646,27 @@ class CryptoManager {
    * @param {Buffer} [pubkeyBuffer] 目标 ECIES 公钥 (临时密钥请求时传入临时公钥, 缺省用控制端静态公钥)
    */
   encryptResponse(data, pubkeyBuffer = null) {
-    if (Config.DEBUG || !this.eciesPubkey) {
+    if (Config.DEBUG) {
+      // 调试模式: 明文返回 (模式头由中间件出口统一盖 x-encrypted: false)
       return JSON.stringify(data);
+    }
+    if (!this.eciesPubkey) {
+      // 🌟 x-encrypted 模式位规范 (docs/API.MD 第十节)：生产模式禁止明文回退，抛错转 500
+      throw new Error('ECIES public key not initialized, cannot encrypt response');
     }
 
     try {
       const plaintextStr = JSON.stringify(data);
       const plaintextBuffer = Buffer.from(plaintextStr, 'utf-8');
       const pubKeyBuffer = pubkeyBuffer || Buffer.from(this.eciesPubkey);
-      
+
       const ciphertext = ecies_encrypt(pubKeyBuffer, plaintextBuffer);
-      
+
       return Buffer.from(ciphertext).toString('base64');
-      
+
     } catch (e) {
-      const errorData = {
-        _encrypt_error: e.message,
-        _raw: Config.DEBUG ? data : null
-      };
-      return JSON.stringify(errorData);
+      // 🌟 模式位规范：生产加密失败禁止明文回退，向上抛错由 express 错误处理转 500
+      throw new Error(`ECIES response encryption failed: ${e.message}`);
     }
   }
 
@@ -716,12 +718,78 @@ function BuildSignatureMessage(method, path, bodyHash, nonce, timestamp) {
 
 function authEncryptMiddleware(cryptoManager, tempKeyManager = null) {
   return async (req, res, next) => {
-    // === 阶段 0: 放行 WebSocket 和预检请求 ===
+    // === 阶段 0: 放行 WebSocket ===
     // 仅按路径前缀 /api/ws/ 放行；不可依据 Upgrade 头判断，否则普通请求伪造该头即可绕过全部认证
     if (req.path.startsWith('/api/ws/')) {
       return next();
     }
+
+    // === 阶段 0.5: 安装 x-encrypted 模式位出口拦截器（docs/API.MD 第十节）===
+    // 必须先于 OPTIONS/HEAD 与 DEBUG 早退安装，确保 debug 一切响应恒 false、生产匿名响应不设头
+    const originalSend = res.send;
+    res.send = function(data) {
+      // 🌟 模式位规范：DEBUG 模式一切响应恒 false（Buffer 二进制体原样透传，仅盖头）
+      if (Config.DEBUG) {
+        const encoded = typeof data === 'string' ? data : (Buffer.isBuffer(data) ? data : JSON.stringify(data));
+        res.set('x-encrypted', 'false');
+        res.set('Content-Length', Buffer.byteLength(encoded).toString());
+        return originalSend.call(this, encoded);
+      }
+
+      if (res.get('Content-Type') && res.get('Content-Type').includes('application/json')) {
+        try {
+          const jsonData = typeof data === 'string' ? JSON.parse(data) : data;
+
+          // 根据中间件最终确立的真伪身份标签，决定是否在出口裹上密文外衣
+          if (req.is_authenticated) {
+            // 按验签来源选择对应 ECIES 公钥: 静态密钥->静态公钥, 临时密钥->临时公钥
+            let targetPub = null;
+            if (req.key_source === 'temp' && tempKeyManager) {
+              targetPub = tempKeyManager.getActiveEciesPub();
+            }
+            const encryptedContent = cryptoManager.encryptResponse(jsonData, targetPub);
+            const encoded = typeof encryptedContent === 'string' ? encryptedContent : JSON.stringify(encryptedContent);
+
+            res.set('x-encrypted', 'true');
+            res.set('x-agent-version', Config.AGENT_VERSION);
+            res.set('Content-Length', Buffer.byteLength(encoded, 'utf8').toString());
+            return originalSend.call(this, encoded);
+          } else {
+            // 匿名放行路径（如未授权访问 baseinfo）：明文直出，不发送模式头（false 仅属于 DEBUG 模式）
+            const encoded = typeof data === 'string' ? data : JSON.stringify(jsonData);
+            res.set('Content-Length', Buffer.byteLength(encoded, 'utf8').toString());
+            return originalSend.call(this, encoded);
+          }
+        } catch (encryptErr) {
+          // 🌟 模式位规范：生产加密失败 → 500 明示错误，禁止明文回退、不发送 x-encrypted
+          if (!res.headersSent) {
+            const errBody = JSON.stringify({ error: `Response encryption failed: ${encryptErr.message}` });
+            res.status(500);
+            res.set('Content-Type', 'application/json');
+            res.set('Content-Length', Buffer.byteLength(errBody, 'utf8').toString());
+            return originalSend.call(this, errBody);
+          }
+          throw encryptErr;
+        }
+      }
+      return originalSend.call(this, data);
+    };
+
+    // 🌟 模式位规范兜底：DEBUG 模式下绕过 res.send 直出的响应（cors 预检 204、
+    // express 默认 404 等经 res.end 直出的场景）也必须携带 false
+    const originalEnd = res.end;
+    res.end = function(...endArgs) {
+      if (Config.DEBUG && !res.get('x-encrypted')) {
+        res.set('x-encrypted', 'false');
+      }
+      return originalEnd.apply(this, endArgs);
+    };
+
     if (req.method === 'OPTIONS' || req.method === 'HEAD') {
+      // 预检/探测无 JSON 体，拦截器不会盖章；DEBUG 模式在此显式补模式头
+      if (Config.DEBUG) {
+        res.set('x-encrypted', 'false');
+      }
       return next();
     }
 
@@ -729,7 +797,7 @@ function authEncryptMiddleware(cryptoManager, tempKeyManager = null) {
     req.is_authenticated = false;
     const bypassPaths = ['/api/baseinfo', '/api/status'];
 
-    // 🌟 2. 优先判定 DEBUG 模式：如果为 true 直接拉满信任并提前放行
+    // 🌟 2. 优先判定 DEBUG 模式：如果为 true 直接拉满信任并放行（出口拦截器已就位，响应恒 false）
     if (Config.DEBUG) {
       req.is_authenticated = true;
       return next();
@@ -798,43 +866,7 @@ function authEncryptMiddleware(cryptoManager, tempKeyManager = null) {
       }
     }
 
-    // === 阶段 2 & 3: 拦截响应方法并执行输出层业务逻辑 ===
-    const originalSend = res.send;
-    
-    res.send = function(data) {
-      if (res.get('Content-Type') && res.get('Content-Type').includes('application/json')) {
-        try {
-          const jsonData = typeof data === 'string' ? JSON.parse(data) : data;
-          
-          // 根据中间件最终确立的真伪身份标签，决定是否在出口裹上密文外衣
-          if (req.is_authenticated) {
-            // 按验签来源选择对应 ECIES 公钥: 静态密钥->静态公钥, 临时密钥->临时公钥
-            let targetPub = null;
-            if (req.key_source === 'temp' && tempKeyManager) {
-              targetPub = tempKeyManager.getActiveEciesPub();
-            }
-            const encryptedContent = cryptoManager.encryptResponse(jsonData, targetPub);
-            const encoded = typeof encryptedContent === 'string' ? encryptedContent : JSON.stringify(encryptedContent);
-
-            res.set('x-encrypted', 'true');
-            res.set('x-agent-version', Config.AGENT_VERSION);
-            res.set('Content-Length', Buffer.byteLength(encoded, 'utf8').toString());
-            return originalSend.call(this, encoded);
-          } else {
-            // 匿名放行路径（如未授权访问 baseinfo）直接直下明文，不污染报文
-            const encoded = typeof data === 'string' ? data : JSON.stringify(jsonData);
-            res.set('x-encrypted', 'false');
-            res.set('Content-Length', Buffer.byteLength(encoded, 'utf8').toString());
-            return originalSend.call(this, encoded);
-          }
-          
-        } catch (e) {
-          if (Config.DEBUG) Logger.error(`💥 [Response Encrypt]: ${e.message}`);
-        }
-      }
-      return originalSend.call(this, data);
-    };
-
+    // （阶段 2 & 3 的响应模式位出口拦截器已前移至中间件入口安装，见阶段 0.5）
     next();
   };
 }
@@ -4381,6 +4413,10 @@ async function main(options = {}) {
 
       // 快速放行 OPTIONS 预检请求 (Preflight)
       if (req.method === 'OPTIONS') {
+        // 🌟 x-encrypted 模式位规范 (docs/API.MD 第十节)：DEBUG 模式预检响应也恒 false（生产不发送该头）
+        if (Config.DEBUG) {
+          res.set('x-encrypted', 'false');
+        }
         return res.status(200).end();
       }
 
