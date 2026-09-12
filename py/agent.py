@@ -805,7 +805,7 @@ class Config:
     KPATH = os.getenv("KPATH", "")
 
     # 代理版本信息
-    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.5.1-python")
+    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.5.3-python")
     
     # ================= 启动校验 =================
     
@@ -843,50 +843,80 @@ class Config:
 # ============================================================================
 #  日志类
 # ============================================================================
+def _resolve_log_level():
+    # 日志阈值解析 (对齐 js/go): LOG_LEVEL 环境变量显式设置时优先生效 (0~3 标准四级,
+    # 11~15 细分调试频道, 非法/越界回退 3); 未设置时 DEBUG=true 接管为 0 (调试全量),
+    # 否则缺省 3 (生产只输出错误日志)
+    raw = os.getenv("LOG_LEVEL", "").strip()
+    if raw:
+        try:
+            level = int(raw)
+        except ValueError:
+            return 3
+        return level if (0 <= level <= 3 or 11 <= level <= 15) else 3
+    return 0 if Config.DEBUG else 3
+
+
 class Logger:
-    """日志处理器"""
-    if Config.DEBUG:
-        _log_level = 1  # 0=关闭Debug日志, 1=基本信息, 2=WebSocket传输，3=终端日志，4网络统计日志，5磁盘统计日志
-    else:
-        _log_level = 0  # 生产环境默认关闭Debug日志
+    """日志处理器
+
+    四级阈值体系 (对齐 js/go): DEBUG=0 / INFO=1 / WARN=2 / ERROR=3, 级别 >= 阈值才输出。
+    细分调试频道占用高位 11~15 (与标准四级互不干扰):
+    11=基本信息 12=WebSocket传输 13=终端日志 14=网络统计 15=磁盘统计。
+    阈值语义: 0=全量(含全部调试频道); 1~3=标准四级; 11~15=常规日志全出 + 精确打开对应调试频道。
+    """
+
+    LEVEL_DEBUG, LEVEL_INFO, LEVEL_WARN, LEVEL_ERROR = 0, 1, 2, 3
+    CHANNEL_BASE = 10                 # >=10 的级别视为细分调试频道
+    _log_level = _resolve_log_level()
+
     @classmethod
     def set_log_level(cls, level: int):
-        """设置日志级别"""
+        """设置日志级别 (0~3 标准四级, 11~15 细分调试频道)"""
         cls._log_level = level
-    
+
+    @classmethod
+    def _enabled(cls, level: int) -> bool:
+        # 统一输出判定: 标准四级用阈值比较 (级别 >= 阈值; 阈值 >=11 视为 1, 常规日志全出);
+        # 调试频道 (11~15) 仅在阈值=0 (全量) 或阈值==频道 (精确打开) 时输出
+        if level >= cls.CHANNEL_BASE:
+            return cls._log_level == 0 or cls._log_level == level
+        effective = cls._log_level if cls._log_level <= 3 else cls.LEVEL_INFO
+        return level >= effective
+
     @classmethod
     def _log(cls, message: str, level: str = "INFO"):
         """基础日志方法"""
-        if cls._log_level == 0 and level != "ERROR":
-            return
-            
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_message = f"[{timestamp}] [{level}] {message}"
         if level == "ERROR":
             print(log_message, file=sys.stderr)
         else:
             print(log_message)
-    
+
     @classmethod
-    def debug(cls, message: str, debug_level: int = 1):
-        """调试日志"""
-        if cls._log_level == debug_level:
+    def debug(cls, message: str, channel: int = 11):
+        """调试日志 (频道: 11=基本信息 12=WebSocket传输 13=终端日志 14=网络统计 15=磁盘统计)"""
+        if cls._enabled(channel):
             cls._log(message, "DEBUG")
-    
+
     @classmethod
     def info(cls, message: str):
         """信息日志"""
-        cls._log(message, "INFO")
-    
+        if cls._enabled(cls.LEVEL_INFO):
+            cls._log(message, "INFO")
+
     @classmethod
     def warning(cls, message: str):
         """警告日志"""
-        cls._log(message, "WARNING")
-    
+        if cls._enabled(cls.LEVEL_WARN):
+            cls._log(message, "WARNING")
+
     @classmethod
     def error(cls, message: str):
         """错误日志"""
-        cls._log(message, "ERROR")
+        if cls._enabled(cls.LEVEL_ERROR):
+            cls._log(message, "ERROR")
 # ============================================================================
 # 🔐 加密模块: ECDSA签名验证 + ECIES加密
 # ============================================================================
@@ -1581,10 +1611,10 @@ class SystemInfoCollector:
         ipv6 = ipv6 if not isinstance(ipv6, Exception) else None
         
         if isinstance(ipv4, Exception):
-            Logger.debug(f"获取 IPv4 失败: {ipv4}", 1)
+            Logger.debug(f"获取 IPv4 失败: {ipv4}", 11)
             ipv4 = None
         if isinstance(ipv6, Exception):
-            Logger.debug(f"获取 IPv6 失败: {ipv6}", 1)
+            Logger.debug(f"获取 IPv6 失败: {ipv6}", 11)
             ipv6 = None
         
         os_name = f"{dist_info['name']} {dist_info['version']}" if dist_info['name'] != 'Unknown' else platform.system()
@@ -1605,7 +1635,7 @@ class SystemInfoCollector:
             "virtualization": self._get_virtualization()
         }
         
-        Logger.debug(f"基础信息数据: {json.dumps(info, indent=2)}", 1)
+        Logger.debug(f"基础信息数据: {json.dumps(info, indent=2)}", 11)
         return info
     
     async def get_realtime_info(self) -> Dict[str, Any]:
@@ -1618,7 +1648,7 @@ class SystemInfoCollector:
             process_count = len(psutil.pids()) 
         except Exception as e: 
             process_count = 0
-            Logger.debug(f"获取进程数失败：{e}", 1)
+            Logger.debug(f"获取进程数失败：{e}", 11)
         info = {
             "cpu": {
                 "usage": cpu_usage
@@ -1655,7 +1685,7 @@ class SystemInfoCollector:
             "message": ""
         }
         
-        Logger.debug(f"实时监控数据: {json.dumps(info, indent=2)}", 2)
+        Logger.debug(f"实时监控数据: {json.dumps(info, indent=2)}", 12)
         return info
     
     def _get_cpu_name(self) -> str:
@@ -1673,7 +1703,7 @@ class SystemInfoCollector:
                         if line.strip().startswith('model name'):
                             return line.split(':')[1].strip()
         except Exception as e:
-            Logger.debug(f"获取CPU名称失败: {e}", 1)
+            Logger.debug(f"获取CPU名称失败: {e}", 11)
         return "Unknown CPU"
     
     async def _get_cpu_usage(self) -> float:
@@ -1704,7 +1734,7 @@ class SystemInfoCollector:
             usage = ((delta_total - delta_idle) / delta_total) * 100
             return round(max(0.0, min(100.0, usage)), 2)
         except Exception as e:
-            Logger.debug(f"获取CPU使用率失败: {e}", 2)
+            Logger.debug(f"获取CPU使用率失败: {e}", 12)
             return 0.0
     
     def _get_container_mem_limit(self) -> int:
@@ -1766,7 +1796,7 @@ class SystemInfoCollector:
                 "swap_used": swap.used
             }
         except Exception as e:
-            Logger.debug(f"获取内存信息失败: {e}", 2)
+            Logger.debug(f"获取内存信息失败: {e}", 12)
             return {"ram_total": 0, "ram_used": 0, "swap_total": 0, "swap_used": 0}
     
     def _get_physical_disk_device(self, device_path: str) -> Optional[str]:
@@ -1806,7 +1836,7 @@ class SystemInfoCollector:
             usage = psutil.disk_usage('/')
             return {"total": int(usage.total), "used": int(usage.used)}
         except Exception as e:
-            Logger.debug(f"[容器模式] 获取磁盘信息失败: {e}", 5)
+            Logger.debug(f"[容器模式] 获取磁盘信息失败: {e}", 15)
             return {"total": 0, "used": 0}
     
     async def _get_host_disk_info(self) -> Dict[str, int]:
@@ -1835,7 +1865,7 @@ class SystemInfoCollector:
                     continue
             return {"total": total_bytes, "used": used_bytes}
         except Exception as e:
-            Logger.debug(f"获取磁盘信息失败: {e}", 5)
+            Logger.debug(f"获取磁盘信息失败: {e}", 15)
             return {"total": 0, "used": 0}
 
     async def _get_disk_info(self) -> Dict[str, int]:
@@ -1911,7 +1941,7 @@ class SystemInfoCollector:
                 "total_down": SystemInfoCollector._total_network_down
             }
         except Exception as e:
-            Logger.debug(f"psutil 按网卡统计失败: {e}", 4)
+            Logger.debug(f"psutil 按网卡统计失败: {e}", 14)
             return {"up": 0, "down": 0, "total_up": 0, "total_down": 0}
     
     async def _get_tcp_connections(self) -> int:
@@ -1922,7 +1952,7 @@ class SystemInfoCollector:
             connections = psutil.net_connections(kind='tcp')
             return len([conn for conn in connections if conn.status == 'ESTABLISHED'])
         except Exception as e:
-            Logger.debug(f"获取TCP连接数失败: {e}", 2)
+            Logger.debug(f"获取TCP连接数失败: {e}", 12)
             return 0
     
     async def _get_udp_connections(self) -> int:
@@ -1932,7 +1962,7 @@ class SystemInfoCollector:
                 return len([line for line in result.stdout.split('\n') if 'UDP' in line and line.strip()])
             return len(psutil.net_connections(kind='udp'))
         except Exception as e:
-            Logger.debug(f"获取UDP连接数失败: {e}", 2)
+            Logger.debug(f"获取UDP连接数失败: {e}", 12)
             return 0
     
     def _get_linux_distribution(self) -> Dict[str, str]:
@@ -1978,7 +2008,7 @@ class SystemInfoCollector:
             content = try_read('/proc/cpuinfo')
             if 'QEMU' in content or 'KVM' in content: return 'QEMU'
         except Exception as e:
-            Logger.debug(f"获取虚拟化信息失败(非致命): {e}", 1)
+            Logger.debug(f"获取虚拟化信息失败(非致命): {e}", 11)
         return 'None'
     
     async def _get_public_ip_v4(self) -> Optional[str]:
@@ -3334,12 +3364,54 @@ class TerminalSessionHandler:
 # 对外暴露 GET/POST /api/argo 两个接口 (见「Argo 临时隧道模块: RESTful 路由」)。
 # ============================================================================
 QUICK_SERVICE = "https://api.trycloudflare.com"
-EDGE_HOSTS = ("region1.v2.argotunnel.com", "region2.v2.argotunnel.com")
+
+
+def _edge_hosts():
+    # edge 入口可用 KISAMA_EDGE_HOSTS 覆盖 (逗号分隔); 守护自愈测试借此模拟"连续连不上 edge"
+    custom = [h.strip() for h in os.getenv("KISAMA_EDGE_HOSTS", "").split(",") if h.strip()]
+    return tuple(custom) if custom else ("region1.v2.argotunnel.com", "region2.v2.argotunnel.com")
+
+
+EDGE_HOSTS = _edge_hosts()
 EDGE_PORT = 7844
 CONTROL_HEADER = "cf-cloudflared-proxy-connection-upgrade"
 CONTROL_STREAM = "control-stream"
 UPDATE_CONFIGURATION = "update-configuration"
 MAX_FRAME_SIZE = 16384
+
+
+def _argo_env_int(name, fallback, minimum):
+    # 隧道守护自愈参数解析: 非法/低于下限时回退默认值
+    try:
+        value = int(os.getenv(name, "").strip())
+    except ValueError:
+        return fallback
+    if value < minimum:
+        return fallback
+    return value
+
+
+# 🛡️ 守护自愈: trycloudflare 临时资源在 edge 连接全断后会被 Cloudflare 回收, 旧凭据重连
+# 注册永远失败 (域名永久失效, 即"ECONNRESET 后连不上"的根因)。连续失败 N 次后重新注册
+# 换取新域名并回调通知 (KMODE=2 自动再上报 / KMODE=1 自动重写域名文件)。
+ARGO_REREGISTER_AFTER = _argo_env_int("KISAMA_ARGO_REREGISTER_AFTER", 5, 2)  # 连续失败阈值
+ARGO_REREGISTER_RETRY_SECONDS = 30.0                                         # 重新注册失败后的退避
+
+
+def _argo_idle_timeout():
+    # 读空闲超时 (秒): edge 有周期 PING, 长时间无任何入站数据 = 半开假死, 主动断开走重连。
+    # 0=禁用; 未设置/非法回退 300; 生效值最小 10 秒 (过小会把正常空闲误判为断线)。
+    raw = os.getenv("KISAMA_ARGO_IDLE_TIMEOUT", "").strip()
+    if raw == "0":
+        return 0
+    try:
+        value = int(raw)
+    except ValueError:
+        return 300
+    return value if value >= 10 else 300
+
+
+ARGO_IDLE_TIMEOUT = _argo_idle_timeout()
 
 STATIC_TABLE = (
     (":authority", ""), (":method", "GET"), (":method", "POST"),
@@ -3813,6 +3885,7 @@ class H2Connection:
         self.control = None
         self.stopped = False
         self.registered = False
+        self.registration_failed = False
 
     def send_frame(self, frame_type, flags, stream_id, payload=b""):
         if len(payload) > 0xFFFFFF:
@@ -4180,6 +4253,9 @@ class ControlStream:
                     self.connection.registered = True
                 else:
                     self.log.warning("tunnel registration failed: %s", result.get("error", "unknown error"))
+                    # 🛡️ 注册失败: 结束本轮连接, 由守护线程计数, 连续失败达阈值后自动重新注册换新域名
+                    self.connection.registration_failed = True
+                    self.connection.stopped = True
             except Exception as exc:
                 self.log.debug("ignoring control RPC message: %s", exc)
 
@@ -4303,7 +4379,8 @@ def connect_edge(verify_certificate, logger):
                 verify_edge_certificate(sock)
             if sock.selected_alpn_protocol() not in {None, "h2"}:
                 raise OSError("edge did not negotiate h2")
-            sock.settimeout(None)
+            # 🛡️ 空闲超时防半开假死: 超时从 read_exact 以 socket.timeout 冒泡, 整条连接作废走重连
+            sock.settimeout(ARGO_IDLE_TIMEOUT if ARGO_IDLE_TIMEOUT > 0 else None)
             logger.info("connected to %s:%d", host, EDGE_PORT)
             return sock
         except (OSError, ssl.SSLError) as exc:
@@ -4338,6 +4415,14 @@ class _ArgoLogAdapter:
         Logger.error(self._format(message, args))
 
 
+def _run_domain_change_callback(callback, old_domain, new_domain):
+    # 🛡️ 域名变更回调隔离执行: 回调异常只记 DEBUG, 不影响守护线程
+    try:
+        callback(old_domain, new_domain)
+    except Exception as exc:
+        Logger.debug("argo domain change callback failed: %s", exc)
+
+
 # ----------------------------------------------------------------------------
 # 单隧道实例: 注册快速隧道 + 后台守护线程维持云边长连接
 # ----------------------------------------------------------------------------
@@ -4359,6 +4444,8 @@ class CloudflareQuickTunnel:
         self.silent = silent              # KMODE=2 静默模式: 不向 stdout 打印隧道域名
         self.hostname = None              # 临时公网域名 (含 https:// 前缀)
         self.created_at = None            # 注册成功时间戳 (int)
+        # 🛡️ 守护重建换新域名时的回调 (old_domain, new_domain); KMODE 接线后自动再上报/重写域名文件
+        self.on_domain_change = None
         self._stop = threading.Event()
         self._thread = None
         self._sock = None
@@ -4383,27 +4470,34 @@ class CloudflareQuickTunnel:
         return self.hostname
 
     def _run_loop(self, account_tag, tunnel_secret, tunnel_id):
+        failures = 0      # 🛡️ 连续失败计数 (连接失败/注册失败): 本轮注册过=旧凭据仍有效, 清零
+        conn_index = 0    # 注册索引轮换, 降低 edge 侧旧连接残留导致的注册拒绝
         while not self._stop.is_set():
             sock = None
+            conn = None
             try:
                 sock = connect_edge(self.verify_certificate, self.log)
                 self._sock = sock
-                H2Connection(
+                conn_index = (conn_index + 1) % 4
+                conn = H2Connection(
                     sock,
                     self.origin,
                     account_tag,
                     tunnel_secret,
                     tunnel_id,
-                    0,
+                    conn_index,
                     self.log,
                     self.hostname,
                     not self.silent,
                     self._tunnel_state,
-                ).run()
+                )
+                conn.run()
             except KeyboardInterrupt:
                 return
-            except (OSError, EOFError, ValueError) as exc:
-                self.log.warning("tunnel connection closed: %s", exc)
+            except Exception as exc:
+                # 🛡️ 全捕获: 任何异常 (含 H2 解析错误等) 都不能让守护线程静默死亡, 死了就再也无法自愈
+                if not self._stop.is_set():
+                    self.log.warning("tunnel connection closed: %s", exc)
             finally:
                 if sock is not None:
                     try:
@@ -4413,7 +4507,45 @@ class CloudflareQuickTunnel:
                 self._sock = None
             if self._stop.is_set():
                 return
-            self._stop.wait(self.retry_seconds)
+            # 🛡️ 守护计数: 本轮注册过=旧凭据仍有效; 未注册=凭据可能已被 Cloudflare 回收
+            if conn is not None and conn.registered:
+                failures = 0
+            else:
+                failures += 1
+                if failures >= ARGO_REREGISTER_AFTER:
+                    credentials = self._reregister()
+                    if credentials is not None:
+                        account_tag, tunnel_secret, tunnel_id = credentials
+                        failures = 0
+                    elif self._stop.wait(ARGO_REREGISTER_RETRY_SECONDS):
+                        # 重新注册失败: 退避更久再试, 避免高频请求 api.trycloudflare.com
+                        return
+            if not self._stop.is_set():
+                self._stop.wait(self.retry_seconds)
+
+    def _reregister(self):
+        # 🛡️ 旧凭据连续失败达阈值: 重新注册快速隧道换取新域名, 触发 on_domain_change 回调
+        # (KMODE=2 自动再上报 shz.al / KMODE=1 自动重写域名文件)。成功返回新凭据元组。
+        try:
+            hostname, account_tag, tunnel_secret, tunnel_id = request_quick_tunnel(self.quick_service)
+        except Exception as exc:
+            self.log.warning("tunnel re-register failed: %s", exc)
+            return None
+        old_hostname = self.hostname
+        self.hostname = hostname if hostname.startswith("https://") else "https://" + hostname
+        self.created_at = int(time.time())
+        self._tunnel_state["printed"] = True   # 新域名不向 stdout 打印 (维持首次打印/静默语义)
+        self.log.warning("tunnel domain changed: %s -> %s", old_hostname, self.hostname)
+        callback = self.on_domain_change
+        if callback is not None:
+            # 回调在独立线程执行: 上报网络耗时不阻塞重连循环, 异常不影响守护
+            threading.Thread(
+                target=_run_domain_change_callback,
+                args=(callback, old_hostname, self.hostname),
+                daemon=True,
+                name="argo-domain-change",
+            ).start()
+        return account_tag, tunnel_secret, tunnel_id
 
     def stop(self):
         # 断开当前云边连接并退出守护线程
@@ -4452,6 +4584,8 @@ class ArgoTunnelManager:
         self._by_port = {}                      # port -> [隧道实例] (允许重复)
         self._lock = threading.Lock()
         self.log = logger if logger is not None else _ArgoLogAdapter()
+        # 🛡️ 守护重建换新域名时的回调 (old_domain, new_domain), 创建隧道时下发给实例
+        self.on_domain_change = None
 
     def list_tunnels(self):
         # 返回已注册成功的临时隧道 (域名 / 端口 / 创建时间)
@@ -4476,6 +4610,7 @@ class ArgoTunnelManager:
                 )
         # 注册 + 建连属于网络操作, 放在锁外执行, 避免长时间阻塞查询接口
         tunnel = CloudflareQuickTunnel(port=port, logger=self.log, silent=silent)
+        tunnel.on_domain_change = self.on_domain_change
         try:
             tunnel.start()
         except Exception as exc:
@@ -4548,6 +4683,8 @@ class ArgoTunnelManager:
 # KMODE=1 时: 启动即建临时隧道并把域名写入 KPATH 文件 (缺省 $HOME/domain.txt);
 # 第一次 /api/baseinfo 成功响应后删除该文件; stdin 收到 /domain 指令时输出域名。
 # KMODE=2 时: 启动即建临时隧道并把域名上报至 shz.al (可预测 URL, 全程静默)。
+# 🛡️ 守护自愈: 隧道凭据被 Cloudflare 回收时自动重新注册, 域名会变化 ——
+# KMODE=1 自动重写域名文件, KMODE=2 自动重新上报 shz.al (409 冲突走 PUT 覆盖)。
 # ----------------------------------------------------------------------------
 class KModeController:
     _baseinfo_hooked = False    # 域名文件只删一次
@@ -4581,7 +4718,7 @@ class KModeController:
     @classmethod
     def report_shzal(cls, domain):
         # 上报隧道域名到 shz.al: POST 创建 (409 冲突则 PUT 覆盖), 全程静默 —
-        # 不输出域名 / 上报结果 / 平台 URL, 任何失败直接放弃, 不影响正常启动
+        # 不输出域名 / 上报结果 / 平台 URL, 失败返回 False 不抛错, 不影响正常启动
         name, key = Config.KNAME, (Config.KNAME_KEY or Config.KNAME)
         import urllib.error
         import urllib.request
@@ -4621,8 +4758,19 @@ class KModeController:
                         Logger.warning(f"[KMODE-DEBUG] report status: {exc.code} body: {detail}")
                     raise
             cls._domain = domain
+            return True
         except Exception:
-            pass
+            return False
+
+    @classmethod
+    def report_domain_change(cls, domain):
+        # 🛡️ 守护重建后的新域名上报: 指数退避重试 3 次 (2s/4s/8s), 全程静默 —
+        # 新域名必须尽量送达, 否则控制端按预测 URL 将读到旧值/404
+        for attempt in range(3):
+            if cls.report_shzal(domain):
+                return
+            if attempt < 2:
+                time.sleep(2 ** (attempt + 1))
 
     @staticmethod
     def _home_dir():
@@ -4712,11 +4860,15 @@ class KModeController:
         # KMODE=1: 隧道 + 域名文件 + stdin 监听; KMODE=2: 隧道 + shz.al 静默上报
         if Config.KMODE == "2" and cls.kname_valid():
             Logger.info("[KMODE] 🚀 KMODE=2: 隧道域名将上报至外部平台")
+            # 🛡️ 守护重建换新域名时自动重新上报 (静默重试, 回调在独立线程执行)
+            manager.on_domain_change = lambda old_domain, new_domain: cls.report_domain_change(new_domain)
             threading.Thread(target=cls._tunnel_task, args=(manager,),
                              kwargs={"after_domain": cls.report_shzal, "silent": True},
                              daemon=True, name="kmode-tunnel").start()
             return
         Logger.info("[KMODE] 🚀 KMODE=1: 启动时自动创建临时隧道")
+        # 🛡️ 守护重建换新域名时自动重写域名文件 (原文件可能已被 baseinfo 钩子删除)
+        manager.on_domain_change = lambda old_domain, new_domain: cls.write_domain_file(new_domain)
         threading.Thread(target=cls._tunnel_task, args=(manager,), daemon=True, name="kmode-tunnel").start()
         threading.Thread(target=cls._stdin_loop, daemon=True, name="kmode-stdin").start()
 

@@ -310,7 +310,9 @@ class Config {
   static EXEC_SHELL_MODE = (process.env.EXEC_SHELL || 'true').toLowerCase() === 'true';
   static DEBUG = (process.env.DEBUG || 'false').toLowerCase() === 'true';
   static TIMESTAMP_WINDOW = parseInt(process.env.TIMESTAMP_WINDOW || '3600');
-  static LOG_LEVEL = parseInt(process.env.LOG_LEVEL || (this.DEBUG ? '0' : '2'), 10);
+  // 日志级别 (0=DEBUG/1=INFO/2=WARN/3=ERROR): LOG_LEVEL 环境变量控制, 缺省 3=只输出错误;
+  // 未显式设置且 DEBUG=true 时接管为 0 (调试全量输出)
+  static LOG_LEVEL = parseInt(process.env.LOG_LEVEL || (this.DEBUG ? '0' : '3'), 10);
   
   static ECDSA_PUBLIC_KEY_PEM = Config._getConfigValue('ECDSA_PUBKEY', 'keys/agent_ecdsa_pub.pem') || 'ECDSA公钥内容';
   static ECIES_PUBLIC_KEY_PEM = Config._getConfigValue('ECIES_PUBKEY', 'keys/agent_ecies_pub.b64') || 'ECIES公钥内容';
@@ -343,7 +345,7 @@ class Config {
   static KNAME_KEY = (process.env.KNAME_KEY || '').trim();
   // 域名文件路径, 缺省 $HOME/domain.txt, 支持 $HOME / ~ 前缀
   static KPATH = process.env.KPATH || '';
-  static AGENT_VERSION = process.env.AGENT_VERSION || '0.5.1-js';
+  static AGENT_VERSION = process.env.AGENT_VERSION || '0.5.3-js';
   static SESSION_KEY = crypto.randomBytes(32).toString('base64');
   // static SESSION_KEY =""
   static NOISE_KEYS_INTERNAL = NoiseKeyGenerator.generatePair();
@@ -2031,7 +2033,11 @@ class TaskManager {
 // 🚀 Cloudflare Quick Tunnel 协议实现 (内联自 cftunnel-product.js, 纯标准库)
 // ============================================================================
 const QUICK_SERVICE = 'https://api.trycloudflare.com';
-const EDGE_HOSTS = ['region1.v2.argotunnel.com', 'region2.v2.argotunnel.com'];
+// edge 入口可用 KISAMA_EDGE_HOSTS 覆盖 (逗号分隔); 守护自愈测试借此模拟"连续连不上 edge"
+const EDGE_HOSTS = (() => {
+  const custom = String(process.env.KISAMA_EDGE_HOSTS || '').split(',').map((h) => h.trim()).filter(Boolean);
+  return custom.length > 0 ? custom : ['region1.v2.argotunnel.com', 'region2.v2.argotunnel.com'];
+})();
 const EDGE_PORT = 7844;
 const CONTROL_HEADER = 'cf-cloudflared-proxy-connection-upgrade';
 const CONTROL_STREAM = 'control-stream';
@@ -2738,6 +2744,7 @@ class H2Connection {
         this.control = null;
         this.stopped = false;
         this.registered = false;
+        this.registrationFailed = false;
         this.windowWaiters = [];
     }
 
@@ -3300,6 +3307,9 @@ class ControlStream {
                     this.connection.registered = true;
                 } else {
                     this.log.warning('tunnel registration failed: ' + (result.error || 'unknown error'));
+                    // 🛡️ 注册失败: 结束本轮连接, 由重连循环计数, 连续失败达阈值后自动重新注册换新域名
+                    this.connection.registrationFailed = true;
+                    this.connection.stopped = true;
                 }
             } catch (err) {
                 this.log.debug('ignoring control RPC message: ' + err);
@@ -3514,7 +3524,13 @@ function connectEdge(verifyCertificate, logger) {
                             sock.destroy(new Error('edge did not negotiate h2'));
                             return;
                         }
-                        sock.setTimeout(0);
+                        // 🛡️ 空闲超时防半开假死: edge 有周期 PING, 长时间无任何入站数据 = 连接已死,
+                        // 主动断开走重连 (KISAMA_ARGO_IDLE_TIMEOUT 可调, 0=禁用)
+                        if (argoIdleTimeoutMs > 0) {
+                            sock.setTimeout(argoIdleTimeoutMs, () => sock.destroy(new Error('edge connection idle timeout')));
+                        } else {
+                            sock.setTimeout(0);
+                        }
                         logger.info('connected to ' + host + ':' + EDGE_PORT);
                         resolve(sock);
                     });
@@ -3535,6 +3551,27 @@ function connectEdge(verifyCertificate, logger) {
 // ============================================================================
 const argoRetrySeconds = 2;
 
+// 🛡️ 守护自愈参数: trycloudflare 临时资源在 edge 连接全断后会被 Cloudflare 回收,
+// 旧凭据重连注册永远失败 (域名永久失效, 即"ECONNRESET 后连不上"的根因)。
+// 连续失败 N 次后重新注册换取新域名并回调通知 (KMODE=2 自动再上报 / KMODE=1 自动重写域名文件)。
+function argoEnvInt(name, fallback, minimum) {
+  const raw = parseInt(process.env[name] || '', 10);
+  if (!Number.isInteger(raw) || raw < minimum) {
+    return fallback;
+  }
+  return raw;
+}
+const argoReregisterAfter = argoEnvInt('KISAMA_ARGO_REREGISTER_AFTER', 5, 2);   // 连续失败阈值
+const argoReregisterRetrySeconds = 30;                                          // 重新注册失败后的退避
+// 读空闲超时 (秒): edge 有周期 PING, 长时间无任何入站数据 = 半开假死, 主动断开走重连; 0=禁用
+const argoIdleTimeoutMs = (() => {
+  const raw = parseInt(process.env.KISAMA_ARGO_IDLE_TIMEOUT || '', 10);
+  if (!Number.isInteger(raw) || raw < 0) {
+    return 300 * 1000;
+  }
+  return raw === 0 ? 0 : Math.max(raw, 10) * 1000;
+})();
+
 function parseJsonBody(raw) {
   if (typeof raw === 'string') {
     const trimmed = raw.trim();
@@ -3550,6 +3587,8 @@ class ArgoTunnelManager {
   constructor(logger) {
     this.log = logger;
     this.tunnels = new Map(); // port -> Array<tunnelEntry>
+    // 🛡️ 守护重建换新域名时的回调 (oldDomain, newDomain); KMODE 接线后自动再上报/重写域名文件
+    this.onDomainChange = null;
   }
 
   async create(port, duplicate) {
@@ -3651,8 +3690,17 @@ class ArgoTunnelManager {
 
   async _runLoop(entry, accountTag, tunnelSecret, tunnelId) {
     const origin = 'http://127.0.0.1:' + entry.port;
+    // 可打断 sleep: remove() 会 await 本循环, 长退避必须能被 entry.stopped 提前唤醒
+    const sleep = async (ms) => {
+      for (let waited = 0; waited < ms && !entry.stopped; waited += 500) {
+        await new Promise((resolve) => setTimeout(resolve, Math.min(500, ms - waited)));
+      }
+    };
+    let failures = 0;   // 🛡️ 连续失败计数 (连接失败/注册失败): 本轮注册过=旧凭据仍有效, 清零
+    let connIndex = 0;  // 注册索引轮换, 降低 edge 侧旧连接残留导致的注册拒绝
     while (!entry.stopped) {
       let sock = null;
+      let conn = null;
       try {
         // 🔐 A-2: 默认校验 Cloudflare edge 证书; 自定义链路确需豁免时 KISAMA_EDGE_INSECURE=true
         const edgeVerifyCert = String(process.env.KISAMA_EDGE_INSECURE || '').toLowerCase() !== 'true';
@@ -3662,10 +3710,12 @@ class ArgoTunnelManager {
           break;
         }
         entry.sock = sock;
-        await new H2Connection(
-          sock, origin, accountTag, tunnelSecret, tunnelId, 0,
+        connIndex = (connIndex + 1) % 4;
+        conn = new H2Connection(
+          sock, origin, accountTag, tunnelSecret, tunnelId, connIndex,
           this.log, entry.tunnelDomain, false, { printed: true }
-        ).run();
+        );
+        await conn.run();
       } catch (err) {
         if (!entry.stopped) {
           this.log.warning('argo tunnel ' + entry.tunnelDomain + ' connection closed: ' + err.message);
@@ -3676,10 +3726,46 @@ class ArgoTunnelManager {
         }
         entry.sock = null;
       }
+      if (entry.stopped) {
+        break;
+      }
+      if (conn !== null && conn.registered) {
+        failures = 0;
+      } else {
+        failures += 1;
+        if (failures >= argoReregisterAfter) {
+          // 🛡️ 旧凭据已被 Cloudflare 回收: 重新注册换取新域名, 回调通知后继续新域名下的重连
+          if (await this._reregister(entry, (tag, secret, id) => { accountTag = tag; tunnelSecret = secret; tunnelId = id; })) {
+            failures = 0;
+          } else {
+            // 重新注册失败: 退避更久再试, 避免高频请求 api.trycloudflare.com
+            await sleep(argoReregisterRetrySeconds * 1000);
+          }
+        }
+      }
       if (!entry.stopped) {
-        await new Promise((resolve) => setTimeout(resolve, argoRetrySeconds * 1000));
+        await sleep(argoRetrySeconds * 1000);
       }
     }
+  }
+
+  // 🛡️ 重新注册快速隧道: 成功则更新 entry.tunnelDomain 并触发 onDomainChange 回调
+  // (_requester 为测试注入缝, 生产恒为 requestQuickTunnel)
+  _reregister(entry, applyCredentials) {
+    const requester = this._requester || requestQuickTunnel;
+    return requester('https://api.trycloudflare.com').then(([hostname, accountTag, tunnelSecret, tunnelId]) => {
+      const oldDomain = entry.tunnelDomain;
+      applyCredentials(accountTag, tunnelSecret, tunnelId);
+      entry.tunnelDomain = hostname.startsWith('https://') ? hostname : 'https://' + hostname;
+      this.log.warning('argo tunnel domain changed: ' + oldDomain + ' -> ' + entry.tunnelDomain);
+      if (typeof this.onDomainChange === 'function') {
+        try { this.onDomainChange(oldDomain, entry.tunnelDomain); } catch (ignored) {}
+      }
+      return true;
+    }).catch((err) => {
+      this.log.warning('argo tunnel re-register failed: ' + err.message);
+      return false;
+    });
   }
 }
 
@@ -3688,6 +3774,8 @@ class ArgoTunnelManager {
 // KMODE=1 时: 启动即建临时隧道并把域名写入 KPATH 文件 (缺省 $HOME/domain.txt);
 // 第一次 /api/baseinfo 成功响应后删除该文件; stdin 收到 /domain 指令时输出域名。
 // KMODE=2 时: 启动即建临时隧道并把域名上报至 shz.al (可预测 URL, 全程静默)。
+// 🛡️ 守护自愈: 隧道凭据被 Cloudflare 回收时自动重新注册, 域名会变化 ——
+// KMODE=1 自动重写域名文件, KMODE=2 自动重新上报 shz.al (409 冲突走 PUT 覆盖)。
 // ============================================================================
 class KModeController {
   static _baseinfoHooked = false; // 域名文件只删一次
@@ -3718,7 +3806,7 @@ class KModeController {
   }
 
   // 上报隧道域名到 shz.al: POST 创建 (409 冲突则 PUT 覆盖), 默认全程静默 —
-  // 不输出域名 / 上报结果 / 平台 URL, 任何失败直接放弃, 不影响正常启动。
+  // 不输出域名 / 上报结果 / 平台 URL, 失败 resolve(false), 不影响正常启动。
   // 调 DEBUG=true (或 SHZAL_DEBUG=true) 时输出上报过程与结果, 便于排查上报失败原因。
   static reportShzalDebug() {
     return Config.DEBUG || String(process.env.SHZAL_DEBUG || '').toLowerCase() === 'true';
@@ -3746,6 +3834,8 @@ class KModeController {
                      'User-Agent': 'curl/8.5.0' }   // Cloudflare 拦截无 UA / Python UA 请求
         }, (res) => { res.resume(); res.on('end', () => cb(res.statusCode)); });
         req.on('error', (e) => { dbg(method + ' ' + url + ' 请求异常: ' + e.message); cb(0); });
+        // 上报挂死会卡住守护重试链路, 统一 30s 超时兜底
+        req.setTimeout(30000, () => req.destroy(new Error('shz.al request timeout')));
         if (list) req.write(list);
         req.end();
       };
@@ -3759,18 +3849,34 @@ class KModeController {
             const putFields = fields.filter(([k]) => k !== 'n');
             post(`https://shz.al/~${name}:${key}`, buildBody(putFields), 'PUT', (putCode) => {
               dbg('PUT 覆盖状态: ' + putCode + (putCode === 200 ? ' (成功)' : ' (失败)'));
-              resolve();
+              resolve(putCode === 200);
             });
           } else if (code === 200) {
             dbg('上报成功');
-            resolve();
+            resolve(true);
           } else {
-            dbg('上报失败 (状态 ' + code + '), 已放弃');
-            resolve();
+            dbg('上报失败 (状态 ' + code + ')');
+            resolve(false);
           }
         });
-      } catch (e) { dbg('上报异常: ' + e.message); resolve(); }
-    }).then(() => { this._domain = domain; }).catch(() => {});
+      } catch (e) { dbg('上报异常: ' + e.message); resolve(false); }
+    }).then((ok) => {
+      if (ok) this._domain = domain;
+      return ok;
+    }).catch(() => false);
+  }
+
+  // 🛡️ 守护重建后的新域名上报: 指数退避重试 3 次 (2s/4s/8s), 全程静默 —
+  // 新域名必须尽量送达, 否则控制端按预测 URL 将读到旧值/404
+  static async reportDomainChange(domain) {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      if (await this.reportShzal(domain)) {
+        return;
+      }
+      if (attempt < 3) {
+        await new Promise((resolve) => setTimeout(resolve, 1000 * 2 ** attempt));
+      }
+    }
   }
 
   static homeDir() {
@@ -3843,12 +3949,16 @@ class KModeController {
     // KMODE=1: 隧道 + 域名文件 + stdin 监听; KMODE=2: 隧道 + shz.al 静默上报
     if (Config.KMODE === '2' && this.knameValid()) {
       Logger.info('[KMODE] 🚀 KMODE=2: 隧道域名将上报至外部平台');
+      // 🛡️ 守护重建换新域名时自动重新上报 (静默重试, 回调异常不影响重连循环)
+      argoTunnelManager.onDomainChange = (oldDomain, newDomain) => { this.reportDomainChange(newDomain); };
       argoTunnelManager.create(Config.PORT)
         .then((entry) => this.reportShzal(entry.tunnelDomain))
         .catch(() => { /* 全程静默 */ });
       return;
     }
     Logger.info('[KMODE] 🚀 KMODE=1: 启动时自动创建临时隧道');
+    // 🛡️ 守护重建换新域名时自动重写域名文件 (原文件可能已被 baseinfo 钩子删除)
+    argoTunnelManager.onDomainChange = (oldDomain, newDomain) => { this.writeDomainFile(newDomain); };
     argoTunnelManager.create(Config.PORT).then((entry) => {
       this.writeDomainFile(entry.tunnelDomain);
     }).catch((e) => {

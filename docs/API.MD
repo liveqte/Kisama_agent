@@ -6,6 +6,9 @@
 ## KMODE 启动模式
 通过环境变量KMODE控制，用于在启动时自动创建临时隧道，并以文件/stdin（KMODE=1）或 shz.al 静默上报（KMODE=2）的方式交付隧道域名，详见「九、KMODE 启动模式」一节。
 
+## 日志级别
+通过环境变量LOG_LEVEL控制（py/js/go/java/java11 五语言统一，0=DEBUG / 1=INFO / 2=WARN / 3=ERROR），缺省 `3` 即生产只输出错误日志；未显式设置且 `DEBUG=true` 时接管为 `0`（调试全量输出），详见「十一、日志级别」一节。
+
 【安全说明】
 除了/api/baseinfo、/api/status 以及 /kisamaproxy 转发器（纯转发，不参与认证）外，
 其他所有接口均受 AuthEncryptMiddleware 保护。
@@ -486,7 +489,7 @@ GET /kisamaproxy/https://host:8443/api/exec
 输入：无  
 行为约定：
 - 返回所有**存活中**的临时隧道（含通过 `duplicate: true` 创建的重复隧道）；
-- 隧道失效（cloudflared 进程退出 / 与 trycloudflare 连接断开）后自动从列表移除；
+- 🛡️ **0.5.2 起隧道具备守护自愈能力**：与 edge 断开后自动重连（短暂抖动域名不变）；若旧隧道凭据被 Cloudflare 回收（连续重连失败达阈值），代理端自动重新注册并**更换新域名**，本接口返回的 `tunnel_domain` 始终为**最新域名**（详见「九、KMODE 启动模式」的「隧道守护自愈」小节）；
 - 无隧道时返回空列表（`count: 0`）。  
 返回示例：
 ```
@@ -714,6 +717,29 @@ curl -X PUT "https://shz.al/~env01a:s3cret-key" -F "c=new-value"
 
 安全提示：预测 URL 无认证即可读（shz.al 平台特性），其暴露的仅是隧道域名本身；隧道背后的 agent 接口仍有完整认证与加密，风险面与 KMODE=1 写本地域名文件相当。
 
+### 隧道守护自愈（0.5.2，四版本统一）
+
+trycloudflare Quick Tunnel 是临时资源：与 Cloudflare edge 的连接全部断开一段时间后，Cloudflare 侧的隧道记录与域名路由会被回收。0.5.2 之前守护线程只用**首次注册的旧凭据**每 2 秒重连，回收后注册永远失败，表现为日志反复出现 `connection closed: read ECONNRESET` 且隧道永久失联。0.5.2 起引入三层自愈（py / js / java / java11 同步）：
+
+1. **断线自动重连（原有）**：固定 2 秒间隔重连 edge；只要旧凭据仍有效（注册成功），**域名保持不变**——短暂网络抖动不会导致换域名、不影响 KMODE 已上报的值。
+2. **凭据失效自动重新注册（新增）**：连续重连失败达到阈值（默认 5 次，约 10~15 秒）后，自动向 `api.trycloudflare.com` 重新注册并**更换新随机域名**（trycloudflare 平台限制，无法保留旧域名），日志输出 `domain changed: <旧域名> -> <新域名>`；重新注册自身失败则 30 秒退避重试。注册索引（connIndex）随重连轮换（0~3），降低 edge 侧旧连接残留导致的注册拒绝。
+3. **域名变更自动通知（新增）**：重新注册成功后触发 `onDomainChange(旧域名, 新域名)` 回调：
+   - **KMODE=2**：自动把新域名重新上报 shz.al（409 冲突走 PUT 覆盖，指数退避重试 3 次），控制端照常轮询同一预测 URL 即可拿到新域名，无需任何干预；
+   - **KMODE=1**：自动重写 KPATH 域名文件（原文件即使已被 baseinfo 钩子删除也会重写），stdin `/domain` 指令输出最新域名；
+   - **无 KMODE（面板 /api/argo 创建的隧道）**：无额外动作，面板刷新 `GET /api/argo` 即得新域名。
+4. **半开假死防护（新增）**：edge 连接开启读空闲超时（默认 300 秒无任何入站数据即主动断开重连；edge 本有周期 PING，正常连接不会触发），根治 NAT/防火墙静默断流导致的"连接看似活着但永远收不到数据"的假死。
+5. **守护线程永不静默死亡（py 版修复）**：重连循环改为全量捕获异常（此前仅捕获 `OSError/EOFError/ValueError`，其他异常会让守护线程无声退出、隧道永久失联）。
+
+守护行为环境变量（四版本统一，支持同目录 `.env`）：
+
+| 环境变量 | 默认值 | 说明 |
+| :--- | :--- | :--- |
+| KISAMA_ARGO_REREGISTER_AFTER | `5` | 连续重连失败多少次后判定旧凭据已被回收并重新注册换新域名（最小 2；调小恢复更快但更易在短暂抖动时换域名） |
+| KISAMA_ARGO_IDLE_TIMEOUT | `300` | edge 连接读空闲超时秒数，无任何入站数据即主动断开重连（最小 10；`0`=禁用半开检测） |
+| KISAMA_EDGE_HOSTS | region1/2.v2.argotunnel.com | edge 入口覆盖（逗号分隔）；守护自愈验收（verify_all.py 场景 6）借此模拟"edge 不可达" |
+
+**控制端对换域名的处理建议**：轮询场景（KMODE=2 / GET /api/argo）天然兼容——检测到域名变化后用新域名重连即可；持有旧域名的连接在换域名后会失败，属预期行为，重试读取最新域名即可恢复。
+
 
 ## 十、x-encrypted 响应模式头规范（0.5.x 起六端强制统一）
 
@@ -828,3 +854,30 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，**请�
 ### 自动化文档地址
 * **交互式文档 (Swagger UI):** `/docs` (仅在 `DEBUG=true` 时可用，仅python版本有此文档)
 * **原始定义 (OpenAPI JSON):** `/openapi.json` (仅在 `DEBUG=true` 时可用，仅python版本有此文档)
+
+## 十一、日志级别（LOG_LEVEL，0.5.3 起五语言统一）
+
+### 取值定义（四级阈值式，与常见日志框架语义一致）
+
+| 级别 | 值 | 含义 |
+| :--- | :--- | :--- |
+| DEBUG | `0` | 调试明细（全量） |
+| INFO | `1` | 一般运行信息（含 DEBUG） |
+| WARN | `2` | 警告（含 INFO 及以下） |
+| ERROR | `3` | 仅错误 |
+
+阈值式输出：当前日志级别 **≥ 设定阈值** 才输出。例如 `LOG_LEVEL=2` 输出 WARN 与 ERROR，`LOG_LEVEL=3` 只输出 ERROR。
+
+### 环境变量与默认值
+
+| 环境变量 | 默认值 | 说明 |
+| :--- | :--- | :--- |
+| LOG_LEVEL | `3` | 输出阈值（`0`~`3`，支持 `debug`/`info`/`warn`/`error` 字符串写法，仅 go）；缺省 `3` 即**生产环境只输出错误日志** |
+| DEBUG | `false` | **接管日志级别**：`DEBUG=true` 且未显式设置 `LOG_LEVEL` 时，阈值强制为 `0`（调试全量输出）；显式设置了 `LOG_LEVEL` 时以 `LOG_LEVEL` 为准（go）|
+| LOG | （已废弃） | 原 java 版布尔总开关已于 0.5.3 移除，由 `LOG_LEVEL` + `DEBUG` 组合替代 |
+
+各语言细节：
+- **js**（`js/agent.js` Logger）：四级阈值，缺省 `3`；`DEBUG=true` 且未设置 `LOG_LEVEL` 时为 `0`。所有级别均走 stdout（ERROR 红色）。
+- **go**（`go/logger`）：四级阈值，缺省 `3`；`DEBUG=true` 且未设置时为 `0`。ERROR 走 stderr，其余走 stdout。
+- **java / java11**（`kisama.java`）：四级阈值，缺省 `3`；`DEBUG=true` 接管为 `0`。ERROR 走 stderr，其余走 stdout，输出统一带 `[DEBUG]/[INFO]/[WARN]/[ERROR]` 前缀。0.5.3 起废弃 `LOG` 布尔开关。
+- **py**（`py/agent.py` Logger）：0.5.3 起纳入同一四级阈值体系，缺省 `3`；`DEBUG=true` 且未设置 `LOG_LEVEL` 时为 `0`（全量含全部调试频道）。原有细分调试频道整体平移到**高位频道 11~15**（与标准四级互不干扰）：`11`=基本信息、`12`=WebSocket传输、`13`=终端日志、`14`=网络统计、`15`=磁盘统计。阈值设为 `11~15` 时常规日志（INFO/WARN/ERROR）全出、且**精确打开对应一个调试频道**；`LOG_LEVEL=0` 时全量输出全部频道。代码内 `Logger.debug(msg, channel)` 的 channel 参数即频道号（缺省 11），DEBUG 行按 `[DEBUG]` 标签输出（ERROR 走 stderr，其余 stdout）。

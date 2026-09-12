@@ -38,7 +38,7 @@ type Logger struct {
 }
 
 var defaultLogger = &Logger{
-	currentLevel: WARN,
+	currentLevel: ERROR,   // Init() 前的兜底与生产默认一致: 只输出错误日志
 }
 
 // SetLevel sets the current log level
@@ -109,13 +109,15 @@ func Errorf(format string, args ...interface{}) {
 }
 
 // Initialize logger from environment
+// 四级阈值日志 (对齐 js): DEBUG=0/INFO=1/WARN=2/ERROR=3, LOG_LEVEL 环境变量控制输出阈值;
+// 缺省 ERROR (只输出错误日志), DEBUG=true 接管为 DEBUG 级 (调试全量输出)
 func Init() {
 	levelStr := os.Getenv("LOG_LEVEL")
 	if levelStr == "" {
 		if os.Getenv("DEBUG") == "true" {
 			SetLevel(DEBUG)
 		} else {
-			SetLevel(WARN)
+			SetLevel(ERROR)
 		}
 	} else {
 		var level LogLevel
@@ -129,7 +131,7 @@ func Init() {
 		case "3", "error", "ERROR":
 			level = ERROR
 		default:
-			level = WARN
+			level = ERROR
 		}
 		SetLevel(level)
 	}

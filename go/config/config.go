@@ -212,7 +212,9 @@ func New() (*Config, error) {
 		}
 	}
 
-	logLevel := 2
+	// 日志级别 (0=DEBUG/1=INFO/2=WARN/3=ERROR): LOG_LEVEL 环境变量控制, 缺省 3=只输出错误;
+	// 未显式设置且 DEBUG=true 时接管为 0 (调试全量输出)
+	logLevel := 3
 	if val := os.Getenv("LOG_LEVEL"); val != "" {
 		if n, err := strconv.Atoi(val); err == nil {
 			logLevel = n
@@ -273,7 +275,7 @@ func New() (*Config, error) {
 
 	agentVersion := os.Getenv("AGENT_VERSION")
 	if agentVersion == "" {
-		agentVersion = "0.5.1-go"
+		agentVersion = "0.5.3-go"
 	}
 
 	tempKeyDefaultTTL := 24
