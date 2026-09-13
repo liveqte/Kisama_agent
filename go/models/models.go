@@ -280,6 +280,30 @@ type FileMkdirRequest struct {
 	Path string `json:"path"`
 }
 
+// ========== File ZIP/Unzip Models (0.5.4, docs/API.MD 12.1/12.2) ==========
+
+// FileZipRequest represents a zip packing request
+type FileZipRequest struct {
+	Path  string   `json:"path"`  // 目标 zip 路径; 父目录自动创建, 已存在时覆盖重建
+	Items []string `json:"items"` // 待压缩文件/目录列表; 目录递归打包; 单项失败不中断
+	Flat  bool     `json:"flat"`  // true 时目录内容不带顶层目录名前缀
+}
+
+// FileZipItemResult represents a per-item zip result
+type FileZipItemResult struct {
+	Item   string `json:"item"`
+	Status string `json:"status"` // ok / not_found / partial / skipped / error
+	Added  int    `json:"added"`
+}
+
+// FileUnzipRequest represents an unzip request
+type FileUnzipRequest struct {
+	Path      string   `json:"path"`      // zip 压缩包路径 (安全沙箱内)
+	DestPath  string   `json:"dest_path"` // 缺省为 zip 所在目录 ("解压到此处"); 目录不存在自动创建
+	Overwrite *bool    `json:"overwrite"` // 缺省 true; false 时目标已存在则跳过并计入 skipped
+	Entries   []string `json:"entries"`   // 仅解压匹配条目 (精确名或不带路径匹配), 缺省解压全部
+}
+
 // ========== Task Models ==========
 
 // TaskLogEntry represents a task log entry

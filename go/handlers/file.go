@@ -1,13 +1,18 @@
 package handlers
 
 import (
+	"archive/zip"
 	"bytes"
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -586,6 +591,374 @@ func MkdirRecursive(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"status": "ok",
 		"path":   req.Path,
+	})
+}
+
+// ========== File ZIP/Unzip (0.5.4, docs/API.MD 12.1/12.2) ==========
+
+// zipMaxEntries 限制写入 zip 的总条目数 (docs/API.MD 12.1/12.2)
+const zipMaxEntries = 20000
+
+// zipMaxTotalBytes 限制解压总 uncompressed 字节 (docs/API.MD 12.1)
+const zipMaxTotalBytes = int64(512) * 1024 * 1024
+
+// zipMaxListedFiles 响应 files 列表最多返回条数, 超出置 files_truncated=true
+const zipMaxListedFiles = 500
+
+// errZipEntryLimit 达到条目上限时中断 WalkDir 的哨兵错误
+var errZipEntryLimit = errors.New("zip entry limit reached")
+
+// relDisplay 沙箱内相对显示路径 (沙箱根显示为 ".")
+func relDisplay(root, target string) string {
+	rel, err := filepath.Rel(root, target)
+	if err != nil {
+		return target
+	}
+	return rel
+}
+
+// ZipFile 将文件/目录(递归)打包为 zip (0.5.4, docs/API.MD 12.2):
+// 父目录自动创建、已存在时覆盖重建 (等价 zip -r)、单项失败不中断
+func ZipFile(c *gin.Context) {
+	cfg := config.Get()
+
+	var req models.FileZipRequest
+	if err := c.BindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
+		return
+	}
+	if req.Path == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "path required"})
+		return
+	}
+	if len(req.Items) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "items required (non-empty array)"})
+		return
+	}
+
+	absZip := filepath.Join(cfg.FileRoot, req.Path)
+	if !isPathInsideFileRoot(cfg.FileRoot, absZip) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied"})
+		return
+	}
+	if info, err := os.Stat(absZip); err == nil && info.IsDir() {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Target is a directory"})
+		return
+	}
+
+	if err := os.MkdirAll(filepath.Dir(absZip), 0755); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create directory"})
+		return
+	}
+
+	zipFile, err := os.Create(absZip) // os.Create 截断 = 覆盖重建
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to create zip"})
+		return
+	}
+
+	w := zip.NewWriter(zipFile)
+	used := 0
+	addedTotal := 0
+	truncated := false
+	results := make([]models.FileZipItemResult, 0, len(req.Items))
+
+	addFile := func(absPath, name string) bool {
+		if used >= zipMaxEntries {
+			return false
+		}
+		info, err := os.Stat(absPath)
+		if err != nil || info.IsDir() {
+			return true
+		}
+		fh, err := zip.FileInfoHeader(info)
+		if err != nil {
+			return true
+		}
+		fh.Name = filepath.ToSlash(name)
+		fh.Method = zip.Deflate
+		fh.Modified = info.ModTime()
+		dst, err := w.CreateHeader(fh)
+		if err != nil {
+			return true
+		}
+		src, err := os.Open(absPath)
+		if err != nil {
+			return true
+		}
+		defer src.Close()
+		if _, err := io.Copy(dst, src); err != nil {
+			return true
+		}
+		used++
+		return true
+	}
+	addDirEntry := func(dirInfo os.FileInfo, name string) bool {
+		if used >= zipMaxEntries {
+			return false
+		}
+		fh, err := zip.FileInfoHeader(dirInfo)
+		if err != nil {
+			return true
+		}
+		fh.Name = filepath.ToSlash(name) + "/" // 目录条目带尾 / 保留空目录
+		fh.Modified = dirInfo.ModTime()
+		if _, err := w.CreateHeader(fh); err != nil {
+			return true
+		}
+		used++
+		return true
+	}
+
+	for _, item := range req.Items {
+		if truncated {
+			results = append(results, models.FileZipItemResult{Item: item, Status: "skipped"})
+			continue
+		}
+		absItem := filepath.Join(cfg.FileRoot, item)
+		if !isPathInsideFileRoot(cfg.FileRoot, absItem) {
+			results = append(results, models.FileZipItemResult{Item: item, Status: "error"})
+			continue
+		}
+		info, err := os.Stat(absItem)
+		if err != nil {
+			results = append(results, models.FileZipItemResult{Item: item, Status: "not_found"})
+			continue
+		}
+		added := 0
+		if !info.IsDir() {
+			if !addFile(absItem, filepath.Base(item)) {
+				truncated = true
+				results = append(results, models.FileZipItemResult{Item: item, Status: "skipped"})
+				continue
+			}
+			added = 1
+		} else {
+			// 目录递归打包; 非 flat 时条目名带顶层目录名前缀
+			base := ""
+			if !req.Flat {
+				base = filepath.Base(item)
+			}
+			status := "ok"
+			if item == "" || item == "." {
+				base = ""
+			}
+			walkErr := filepath.WalkDir(absItem, func(p string, d fs.DirEntry, werr error) error {
+				if werr != nil {
+					return nil // 单个不可读条目不中断
+				}
+				rel, rerr := filepath.Rel(absItem, p)
+				if rerr != nil {
+					return nil
+				}
+				if rel == "." {
+					return nil
+				}
+				name := rel
+				if base != "" {
+					name = base + string(filepath.Separator) + rel
+				}
+				if d.IsDir() {
+					dirInfo, ierr := d.Info()
+					if ierr != nil {
+						return nil
+					}
+					if !addDirEntry(dirInfo, name) {
+						return errZipEntryLimit
+					}
+					return nil
+				}
+				if !addFile(p, name) {
+					return errZipEntryLimit
+				}
+				added++
+				return nil
+			})
+			if walkErr == errZipEntryLimit {
+				status = "partial"
+				truncated = true
+			}
+			results = append(results, models.FileZipItemResult{Item: item, Status: status, Added: added})
+			addedTotal += added
+			continue
+		}
+		addedTotal += added
+		results = append(results, models.FileZipItemResult{Item: item, Status: "ok", Added: added})
+	}
+
+	if err := w.Close(); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to write zip"})
+		return
+	}
+	if err := zipFile.Close(); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to write zip"})
+		return
+	}
+	size := 0
+	if info, err := os.Stat(absZip); err == nil {
+		size = int(info.Size())
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":  "ok",
+		"path":    relDisplay(cfg.FileRoot, absZip),
+		"entries": addedTotal,
+		"size":    size,
+		"results": results,
+	})
+}
+
+// UnzipFile 解压 zip 到指定目录 (0.5.4, docs/API.MD 12.1):
+// 缺省解压到 zip 所在目录; 防 zip-slip (归一化后逃出目标目录的条目计入 skipped 不报错);
+// 限额 20000 条目 / 512MB, 超出部分计入 skipped
+func UnzipFile(c *gin.Context) {
+	cfg := config.Get()
+
+	var req models.FileUnzipRequest
+	if err := c.BindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
+		return
+	}
+	if req.Path == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "path required"})
+		return
+	}
+
+	absZip := filepath.Join(cfg.FileRoot, req.Path)
+	if !isPathInsideFileRoot(cfg.FileRoot, absZip) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied"})
+		return
+	}
+	if info, err := os.Stat(absZip); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Zip not found"})
+		return
+	} else if info.IsDir() {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Path is a directory"})
+		return
+	}
+
+	absDest := filepath.Dir(absZip) // 缺省: 解压到此处
+	if req.DestPath != "" {
+		absDest = filepath.Join(cfg.FileRoot, req.DestPath)
+		if !isPathInsideFileRoot(cfg.FileRoot, absDest) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "Access denied"})
+			return
+		}
+	}
+	if fi, err := os.Stat(absDest); err == nil && !fi.IsDir() {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Destination is a file"})
+		return
+	}
+	if err := os.MkdirAll(absDest, 0755); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create directory"})
+		return
+	}
+
+	overwrite := req.Overwrite == nil || *req.Overwrite
+
+	reader, err := zip.OpenReader(absZip)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Not a zip file"})
+		return
+	}
+	defer reader.Close()
+
+	extracted, skipped := 0, 0
+	var totalBytes int64
+	files := []string{}
+	filesTruncated := false
+
+	for _, f := range reader.File {
+		if extracted+skipped >= zipMaxEntries || totalBytes >= zipMaxTotalBytes {
+			skipped++
+			continue
+		}
+		if len(req.Entries) > 0 {
+			name := filepath.ToSlash(f.Name)
+			base := path.Base(name)
+			matched := false
+			for _, e := range req.Entries {
+				ne := filepath.ToSlash(strings.TrimPrefix(e, "/"))
+				if name == ne || base == ne {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				skipped++
+				continue
+			}
+		}
+		if f.Flags&0x1 != 0 { // 加密条目
+			skipped++
+			continue
+		}
+		if totalBytes+int64(f.UncompressedSize64) > zipMaxTotalBytes {
+			skipped++
+			continue
+		}
+		// zip-slip: 归一化后必须仍在目标目录内
+		cleaned := filepath.Clean(filepath.Join(absDest, f.Name))
+		relToDest, rerr := filepath.Rel(absDest, cleaned)
+		if rerr != nil || relToDest == ".." ||
+			strings.HasPrefix(relToDest, ".."+string(filepath.Separator)) || filepath.IsAbs(relToDest) {
+			skipped++
+			continue
+		}
+		if f.FileInfo().IsDir() {
+			// 目录条目: 按归一化路径创建目录 (保留空目录并支撑后续文件写入)
+			if err := os.MkdirAll(cleaned, 0755); err != nil {
+				skipped++
+			}
+			continue
+		}
+		if !overwrite {
+			if _, err := os.Stat(cleaned); err == nil {
+				skipped++
+				continue
+			}
+		}
+		// 上游无目录条目的 zip 也能写入: 写文件前先确保父目录存在
+		if err := os.MkdirAll(filepath.Dir(cleaned), 0755); err != nil {
+			skipped++
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			skipped++
+			continue
+		}
+		out, err := os.OpenFile(cleaned, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+		if err != nil {
+			rc.Close()
+			skipped++
+			continue
+		}
+		n, cerr := io.Copy(out, rc)
+		closeErr := out.Close()
+		rc.Close()
+		if cerr != nil || closeErr != nil {
+			os.Remove(cleaned)
+			skipped++
+			continue
+		}
+		extracted++
+		totalBytes += n
+		if len(files) < zipMaxListedFiles {
+			files = append(files, relDisplay(cfg.FileRoot, cleaned))
+		} else {
+			filesTruncated = true
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":          "ok",
+		"path":            relDisplay(cfg.FileRoot, absZip),
+		"dest":            relDisplay(cfg.FileRoot, absDest),
+		"extracted":       extracted,
+		"skipped":         skipped,
+		"files":           files,
+		"files_truncated": filesTruncated,
 	})
 }
 

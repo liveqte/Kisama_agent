@@ -289,6 +289,47 @@ X-Total-Chunks: 1
 { "status": "ok", "path": "tmp/new/project/logs" }
 ```
 
+### 12.1 解压 ZIP 文件
+路径：POST /api/file/unzip
+用途：解压代理端 zip 压缩包到指定目录（防 zip-slip，条目与体积限额）
+输入示例：
+```
+{ "path": "/tmp/archive.zip", "dest_path": "/tmp/extract", "overwrite": true, "entries": ["sub/data.txt"] }
+```
+输入字段：
+| 字段 | 类型 | 必填 | 说明 |
+| :--- | :--- | :---: | :--- |
+| path | string | 是 | zip 压缩包路径（安全沙箱内） |
+| dest_path | string | 否 | 解压目标目录，缺省为 zip 所在目录（"解压到此处"）；目录不存在自动创建 |
+| overwrite | boolean | 否 | 目标文件已存在时是否覆盖，默认 `true`；`false` 时跳过并计入 skipped |
+| entries | array | 否 | 仅解压匹配条目（精确名或不带路径匹配），缺省解压全部 |
+返回示例：
+```
+{ "status": "ok", "path": "tmp/archive.zip", "dest": "tmp/extract", "extracted": 5, "skipped": 1, "files": ["tmp/extract/a.txt", "tmp/extract/sub/b.txt"], "files_truncated": false }
+```
+字段说明：dest 为解压目标目录（显示相对路径，沙箱根显示为 `.`）；files 为解压出的路径（显示相对路径），最多返回 500 条，超出时 files_truncated=true；zip-slip 条目（归一化后逃出目标目录）不报错，计入 skipped；限额 20000 条目 / 512MB，超出部分计入 skipped。
+错误：400（path 缺失 / zip 文件不存在 / 非 zip 打不开 / 主机缺 zip 扩展）。
+
+### 12.2 压缩 ZIP 文件
+路径：POST /api/file/zip
+用途：将指定文件/目录（递归）打包为 zip 压缩包
+输入示例：
+```
+{ "path": "/tmp/out.zip", "items": ["/tmp/a.txt", "/tmp/logs"], "flat": false }
+```
+输入字段：
+| 字段 | 类型 | 必填 | 说明 |
+| :--- | :--- | :---: | :--- |
+| path | string | 是 | 目标 zip 路径；父目录自动创建；已存在时覆盖重建（等价 zip -r） |
+| items | array | 是 | 待压缩文件/目录列表；目录递归打包且带顶层目录名前缀；单项失败不中断 |
+| flat | boolean | 否 | 默认 `false`；`true` 时目录内容不带顶层目录名前缀 |
+返回示例：
+```
+{ "status": "ok", "path": "tmp/out.zip", "entries": 12, "size": 34567, "results": [{ "item": "/tmp/a.txt", "status": "ok", "added": 1 }, { "item": "/tmp/ghost", "status": "not_found" }] }
+```
+字段说明：entries 为写入 zip 的条目总数，size 为 zip 文件字节数；results 逐项回显请求中的 item 原始路径与压缩结果。条目数上限 20000。
+错误：400（path/items 缺失、items 非数组或为空、目标是目录、zip 创建失败、主机缺 zip 扩展）。
+
 ## 四、任务管理模块
 
 
@@ -820,6 +861,8 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，**请�
 | **文件移动** | PUT | `/api/file` | 批量移动 | ✅ | ✅ |
 | **文件批量复制** | POST | `/api/file/cp` | 批量复制 | ✅ | ✅ |
 | **新建目录** | POST | `/api/file/new` | 创建目录 | ✅ | ✅ |
+| **文件解压** | POST | `/api/file/unzip` | 解压 ZIP 压缩包 | ✅ | ✅ |
+| **文件压缩** | POST | `/api/file/zip` | 压缩 ZIP 压缩包 | ✅ | ✅ |
 | **启动任务-查** | GET | `/api/task/onetime` | 获取任务列表 | ✅ | ✅ |
 | **启动任务-设** | POST | `/api/task/onetime` | 设置并执行任务 | ✅ | ✅ |
 | **启动任务-重** | POST | `/api/task/onetime/execute` | 重试当前任务 | ✅ | ✅ |

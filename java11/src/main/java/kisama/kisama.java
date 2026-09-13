@@ -15,12 +15,16 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.security.*;
 import java.security.spec.X509EncodedKeySpec;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+import java.util.zip.*;
 import org.bouncycastle.jce.ECNamedCurveTable;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import org.bouncycastle.jce.spec.ECNamedCurveParameterSpec;
@@ -164,7 +168,7 @@ public class kisama {
 
     private static final int TEMPKEY_DEFAULT_TTL_HOURS = Integer.parseInt(DOTENV.getOrDefault("TEMPKEY_TTL", "24"));
     private static final int TEMPKEY_MAX_TTL_HOURS = Integer.parseInt(DOTENV.getOrDefault("TEMPKEY_MAX_TTL", "168"));
-    private static final String AGENT_VERSION = "0.5.3-java11";
+    private static final String AGENT_VERSION = "0.5.4-java11";
 
     private Map<String, Object> baseInfoCache = null;
     private long lastBaseInfoCacheTime = 0;
@@ -856,6 +860,20 @@ public class kisama {
         post("/api/file/new", (Route) fileNewHandler);
         post("/api/file/mkdir", (Route) fileNewHandler);
 
+        // 压缩 ZIP 文件 (0.5.4, docs/API.MD 12.2)
+        post("/api/file/zip", (Route) (req, res) -> {
+            Map<String, Object> body = req.attribute("json_body");
+            res.type("application/json");
+            return this.fileZipImpl(body);
+        });
+
+        // 解压 ZIP 文件 (0.5.4, docs/API.MD 12.1)
+        post("/api/file/unzip", (Route) (req, res) -> {
+            Map<String, Object> body = req.attribute("json_body");
+            res.type("application/json");
+            return this.fileUnzipImpl(body);
+        });
+
         get("/api/task/onetime", (req, res) -> {
             res.type("application/json");
             return this.gson.toJson(Map.of("status", "ok", "count", this.onetime.size(), "tasks", new ArrayList<>(this.onetime)));
@@ -1447,6 +1465,282 @@ public class kisama {
         } catch (Exception e) {
             return false;
         }
+    }
+
+    // ========== File ZIP/Unzip (0.5.4, docs/API.MD 12.1/12.2) ==========
+
+    // 限额: 条目数 / 解压总 uncompressed 字节; files 列表最多返回条数
+    private static final int ZIP_MAX_ENTRIES = 20000;
+    private static final long ZIP_MAX_TOTAL_BYTES = 512L * 1024 * 1024;
+    private static final int ZIP_MAX_LISTED_FILES = 500;
+
+    // 沙箱内相对显示路径 (沙箱根显示为 ".")
+    private String relDisplay(Path p) {
+        try {
+            String rel = Paths.get(this.FILE_ROOT).toAbsolutePath().relativize(p.toAbsolutePath()).toString();
+            return rel.isEmpty() ? "." : rel;
+        } catch (Exception e) {
+            return p.toString();
+        }
+    }
+
+    private Map<String, Object> zipItemRes(String item, String status, int added) {
+        Map<String, Object> r = new LinkedHashMap<>();
+        r.put("item", item);
+        r.put("status", status);
+        r.put("added", added);
+        return r;
+    }
+
+    private boolean zipPutFile(ZipOutputStream zos, Path file, String entryName) {
+        try {
+            ZipEntry entry = new ZipEntry(entryName.replace('\\', '/'));
+            entry.setTime(Files.getLastModifiedTime(file).toMillis());
+            zos.putNextEntry(entry);
+            Files.copy(file, zos);
+            zos.closeEntry();
+            return true;
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    private void zipPutDir(ZipOutputStream zos, Path dir, String entryName) {
+        try {
+            ZipEntry entry = new ZipEntry(entryName.replace('\\', '/') + "/"); // 目录条目带尾 / 保留空目录
+            entry.setTime(Files.getLastModifiedTime(dir).toMillis());
+            zos.putNextEntry(entry);
+            zos.closeEntry();
+        } catch (IOException ignored) {
+        }
+    }
+
+    // 压缩 ZIP: 父目录自动创建、已存在时覆盖重建 (等价 zip -r)、单项失败不中断 (docs/API.MD 12.2)
+    private String fileZipImpl(Map<String, Object> body) {
+        if (body == null || body.get("path") == null || body.get("path").toString().isBlank()) {
+            halt(400, this.gson.toJson(Map.of("status", "error", "message", "path required")));
+        }
+        Object itemsObj = body.get("items");
+        if (!(itemsObj instanceof List) || ((List<?>) itemsObj).isEmpty()) {
+            halt(400, this.gson.toJson(Map.of("status", "error", "message", "items required (non-empty array)")));
+        }
+        List<?> items = (List<?>) itemsObj;
+        boolean flat = Boolean.TRUE.equals(body.get("flat"));
+
+        Path zipPath = Paths.get(this.FILE_ROOT).resolve(Objects.toString(body.get("path"))).normalize();
+        if (!isPathInsideFileRoot(zipPath)) halt(403);
+        if (Files.exists(zipPath) && Files.isDirectory(zipPath)) {
+            halt(400, this.gson.toJson(Map.of("status", "error", "message", "Target is a directory")));
+        }
+        try {
+            if (zipPath.getParent() != null) Files.createDirectories(zipPath.getParent());
+            Files.deleteIfExists(zipPath);
+        } catch (IOException e) {
+            halt(400, this.gson.toJson(Map.of("status", "error", "message", "Failed to create zip")));
+        }
+
+        List<Map<String, Object>> results = new ArrayList<>();
+        int addedTotal = 0;
+        boolean truncated = false;
+        java.util.concurrent.atomic.AtomicInteger used = new java.util.concurrent.atomic.AtomicInteger();
+
+        try (ZipOutputStream zos = new ZipOutputStream(Files.newOutputStream(zipPath))) {
+            for (Object itemObj : items) {
+                String item = Objects.toString(itemObj, "");
+                if (truncated) {
+                    results.add(zipItemRes(item, "skipped", 0));
+                    continue;
+                }
+                Path src = Paths.get(this.FILE_ROOT).resolve(item).normalize();
+                if (!isPathInsideFileRoot(src)) {
+                    results.add(zipItemRes(item, "error", 0));
+                    continue;
+                }
+                if (!Files.exists(src)) {
+                    results.add(zipItemRes(item, "not_found", 0));
+                    continue;
+                }
+                int[] added = {0};
+                if (Files.isRegularFile(src)) {
+                    if (used.get() >= ZIP_MAX_ENTRIES || !zipPutFile(zos, src, src.getFileName().toString())) {
+                        truncated = true;
+                        results.add(zipItemRes(item, "skipped", 0));
+                        continue;
+                    }
+                    used.incrementAndGet();
+                    added[0] = 1;
+                } else if (Files.isDirectory(src)) {
+                    // 目录递归打包; 非 flat 时条目名带顶层目录名前缀; 目录条目 (带尾 /) 保留空目录
+                    String base = flat ? "" : src.getFileName().toString();
+                    String status = "ok";
+                    try (Stream<Path> walkStream = Files.walk(src)) {
+                        for (Path p : walkStream.sorted().collect(Collectors.toList())) {
+                            if (p.equals(src)) continue;
+                            String rel = src.relativize(p).toString();
+                            String name = base.isEmpty() ? rel : base + "/" + rel;
+                            if (Files.isDirectory(p)) {
+                                if (used.get() >= ZIP_MAX_ENTRIES) {
+                                    status = "partial";
+                                    truncated = true;
+                                    break;
+                                }
+                                zipPutDir(zos, p, name);
+                                used.incrementAndGet();
+                            } else if (Files.isRegularFile(p)) {
+                                if (used.get() >= ZIP_MAX_ENTRIES) {
+                                    status = "partial";
+                                    truncated = true;
+                                    break;
+                                }
+                                if (zipPutFile(zos, p, name)) {
+                                    used.incrementAndGet();
+                                    added[0]++;
+                                }
+                            }
+                        }
+                    } catch (IOException ignored) {
+                        // 单个不可读条目不中断
+                    }
+                    results.add(zipItemRes(item, status, added[0]));
+                    addedTotal += added[0];
+                    continue;
+                } else {
+                    results.add(zipItemRes(item, "error", 0));
+                    continue;
+                }
+                addedTotal += added[0];
+                results.add(zipItemRes(item, "ok", added[0]));
+            }
+        } catch (IOException e) {
+            halt(400, this.gson.toJson(Map.of("status", "error", "message", "Zip failed: " + e.getMessage())));
+        }
+
+        long size = 0;
+        try {
+            size = Files.size(zipPath);
+        } catch (IOException ignored) {
+        }
+        Map<String, Object> resp = new LinkedHashMap<>();
+        resp.put("status", "ok");
+        resp.put("path", relDisplay(zipPath));
+        resp.put("entries", addedTotal);
+        resp.put("size", size);
+        resp.put("results", results);
+        return this.gson.toJson(resp);
+    }
+
+    // 解压 ZIP: 缺省解压到 zip 所在目录; 防 zip-slip (逃出目标目录的条目计入 skipped 不报错);
+    // 限额 20000 条目 / 512MB, 超出部分计入 skipped (docs/API.MD 12.1)
+    private String fileUnzipImpl(Map<String, Object> body) {
+        if (body == null || body.get("path") == null || body.get("path").toString().isBlank()) {
+            halt(400, this.gson.toJson(Map.of("status", "error", "message", "path required")));
+        }
+        Path zipPath = Paths.get(this.FILE_ROOT).resolve(Objects.toString(body.get("path"))).normalize();
+        if (!isPathInsideFileRoot(zipPath)) halt(403);
+        if (!Files.exists(zipPath)) {
+            halt(400, this.gson.toJson(Map.of("status", "error", "message", "Zip not found")));
+        }
+        if (Files.isDirectory(zipPath)) {
+            halt(400, this.gson.toJson(Map.of("status", "error", "message", "Path is a directory")));
+        }
+
+        Path dest;
+        Object destObj = body.get("dest_path");
+        if (destObj != null && !destObj.toString().isBlank()) {
+            dest = Paths.get(this.FILE_ROOT).resolve(destObj.toString()).normalize();
+            if (!isPathInsideFileRoot(dest)) halt(403);
+            if (Files.exists(dest) && !Files.isDirectory(dest)) {
+                halt(400, this.gson.toJson(Map.of("status", "error", "message", "Destination is a file")));
+            }
+        } else {
+            dest = zipPath.getParent();
+        }
+        try {
+            Files.createDirectories(dest);
+        } catch (IOException e) {
+            halt(400, this.gson.toJson(Map.of("status", "error", "message", "Failed to create directory")));
+        }
+
+        boolean overwrite = !Boolean.FALSE.equals(body.get("overwrite"));
+        List<String> filters = new ArrayList<>();
+        Object entriesObj = body.get("entries");
+        if (entriesObj instanceof List) {
+            for (Object o : (List<?>) entriesObj) {
+                if (o != null && !o.toString().isEmpty()) filters.add(o.toString().replace('\\', '/'));
+            }
+        }
+
+        int extracted = 0, skipped = 0;
+        long totalBytes = 0;
+        List<String> files = new ArrayList<>();
+        boolean filesTruncated = false;
+
+        try (ZipFile zf = new ZipFile(zipPath.toFile())) {
+            Enumeration<? extends ZipEntry> en = zf.entries();
+            while (en.hasMoreElements()) {
+                ZipEntry entry = en.nextElement();
+                if (entry.isDirectory()) continue; // 目录条目: 按需由父级 createDirectories 创建
+                if (extracted + skipped >= ZIP_MAX_ENTRIES || totalBytes >= ZIP_MAX_TOTAL_BYTES) {
+                    skipped++;
+                    continue;
+                }
+                String name = entry.getName().replace('\\', '/');
+                if (!filters.isEmpty()) {
+                    String base = name.contains("/") ? name.substring(name.lastIndexOf('/') + 1) : name;
+                    if (!filters.contains(name) && !filters.contains(base)) {
+                        skipped++;
+                        continue;
+                    }
+                }
+                if (entry.getMethod() != ZipEntry.STORED && entry.getMethod() != ZipEntry.DEFLATED) {
+                    skipped++;
+                    continue;
+                }
+                long size = entry.getSize();
+                if (size < 0 || totalBytes + size > ZIP_MAX_TOTAL_BYTES) {
+                    skipped++;
+                    continue;
+                }
+                Path out = dest.resolve(entry.getName()).normalize();
+                // zip-slip: 归一化后必须仍在目标目录内
+                if (!out.startsWith(dest) || out.equals(dest)) {
+                    skipped++;
+                    continue;
+                }
+                if (!overwrite && Files.exists(out)) {
+                    skipped++;
+                    continue;
+                }
+                try (InputStream in = zf.getInputStream(entry)) {
+                    Files.createDirectories(out.getParent());
+                    Files.copy(in, out, StandardCopyOption.REPLACE_EXISTING);
+                } catch (Exception e) {
+                    skipped++;
+                    continue;
+                }
+                extracted++;
+                totalBytes += size;
+                if (files.size() < ZIP_MAX_LISTED_FILES) {
+                    files.add(relDisplay(out));
+                } else {
+                    filesTruncated = true;
+                }
+            }
+        } catch (ZipException ze) {
+            halt(400, this.gson.toJson(Map.of("status", "error", "message", "Not a zip file")));
+        } catch (IOException ioe) {
+            halt(400, this.gson.toJson(Map.of("status", "error", "message", "Unzip failed: " + ioe.getMessage())));
+        }
+
+        Map<String, Object> resp = new LinkedHashMap<>();
+        resp.put("status", "ok");
+        resp.put("path", relDisplay(zipPath));
+        resp.put("dest", relDisplay(dest));
+        resp.put("extracted", extracted);
+        resp.put("skipped", skipped);
+        resp.put("files", files);
+        resp.put("files_truncated", filesTruncated);
+        return this.gson.toJson(resp);
     }
 
     private String bytesToHex(byte[] bytes) {

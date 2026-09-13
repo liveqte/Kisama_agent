@@ -486,6 +486,28 @@ def file_mkdir(path: str, skip_print: bool = False):
                         ecies_sk=ecies_sk, label="mkdir", skip_print=skip_print)
 
 
+def file_zip(path: str, items: List[str], flat: bool = False, skip_print: bool = False):
+    """POST /api/file/zip - 压缩 ZIP 文件 (0.5.4)"""
+    _, ecies_sk = load_control_keys()
+    return _make_request("POST", "/api/file/zip",
+                        params={"path": path, "items": list(items), "flat": flat},
+                        ecies_sk=ecies_sk, label="zip", skip_print=skip_print)
+
+
+def file_unzip(path: str, dest_path: str = None, overwrite: bool = True,
+               entries: List[str] = None, skip_print: bool = False):
+    """POST /api/file/unzip - 解压 ZIP 文件 (0.5.4)"""
+    _, ecies_sk = load_control_keys()
+    params = {"path": path, "overwrite": overwrite}
+    if dest_path:
+        params["dest_path"] = dest_path
+    if entries:
+        params["entries"] = list(entries)
+    return _make_request("POST", "/api/file/unzip",
+                        params=params,
+                        ecies_sk=ecies_sk, label="unzip", skip_print=skip_print)
+
+
 # ================= 🧪 测试套件 =================
 
 def _test_result(name: str, passed: bool, msg: str = "", details: dict = None):
@@ -836,6 +858,134 @@ def test_file_ops():
     return tests_passed
 
 
+def test_file_archive():
+    """测试 ZIP 压缩/解压接口 (0.5.4: /api/file/zip + /api/file/unzip)"""
+    print("\n🔹 测试: 文件压缩/解压 (/api/file/zip + /api/file/unzip)")
+    tests_passed = True
+    test_prefix = f"{CONFIG['test_prefix']}_{int(time.time())}_arch"
+    zip_path = f"{test_prefix}.zip"
+    src_dir = f"{test_prefix}_src"
+    dest_dir = f"{test_prefix}_dest"
+    content_a = "Hello Zip A!"
+    content_b = "Hello Zip B!"
+
+    def cleanup(*paths):
+        for p in paths:
+            try:
+                file_delete(p, skip_print=True)
+            except:
+                pass
+
+    try:
+        # ========== 1. 准备测试文件 ==========
+        print("  ├─ 1/6 准备: mkdir + upload...")
+        r = file_mkdir(src_dir, skip_print=True)
+        ok = bool(r and r.get("status") == "ok")
+        local_a = local_b = None
+        if ok:
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as tmp:
+                tmp.write(content_a)
+                local_a = tmp.name
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as tmp:
+                tmp.write(content_b)
+                local_b = tmp.name
+            r = file_upload(local_a, src_dir, "a.txt", skip_print=True)
+            ok = bool(r and r.get("status") == "ok")
+        if ok:
+            r = file_upload(local_b, src_dir, "b.txt", skip_print=True)
+            ok = bool(r and r.get("status") == "ok")
+        if local_a:
+            os.unlink(local_a)
+        if local_b:
+            os.unlink(local_b)
+        _test_result("zip: 准备测试文件", ok, "" if ok else f"result={r}")
+        if not ok:
+            tests_passed = False
+
+        # ========== 2. zip 压缩目录 (递归) ==========
+        print("  ├─ 2/6 zip...")
+        try:
+            r = file_zip(zip_path, [src_dir], skip_print=True)
+            if r and r.get("status") == "ok" and r.get("entries", 0) >= 2:
+                _test_result("zip: 压缩目录 (递归)", True)
+            else:
+                _test_result("zip: 压缩目录 (递归)", False, f"result={r}")
+                tests_passed = False
+        except Exception as e:
+            _test_result("zip: 压缩目录 (递归)", False, f"异常: {e}")
+            tests_passed = False
+
+        # ========== 3. unzip 解压到指定目录 ==========
+        # 注: zip 打包目录时条目名带顶层目录名前缀 (docs/API.MD 12.2), 解压后为 dest/<src目录名>/a.txt
+        print("  ├─ 3/6 unzip...")
+        try:
+            r = file_unzip(zip_path, dest_path=dest_dir, skip_print=True)
+            files = [str(x).replace("\\", "/") for x in ((r or {}).get("files") or [])]
+            if r and r.get("status") == "ok" and r.get("extracted", 0) >= 2 \
+                    and f"{dest_dir}/{src_dir}/a.txt" in files and f"{dest_dir}/{src_dir}/b.txt" in files:
+                _test_result("zip: 解压到指定目录", True)
+            else:
+                _test_result("zip: 解压到指定目录", False, f"result={r}")
+                tests_passed = False
+        except Exception as e:
+            _test_result("zip: 解压到指定目录", False, f"异常: {e}")
+            tests_passed = False
+
+        # ========== 4. cat 验证解压内容一致 ==========
+        print("  ├─ 4/6 cat 内容比对...")
+        try:
+            r = file_cat(f"{dest_dir}/{src_dir}/a.txt", skip_print=True)
+            if r and r.get("content") == content_a:
+                _test_result("zip: 解压内容一致", True)
+            else:
+                _test_result("zip: 解压内容一致", False, f"result={r}")
+                tests_passed = False
+        except Exception as e:
+            _test_result("zip: 解压内容一致", False, f"异常: {e}")
+            tests_passed = False
+
+        # ========== 5. 边界: 不存在的 item + 不存在的 zip ==========
+        print("  ├─ 5/6 边界场景...")
+        try:
+            r = file_zip(f"{test_prefix}_ghost.zip", [f"{test_prefix}_ghost"], skip_print=True)
+            ghost_ok = bool(r and r.get("status") == "ok"
+                            and (r.get("results") or [{}])[0].get("status") == "not_found")
+            r2 = file_unzip(f"{test_prefix}_noexist.zip", skip_print=True)
+            http_400 = isinstance(r2, dict) and r2.get("_http_error") == 400
+            _test_result("zip: ghost项not_found + 不存在zip返回400", ghost_ok and http_400,
+                         "" if (ghost_ok and http_400) else f"ghost={r} noexist={r2}")
+            if not (ghost_ok and http_400):
+                tests_passed = False
+        except Exception as e:
+            _test_result("zip: 边界场景", False, f"异常: {e}")
+            tests_passed = False
+
+        # ========== 6. 清理 ==========
+        print("  └─ 6/6 清理...")
+        try:
+            cleanup(zip_path, f"{test_prefix}_ghost.zip", src_dir, dest_dir)
+            r = file_list(".", skip_print=True)
+            names = str([f.get("name") for f in ((r or {}).get("files") or [])])
+            if test_prefix not in names:
+                _test_result("zip: 清理验证", True, "测试文件已清除")
+            else:
+                _test_result("zip: 清理验证", False, "测试文件仍存在")
+                tests_passed = False
+        except Exception as e:
+            _test_result("zip: 清理验证", False, f"异常: {e}")
+            tests_passed = False
+
+    except Exception as e:
+        _test_result("zip: 测试组异常", False, f"未预期错误: {e}")
+        tests_passed = False
+        import traceback
+        traceback.print_exc()
+    finally:
+        cleanup(zip_path, f"{test_prefix}_ghost.zip", src_dir, dest_dir)
+    
+    return tests_passed
+
+
 def run_all_tests():
     """执行所有接口测试"""
     global TEST_REPORT
@@ -873,6 +1023,9 @@ def run_all_tests():
     
     # 🔹 文件模块接口
     test_file_ops()
+    
+    # 🔹 文件压缩/解压接口 (0.5.4)
+    test_file_archive()
     
     # 🔹 任务模块接口 (PHP 版本不支持时直接静默跳过，不输出任何内容)
     if not IS_PHP_SERVER:

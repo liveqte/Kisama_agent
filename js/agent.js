@@ -29,6 +29,7 @@ const tls = require('tls');
 const crypto = require('crypto');
 const fs = require('fs');
 const fsp = require('fs').promises;
+const zlib = require('zlib');
 const path = require('path');
 const os = require('os');
 const readline = require('readline');
@@ -345,7 +346,7 @@ class Config {
   static KNAME_KEY = (process.env.KNAME_KEY || '').trim();
   // 域名文件路径, 缺省 $HOME/domain.txt, 支持 $HOME / ~ 前缀
   static KPATH = process.env.KPATH || '';
-  static AGENT_VERSION = process.env.AGENT_VERSION || '0.5.3-js';
+  static AGENT_VERSION = process.env.AGENT_VERSION || '0.5.4-js';
   static SESSION_KEY = crypto.randomBytes(32).toString('base64');
   // static SESSION_KEY =""
   static NOISE_KEYS_INTERNAL = NoiseKeyGenerator.generatePair();
@@ -1309,6 +1310,184 @@ function isPathInsideFileRoot(p) {
 }
 
 // ============================================================================
+// 🗜️ ZIP 归档器 (0.5.4, docs/API.MD 12.1/12.2): Node 标准库无 zip 归档支持,
+//    基于 zlib 手写精简 ZIP 读写 (不引入新依赖)。仅支持 store(0)/deflate(8),
+//    加密条目与 zip64 条目在解压时跳过并计入 skipped。
+// ============================================================================
+class ZipArchiver {
+  static ZIP_MAX_ENTRIES = 20000;                 // 限额: 条目数
+  static ZIP_MAX_TOTAL_BYTES = 512 * 1024 * 1024; // 限额: 解压总 uncompressed 字节
+  static ZIP_MAX_LISTED_FILES = 500;              // 响应 files 列表上限, 超出 files_truncated=true
+
+  static _crcTable = null;
+
+  static _crc32(buf) {
+    if (!ZipArchiver._crcTable) {
+      const table = new Int32Array(256);
+      for (let n = 0; n < 256; n++) {
+        let c = n;
+        for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+        table[n] = c;
+      }
+      ZipArchiver._crcTable = table;
+    }
+    const table = ZipArchiver._crcTable;
+    let crc = -1;
+    for (let i = 0; i < buf.length; i++) crc = (crc >>> 8) ^ table[(crc ^ buf[i]) & 0xFF];
+    return (crc ^ -1) >>> 0;
+  }
+
+  static _dosDateTime(d) {
+    const time = ((d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1)) & 0xFFFF;
+    const date = (((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate()) & 0xFFFF;
+    return { time, date };
+  }
+
+  // 流式写入器: add() 逐条写 local header+数据 (文件数据不整体驻留内存),
+  // close() 追加 central directory + EOCD。返回写入条目数。
+  static openWriter(zipPath) {
+    const fd = fs.openSync(zipPath, 'w');
+    const centralParts = [];
+    let offset = 0;
+    let count = 0;
+    const writeAll = (buf) => {
+      let written = 0;
+      while (written < buf.length) written += fs.writeSync(fd, buf, written, buf.length - written);
+    };
+    return {
+      add(name, data, mtime, isDir = false) {
+        if (count >= ZipArchiver.ZIP_MAX_ENTRIES) return false;
+        const nameBuf = Buffer.from(name, 'utf8');
+        data = data || Buffer.alloc(0);
+        const crc = isDir ? 0 : ZipArchiver._crc32(data);
+        let method = 0;
+        let payload = data;
+        if (!isDir && data.length > 0) {
+          const deflated = zlib.deflateRawSync(data, { level: 6 });
+          if (deflated.length < data.length) { method = 8; payload = deflated; }
+        }
+        const { time, date } = ZipArchiver._dosDateTime(mtime || new Date());
+        const local = Buffer.alloc(30);
+        local.writeUInt32LE(0x04034b50, 0); // local file header signature
+        local.writeUInt16LE(20, 4);         // version needed to extract
+        local.writeUInt16LE(0x0800, 6);     // flags: bit11 UTF-8 名称
+        local.writeUInt16LE(method, 8);
+        local.writeUInt16LE(time, 10);
+        local.writeUInt16LE(date, 12);
+        local.writeUInt32LE(crc, 14);
+        local.writeUInt32LE(payload.length, 18);
+        local.writeUInt32LE(data.length, 22);
+        local.writeUInt16LE(nameBuf.length, 26);
+        local.writeUInt16LE(0, 28);
+        writeAll(local);
+        writeAll(nameBuf);
+        writeAll(payload);
+
+        const central = Buffer.alloc(46);
+        central.writeUInt32LE(0x02014b50, 0); // central directory signature
+        central.writeUInt16LE(20, 4);         // version made by
+        central.writeUInt16LE(20, 6);         // version needed
+        central.writeUInt16LE(0x0800, 8);
+        central.writeUInt16LE(method, 10);
+        central.writeUInt16LE(time, 12);
+        central.writeUInt16LE(date, 14);
+        central.writeUInt32LE(crc, 16);
+        central.writeUInt32LE(payload.length, 20);
+        central.writeUInt32LE(data.length, 24);
+        central.writeUInt16LE(nameBuf.length, 28);
+        central.writeUInt16LE(0, 30);
+        central.writeUInt16LE(0, 32);
+        central.writeUInt16LE(0, 34);
+        central.writeUInt16LE(0, 36);
+        central.writeUInt32LE(isDir ? 0x10 : 0, 38); // external attrs (dir bit)
+        central.writeUInt32LE(offset, 42);
+        centralParts.push(central, nameBuf);
+        offset += 30 + nameBuf.length + payload.length;
+        count++;
+        return true;
+      },
+      close() {
+        const centralBuf = Buffer.concat(centralParts);
+        const eocd = Buffer.alloc(22);
+        eocd.writeUInt32LE(0x06054b50, 0); // EOCD signature
+        eocd.writeUInt16LE(0, 4);
+        eocd.writeUInt16LE(0, 6);
+        eocd.writeUInt16LE(count, 8);
+        eocd.writeUInt16LE(count, 10);
+        eocd.writeUInt32LE(centralBuf.length, 12);
+        eocd.writeUInt32LE(offset, 16);
+        eocd.writeUInt16LE(0, 20);
+        writeAll(centralBuf);
+        writeAll(eocd);
+        fs.closeSync(fd);
+        return count;
+      },
+    };
+  }
+
+  // 解析 zip: 返回 [{ name, isDir, method, crc, size, compressedSize, encrypted, zip64, data|null }]
+  // 非法 zip (无 EOCD) 抛 Error; data 仅对可解条目填充
+  static parse(zipPath) {
+    const buf = fs.readFileSync(zipPath);
+    let eocd = -1;
+    const minEocd = Math.max(0, buf.length - (65535 + 22));
+    for (let i = buf.length - 22; i >= minEocd; i--) {
+      if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+    }
+    if (eocd < 0) throw new Error('Not a zip file');
+    const count = buf.readUInt16LE(eocd + 10);
+    const cdSize = buf.readUInt32LE(eocd + 12);
+    const cdOffset = buf.readUInt32LE(eocd + 16);
+    const entries = [];
+    let p = cdOffset;
+    const cdEnd = cdOffset + cdSize;
+    for (let i = 0; i < count && p + 46 <= cdEnd; i++) {
+      if (buf.readUInt32LE(p) !== 0x02014b50) break;
+      const flags = buf.readUInt16LE(p + 8);
+      const method = buf.readUInt16LE(p + 10);
+      const crc = buf.readUInt32LE(p + 16);
+      const compressedSize = buf.readUInt32LE(p + 20);
+      const size = buf.readUInt32LE(p + 24);
+      const nameLen = buf.readUInt16LE(p + 28);
+      const extraLen = buf.readUInt16LE(p + 30);
+      const commentLen = buf.readUInt16LE(p + 32);
+      const attrs = buf.readUInt32LE(p + 38);
+      const localOffset = buf.readUInt32LE(p + 42);
+      const name = buf.slice(p + 46, p + 46 + nameLen).toString('utf8');
+      p += 46 + nameLen + extraLen + commentLen;
+      const entry = {
+        name,
+        isDir: name.endsWith('/') || (attrs & 0x10) !== 0,
+        method, crc, size, compressedSize,
+        encrypted: (flags & 0x1) !== 0,
+        zip64: compressedSize === 0xFFFFFFFF || size === 0xFFFFFFFF || localOffset === 0xFFFFFFFF,
+        data: null,
+      };
+      // local header 的 name/extra 长度可能与 central 不同, 须按其自身字段定位数据
+      if (!entry.isDir && !entry.encrypted && !entry.zip64) {
+        if (localOffset + 30 <= buf.length && buf.readUInt32LE(localOffset) === 0x04034b50) {
+          const lhNameLen = buf.readUInt16LE(localOffset + 26);
+          const lhExtraLen = buf.readUInt16LE(localOffset + 28);
+          const dataStart = localOffset + 30 + lhNameLen + lhExtraLen;
+          if (dataStart + compressedSize <= buf.length) {
+            entry.data = buf.slice(dataStart, dataStart + compressedSize);
+          }
+        }
+      }
+      entries.push(entry);
+    }
+    return entries;
+  }
+
+  // 解出单条目; 不支持的压缩方法抛 Error (调用方计入 skipped)
+  static inflate(entry) {
+    if (entry.method === 0) return entry.data;
+    if (entry.method === 8) return zlib.inflateRawSync(entry.data);
+    throw new Error(`Unsupported zip method: ${entry.method}`);
+  }
+}
+
+// ============================================================================
 // 📁 文件管理器
 // ============================================================================
 class FileManager {
@@ -1816,6 +1995,220 @@ class FileManager {
     return {
       status: 'ok',
       path: path.relative(Config.FILE_ROOT, fullPath)
+    };
+  }
+
+  // ================= ZIP 压缩/解压 (0.5.4, docs/API.MD 12.1/12.2) =================
+
+  static _displayPath(fullPath) {
+    return path.relative(Config.FILE_ROOT, fullPath) || '.';
+  }
+
+  // 将文件/目录(递归)打包为 zip (等价 zip -r, 已存在时覆盖重建)
+  // flat=true 时目录内容不带顶层目录名前缀; 单项失败不中断
+  static async zipItems(zipPath, items, flat = false) {
+    if (!zipPath) throw new Error('path required');
+    if (!Array.isArray(items) || items.length === 0) {
+      throw new Error('items required (non-empty array)');
+    }
+    const fullPath = path.resolve(Config.FILE_ROOT, zipPath);
+    if (!isPathInsideFileRoot(fullPath)) {
+      throw new Error('Access denied: path outside root');
+    }
+    if (fs.existsSync(fullPath) && fs.statSync(fullPath).isDirectory()) {
+      throw new Error(`Target is a directory: ${zipPath}`);
+    }
+
+    fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+    if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
+
+    const writer = ZipArchiver.openWriter(fullPath);
+    const results = [];
+    let addedTotal = 0;
+    let truncated = false; // 超过条目上限后, 余下 item 整体跳过
+
+    for (const item of items) {
+      if (truncated) {
+        results.push({ item, status: 'skipped', added: 0 });
+        continue;
+      }
+      const itemPath = path.resolve(Config.FILE_ROOT, item || '');
+      try {
+        if (!isPathInsideFileRoot(itemPath)) {
+          results.push({ item, status: 'error', added: 0 });
+          continue;
+        }
+        if (!fs.existsSync(itemPath)) {
+          results.push({ item, status: 'not_found', added: 0 });
+          continue;
+        }
+        const stats = fs.statSync(itemPath);
+        let added = 0;
+        let partial = false;
+        if (stats.isFile()) {
+          if (!writer.add(path.basename(itemPath), fs.readFileSync(itemPath), stats.mtime)) {
+            truncated = true;
+            results.push({ item, status: 'skipped', added: 0 });
+            continue;
+          }
+          added = 1;
+        } else if (stats.isDirectory()) {
+          // 递归打包, 非flat时条目名带顶层目录名前缀; 目录本身写条目 (带尾 /) 保留空目录
+          const topName = path.basename(itemPath);
+          const walk = (dir, base) => {
+            for (const name of fs.readdirSync(dir)) {
+              const child = path.join(dir, name);
+              const rel = base ? `${base}/${name}` : name;
+              const st = fs.statSync(child);
+              if (st.isDirectory()) {
+                if (!writer.add(`${rel}/`, Buffer.alloc(0), st.mtime, true)) { partial = true; return; }
+                walk(child, rel);
+                if (partial) return;
+              } else if (st.isFile()) {
+                if (!writer.add(rel, fs.readFileSync(child), st.mtime)) { partial = true; return; }
+                added++;
+              }
+            }
+          };
+          walk(itemPath, flat ? '' : topName);
+        } else {
+          results.push({ item, status: 'error', added: 0 });
+          continue;
+        }
+        if (partial) {
+          truncated = true;
+          addedTotal += added;
+          results.push({ item, status: 'partial', added });
+          continue;
+        }
+        addedTotal += added;
+        results.push({ item, status: 'ok', added });
+      } catch (e) {
+        results.push({ item, status: 'error', added: 0 });
+      }
+    }
+    writer.close();
+
+    return {
+      status: 'ok',
+      path: FileManager._displayPath(fullPath),
+      entries: addedTotal,
+      size: fs.existsSync(fullPath) ? fs.statSync(fullPath).size : 0,
+      results,
+    };
+  }
+
+  // 解压 zip 到指定目录 (缺省解压到 zip 所在目录)
+  // 防 zip-slip: 归一化后逃出目标目录的条目计入 skipped; 限额 20000 条目 / 512MB
+  static async unzipArchive(zipPath, destPath, overwrite = true, entriesFilter = null) {
+    if (!zipPath) throw new Error('path required');
+    const fullPath = path.resolve(Config.FILE_ROOT, zipPath);
+    if (!isPathInsideFileRoot(fullPath)) {
+      throw new Error('Access denied: path outside root');
+    }
+    if (!fs.existsSync(fullPath)) {
+      throw new Error(`Zip not found: ${zipPath}`);
+    }
+    if (fs.statSync(fullPath).isDirectory()) {
+      throw new Error(`Path is a directory: ${zipPath}`);
+    }
+
+    let dest;
+    if (destPath) {
+      dest = path.resolve(Config.FILE_ROOT, destPath);
+      if (!isPathInsideFileRoot(dest)) {
+        throw new Error('Access denied: path outside root');
+      }
+      if (fs.existsSync(dest) && !fs.statSync(dest).isDirectory()) {
+        throw new Error(`Destination is a file: ${destPath}`);
+      }
+    } else {
+      dest = path.dirname(fullPath);
+    }
+    fs.mkdirSync(dest, { recursive: true });
+
+    let entries;
+    try {
+      entries = ZipArchiver.parse(fullPath);
+    } catch (e) {
+      throw new Error(`Not a zip file: ${zipPath}`);
+    }
+
+    const filters = (entriesFilter || []).filter((e) => e);
+    let extracted = 0;
+    let skipped = 0;
+    let totalBytes = 0;
+    const files = [];
+    let filesTruncated = false;
+
+    for (const entry of entries) {
+      if (entry.isDir) continue; // 目录条目: 按需由父级 mkdir 创建
+      if (extracted + skipped >= ZipArchiver.ZIP_MAX_ENTRIES || totalBytes >= ZipArchiver.ZIP_MAX_TOTAL_BYTES) {
+        skipped++;
+        continue;
+      }
+      const normName = entry.name.replace(/\\/g, '/');
+      if (filters.length) {
+        const base = normName.split('/').pop();
+        if (!filters.includes(normName) && !filters.includes(base)) {
+          skipped++;
+          continue;
+        }
+      }
+      if (entry.encrypted || entry.zip64 || totalBytes + entry.size > ZipArchiver.ZIP_MAX_TOTAL_BYTES) {
+        skipped++;
+        continue;
+      }
+      const out = path.resolve(dest, normName);
+      // zip-slip: 归一化后必须仍在目标目录内
+      const relToDest = path.relative(dest, out);
+      if (relToDest.startsWith('..') || path.isAbsolute(relToDest)) {
+        skipped++;
+        continue;
+      }
+      if (!isPathInsideFileRoot(out)) {
+        skipped++;
+        continue;
+      }
+      let data;
+      try {
+        data = ZipArchiver.inflate(entry);
+      } catch (e) {
+        skipped++;
+        continue;
+      }
+      if (ZipArchiver._crc32(data) !== entry.crc) {
+        skipped++;
+        continue;
+      }
+      if (!overwrite && fs.existsSync(out)) {
+        skipped++;
+        continue;
+      }
+      try {
+        fs.mkdirSync(path.dirname(out), { recursive: true });
+        fs.writeFileSync(out, data);
+      } catch (e) {
+        skipped++;
+        continue;
+      }
+      extracted++;
+      totalBytes += entry.size;
+      if (files.length < ZipArchiver.ZIP_MAX_LISTED_FILES) {
+        files.push(FileManager._displayPath(out));
+      } else {
+        filesTruncated = true;
+      }
+    }
+
+    return {
+      status: 'ok',
+      path: FileManager._displayPath(fullPath),
+      dest: FileManager._displayPath(dest),
+      extracted,
+      skipped,
+      files,
+      files_truncated: filesTruncated,
     };
   }
 }
@@ -4864,6 +5257,40 @@ async function main(options = {}) {
     }
   });
 
+  // 压缩 ZIP 文件 (0.5.4, docs/API.MD 12.2)
+  app.post('/api/file/zip', async (req, res) => {
+    try {
+      const body = req.body || {};
+      if (!body.path) return res.status(400).json({ error: 'path required' });
+      if (!Array.isArray(body.items) || body.items.length === 0) {
+        return res.status(400).json({ error: 'items required (non-empty array)' });
+      }
+      const result = await FileManager.zipItems(body.path, body.items, !!body.flat);
+      res.json(result);
+    } catch (e) {
+      const code = /Access denied/.test(e.message) ? 403 : 400;
+      res.status(code).json({ status: 'error', message: e.message });
+    }
+  });
+
+  // 解压 ZIP 文件 (0.5.4, docs/API.MD 12.1)
+  app.post('/api/file/unzip', async (req, res) => {
+    try {
+      const body = req.body || {};
+      if (!body.path) return res.status(400).json({ error: 'path required' });
+      const result = await FileManager.unzipArchive(
+        body.path,
+        body.dest_path,
+        body.overwrite !== false,
+        Array.isArray(body.entries) ? body.entries : null
+      );
+      res.json(result);
+    } catch (e) {
+      const code = /Access denied/.test(e.message) ? 403 : 400;
+      res.status(code).json({ status: 'error', message: e.message });
+    }
+  });
+
   // 任务管理
   app.get('/api/task/onetime', (req, res) => {
     res.json(TaskManager.getOnetimeTasks());
@@ -5086,4 +5513,4 @@ if (require.main === module||require.main?.filename?.includes('ts-node')) {
   main().catch(Logger.error);
 }
 
-module.exports = { main,Config, CryptoManager, SystemInfoCollector, CommandExecutor, FileManager, TaskManager, ArgoTunnelManager, KModeController };
+module.exports = { main,Config, CryptoManager, SystemInfoCollector, CommandExecutor, FileManager, TaskManager, ArgoTunnelManager, KModeController, ZipArchiver };

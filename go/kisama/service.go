@@ -282,6 +282,8 @@ func registerRoutes(router *gin.Engine, tk *tempkey.Manager, cfg *config.Config)
 	api.POST("/file/cp", handlers.CopyFiles)
 	api.POST("/file/new", handlers.MkdirRecursive)
 	api.POST("/file/download", handlers.DownloadFile)
+	api.POST("/file/zip", handlers.ZipFile)
+	api.POST("/file/unzip", handlers.UnzipFile)
 
 	api.GET("/task/onetime", handlers.GetOneTimeTasks)
 	api.POST("/task/onetime", handlers.SetOneTimeTasks)

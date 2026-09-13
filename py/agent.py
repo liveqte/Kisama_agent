@@ -443,6 +443,39 @@ class FileMkdirResponse(BaseModel):
     status: str
     path: str
 
+# --- ZIP 压缩/解压 (0.5.4, docs/API.MD 12.1/12.2) ---
+class FileZipRequest(BaseModel):
+    path: str = Field(..., description="目标 zip 路径; 父目录自动创建, 已存在时覆盖重建")
+    items: Optional[List[str]] = Field(None, description="待压缩文件/目录列表; 目录递归打包; 单项失败不中断")
+    flat: bool = Field(False, description="True 时目录内容不带顶层目录名前缀")
+
+class FileZipItemResult(BaseModel):
+    item: str
+    status: str
+    added: int = 0
+
+class FileZipResponse(BaseModel):
+    status: str
+    path: str
+    entries: int
+    size: int
+    results: List[FileZipItemResult]
+
+class FileUnzipRequest(BaseModel):
+    path: str = Field(..., description="zip 压缩包路径 (安全沙箱内)")
+    dest_path: Optional[str] = Field(None, description="解压目标目录, 缺省为 zip 所在目录; 目录不存在自动创建")
+    overwrite: bool = Field(True, description="目标文件已存在时是否覆盖, 默认 true; false 时跳过并计入 skipped")
+    entries: Optional[List[str]] = Field(None, description="仅解压匹配条目 (精确名或不带路径匹配), 缺省解压全部")
+
+class FileUnzipResponse(BaseModel):
+    status: str
+    path: str
+    dest: str
+    extracted: int
+    skipped: int
+    files: List[str]
+    files_truncated: bool
+
 class OneTimeTaskGetResponse(BaseModel):
     status: str = Field("ok", description="请求状态", examples=["ok"])
     count: int = Field(..., description="待执行任务的数量", examples=[2])
@@ -805,7 +838,7 @@ class Config:
     KPATH = os.getenv("KPATH", "")
 
     # 代理版本信息
-    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.5.3-python")
+    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.5.4-python")
     
     # ================= 启动校验 =================
     
@@ -2057,7 +2090,8 @@ import hashlib
 import mimetypes
 import base64
 import json
-from pathlib import Path
+import zipfile
+from pathlib import Path, PurePosixPath
 from datetime import datetime, timezone
 from typing import List, Dict, Optional, Union
 from fastapi import HTTPException, status, UploadFile
@@ -2537,6 +2571,195 @@ class FileManager:
             return {"status": "ok", "path": str(target.relative_to(self.root))}
         except Exception as e:
             raise HTTPException(500, f"Mkdir failed: {e}")
+    
+    # ================= ZIP 压缩/解压 (0.5.4, docs/API.MD 12.1/12.2) =================
+    
+    # 限额: 条目数 / 解压总 uncompressed 字节 (docs/API.MD 12.1)
+    ZIP_MAX_ENTRIES = 20000
+    ZIP_MAX_TOTAL_BYTES = 512 * 1024 * 1024
+    # 响应 files 列表最多返回条数, 超出置 files_truncated=true
+    ZIP_MAX_LISTED_FILES = 500
+    
+    def _display_path(self, path: Path) -> str:
+        """沙箱内相对显示路径, 沙箱根显示为 '.'"""
+        rel = path.relative_to(self.root)
+        text = str(rel)
+        return text if text else "."
+    
+    def zip_items(self, zip_path: str, items: List[str], flat: bool = False) -> dict:
+        """
+        将文件/目录(递归)打包为 zip (等价 zip -r, 已存在时覆盖重建)
+        :param flat: True 时目录内容不带顶层目录名前缀
+        :return: {"status": "ok", "path", "entries", "size", "results": [{"item", "status", "added"}]}
+        """
+        target = self._safe_path(zip_path)
+        if target.exists() and target.is_dir():
+            raise HTTPException(400, f"Target is a directory: {zip_path}")
+        if not items:
+            raise HTTPException(400, "items required (non-empty array)")
+        
+        results = []
+        added_total = 0
+        truncated = False  # 超过条目上限后, 余下 item 整体跳过
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                target.unlink()
+            with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as zf:
+                entry_count = 0
+                
+                def add_entry(write_fn) -> bool:
+                    """写入单条目; 超上限返回 False"""
+                    nonlocal entry_count
+                    if entry_count >= self.ZIP_MAX_ENTRIES:
+                        return False
+                    write_fn()
+                    entry_count += 1
+                    return True
+                
+                for item in items:
+                    if truncated:
+                        results.append({"item": item, "status": "skipped", "added": 0})
+                        continue
+                    try:
+                        src = self._safe_path(item)
+                        if not src.exists():
+                            results.append({"item": item, "status": "not_found", "added": 0})
+                            continue
+                        top_name = PurePosixPath(item.replace("\\", "/").strip("/")).name or "item"
+                        added = 0
+                        if src.is_file():
+                            if not add_entry(lambda s=src, n=top_name: zf.write(s, n)):
+                                truncated = True
+                                results.append({"item": item, "status": "skipped", "added": 0})
+                                continue
+                            added = 1
+                        elif src.is_dir():
+                            base = "" if flat else top_name
+                            partial = False
+                            # 按路径深度排序保证父目录条目先于子内容; 目录本身也写入 (带尾 /) 保留空目录
+                            for p in sorted(src.rglob("*"), key=lambda x: len(x.parts)):
+                                arc = "/".join([base] + list(p.relative_to(src).parts))
+                                if p.is_dir():
+                                    if not add_entry(lambda a=arc: zf.writestr(zipfile.ZipInfo(a + "/"), b"")):
+                                        partial = True
+                                        break
+                                else:
+                                    if not add_entry(lambda s=p, a=arc: zf.write(s, a)):
+                                        partial = True
+                                        break
+                                    added += 1
+                            if partial:
+                                truncated = True
+                                added_total += added
+                                results.append({"item": item, "status": "partial", "added": added})
+                                continue
+                        else:
+                            results.append({"item": item, "status": "error", "added": 0})
+                            continue
+                        added_total += added
+                        results.append({"item": item, "status": "ok", "added": added})
+                        self._audit("zip", item, "ok")
+                    except HTTPException:
+                        results.append({"item": item, "status": "error", "added": 0})
+                    except Exception:
+                        results.append({"item": item, "status": "error", "added": 0})
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(400, f"Zip failed: {e}")
+        
+        return {
+            "status": "ok",
+            "path": self._display_path(target),
+            "entries": added_total,
+            "size": target.stat().st_size if target.exists() else 0,
+            "results": results,
+        }
+    
+    def unzip_archive(self, zip_path: str, dest_path: Optional[str] = None,
+                      overwrite: bool = True, entries: Optional[List[str]] = None) -> dict:
+        """
+        解压 zip 到指定目录 (缺省解压到 zip 所在目录)
+        防 zip-slip: 归一化后逃出目标目录的条目不计入 extracted, 计入 skipped; 限额 20000 条目 / 512MB
+        :return: {"status": "ok", "path", "dest", "extracted", "skipped", "files", "files_truncated"}
+        """
+        target = self._safe_path(zip_path)
+        if not target.exists():
+            raise HTTPException(400, f"Zip not found: {zip_path}")
+        if target.is_dir():
+            raise HTTPException(400, f"Path is a directory: {zip_path}")
+        
+        if dest_path:
+            dest = self._safe_path(dest_path)
+            if dest.exists() and not dest.is_dir():
+                raise HTTPException(400, f"Destination is a file: {dest_path}")
+        else:
+            dest = target.parent
+        dest.mkdir(parents=True, exist_ok=True)
+        
+        filters = [e for e in (entries or []) if e] if entries else None
+        dest_real = dest.resolve()
+        extracted = 0
+        skipped = 0
+        files: List[str] = []
+        files_truncated = False
+        total_bytes = 0
+        try:
+            with zipfile.ZipFile(target) as zf:
+                for info in zf.infolist():
+                    if info.filename.endswith("/"):
+                        continue  # 目录条目: 按需由父级 mkdir 创建
+                    if extracted + skipped >= self.ZIP_MAX_ENTRIES or total_bytes >= self.ZIP_MAX_TOTAL_BYTES:
+                        skipped += 1
+                        continue
+                    if filters:
+                        name = info.filename.replace("\\", "/")
+                        base = name.rsplit("/", 1)[-1]
+                        if name not in filters and base not in filters:
+                            skipped += 1
+                            continue
+                    out = (dest / info.filename).resolve()
+                    try:
+                        out.relative_to(dest_real)
+                    except ValueError:
+                        skipped += 1  # zip-slip: 逃出目标目录
+                        continue
+                    if not overwrite and out.exists():
+                        skipped += 1
+                        continue
+                    if total_bytes + info.file_size > self.ZIP_MAX_TOTAL_BYTES:
+                        skipped += 1
+                        continue
+                    try:
+                        out.parent.mkdir(parents=True, exist_ok=True)
+                        with zf.open(info) as src_fh, open(out, "wb") as dst_fh:
+                            shutil.copyfileobj(src_fh, dst_fh)
+                        extracted += 1
+                        total_bytes += info.file_size
+                        if len(files) < self.ZIP_MAX_LISTED_FILES:
+                            files.append(self._display_path(out))
+                        else:
+                            files_truncated = True
+                        self._audit("unzip", info.filename, "ok")
+                    except Exception as e:
+                        skipped += 1
+        except zipfile.BadZipFile:
+            raise HTTPException(400, f"Not a zip file: {zip_path}")
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(400, f"Unzip failed: {e}")
+        
+        return {
+            "status": "ok",
+            "path": self._display_path(target),
+            "dest": self._display_path(dest),
+            "extracted": extracted,
+            "skipped": skipped,
+            "files": files,
+            "files_truncated": files_truncated,
+        }
 # ==================== 1. 解耦的 Noise 加密封装类 ====================
 class NoiseSessionWrapper:
     """
@@ -5874,6 +6097,42 @@ async def file_mkdir(
     
     fm = request.app.state.file_manager
     result = fm.create_directory(body.path)
+    return result
+
+
+# --- POST /api/file/zip : 压缩 ZIP 文件 (0.5.4) ---
+@app.post("/api/file/zip", response_model=FileZipResponse)
+async def file_zip(
+    request: Request,
+    body: FileZipRequest = Body(...)
+):
+    if not body.path:
+        return JSONResponse(status_code=400, content={"error": "path required"})
+    # items 必填: 手动校验返回 400 (避免 pydantic 缺省 422 与 docs/API.MD 12.2 不一致)
+    if not body.items or not isinstance(body.items, list):
+        return JSONResponse(status_code=400, content={"error": "items required (non-empty array)"})
+    
+    fm = request.app.state.file_manager
+    result = fm.zip_items(body.path, body.items, flat=bool(body.flat))
+    return result
+
+
+# --- POST /api/file/unzip : 解压 ZIP 文件 (0.5.4) ---
+@app.post("/api/file/unzip", response_model=FileUnzipResponse)
+async def file_unzip(
+    request: Request,
+    body: FileUnzipRequest = Body(...)
+):
+    if not body.path:
+        return JSONResponse(status_code=400, content={"error": "path required"})
+    
+    fm = request.app.state.file_manager
+    result = fm.unzip_archive(
+        body.path,
+        dest_path=body.dest_path,
+        overwrite=bool(body.overwrite),
+        entries=body.entries,
+    )
     return result
 
 
