@@ -4,6 +4,7 @@ package handlers
 
 import (
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -95,5 +96,86 @@ func TestWindowsTerminalEmptyEnter(t *testing.T) {
 	collected := readTermOutput(t, term, "ENTEROK", 15*time.Second)
 	if !strings.Contains(collected, "\r\n") {
 		t.Fatalf("expected CRLF newline after empty enter (real terminal behavior), got: %q", collected)
+	}
+}
+
+// TestIncognitoShellArgs 验证无痕启动参数只对 PowerShell 生效 (0.5.5)
+func TestIncognitoShellArgs(t *testing.T) {
+	if got := incognitoShellArgs("powershell.exe", true); len(got) != 3 {
+		t.Fatalf("expected 3 args for powershell.exe, got %v", got)
+	}
+	if got := incognitoShellArgs(`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`, true); len(got) != 3 {
+		t.Fatalf("expected 3 args for absolute powershell path, got %v", got)
+	}
+	if got := incognitoShellArgs("powershell.exe", false); got != nil {
+		t.Fatalf("expected nil args when disabled, got %v", got)
+	}
+	if got := incognitoShellArgs("cmd.exe", true); got != nil {
+		t.Fatalf("expected nil args for cmd.exe, got %v", got)
+	}
+	if !incognitoNativeApplied("powershell.exe") || !incognitoNativeApplied("cmd.exe") {
+		t.Fatalf("powershell/cmd should report incognito applied")
+	}
+	if incognitoNativeApplied("pwsh.exe") {
+		t.Fatalf("pwsh.exe has persistent history, should report false")
+	}
+}
+
+// TestNormalizeShellName 验证 welcome 帧的 shell 归一化名 (0.5.5)
+func TestNormalizeShellName(t *testing.T) {
+	cases := map[string]string{
+		"powershell.exe":              "powershell",
+		"cmd.exe":                     "cmd",
+		`C:\Windows\System32\cmd.exe`: "cmd",
+		"/bin/bash":                   "bash",
+		"/usr/bin/zsh":                "zsh",
+		"":                            "sh",
+	}
+	for in, want := range cases {
+		if got := normalizeShellName(in); got != want {
+			t.Fatalf("normalizeShellName(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestBuildCommandLine 验证 ConPTY 命令行拼接: 含空格的参数加引号 (0.5.5 incognito 依赖)
+func TestBuildCommandLine(t *testing.T) {
+	cmd := exec.Command("powershell.exe", "-NoExit", "-Command", "Set-PSReadLineOption -HistorySaveStyle SaveNothing")
+	line := buildCommandLine(cmd)
+	if !strings.HasPrefix(line, cmd.Path) && !strings.HasPrefix(line, `"`+cmd.Path+`"`) {
+		t.Fatalf("command line should start with shell path, got %q", line)
+	}
+	if !strings.Contains(line, `"Set-PSReadLineOption -HistorySaveStyle SaveNothing"`) {
+		t.Fatalf("argument with spaces should be quoted, got %q", line)
+	}
+	if n := strings.Count(line, `"Set-PSReadLineOption`); n != 1 {
+		t.Fatalf("expected command argument exactly once, got %d in %q", n, line)
+	}
+}
+
+// TestWindowsTerminalIncognito 端到端: 无痕启动参数下 PSReadLine 历史保存被禁用 (0.5.5)
+func TestWindowsTerminalIncognito(t *testing.T) {
+	shell := defaultTerminalShell()
+	if !strings.EqualFold(filepath.Base(shell), "powershell.exe") {
+		t.Skipf("default shell is %q, incognito assertion only covers powershell", shell)
+	}
+	cmd := exec.Command(shell, incognitoShellArgs(shell, true)...)
+	term, err := newTerminalSession(cmd, 24, 80)
+	if err != nil {
+		t.Fatalf("newTerminalSession error: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = term.KillTree()
+		_ = term.Close()
+	})
+	time.Sleep(1200 * time.Millisecond) // 等待 shell 与 profile 加载完成
+
+	if _, err := term.Write([]byte("(Get-PSReadLineOption).HistorySaveStyle\r\nexit\r\n")); err != nil {
+		t.Fatalf("write to terminal error: %v", err)
+	}
+
+	out := readTermOutput(t, term, "SaveNothing", 15*time.Second)
+	if !strings.Contains(out, "SaveNothing") {
+		t.Fatalf("expected HistorySaveStyle=SaveNothing under incognito args, got %q", out)
 	}
 }

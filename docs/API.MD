@@ -50,6 +50,7 @@
     }
   }
 ```
+> **session_key 下发规则（与运行模式相关）**：生产模式（`DEBUG=false`）已认证请求返回真实 `session_key`（供控制端 AES-GCM 加密请求体）；**生产明文模式（`PLAIN_MODE=true`，PHP 独有）恒返回 `session_key: null`**（即使已认证）——控制端据此判定请求体改发明文 JSON，不再尝试 AES 加密（详见「十、x-encrypted 响应模式头规范」）；DEBUG 模式（`DEBUG=true`）同样恒为 `null`。
 ### 2. 获取实时监控信息  
 路径：GET /api/status  
 用途：获取代理端动态资源使用率（CPU/内存/磁盘/网络/连接数）  
@@ -68,7 +69,6 @@
   "process": 30,
   "message": ""
 }
-```
 
 ## 二、命令执行模块
 
@@ -142,20 +142,11 @@
 { "status": "ok", "path": "tmp/config.json", "content": "{\n  \"key\": \"value\"\n}", "encoding": "utf-8", "is_binary": false, "size": 24 }
 ```
 
-### 8. 上传文件
-路径：POST /api/file  
-用途：上传文件至代理端（支持 >2MB 自动分块合并）  
-输入示例：
-```
-{ "path": "/tmp/uploads", "filename": "data.tar.gz", "content": "<Base64文件内容>" } 
-```
-返回示例：
-```
-{ "status": "ok", "path": "tmp/uploads/data.tar.gz" }
-```
-### 8.1 上传文件（裸二进制流传输）
+### 8. 上传文件（裸二进制流传输）
 * **路径**：`POST /api/fileraw`
 * **用途**：上传文件或文件分块至代理端（支持大文件流式裸二进制传输，零体积膨胀）
+
+> 历史接口 `POST /api/file`（Base64 编码上传）自面板 0.6.0 起弃用停用，文档不再收录。
 
 #### 1. 请求头配置 (Headers)
 在前台发起请求时，必须携带以下自定义头部来传递元数据：
@@ -432,7 +423,21 @@ X-Total-Chunks: 1
 ```
 request_id：用来区分每个会话。  
 token：仅在https传输下使用，其使用代理端noise公钥进行认证。
+meta：可选，=1 时表示客户端可解析 JSON 控制帧，代理端会在 PTY 启动后、输出任何 shell 回显之前，主动推送一帧 welcome 元数据（0.5.5+，旧版代理端忽略此参数）。
+incognito：可选，=1 时请求原生无痕会话（0.5.5+，旧版代理端忽略此参数）。
 ```
+
+welcome 元数据帧（0.5.5+，仅 meta=1 时发送；Noise 模式下经加密通道推送，二进制帧内为 JSON）：
+
+```
+{"type":"welcome","shell":"zsh","path":"/usr/bin/zsh","incognito":true}
+shell：归一化 shell 名（Unix 取 basename：bash/zsh/ash/sh；Windows：powershell/cmd/pwsh）。
+path：实际拉起的 shell 完整路径。
+incognito：本次会话原生无痕是否实际生效（面板请求 incognito=1 且代理端支持时为 true）。
+```
+
+原生无痕行为（0.5.5+，incognito=1 时）：代理端在 spawn 现场保证 shell 历史不落盘 —— Unix 向子进程环境注入 `HISTFILE=/dev/null`（bash/zsh/ash 通用，会话内 ↑↑ 历史保留）；Windows 对 PowerShell 附加启动参数 `-NoExit -Command "Set-PSReadLineOption -HistorySaveStyle SaveNothing"`（cmd.exe 本身无持久历史，无需处理）。旧版代理端不支持时由面板侧命令注入方案兜底。
+
 返回示例：无。 
 
 ## 五、临时密钥模块（临时授权）
@@ -470,7 +475,7 @@ token：仅在https传输下使用，其使用代理端noise公钥进行认证�
 ```
 
 临时密钥使用方式（与静态密钥完全一致的请求流程）：
-1. 调用方持有 `ecdsa.private_key`，对消息 `SHA256(nonce + timestamp)` 做 ECDSA 签名，放入 `X-Auth-Token`（Raw 64 字节或 DER 格式均可）；
+1. 调用方持有 `ecdsa.private_key`，按与静态密钥一致的 v2 五段签名消息（见「通用请求头要求」）做 ECDSA 签名，放入 `X-Auth-Token`（Raw 64 字节或 DER 格式均可）；
 2. 代理端验签时自动识别签名来源（静态密钥 → 临时密钥），响应体使用与来源**对应**的 ECIES 公钥加密；
 3. 临时调用方用 `ecies.private_key` 解密响应内容，无需任何额外请求头。
 
@@ -502,7 +507,8 @@ GET /kisamaproxy/https://host:8443/api/exec
 
 #### CORS 与 OPTIONS 预检
 - 全局 CORS 中间件对 `/kisamaproxy` 前缀直接放行，由转发器自行管理跨域头；
-- `OPTIONS` 预检请求直接返回 `204`，并附带 kpng 一致的 CORS 响应头（`Access-Control-Allow-Origin: *` 等）。
+- `OPTIONS` 预检请求直接返回 `204`，并附带 kpng 一致的 CORS 响应头（`Access-Control-Allow-Origin: *` 等）；
+- 额外声明 `Access-Control-Expose-Headers: ETag, Location, Content-Location, DAV, Lock-Token`（Go 侧新增，kpng 同步跟进）：`ETag` 不在 CORS 安全响应头白名单内，不显式暴露时跨域 JS 读不到，WebDAV 乐观锁（读取 ETag → 后续请求带 `If-Match`）无法成立；请求方向 `If-Match` / `If-None-Match` / `If` 均已在预检 `Allow-Headers` 白名单内。
 
 #### 请求头处理
 - 客户端请求头原样透传，仅清理 `Origin` / `Referer`（避免泄露来源页）；
@@ -793,34 +799,35 @@ trycloudflare Quick Tunnel 是临时资源：与 Cloudflare edge 的连接全部
 | 运行模式 | 响应场景 | x-encrypted |
 | :--- | :--- | :--- |
 | `DEBUG=true`（调试模式） | **一切**响应：JSON、二进制、401/403/404/5xx、OPTIONS/HEAD 预检 | **必须为 `false`**（不得缺省、不得为 true） |
-| `DEBUG=false`（生产模式） | 已认证（验签通过）且响应体已 ECIES 加密 | **必须为 `true`** |
+| `DEBUG=false`（生产模式） | 已认证（验签通过）且响应体已加密（0.5.5-：全部端点 ECIES；**0.5.6+：`/api/baseinfo` 为 ECIES，其余端点为 AES-256-GCM(SESSION_KEY)**，详见「十二、0.5.6 响应加密协议变更」） | **必须为 `true`** |
 | `DEBUG=false`（生产模式） | **生产明文认证模式**（`PLAIN_MODE=true`，**仅 PHP 版本提供**）：已认证，响应体明文 | **必须为 `plain`** |
 | `DEBUG=false`（生产模式） | 未认证 / 匿名白名单（/api/baseinfo、/api/status）/ 验签失败 / 40x / OPTIONS / HEAD / 非 JSON 二进制响应 | **不发送该头** |
-| `DEBUG=false`（生产模式） | ECIES 响应加密失败 | HTTP 500，**不发送该头**（严禁明文 body + `false` 出门） |
+| `DEBUG=false`（生产模式） | 响应加密失败（ECIES 或 AES 均同） | HTTP 500，**不发送该头**（严禁明文 body + `false` 出门） |
 
 核心不变式：
 
 1. **生产模式永不返回 `false`** —— 出现 `false` 即实现缺陷；
 2. **调试模式恒为 `false`** —— 不缺省、不为 `true`；
-3. `true` 不承诺 body 必为密文（二进制下载等非加密响应体也照发）—— 是否解密由客户端按响应类型自行决定（仅对 JSON 响应尝试 ECIES 解密）。
+3. `true` 不承诺 body 必为密文（二进制下载等非加密响应体也照发）—— 是否解密由客户端按响应类型自行决定（仅对 JSON 响应尝试解密；解密算法 0.5.6 起按代理版本判定，见「十二」）。
 
 ### 生产明文认证模式（`x-encrypted: plain`，PHP 独有）
 
-PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，**请求方向与常规生产模式完全一致**——控制端照常发送 ECDSA 签名头 + AES-256-GCM 加密请求体（代理端验签、解密流程不变，控制端请求路径零改动）；仅**响应方向**不做 ECIES 加密，明文 JSON 直出并以 `x-encrypted: plain` 标识。
+PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，请求与响应方向均不再做体加密——控制端照常发送 ECDSA 签名头，但**请求体改为明文 JSON 直发**（服务端不下发 `session_key`，控制端据此放弃 AES-GCM 加密）；响应方向同样明文 JSON 直出，并以 `x-encrypted: plain` 标识。仅 ECDSA 请求签名保持强制校验（未认证/验签失败行为与常规生产模式一致）。
 
-- 适用场景：HTTPS 内传输（机密性由 TLS 承担，省去响应方向 ECIES 开销）及特殊场景；
+- 适用场景：HTTPS 内传输（机密性由 TLS 承担，省去请求 AES 与响应 ECIES 双向密码学开销）、及主机层 WAF 拦截 AES 密文请求体的受限环境；
+- **`session_key`/`noise_key` 恒不下发**（baseinfo 响应中为 `null`，即使已认证）——控制端据此判定请求体走明文，不再尝试 AES 加密；
 - 认证语义不变：未认证/验签失败/匿名白名单/40x 行为与常规生产模式完全一致（响应不带头、无 session_key）；
-- `session_key`/`noise_key` 照常经已认证的 baseinfo 下发（AES 请求加密与 WS 终端令牌依赖）；
+- WS 终端不可用：无 `session_key` 无法计算降级令牌（PHP 版代理本就不支持 terminal）；
 - 兼容性：即使控制端仍对响应尝试 ECIES 解密，因 `plain ≠ true` 不会触发解密，明文 JSON 直接可解析；
 - 优先级：`DEBUG=true` 时以 DEBUG 为准（一切响应 `false`），`PLAIN_MODE` 失效；
-- 风险提示：响应（含 `/api/tempkey` 私钥、命令输出）全程明文，必须确保部署在 HTTPS/TLS 链路内。
+- 风险提示：请求（含命令输入）与响应（含 `/api/tempkey` 私钥、命令输出）全程明文，必须确保部署在 HTTPS/TLS 链路内；请求仅凭 ECDSA 签名防篡改，不提供机密性。
 
 ### 控制端判定表
 
 | 观测 | 判定 | 客户端动作 |
 | :--- | :--- | :--- |
-| `x-encrypted: true` | 生产模式（该 JSON 响应体为 ECIES 密文） | ECIES 解密 |
-| `x-encrypted: plain` | **生产明文认证模式**（PHP 独有）：验签照常、请求 AES 照常，响应明文 | 照常签名 + AES 加密请求；响应按明文 JSON 解析，不得判为 DEBUG |
+| `x-encrypted: true` | 生产模式（该 JSON 响应体为密文；0.5.5- 全部为 ECIES，**0.5.6+ 仅 `/api/baseinfo` 为 ECIES、其余端点为 AES-GCM(SESSION_KEY)**） | 按代理版本号数字前缀判定算法（见「十二」）：`≥ 0.5.6` → 非 baseinfo 端点用 `session_key` 做 AES-256-GCM 解密、`/api/baseinfo` 用 ECIES 解密；`< 0.5.6` → 全部 ECIES 解密 |
+| `x-encrypted: plain` | **生产明文认证模式**（PHP 独有）：验签照常、双向体加密关闭 | 照常发送 ECDSA 签名头；请求体改发明文 JSON（不设 `X-AES-Encrypted`，无 session_key 可加密）；响应按明文 JSON 解析，不得判为 DEBUG |
 | `x-encrypted: false` | **调试模式**（认证形同虚设，凭据经 baseinfo 明文下发） | 停止签名/加密通信，UI 显著警示 |
 | 头缺失 | 生产模式的未加密响应（匿名白名单 / 错误 / 预检），body 为明文 JSON | 按明文处理；**不得**判为调试模式 |
 
@@ -854,7 +861,7 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，**请�
 | **权限查询** | POST | `/api/file/authority` | 查询权限 | ✅ | ✅ |
 | **权限设置** | PUT | `/api/file/authority` | 设置权限 | ✅ | ✅ |
 | **文件查看** | POST | `/api/file/cat` | 查看文本内容 | ✅ | ✅ |
-| **文件上传** | POST | `/api/file` | 上传文件 | ✅ | ✅ |
+| **文件上传** | POST | `/api/fileraw` | 上传文件（裸二进制流，支持分块） | ✅ | ✅ |
 | **文件下载** | POST | `/api/file/download` | 下载文件 | ✅ | ✅ |
 | **文件删除** | DELETE | `/api/file` | 批量删除 | ✅ | ✅ |
 | **文件删除(PHP兼容)** | POST | `/api/file/delete` | 批量删除（**仅 PHP**，与 DELETE /api/file 等价） | ✅ | ✅ |
@@ -881,6 +888,7 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，**请�
 | **临时隧道-建** | POST | `/api/argo` | 创建临时隧道（Py/Js） | ✅ | ✅ |
 | **临时隧道-删** | DELETE | `/api/argo` | 删除临时隧道（Py/Js） | ✅ | ✅ |
 ---
+> 注：上表「认证/加密」为常规生产模式（`DEBUG=false, PLAIN_MODE=false`）语义。PHP 版配置 `PLAIN_MODE=true` 后，全部接口**认证列不变**（ECDSA 签名照常强制），**加密列改为明文直发**（请求体明文 JSON、响应明文 + `x-encrypted: plain`，且 `/api/baseinfo` 不下发 `session_key`）；`DEBUG=true` 时认证与加密均豁免（详见「十、x-encrypted 响应模式头规范」）。
 
 ### 通用请求头要求 (Headers)
 所有标记为 ✅ 的接口必须包含以下字段：
@@ -890,7 +898,9 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，**请�
 3. `X-Auth-Token`: `<ECDSA签名>`
 4. `Content-Type`: `application/json`
 
-签名密钥说明：`X-Auth-Token` 可由控制端**静态密钥**签名，也可由 `GET /api/tempkey` 获取的**有效临时密钥**签名（`ecdsa.private_key`）。代理端验签时自动切换，并据此选择对应的 ECIES 公钥加密响应（静态密钥请求→静态公钥，临时密钥请求→临时公钥）。
+签名消息（agent ≥ 0.4.8，v2 五段）：取 `METHOD`（大写）、`PATH`（不含 query，PHP 入口脚本转发形态需剔除 `*.php` 段）、`SHA256_HEX(实际发送body)`（无体请求及 `/api/fileraw` 固定为 `sha256("")`，AES 加密请求签**加密后**的密文）、`X-Nonce`、`X-Timestamp` 五段以 `\n` 拼接，SHA256 后做 ECDSA-P256 签名（DER 或 Raw 64 字节均可）。
+
+签名密钥说明：`X-Auth-Token` 可由控制端**静态密钥**签名，也可由 `GET /api/tempkey` 获取的**有效临时密钥**签名（`ecdsa.private_key`）。代理端验签时自动切换，并据此选择对应的 ECIES 公钥加密响应（静态密钥请求→静态公钥，临时密钥请求→临时公钥）。**0.5.6 起**该公钥选择仅作用于 `/api/baseinfo` 的响应加密；其余端点的响应改用 `session_key` 做 AES-256-GCM 加密（与验签来源无关，见「十二」）。
 
 响应模式判定头 `x-encrypted`（生产恒 `true` / 调试恒 `false` / 生产未加密态不发送）的完整取值规则见「十、x-encrypted 响应模式头规范」。
 
@@ -924,3 +934,34 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，**请�
 - **go**（`go/logger`）：四级阈值，缺省 `3`；`DEBUG=true` 且未设置时为 `0`。ERROR 走 stderr，其余走 stdout。
 - **java / java11**（`kisama.java`）：四级阈值，缺省 `3`；`DEBUG=true` 接管为 `0`。ERROR 走 stderr，其余走 stdout，输出统一带 `[DEBUG]/[INFO]/[WARN]/[ERROR]` 前缀。0.5.3 起废弃 `LOG` 布尔开关。
 - **py**（`py/agent.py` Logger）：0.5.3 起纳入同一四级阈值体系，缺省 `3`；`DEBUG=true` 且未设置 `LOG_LEVEL` 时为 `0`（全量含全部调试频道）。原有细分调试频道整体平移到**高位频道 11~15**（与标准四级互不干扰）：`11`=基本信息、`12`=WebSocket传输、`13`=终端日志、`14`=网络统计、`15`=磁盘统计。阈值设为 `11~15` 时常规日志（INFO/WARN/ERROR）全出、且**精确打开对应一个调试频道**；`LOG_LEVEL=0` 时全量输出全部频道。代码内 `Logger.debug(msg, channel)` 的 channel 参数即频道号（缺省 11），DEBUG 行按 `[DEBUG]` 标签输出（ERROR 走 stderr，其余 stdout）。
+
+## 十二、0.5.6 响应加密协议变更（ECIES 仅存于 baseinfo，其余端点改用 session_key 对称加密）
+
+### 变更动机
+
+0.5.5 及之前，代理端对**每一个**认证 JSON 响应都执行一次完整 ECIES 加密（临时 secp256k1 密钥对生成 + ECDH + HKDF-SHA256 + AES-GCM + Base64），密钥建立开销随请求线性增长，且在无原生加速库的环境（如 py 纯 Python 回退、java BouncyCastle 弱机）下单次可达毫秒到数十毫秒。0.5.6 起改为 TLS 式的两段设计：**`/api/baseinfo` 作为唯一的 ECIES 端点承担密钥分发（握手），其余端点的响应统一使用 baseinfo 下发的 `session_key` 做 AES-256-GCM 对称加密**——省去每响应的非对称密钥建立，仅保留对称加密开销（微秒级）。
+
+### 加密规则（0.5.6 起，生产模式 DEBUG=false）
+
+| 场景 | 响应加密方式 | 说明 |
+| :--- | :--- | :--- |
+| `/api/baseinfo`（已认证） | **恒为 ECIES** | 静态密钥签名→静态 ECIES 公钥；临时密钥签名→临时 ECIES 公钥（临时持有者此时还没有 session_key，必须经此端点取得） |
+| 其余全部端点（已认证，含 `/api/tempkey`） | **AES-256-GCM(SESSION_KEY)** | 密文容器 `Base64(JSON{nonce, tag, ciphertext})`，`nonce` 为每响应随机 12 字节，`session_key` 为 baseinfo 下发的 32 字节原始密钥（Base64 解码后）；与验签来源无关（静态/temp 一视同仁） |
+| 未认证 / 匿名白名单 / 40x / OPTIONS / HEAD | 不加密 | 与 0.5.5 一致（不发送 `x-encrypted`） |
+| `DEBUG=true` | 全部明文 | 与 0.5.5 一致（`x-encrypted: false`） |
+| `/api/fileraw` 裸流、octet-stream 二进制响应 | 不加密 | 与 0.5.5 一致（机密性由传输层 TLS 承担） |
+
+不变式：`x-encrypted` 头语义与取值规则不变（见「十」），`true` 依旧表示"已认证的加密 JSON 响应"，仅**算法**由版本号区分；加密失败仍为 HTTP 500 且不发送该头。
+
+### 客户端判定规则
+
+1. 客户端从 `/api/baseinfo` 响应 JSON 的 `version` 字段（或 `x-agent-version` 响应头）读取代理版本号，取**数字前缀**解析为三元组（如 `"0.5.6-python"` → `(0,5,6)`；带语言后缀不影响比较）；
+2. 版本 `≥ 0.5.6`：`/api/baseinfo` 用 ECIES 解密（本就如此），**其余端点**用 `session_key` 做 AES-256-GCM 解密；
+3. 版本 `< 0.5.6`：全部端点按 ECIES 解密（旧代理行为不变）；
+4. 不引入任何新请求/响应头，判定完全由客户端按版本号自适应。
+
+### 兼容性与安全性说明
+
+- **版本必须成对升级**：旧版控制端/面板（< 0.5.6 感知）遇到 0.5.6+ 代理时将无法解密非 baseinfo 响应；反之 0.5.6+ 控制端遇到旧代理自动走 ECIES（版本判定天然兼容）。客户端应在版本判定后按对应算法解密，解密失败给出"版本需成对升级"的明确提示而非模糊的解密错误。
+- **tempkey 授权寿命不变**：认证门仍为 ECDSA 签名；tempkey 过期检查仍在每个认证请求路径上，过期即作废临时密钥并触发 `SESSION_KEY` + 控制 Noise 密钥轮换（`rotateOperationalSecrets`），临时持有者缓存的 session_key 随轮换失效——改为对称加密**不会**使临时授权变成永久授权。
+- `session_key` 仍是随机 32 字节、仅存内存、仅经 baseinfo（ECIES 保护下）下发；其用途在原有"请求体 AES 解密（X-AES-Encrypted）+ WS 降级令牌"基础上增加"响应体 AES 加密"。

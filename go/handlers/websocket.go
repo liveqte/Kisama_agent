@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -228,6 +229,9 @@ type TerminalSessionHandler struct {
 	useNoise  bool
 	cipher    *NoiseSessionWrapper
 
+	metaRequested      bool // 面板可解析控制帧 (meta=1), 请求 welcome 元数据帧
+	incognitoRequested bool // 面板请求原生无痕会话 (incognito=1)
+
 	msgChan     chan []byte
 	closeOnce   sync.Once
 	cmd         *exec.Cmd
@@ -274,6 +278,9 @@ func WebSocketHandler(c *gin.Context) {
 
 	requestID := c.Query("request_id")
 	token := c.Query("token")
+	// meta=1: 面板可解析控制帧, 请求 welcome 元数据帧; incognito=1: 请求原生无痕会话
+	metaFlag := c.Query("meta") == "1"
+	incognitoFlag := c.Query("incognito") == "1"
 
 	logger.Debugf("WebSocket connection attempt with request_id: %s", requestID)
 
@@ -311,13 +318,15 @@ func WebSocketHandler(c *gin.Context) {
 		return
 	}
 
-	handler.StartSession(conn, requestID, token)
+	handler.StartSession(conn, requestID, token, metaFlag, incognitoFlag)
 }
 
-func (h *TerminalSessionHandler) StartSession(ws *websocket.Conn, requestID string, token string) {
+func (h *TerminalSessionHandler) StartSession(ws *websocket.Conn, requestID string, token string, metaRequested bool, incognitoRequested bool) {
 	h.ws = ws
 	h.requestID = requestID
 	h.useNoise = (token == "")
+	h.metaRequested = metaRequested
+	h.incognitoRequested = incognitoRequested
 	h.ws.SetReadLimit(terminalMaxMessageSize)
 	_ = h.ws.SetReadDeadline(time.Now().Add(terminalIdleTimeout))
 	h.ws.SetPongHandler(func(string) error {
@@ -418,13 +427,19 @@ func (h *TerminalSessionHandler) runTerminal() error {
 	shell := h.getAvailableShell()
 	logger.Infof("[终端会话 %s] 🐚 使用 Shell 路径: %s", h.requestID, shell)
 
-	cmd := exec.Command(shell)
+	cmd := exec.Command(shell, incognitoShellArgs(shell, h.incognitoRequested)...)
 	cmd.Env = os.Environ()
 	filteredEnv := []string{"TERM=xterm-256color", "LANG=C.UTF-8"}
 	for _, env := range cmd.Env {
 		if !strings.HasPrefix(env, "PROMPT_COMMAND=") && !strings.HasPrefix(env, "TERM=") && !strings.HasPrefix(env, "LANG=") {
 			filteredEnv = append(filteredEnv, env)
 		}
+	}
+	// 🕶️ 原生无痕模式 (0.5.5): 面板经 WS query incognito=1 请求后，在 spawn 现场注入
+	// HISTFILE=/dev/null（仅 Unix；bash/zsh/ash 均认该变量，退出时历史写往 /dev/null，
+	// 内存内 ↑↑ 历史保留），替代旧版面板的命令注入 hack
+	if h.incognitoRequested {
+		filteredEnv = append(filteredEnv, incognitoEnv()...)
 	}
 	cmd.Env = filteredEnv
 	cmd.Dir = safeCwd()
@@ -445,6 +460,11 @@ func (h *TerminalSessionHandler) runTerminal() error {
 		_ = cmd.Wait()
 		close(h.processDone)
 	}()
+
+	// welcome 帧先于输出泵: 面板永远先拿到 shell 元数据再见到首字节回显
+	if h.metaRequested {
+		h.sendWelcome(shell)
+	}
 
 	// term -> WS
 	go func() {
@@ -528,6 +548,32 @@ func (h *TerminalSessionHandler) processTerminalMessage(message []byte) {
 
 func (h *TerminalSessionHandler) getAvailableShell() string {
 	return defaultTerminalShell()
+}
+
+// sendWelcome 在 PTY 输出泵启动前主动推送 welcome 元数据帧（复刻心跳回包的加密发送路径）。
+// 仅 meta=1 时发送；WS 帧有序，面板保证先收到本帧再见到首字节 shell 回显
+func (h *TerminalSessionHandler) sendWelcome(shellPath string) {
+	payload, _ := json.Marshal(map[string]interface{}{
+		"type":      "welcome",
+		"shell":     normalizeShellName(shellPath),
+		"path":      shellPath,
+		"incognito": h.incognitoRequested && incognitoNativeApplied(shellPath),
+	})
+	_ = h.writeEncryptedMessage(websocket.BinaryMessage, payload)
+}
+
+// normalizeShellName welcome 帧用的 shell 归一化名: basename + 去 .exe 后缀 (powershell.exe -> powershell)
+func normalizeShellName(shellPath string) string {
+	trimmed := strings.TrimSpace(shellPath)
+	if trimmed == "" {
+		return "sh"
+	}
+	name := strings.ToLower(filepath.Base(trimmed))
+	name = strings.TrimSuffix(name, ".exe")
+	if name == "" || name == "." {
+		return "sh"
+	}
+	return name
 }
 
 func (h *TerminalSessionHandler) writeMessage(messageType int, data []byte) error {

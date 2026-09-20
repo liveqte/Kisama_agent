@@ -147,7 +147,17 @@ func (s *Service) Start() error {
 	logger.Infof("Starting Kisama Agent server on %s", addr)
 	logger.Infof("Agent version: %s", s.cfg.AgentVersion)
 
-	server := &http.Server{Addr: addr, Handler: s.router}
+	// 🚀 0.5.6 性能/健壮性: 补齐 http.Server 超时与连接空闲上限 — 原实现无任何超时,
+	// 慢连接 (slowloris) 与空闲 keep-alive 可无限占用 goroutine 与文件描述符
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           s.router,
+		ReadHeaderTimeout: 30 * time.Second,
+		ReadTimeout:       10 * time.Minute,  // 大文件上传 (/api/fileraw) 需要长读窗口
+		WriteTimeout:      10 * time.Minute,  // 大文件下载需要长写窗口
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		s.mu.Unlock()

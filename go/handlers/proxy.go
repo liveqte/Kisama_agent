@@ -17,9 +17,13 @@ import (
 )
 
 // kisamaProxyCORSHeaders 与 kpng worker.js / ng.conf 中的 CORS 头配置保持一致。
+// Expose-Headers 为 Go 侧新增：ETag 不在 CORS 安全响应头白名单内，跨域 JS 不显式暴露
+// 就读不到（WebDAV 乐观锁 If-Match 的前提）；Location/Content-Location/DAV/Lock-Token
+// 同理，为浏览器端 WebDAV 客户端补齐。kpng 侧配置需同步补上。
 var kisamaProxyCORSHeaders = map[string]string{
-	"Access-Control-Allow-Methods": "GET, POST, OPTIONS, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, COPY, MOVE, LOCK, UNLOCK, HEAD",
-	"Access-Control-Allow-Headers": "authorization,DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,x-nonce,x-timestamp,x-auth-token,x-aes-encrypted,x-file-path,x-file-name,x-chunk-id,x-total-chunks,Depth,Destination,Overwrite,If,If-Match,If-None-Match,Lock-Token,Timeout,Dav,Prefer,Brief,Compliance-Class,",
+	"Access-Control-Allow-Methods":  "GET, POST, OPTIONS, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, COPY, MOVE, LOCK, UNLOCK, HEAD",
+	"Access-Control-Allow-Headers":  "authorization,DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,x-nonce,x-timestamp,x-auth-token,x-aes-encrypted,x-file-path,x-file-name,x-chunk-id,x-total-chunks,Depth,Destination,Overwrite,If,If-Match,If-None-Match,Lock-Token,Timeout,Dav,Prefer,Brief,Compliance-Class",
+	"Access-Control-Expose-Headers": "ETag, Location, Content-Location, DAV, Lock-Token",
 }
 
 // webdavMethods 定义 WebDAV 专有的 HTTP 扩展方法

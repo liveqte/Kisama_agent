@@ -119,6 +119,8 @@ public class kisama {
     private final Map<String, String> crons = new ConcurrentHashMap<>();
     private final List<Map<String, Object>> cron_log = Collections.synchronizedList(new ArrayList<>());
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(4);
+    // 🔧 0.5.6 cron 修复: 记录上次 tick 所在分钟, 防止 30s 间隔在同一分钟内触发两次执行
+    private volatile String lastCronTickMinute = "";
 
     private volatile boolean isRunning = false;
 
@@ -168,7 +170,7 @@ public class kisama {
 
     private static final int TEMPKEY_DEFAULT_TTL_HOURS = Integer.parseInt(DOTENV.getOrDefault("TEMPKEY_TTL", "24"));
     private static final int TEMPKEY_MAX_TTL_HOURS = Integer.parseInt(DOTENV.getOrDefault("TEMPKEY_MAX_TTL", "168"));
-    private static final String AGENT_VERSION = "0.5.4-java";
+    private static final String AGENT_VERSION = "0.5.6-java";
 
     private Map<String, Object> baseInfoCache = null;
     private long lastBaseInfoCacheTime = 0;
@@ -236,6 +238,74 @@ public class kisama {
         boolean debug = Boolean.parseBoolean(DOTENV.getOrDefault("DEBUG", "false"));
         return debug ? LOG_LEVEL_DEBUG : LOG_LEVEL_ERROR;
     }
+
+    // ==================== Cron 表达式匹配 (0.5.6 修复: 表达式此前从未参与调度) ====================
+    // 支持标准 5 字段: 分 时 日 月 周; 每字段支持 * , - / 语法;
+    // 日 与 周 均受限时按 Vixie cron 语义取或; 匹配基于 30s 扫描时刻所在的分钟。
+    private static boolean cronFieldMatches(String field, int value, int min, int max) {
+        if (field == null) return false;
+        field = field.trim();
+        if (field.equals("*")) return true;
+        for (String part : field.split(",")) {
+            part = part.trim();
+            if (part.isEmpty()) continue;
+            int step = 1;
+            int slash = part.indexOf('/');
+            if (slash >= 0) {
+                try {
+                    step = Integer.parseInt(part.substring(slash + 1).trim());
+                } catch (NumberFormatException e) {
+                    return false;
+                }
+                if (step <= 0) return false;
+                part = part.substring(0, slash).trim();
+            }
+            int lo = min, hi = max;
+            if (slash < 0 || !part.equals("*")) {
+                int dash = part.indexOf('-');
+                try {
+                    if (dash >= 0) {
+                        lo = Integer.parseInt(part.substring(0, dash).trim());
+                        hi = Integer.parseInt(part.substring(dash + 1).trim());
+                    } else if (slash >= 0) {
+                        lo = Integer.parseInt(part);
+                        hi = max;
+                    } else {
+                        lo = hi = Integer.parseInt(part);
+                    }
+                } catch (NumberFormatException e) {
+                    return false;
+                }
+            }
+            for (int v = lo; v <= hi; v += step) {
+                if (v == value) return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean cronMatchesNow(String expr) {
+        if (expr == null || expr.isBlank()) return false;
+        String[] parts = expr.trim().split("\\s+");
+        if (parts.length != 5) return false; // 仅支持标准 5 字段 (与面板写入格式一致)
+        java.time.ZonedDateTime now = java.time.ZonedDateTime.now();
+        int dow = now.getDayOfWeek().getValue() % 7; // cron 语义: 0/7=周日, 1..6=周一..周六
+
+        boolean domRestricted = !parts[2].trim().equals("*");
+        boolean dowRestricted = !parts[4].trim().equals("*");
+        boolean domMatch = cronFieldMatches(parts[2], now.getDayOfMonth(), 1, 31);
+        boolean dowMatch = cronFieldMatches(parts[4], dow, 0, 7)
+                || (dow == 0 && cronFieldMatches(parts[4], 7, 0, 7));
+        boolean dayMatch = (domRestricted && dowRestricted)
+                ? (domMatch || dowMatch)   // Vixie 语义: 日与周双受限时取或
+                : (domMatch && dowMatch);  // 单受限: 受限者必须命中 (另一字段为 * 恒真)
+
+        return cronFieldMatches(parts[0], now.getMinute(), 0, 59)
+                && cronFieldMatches(parts[1], now.getHour(), 0, 23)
+                && dayMatch
+                && cronFieldMatches(parts[3], now.getMonthValue(), 1, 12);
+    }
+
     // ==================== 生命周期管理 ====================
     public void start() throws Exception {
         if (isRunning) {
@@ -256,10 +326,23 @@ public class kisama {
         this.scheduler.scheduleAtFixedRate(() -> {
             try {
                 if (!this.crons.isEmpty()) {
+                    // 🔧 0.5.6 修复: 此前 30s tick 无条件全量执行所有 cron 任务, 表达式从未参与
+                    // 调度; 现按表达式匹配当前分钟, 仅执行命中任务 (对齐 py/js 版语义)。
+                    // 30s 间隔会在同一分钟内 tick 两次, 以分钟戳去重防止重复执行。
+                    String minuteStamp = java.time.ZonedDateTime.now()
+                            .format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMddHHmm"));
+                    if (minuteStamp.equals(this.lastCronTickMinute)) {
+                        return;
+                    }
+                    this.lastCronTickMinute = minuteStamp;
+
                     log("[TRACE-CRON] 触发周期性定时任务动态扫描...");
                     for (Map.Entry<String, String> entry : this.crons.entrySet()) {
                         String cronExpression = entry.getKey();
                         String cmd = entry.getValue();
+                        if (!cronMatchesNow(cronExpression)) {
+                            continue;
+                        }
                         Map<String, Object> r = executeCommandSync(cmd, null);
 
                         Map<String, Object> logEntry = new LinkedHashMap<>();
@@ -400,18 +483,30 @@ public class kisama {
             long now = System.currentTimeMillis();
             Map<String, Object> clientResponseMap;
 
-            // 1. 原子互斥锁检查：解决高并发多线程涌入时的 Cache Stampede 效应
+            // 1. 缓存检查 + 锁外重建 (0.5.6 优化): buildRawBaseInfo 含外网 IP 探测/GPU 探测等
+            //    慢操作, 原实现持锁构建会让并发请求全部排队 5~15s; 改为锁外构建、锁内原子替换
+            //    (与 JS/py 版锁外构建同模式)
             synchronized (baseInfoCacheLock) {
-                if (baseInfoCache == null || (now - lastBaseInfoCacheTime) > BASEINFO_CACHE_TTL_MS) {
-                    baseInfoCache = buildRawBaseInfo();
-                    lastBaseInfoCacheTime = now;
-                    log("[TRACE-CACHE] 🔄 BaseInfo 缓存已过期，已重新调度生成。");
-                } else {
+                if (baseInfoCache != null && (now - lastBaseInfoCacheTime) <= BASEINFO_CACHE_TTL_MS) {
                     log("[TRACE-CACHE] 📦 BaseInfo 命中有效缓存，直接输出。");
+                    // ⚠️ 安全关键点：浅拷贝解耦出一个全新的可变 Map 容器
+                    // 严禁直接修改 baseInfoCache 全局静态引用的属性，否则会导致敏感密钥永久越权暴露给匿名请求
+                    clientResponseMap = new LinkedHashMap<>(baseInfoCache);
+                } else {
+                    clientResponseMap = null;
                 }
-                // ⚠️ 安全关键点：浅拷贝解耦出一个全新的可变 Map 容器
-                // 严禁直接修改 baseInfoCache 全局静态引用的属性，否则会导致敏感密钥永久越权暴露给匿名请求
-                clientResponseMap = new LinkedHashMap<>(baseInfoCache);
+            }
+            if (clientResponseMap == null) {
+                Map<String, Object> rebuilt = buildRawBaseInfo();
+                synchronized (baseInfoCacheLock) {
+                    // 双检: 并发线程可能已完成重建, 避免慢构建的旧数据覆盖新缓存
+                    if (baseInfoCache == null || (System.currentTimeMillis() - lastBaseInfoCacheTime) > BASEINFO_CACHE_TTL_MS) {
+                        baseInfoCache = rebuilt;
+                        lastBaseInfoCacheTime = System.currentTimeMillis();
+                    }
+                    clientResponseMap = new LinkedHashMap<>(baseInfoCache != null ? baseInfoCache : rebuilt);
+                }
+                log("[TRACE-CACHE] 🔄 BaseInfo 缓存已过期，已重新调度生成。");
             }
 
             // 2. 动态审查当前单次请求的认证标签状态，安全追加或剔除核心敏感凭证
@@ -484,16 +579,27 @@ public class kisama {
             long now = System.currentTimeMillis();
             Map<String, Object> clientStatusMap;
 
-            // 1. 30 秒缓存锁流控拦截
+            // 1. 30 秒缓存 + 锁外重建 (0.5.6 优化): buildRawStatusInfo 含 1s CPU 采样等
+            //    慢操作, 原实现持锁构建会让并发请求全部排队; 改为锁外构建、锁内原子替换
             synchronized (statusCacheLock) {
-                if (statusCache == null || (now - lastStatusCacheTime) > STATUS_CACHE_TTL_MS) {
-                    statusCache = buildRawStatusInfo();
-                    lastStatusCacheTime = now;
-                    log("[TRACE-CACHE] 🔄 Status 实时监控缓存已过期，已重新生成度量快照。");
-                } else {
+                if (statusCache != null && (now - lastStatusCacheTime) <= STATUS_CACHE_TTL_MS) {
                     log("[TRACE-CACHE] 📦 Status 命中监控缓存。");
+                    clientStatusMap = new LinkedHashMap<>(statusCache);
+                } else {
+                    clientStatusMap = null;
                 }
-                clientStatusMap = new LinkedHashMap<>(statusCache);
+            }
+            if (clientStatusMap == null) {
+                Map<String, Object> rebuilt = buildRawStatusInfo();
+                synchronized (statusCacheLock) {
+                    // 双检: 并发线程可能已完成重建, 避免慢构建的旧数据覆盖新缓存
+                    if (statusCache == null || (System.currentTimeMillis() - lastStatusCacheTime) > STATUS_CACHE_TTL_MS) {
+                        statusCache = rebuilt;
+                        lastStatusCacheTime = System.currentTimeMillis();
+                    }
+                    clientStatusMap = new LinkedHashMap<>(statusCache != null ? statusCache : rebuilt);
+                }
+                log("[TRACE-CACHE] 🔄 Status 实时监控缓存已过期，已重新生成度量快照。");
             }
 
             return this.gson.toJson(clientStatusMap);
@@ -1098,13 +1204,21 @@ public class kisama {
                 // 🌟 只有身份确实为已认证（true）状态，才在出口统一披上密文外衣
                 if (isAuthenticated) {
                     try {
-                        // 按验签来源选择对应 ECIES 公钥: 静态密钥->静态公钥, 临时密钥->临时公钥
-                        byte[] targetPub = this.ECIES_PUBLIC_KEY;
-                        if ("temp".equals(req.attribute("key_source"))) {
-                            byte[] tempPub = this.tempKeyManager.getActiveEciesPub();
-                            if (tempPub != null) targetPub = tempPub;
+                        // 🔐 0.5.6 响应加密分流 (docs/API.MD 十二): /api/baseinfo 恒走 ECIES
+                        // (密钥分发握手, 静态签名->静态公钥 / 临时签名->临时公钥); 其余认证端点
+                        // 用 session_key 对原始响应字节做 AES-256-GCM 加密
+                        String encrypted;
+                        if ("/api/baseinfo".equals(req.pathInfo())) {
+                            // 按验签来源选择对应 ECIES 公钥: 静态密钥->静态公钥, 临时密钥->临时公钥
+                            byte[] targetPub = this.ECIES_PUBLIC_KEY;
+                            if ("temp".equals(req.attribute("key_source"))) {
+                                byte[] tempPub = this.tempKeyManager.getActiveEciesPub();
+                                if (tempPub != null) targetPub = tempPub;
+                            }
+                            encrypted = encryptResponse(res.body().getBytes(StandardCharsets.UTF_8), targetPub);
+                        } else {
+                            encrypted = encryptAesPayload(res.body().getBytes(StandardCharsets.UTF_8), this.SESSION_KEY);
                         }
-                        String encrypted = encryptResponse(res.body().getBytes(StandardCharsets.UTF_8), targetPub);
                         if (encrypted != null) {
                             res.body(encrypted);
                             res.header("X-Encrypted", "true");
@@ -2724,7 +2838,10 @@ public class kisama {
 
     private String encryptResponse(byte[] plaintext, byte[] targetPubKey) throws Exception {
         if (targetPubKey == null) return null;
-        log("[TRACE-ECIES] 启动标准 ECIES 加密包封装...  ");
+        // 🚀 0.5.6 性能: 逐步骤 trace 日志的字符串拼接 (bytesToHex/Base64 截取) 在低日志级别
+        // 下也照常执行, 每个加密响应都要白白付出这份开销; 统一收口到日志级别判断内
+        boolean traceLog = this.logLevel <= LOG_LEVEL_INFO;
+        if (traceLog) log("[TRACE-ECIES] 启动标准 ECIES 加密包封装...  ");
         ECNamedCurveParameterSpec ecSpec = ECNamedCurveTable.getParameterSpec("secp256k1");
         ECPoint receiverPoint = ecSpec.getCurve().decodePoint(targetPubKey);
         KeyPairGenerator kpg = KeyPairGenerator.getInstance("EC", "BC");
@@ -2732,7 +2849,7 @@ public class kisama {
         KeyPair ephemeralKeyPair = kpg.generateKeyPair();
         org.bouncycastle.jce.interfaces.ECPublicKey ecEphemPubKey = (org.bouncycastle.jce.interfaces.ECPublicKey) ephemeralKeyPair.getPublic();
         byte[] ephemeralPubKeyBytes = ecEphemPubKey.getQ().getEncoded(false);
-        log("  -> [Step 1] 产生会话非压缩临时公钥 (65字节): " + bytesToHex(ephemeralPubKeyBytes));
+        if (traceLog) log("  -> [Step 1] 产生会话非压缩临时公钥 (65字节): " + bytesToHex(ephemeralPubKeyBytes));
         org.bouncycastle.jce.interfaces.ECPrivateKey ecPrivKey = (org.bouncycastle.jce.interfaces.ECPrivateKey) ephemeralKeyPair.getPrivate();
         ECPoint sharedPoint = receiverPoint.multiply(ecPrivKey.getD()).normalize();
         byte[] sharedPointBytes = sharedPoint.getEncoded(false);
@@ -2740,16 +2857,16 @@ public class kisama {
         System.arraycopy(ephemeralPubKeyBytes, 0, master, 0, ephemeralPubKeyBytes.length);
         System.arraycopy(sharedPointBytes, 0, master, ephemeralPubKeyBytes.length, sharedPointBytes.length);
         byte[] aesKey = hkdfSha256(master, 32);
-        log("  -> [Step 2] ECIES HKDF master 长度: " + master.length + " = ephemeralPubKey(" + ephemeralPubKeyBytes.length + ") + sharedPoint(" + sharedPointBytes.length + ")");
-        log("  -> [Step 3] HKDF 派生 AES-256 key 完成 (内容不落日志)");
+        if (traceLog) log("  -> [Step 2] ECIES HKDF master 长度: " + master.length + " = ephemeralPubKey(" + ephemeralPubKeyBytes.length + ") + sharedPoint(" + sharedPointBytes.length + ")");
+        if (traceLog) log("  -> [Step 3] HKDF 派生 AES-256 key 完成 (内容不落日志)");
         byte[] nonce = new byte[16];
         new SecureRandom().nextBytes(nonce);
-        log("  -> [Step 4] 已生成 16 字节标准 AES-GCM 传输 Nonce (内容不落日志)");
+        if (traceLog) log("  -> [Step 4] 已生成 16 字节标准 AES-GCM 传输 Nonce (内容不落日志)");
         Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding", "BC");
         GCMParameterSpec gcmSpec = new GCMParameterSpec(128, nonce);
         cipher.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(aesKey, "AES"), gcmSpec);
         byte[] ciphertextWithTag = cipher.doFinal(plaintext);
-        log("  -> [Step 5] 对称运算完成，复合密文流（含尾部 Tag）长度: " + ciphertextWithTag.length + "字节  ");
+        if (traceLog) log("  -> [Step 5] 对称运算完成，复合密文流（含尾部 Tag）长度: " + ciphertextWithTag.length + "字节  ");
         int ciphertextLen = ciphertextWithTag.length - 16;
         byte[] ciphertextPure = new byte[ciphertextLen];
         byte[] tag = new byte[16];
@@ -2761,7 +2878,7 @@ public class kisama {
         System.arraycopy(tag, 0, result, 81, 16);
         System.arraycopy(ciphertextPure, 0, result, 97, ciphertextLen);
         String finalB64 = Base64.getEncoder().encodeToString(result);
-        log("  -> [Step 6] 🏁 ECIES 官方标准打包合流完成。Base64 前30位: " + finalB64.substring(0, Math.min(30, finalB64.length())));
+        if (traceLog) log("  -> [Step 6] 🏁 ECIES 官方标准打包合流完成。Base64 前30位: " + finalB64.substring(0, Math.min(30, finalB64.length())));
         return finalB64;
     }
 
@@ -2779,6 +2896,27 @@ public class kisama {
         System.arraycopy(cipher, 0, ctWithTag, 0, cipher.length);
         System.arraycopy(tag, 0, ctWithTag, cipher.length, tag.length);
         return new String(c.doFinal(ctWithTag), StandardCharsets.UTF_8);
+    }
+
+    // 🔐 encryptAesPayload: decryptAesPayload 的对称操作 (0.5.6 响应加密用, docs/API.MD 十二)。
+    // 输出 Base64(JSON{nonce, tag, ciphertext}), nonce 每次随机 12 字节, 与控制端 aes_gcm_open 契约一致。
+    private String encryptAesPayload(byte[] plaintext, byte[] key) throws Exception {
+        byte[] nonce = new byte[12];
+        new SecureRandom().nextBytes(nonce);
+        Cipher c = Cipher.getInstance("AES/GCM/NoPadding", "BC");
+        c.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(key, "AES"), new GCMParameterSpec(128, nonce));
+        byte[] ciphertextWithTag = c.doFinal(plaintext);
+        int cipherLen = ciphertextWithTag.length - 16;
+        byte[] ciphertextPure = new byte[cipherLen];
+        byte[] tag = new byte[16];
+        System.arraycopy(ciphertextWithTag, 0, ciphertextPure, 0, cipherLen);
+        System.arraycopy(ciphertextWithTag, cipherLen, tag, 0, 16);
+        Map<String, String> m = new LinkedHashMap<>();
+        m.put("nonce", Base64.getEncoder().encodeToString(nonce));
+        m.put("tag", Base64.getEncoder().encodeToString(tag));
+        m.put("ciphertext", Base64.getEncoder().encodeToString(ciphertextPure));
+        String outerJson = this.gson.toJson(m);
+        return Base64.getEncoder().encodeToString(outerJson.getBytes(StandardCharsets.UTF_8));
     }
 
     // ==================== 内部类重构：改为 static 静态内部类，彻底解决反射膨胀 Bug ====================
@@ -2803,6 +2941,11 @@ public class kisama {
                 String requestId = rIds.get(0);
                 List<String> tokens = queryParams.get("token");
                 String token = (tokens != null && !tokens.isEmpty()) ? tokens.get(0) : null;
+                // meta=1: 面板可解析控制帧, 请求 welcome 元数据帧; incognito=1: 请求原生无痕会话
+                List<String> metas = queryParams.get("meta");
+                boolean metaRequested = metas != null && !metas.isEmpty() && "1".equals(metas.get(0));
+                List<String> incogs = queryParams.get("incognito");
+                boolean incognitoRequested = incogs != null && !incogs.isEmpty() && "1".equals(incogs.get(0));
                 agent.log("[TRACE-WS] 收到超级终端连接请求, request_id: " + requestId);
 
                 // WSS 降级模式(token 认证)：token 必须等于 HMAC(SESSION_KEY) 降级令牌（常数时间比较）。
@@ -2819,7 +2962,7 @@ public class kisama {
                 }
                 
                 // 传入 agent 实例
-                TerminalSession terminalSession = new TerminalSession(this.agent, session, requestId, token);
+                TerminalSession terminalSession = new TerminalSession(this.agent, session, requestId, token, metaRequested, incognitoRequested);
                 activeSessions.put(session, terminalSession);
                 terminalSession.start();
             } catch (Exception e) {
@@ -2877,6 +3020,8 @@ public class kisama {
         private final String requestId;
         private final String token;
         private final boolean useNoise;
+        private final boolean metaRequested;      // 面板请求 welcome 元数据帧 (meta=1)
+        private final boolean incognitoRequested; // 面板请求原生无痕会话 (incognito=1)
         private static final boolean IS_WINDOWS = System.getProperty("os.name", "").toLowerCase().contains("win");
         private PtyProcess ptyProcess;
         private int handshakePhase = 1;
@@ -2887,12 +3032,15 @@ public class kisama {
         // 终端帧发送锁：加密(消耗发送 nonce)与写 socket 必须原子完成
         private final Object wsSendLock = new Object();
 
-        public TerminalSession(kisama agent, Session wsSession, String requestId, String token) {
+        public TerminalSession(kisama agent, Session wsSession, String requestId, String token,
+                               boolean metaRequested, boolean incognitoRequested) {
             this.agent = agent;
             this.wsSession = wsSession;
             this.requestId = requestId;
             this.token = token;
             this.useNoise = (token == null || token.isBlank());
+            this.metaRequested = metaRequested;
+            this.incognitoRequested = incognitoRequested;
             if (this.useNoise) {
                 this.noiseCipher = new NoiseSession(agent.AGENT_PRIVATE_KEY, agent.CONTROL_PUBLIC_KEY);
             }
@@ -2952,6 +3100,51 @@ public class kisama {
             // 3. 最后的兜底平衡
             return "/bin/sh";
         }
+
+        // welcome 帧用的 shell 归一化名: basename + 去 .exe 后缀 (powershell.exe -> powershell)
+        private static String normalizeShellName(String shellPath) {
+            if (shellPath == null || shellPath.isBlank()) return "sh";
+            String name = shellPath.replace('\\', '/');
+            int idx = name.lastIndexOf('/');
+            name = (idx >= 0 ? name.substring(idx + 1) : name).trim().toLowerCase();
+            if (name.endsWith(".exe")) name = name.substring(0, name.length() - 4);
+            return name.isEmpty() ? "sh" : name;
+        }
+
+        // 本次 spawn 的 shell 是否已满足无痕要求 (面板据此决定是否退回命令注入 hack)。
+        // Unix: HISTFILE=/dev/null 已注入 -> true; Windows: powershell 已带 SaveNothing 参数,
+        // cmd 本身无持久历史 -> true; 其余未知 shell (可能落盘历史, 如 pwsh) -> false
+        private static boolean incognitoNativeApplied(String shellPath) {
+            if (!IS_WINDOWS) return true;
+            String base = normalizeShellName(shellPath);
+            return "powershell".equals(base) || "cmd".equals(base);
+        }
+
+        // 无痕模式下的 spawn 命令: PowerShell 附加 SaveNothing 启动参数 (-Command 在 profile
+        // 之后执行, 可覆盖用户配置); cmd 无持久历史, 维持裸 shell
+        private String[] buildShellCommand(String shell) {
+            if (incognitoRequested && IS_WINDOWS && "powershell".equals(normalizeShellName(shell))) {
+                return new String[]{shell, "-NoExit", "-Command", "Set-PSReadLineOption -HistorySaveStyle SaveNothing"};
+            }
+            return new String[]{shell};
+        }
+
+        // meta=1 时在 PTY 输出泵启动前主动推 welcome 元数据帧 (复刻心跳回包的加密发送路径)。
+        // WS 帧有序: 面板保证先收到本帧再见到首字节 shell 回显
+        private void sendWelcome(String shellPath) {
+            if (!metaRequested) return;
+            try {
+                Map<String, Object> payload = new HashMap<>();
+                payload.put("type", "welcome");
+                payload.put("shell", normalizeShellName(shellPath));
+                payload.put("path", shellPath);
+                payload.put("incognito", incognitoRequested && incognitoNativeApplied(shellPath));
+                sendEncryptedFrame(agent.gson.toJson(payload).getBytes(StandardCharsets.UTF_8));
+            } catch (Exception e) {
+                agent.log("[TRACE-WS] [" + requestId + "] welcome 帧发送失败: " + e.getMessage());
+            }
+        }
+
         public void start() throws Exception {
             if (!useNoise) {
                 startProcess();
@@ -2965,6 +3158,13 @@ public class kisama {
             env.remove("PROMPT_COMMAND");
             env.put("TERM", "xterm-256color");
             env.putIfAbsent("LANG", "C.UTF-8");
+
+            // 🕶️ 原生无痕模式 (0.5.5): 面板经 WS query incognito=1 请求后，在 spawn 现场
+            // 注入 HISTFILE=/dev/null（仅 Unix；bash/zsh/ash 均认该变量，退出时历史写往
+            // /dev/null，内存内 ↑↑ 历史保留），替代旧版面板的命令注入 hack
+            if (incognitoRequested && !IS_WINDOWS) {
+                env.put("HISTFILE", "/dev/null");
+            }
 
             agent.log("[TRACE-WS] 🚀 正在使用 Pty4J 启动真正的原生伪终端...");
 
@@ -2984,12 +3184,15 @@ public class kisama {
             }
 
             this.ptyProcess = new PtyProcessBuilder()
-                    .setCommand(new String[]{shell}) // 注入动态计算出的富文本 Shell
+                    .setCommand(buildShellCommand(shell)) // 注入动态计算出的富文本 Shell (无痕时为 PowerShell 附加 SaveNothing 参数)
                     .setEnvironment(env)
                     .setDirectory(workDir)
                     .start();
 
             this.processStdin = ptyProcess.getOutputStream();
+
+            // welcome 帧先于输出泵: 面板永远先拿到 shell 元数据再见到首字节回显
+            sendWelcome(shell);
 
             this.pipeOutputThread = new Thread(() -> {
                 byte[] buffer = new byte[1024];

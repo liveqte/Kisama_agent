@@ -1,4 +1,5 @@
 const fs = require('fs');
+const path = require('path');
 const pty = require('node-pty');
 const express = require('express');
 const expressWs = require('express-ws');
@@ -132,6 +133,8 @@ class TerminalSessionHandler {
         this.ptyProcess = null;
         this.websocket = null;
         this.requestId = null;
+        this.metaRequested = false;      // 客户端请求 welcome 元数据帧 (meta=1)
+        this.incognitoRequested = false; // 客户端请求原生无痕会话 (incognito=1)
         
         this.AGENT_PRIVATE_KEY = this._readKeyFile("noise_keys/agent_private.key");
         this.CONTROL_PUBLIC_KEY = this._readKeyFile("noise_keys/control_public.key");
@@ -228,9 +231,22 @@ class TerminalSessionHandler {
     }
 
     getAvailableShell() {
+        // 对齐 js/agent.js getAvailableShell: Windows 优先 PowerShell, Unix 优先高级 Shell
+        if (process.platform === 'win32') {
+            const systemRoot = process.env.SystemRoot || 'C:\\Windows';
+            const windowsShells = [
+                path.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+                process.env.COMSPEC,
+                path.join(systemRoot, 'System32', 'cmd.exe'),
+            ];
+            for (const sh of windowsShells) {
+                if (sh && fs.existsSync(sh)) return sh;
+            }
+            return 'cmd.exe';
+        }
         const envShell = process.env.SHELL;
         if (envShell && fs.existsSync(envShell)) return envShell;
-        
+
         const shells = ['/bin/bash', '/bin/zsh', '/bin/ash', '/bin/sh'];
         for (const sh of shells) {
             if (fs.existsSync(sh)) return sh;
@@ -238,9 +254,43 @@ class TerminalSessionHandler {
         return '/bin/sh';
     }
 
-    async startSession(ws, requestId, token) {
+    // welcome 帧用的 shell 归一化名: basename + 去 .exe 后缀 (对齐 js/agent.js)
+    static normalizeShellName(shellPath) {
+        let name = path.basename(String(shellPath || '').trim()).toLowerCase();
+        if (name.endsWith('.exe')) name = name.slice(0, -4);
+        return name || 'sh';
+    }
+
+    // 本次 spawn 的 shell 是否已满足无痕要求 (对齐 js/agent.js)
+    static incognitoNativeApplied(shellPath) {
+        if (process.platform === 'win32') {
+            const base = path.basename(String(shellPath || '')).toLowerCase();
+            return base === 'powershell.exe' || base === 'cmd.exe';
+        }
+        return true;
+    }
+
+    // meta=1 时在 PTY 输出泵启动前主动推 welcome 元数据帧 (对齐 js/agent.js _sendWelcome)
+    _sendWelcome(ws, useNoise, shellPath) {
+        try {
+            let payload = Buffer.from(JSON.stringify({
+                type: "welcome",
+                shell: TerminalSessionHandler.normalizeShellName(shellPath),
+                path: shellPath,
+                incognito: !!(this.incognitoRequested && TerminalSessionHandler.incognitoNativeApplied(shellPath)),
+            }));
+            if (useNoise && this.cipher && this.cipher.handshakeFinished) {
+                payload = this.cipher.encrypt(payload);
+            }
+            if (ws.readyState === ws.OPEN) ws.send(payload);
+        } catch (e) { /* 忽略发送失败 */ }
+    }
+
+    async startSession(ws, requestId, token, metaRequested = false, incognitoRequested = false) {
         this.websocket = ws;
         this.requestId = requestId;
+        this.metaRequested = metaRequested;
+        this.incognitoRequested = incognitoRequested;
         const log = (msg) => Logger.info(`[终端会话 ${requestId}] ${msg}`);
         
         // 🚀 动态判断：有 Token 视为 HTTPS/WSS (明文)，无 Token 视为 WS (启用 Noise)
@@ -271,8 +321,17 @@ class TerminalSessionHandler {
         env.TERM = 'xterm-256color';
         if (!env.LANG) env.LANG = 'C.UTF-8';
 
+        // 🕶️ 原生无痕 (0.5.5): Unix 注入 HISTFILE=/dev/null; Windows PowerShell 附加 SaveNothing 启动参数
+        if (this.incognitoRequested && process.platform !== 'win32') {
+            env.HISTFILE = '/dev/null';
+        }
+        const shellArgs = (this.incognitoRequested && process.platform === 'win32' &&
+            path.basename(shell).toLowerCase() === 'powershell.exe')
+            ? ['-NoExit', '-Command', 'Set-PSReadLineOption -HistorySaveStyle SaveNothing']
+            : [];
+
         try {
-            this.ptyProcess = pty.spawn(shell, [], {
+            this.ptyProcess = pty.spawn(shell, shellArgs, {
                 name: 'xterm-256color',
                 cols: 80,
                 rows: 24,
@@ -281,6 +340,11 @@ class TerminalSessionHandler {
             });
 
             log(`🚀 终端进程已启动 (PID: ${this.ptyProcess.pid || 'unknown'})`);
+
+            // welcome 帧先于 onData 挂载: 面板永远先拿到 shell 元数据再见到首字节回显
+            if (this.metaRequested) {
+                this._sendWelcome(ws, useNoise, shell);
+            }
 
             // --- PTY -> WebSocket (发送端) ---
             this.ptyProcess.onData((data) => {
@@ -378,14 +442,18 @@ expressWs(app);
 
 app.ws('/api/ws/terminal', async (ws, req) => {
     const requestId = req.query.request_id;
-    
+
     if (!requestId) {
         ws.close(1008, "Missing request_id");
         return;
     }
 
+    // meta=1: 客户端可解析控制帧, 请求 welcome 元数据帧; incognito=1: 请求原生无痕会话
+    const metaFlag = req.query.meta === '1';
+    const incognitoFlag = req.query.incognito === '1';
+
     const handler = new TerminalSessionHandler();
-    await handler.startSession(ws, requestId);
+    await handler.startSession(ws, requestId, null, metaFlag, incognitoFlag);
 });
 
 const PORT = 8002;

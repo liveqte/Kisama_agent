@@ -59,6 +59,23 @@ func AuthEncryptMiddleware(cm *crypto.CryptoManager, cfg *config.Config, tk *tem
 		path := c.Request.URL.Path
 		isBypassPath := path == "/api/baseinfo" || path == "/api/status"
 
+		// 🚀 0.5.6 性能: 请求体只完整读取一次 (此前 Phase 1 读一遍算摘要、Phase 1.5 再
+		// 读一遍, 每个 POST/PUT/DELETE 双倍内存拷贝); 读取结果供两阶段共用
+		var rawBodyBytes []byte
+		if c.Request.Body != nil && c.Request.URL.Path != "/api/fileraw" &&
+			(c.Request.Method == "POST" || c.Request.Method == "PUT" || c.Request.Method == "DELETE") {
+			bodyBytes, err := io.ReadAll(c.Request.Body)
+			if err != nil {
+				logger.Errorf("Failed to read body: %v", err)
+				c.JSON(400, gin.H{"error": "Failed to read body"})
+				c.Abort()
+				return
+			}
+			_ = c.Request.Body.Close()
+			c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			rawBodyBytes = bodyBytes
+		}
+
 		// 🌟 核心修复 2：优先判断 Config.DEBUG 状态，且剔除客户端伪造 x-debug 的隐患
 		if cfg.Debug {
 			// 如果为 true 则全量让其认证通过，赋予最高信任身份并跳过后续验证
@@ -68,18 +85,8 @@ func AuthEncryptMiddleware(cm *crypto.CryptoManager, cfg *config.Config, tk *tem
 			// 防止捕获的签名头被改换请求体后重放。/api/fileraw (大文件裸流) 不在此缓冲，
 			// 客户端与服务端统一按空请求体计算摘要 (与下方 Phase 1.5 的 body 边界一致)。
 			requestBodyHash := ""
-			if c.Request.Body != nil && c.Request.URL.Path != "/api/fileraw" &&
-				(c.Request.Method == "POST" || c.Request.Method == "PUT" || c.Request.Method == "DELETE") {
-				bodyBytes, err := io.ReadAll(c.Request.Body)
-				if err != nil {
-					logger.Errorf("Failed to read body: %v", err)
-					c.JSON(400, gin.H{"error": "Failed to read body"})
-					c.Abort()
-					return
-				}
-				_ = c.Request.Body.Close()
-				c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-				sum := sha256.Sum256(bodyBytes)
+			if len(rawBodyBytes) > 0 {
+				sum := sha256.Sum256(rawBodyBytes)
 				requestBodyHash = hex.EncodeToString(sum[:])
 			}
 
@@ -145,15 +152,8 @@ func AuthEncryptMiddleware(cm *crypto.CryptoManager, cfg *config.Config, tk *tem
 		if c.Request.Body != nil && c.Request.URL.Path != "/api/fileraw" &&
 			(c.Request.Method == "POST" || c.Request.Method == "PUT" || c.Request.Method == "DELETE") {
 
-			// Read body
-			bodyBytes, err := io.ReadAll(c.Request.Body)
-			if err != nil {
-				logger.Errorf("Failed to read body: %v", err)
-				c.JSON(400, gin.H{"error": "Failed to read body"})
-				c.Abort()
-				return
-			}
-			bodyStr := string(bodyBytes)
+			// 🚀 0.5.6 性能: 直接复用 Phase 1 已读取的请求体, 不再二次 ReadAll
+			bodyStr := string(rawBodyBytes)
 			logger.Debugf("Raw request body: %s (length: %d)", bodyStr[:min(len(bodyStr), 100)], len(bodyStr))
 
 			// Check if AES encrypted
@@ -210,25 +210,31 @@ func AuthEncryptMiddleware(cm *crypto.CryptoManager, cfg *config.Config, tk *tem
 		c.Next()
 
 		// ============================================================================
-		// 🌟 核心修复 4：业务层执行结束，在出口网关统一收网进行响应体 ECIES 加密
+		// 🌟 核心修复 4：业务层执行结束，在出口网关统一收网进行响应体加密
+		// 🔐 0.5.6 分流 (docs/API.MD 十二): /api/baseinfo 恒走 ECIES (密钥分发握手,
+		// 静态签名->静态公钥 / 临时签名->临时公钥); 其余认证端点用 session_key 对
+		// 原始响应字节做 AES-256-GCM 加密
 		// ============================================================================
 		if strings.Contains(bufferWriter.Header().Get("Content-Type"), "application/json") {
 			isAuth, _ := c.Get("is_authenticated")
 
-			// 只有在【已认证】且【非 DEBUG】状态下，才将其转化为 ECIES 强加密密文
+			// 只有在【已认证】且【非 DEBUG】状态下，才将其转化为强加密密文
 			if isAuth == true && !cfg.Debug {
-				// ⚡ 终极修复：直接对 bufferWriter 里的原始响应字节执行加密
-				// 1. 彻底解决 Go 语言 interface{} 机制导致的大整数转科学计数法变形问题
-				// 2. 配合升级后的 v2 密码学库，传输格式、Nonce、公钥状态与客户端 eciesjs 100% 绝对对齐
-				// 3. 按验签来源选择对应 ECIES 公钥: 静态密钥->静态公钥, 临时密钥->临时公钥
-				targetPub := cm.ECIESPublicKey()
-				if keySource, _ := c.Get("key_source"); keySource == "temp" {
-					if tempPub := tk.ActiveEciesPub(); tempPub != nil {
-						targetPub = tempPub
+				var encrypted string
+				var encErr error
+				if c.Request.URL.Path == "/api/baseinfo" {
+					// 按验签来源选择对应 ECIES 公钥: 静态密钥->静态公钥, 临时密钥->临时公钥
+					targetPub := cm.ECIESPublicKey()
+					if keySource, _ := c.Get("key_source"); keySource == "temp" {
+						if tempPub := tk.ActiveEciesPub(); tempPub != nil {
+							targetPub = tempPub
+						}
 					}
+					encrypted, encErr = cm.EncryptResponseBytesTo(bufferWriter.bodyBuffer.Bytes(), cfg.Debug, targetPub)
+				} else {
+					encrypted, encErr = crypto.EncryptAES256GCM(bufferWriter.bodyBuffer.String(), cfg.SessionKey)
 				}
-				encrypted, err := cm.EncryptResponseBytesTo(bufferWriter.bodyBuffer.Bytes(), cfg.Debug, targetPub)
-				if err == nil {
+				if encErr == nil {
 					// 写入标准高强度加密响应头
 					bufferWriter.ResponseWriter.Header().Set("x-encrypted", "true")
 					bufferWriter.ResponseWriter.Header().Set("x-agent-version", cfg.AgentVersion)
@@ -240,7 +246,7 @@ func AuthEncryptMiddleware(cm *crypto.CryptoManager, cfg *config.Config, tk *tem
 				}
 				// 🌟 x-encrypted 模式位规范 (docs/API.MD 第十节)：生产加密失败禁止明文回退
 				// → 500 且不发送 x-encrypted（false 仅属于 DEBUG 模式）
-				logger.Errorf("Failed to encrypt response via ECIES: %v", err)
+				logger.Errorf("Failed to encrypt response: %v", encErr)
 				bufferWriter.ResponseWriter.Header().Del("x-encrypted")
 				bufferWriter.ResponseWriter.Header().Set("Content-Type", "application/json")
 				bufferWriter.ResponseWriter.Header().Set("Content-Length", "34")

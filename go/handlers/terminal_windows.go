@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -21,6 +22,25 @@ func newTerminalSession(cmd *exec.Cmd, rows, cols uint16) (terminalSession, erro
 	return newPipeTerminal(cmd)
 }
 
+// buildCommandLine 由 cmd.Args 拼接 CreateProcessW 命令行（含空格的参数加引号）
+func buildCommandLine(cmd *exec.Cmd) string {
+	parts := make([]string, 0, len(cmd.Args))
+	if cmd.Path != "" {
+		parts = append(parts, quoteIfNeeded(cmd.Path))
+	}
+	for _, arg := range cmd.Args[min(1, len(cmd.Args)):] {
+		parts = append(parts, quoteIfNeeded(arg))
+	}
+	return strings.Join(parts, " ")
+}
+
+func quoteIfNeeded(s string) string {
+	if strings.ContainsAny(s, " ") {
+		return `"` + s + `"`
+	}
+	return s
+}
+
 // conptyTerminal 基于 Windows Pseudo Console (ConPTY) 的真实终端实现
 type conptyTerminal struct {
 	cpty *conpty.ConPty
@@ -28,11 +48,9 @@ type conptyTerminal struct {
 }
 
 func newConPtyTerminal(cmd *exec.Cmd, rows, cols uint16) (terminalSession, error) {
-	// ConPTY 通过 CreateProcessW 直接启动进程，commandLine 为 shell 路径（含空格需加引号）
-	commandLine := cmd.Path
-	if strings.ContainsAny(commandLine, " ") {
-		commandLine = `"` + commandLine + `"`
-	}
+	// ConPTY 通过 CreateProcessW 直接启动进程，commandLine 由 cmd.Args 拼接（含空格需加引号），
+	// 使 incognito 模式下 PowerShell 的 -NoExit -Command 启动参数得以传入
+	commandLine := buildCommandLine(cmd)
 
 	env := cmd.Env
 	if env == nil {
@@ -135,4 +153,23 @@ func defaultTerminalShell() string {
 		}
 	}
 	return "cmd.exe"
+}
+
+// incognitoShellArgs Windows 端无痕: PowerShell 经启动参数禁用 PSReadLine 历史落盘
+// (-Command 在 profile 之后执行, 可覆盖用户配置); cmd.exe 无持久历史, 无需处理
+func incognitoShellArgs(shell string, enabled bool) []string {
+	if enabled && strings.EqualFold(filepath.Base(shell), "powershell.exe") {
+		return []string{"-NoExit", "-Command", "Set-PSReadLineOption -HistorySaveStyle SaveNothing"}
+	}
+	return nil
+}
+
+// incognitoEnv Windows 端无痕经启动参数实现，无需环境变量
+func incognitoEnv() []string { return nil }
+
+// incognitoNativeApplied 本次 spawn 的 shell 是否已满足无痕要求
+// (powershell 已带 SaveNothing 参数, cmd 本身无持久历史 -> true; 其余未知 shell -> false)
+func incognitoNativeApplied(shell string) bool {
+	base := strings.ToLower(filepath.Base(shell))
+	return base == "powershell.exe" || base == "cmd.exe"
 }

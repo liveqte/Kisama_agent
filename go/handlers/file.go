@@ -1024,7 +1024,8 @@ func UploadFileRaw(c *gin.Context) {
 	}
 
 	// 3. 直接在 Request Body 中读取 100% 原始二进制裸字节，免除 Base64 编解码开销
-	content, err := ioutil.ReadAll(c.Request.Body)
+	// 🚀 0.5.6: 用 LimitReader 按上限+1 预读, 超限请求不再先整块缓冲进内存才被拒绝
+	content, err := ioutil.ReadAll(io.LimitReader(c.Request.Body, cfg.MaxUploadSize+1))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "completed": false, "message": "Failed to read binary stream"})
 		return

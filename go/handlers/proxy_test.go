@@ -193,6 +193,13 @@ func TestProxyOptionsPreflight(t *testing.T) {
 	if got := resp.Header.Get("Access-Control-Max-Age"); got != "1728000" {
 		t.Errorf("Max-Age = %q, want 1728000", got)
 	}
+	// ETag 不在 CORS 安全响应头列表内，预检即应声明后续会暴露哪些头
+	if got := resp.Header.Get("Access-Control-Expose-Headers"); !strings.Contains(got, "ETag") {
+		t.Errorf("Expose-Headers = %q, want contains ETag", got)
+	}
+	if got := resp.Header.Get("Access-Control-Allow-Headers"); !strings.Contains(got, "If-Match") {
+		t.Errorf("Allow-Headers = %q, want contains If-Match", got)
+	}
 }
 
 // TestProxyForwardsNonAPIPath 验证 /kisamaproxy 对不含 "api" 的路径同样放行转发——
@@ -305,5 +312,46 @@ func TestProxyAllowsWebDAVByHeader(t *testing.T) {
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200 for WebDAV header request, got %d", resp.StatusCode)
+	}
+}
+
+// TestProxyExposesEtagAndForwardsIfMatch 验证 WebDAV 乐观锁链路在浏览器跨域场景下成立：
+// If-Match 请求头透传上游；ETag 响应头透传客户端且经 Access-Control-Expose-Headers 暴露
+// （ETag 不在 CORS 安全响应头列表内，缺失该头时跨域 JS 读不到，拿不到 ETag 也就无从 If-Match）。
+func TestProxyExposesEtagAndForwardsIfMatch(t *testing.T) {
+	var upstreamIfMatch string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		upstreamIfMatch = req.Header.Get("If-Match")
+		w.Header().Set("ETag", `"abc123"`)
+		// 上游自带的暴露头应被中转覆盖，而非透传给客户端
+		w.Header().Set("Access-Control-Expose-Headers", "X-Evil")
+		io.WriteString(w, `{"ok":true}`)
+	}))
+	t.Cleanup(upstream.Close)
+
+	r := newProxyRouter()
+	resp, _ := doProxyRequest(t, r, http.MethodPut, "/kisamaproxy/"+upstream.URL+"/dav/kisama.json", nil, map[string]string{
+		"If-Match": `"old-etag"`,
+		"Origin":   "https://panel.example.com",
+	})
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	if upstreamIfMatch != `"old-etag"` {
+		t.Errorf("upstream If-Match = %q, want \"old-etag\"", upstreamIfMatch)
+	}
+	if got := resp.Header.Get("ETag"); got != `"abc123"` {
+		t.Errorf("client ETag = %q, want \"abc123\"", got)
+	}
+	expose := resp.Header.Get("Access-Control-Expose-Headers")
+	if !strings.Contains(expose, "ETag") {
+		t.Errorf("Expose-Headers = %q, want contains ETag", expose)
+	}
+	if strings.Contains(expose, "X-Evil") {
+		t.Errorf("Expose-Headers = %q, upstream rogue value must be overridden", expose)
+	}
+	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "https://panel.example.com" {
+		t.Errorf("Allow-Origin = %q, want echoed origin", got)
 	}
 }

@@ -346,7 +346,7 @@ class Config {
   static KNAME_KEY = (process.env.KNAME_KEY || '').trim();
   // 域名文件路径, 缺省 $HOME/domain.txt, 支持 $HOME / ~ 前缀
   static KPATH = process.env.KPATH || '';
-  static AGENT_VERSION = process.env.AGENT_VERSION || '0.5.4-js';
+  static AGENT_VERSION = process.env.AGENT_VERSION || '0.5.6-js';
   static SESSION_KEY = crypto.randomBytes(32).toString('base64');
   // static SESSION_KEY =""
   static NOISE_KEYS_INTERNAL = NoiseKeyGenerator.generatePair();
@@ -705,6 +705,28 @@ class CryptoManager {
       throw new Error(`AES Decrypt Error: ${e.message}`);
     }
   }
+
+  // 🔐 encryptData: decryptData 的对称操作 (0.5.6 响应加密用, docs/API.MD 十二)。
+  // 输出 Base64(JSON{nonce, tag, ciphertext}), nonce 每次随机 12 字节, 与客户端 aes_gcm_open 契约一致。
+  encryptData(plaintextBuffer, rawKeyBuffer) {
+    if (!rawKeyBuffer || rawKeyBuffer.length !== 32) {
+      throw new Error("AES Encrypt Error: Key must be exactly 32 bytes for AES-256.");
+    }
+    try {
+      const iv = crypto.randomBytes(12);
+      const cipher = crypto.createCipheriv('aes-256-gcm', rawKeyBuffer, iv);
+      const ciphertext = Buffer.concat([cipher.update(plaintextBuffer), cipher.final()]);
+      const authTag = cipher.getAuthTag();
+      const payload = {
+        nonce: iv.toString('base64'),
+        tag: authTag.toString('base64'),
+        ciphertext: ciphertext.toString('base64')
+      };
+      return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64');
+    } catch (e) {
+      throw new Error(`AES Encrypt Error: ${e.message}`);
+    }
+  }
 }
 // ============================================================================
 // 🛡️ 认证 + 加密中间件 (逻辑解耦修复版)
@@ -741,17 +763,26 @@ function authEncryptMiddleware(cryptoManager, tempKeyManager = null) {
 
       if (res.get('Content-Type') && res.get('Content-Type').includes('application/json')) {
         try {
-          const jsonData = typeof data === 'string' ? JSON.parse(data) : data;
-
           // 根据中间件最终确立的真伪身份标签，决定是否在出口裹上密文外衣
           if (req.is_authenticated) {
-            // 按验签来源选择对应 ECIES 公钥: 静态密钥->静态公钥, 临时密钥->临时公钥
-            let targetPub = null;
-            if (req.key_source === 'temp' && tempKeyManager) {
-              targetPub = tempKeyManager.getActiveEciesPub();
+            let encoded;
+            if (req.path === '/api/baseinfo') {
+              // 🔐 0.5.6 (docs/API.MD 十二): baseinfo 恒走 ECIES —— 密钥分发握手。
+              // 按验签来源选择对应 ECIES 公钥: 静态密钥->静态公钥, 临时密钥->临时公钥
+              const jsonData = typeof data === 'string' ? JSON.parse(data) : data;
+              let targetPub = null;
+              if (req.key_source === 'temp' && tempKeyManager) {
+                targetPub = tempKeyManager.getActiveEciesPub();
+              }
+              const encryptedContent = cryptoManager.encryptResponse(jsonData, targetPub);
+              encoded = typeof encryptedContent === 'string' ? encryptedContent : JSON.stringify(encryptedContent);
+            } else {
+              // 🔐 0.5.6: 其余认证端点用 session_key 对原始 JSON 字节做 AES-256-GCM 加密
+              // (直接加密原始字节, 省一次 parse/stringify)
+              const plainBuf = Buffer.isBuffer(data) ? data
+                : (typeof data === 'string' ? Buffer.from(data, 'utf8') : Buffer.from(JSON.stringify(data), 'utf8'));
+              encoded = cryptoManager.encryptData(plainBuf, Buffer.from(Config.SESSION_KEY, 'base64'));
             }
-            const encryptedContent = cryptoManager.encryptResponse(jsonData, targetPub);
-            const encoded = typeof encryptedContent === 'string' ? encryptedContent : JSON.stringify(encryptedContent);
 
             res.set('x-encrypted', 'true');
             res.set('x-agent-version', Config.AGENT_VERSION);
@@ -759,7 +790,7 @@ function authEncryptMiddleware(cryptoManager, tempKeyManager = null) {
             return originalSend.call(this, encoded);
           } else {
             // 匿名放行路径（如未授权访问 baseinfo）：明文直出，不发送模式头（false 仅属于 DEBUG 模式）
-            const encoded = typeof data === 'string' ? data : JSON.stringify(jsonData);
+            const encoded = typeof data === 'string' ? data : JSON.stringify(data);
             res.set('Content-Length', Buffer.byteLength(encoded, 'utf8').toString());
             return originalSend.call(this, encoded);
           }
@@ -1861,12 +1892,13 @@ class FileManager {
     }
 
     const stats = fs.statSync(fullPath);
-    const content = fs.readFileSync(fullPath);
-    const encoded = base64.fromByteArray(content);
+    // 🚀 0.5.6: 直接返回原始 Buffer 且改用异步读取 — 原实现 readFileSync 后先 base64
+    // 编码、路由层再解码回 Buffer, 大文件凭空多出 1.33x 内存峰值与两次全量拷贝
+    const content = await fs.promises.readFile(fullPath);
 
     return {
       path: path.relative(Config.FILE_ROOT, fullPath),
-      content: encoded,
+      content,
       size: stats.size
     };
   }
@@ -4509,10 +4541,11 @@ class NoiseSessionWrapper {
 // 无 ConPTY 的旧系统或 bun-pty Windows 构建异常时的兜底：无真实终端语义，resize 为 no-op，
 // 仅保持与 pty 相同的 onData/onExit/write/resize/kill/pid 接口，stdout+stderr 合并输出。
 class PipeTerminalShim {
-    constructor(shell, env, cwd) {
+    constructor(shell, env, cwd, args) {
         this.shell = shell;
         this.env = env;
         this.cwd = cwd;
+        this.args = args || [];
         this.proc = null;
         this.pid = 0;
         this._onDataCb = null;
@@ -4520,7 +4553,7 @@ class PipeTerminalShim {
     }
 
     spawn() {
-        this.proc = spawn(this.shell, [], {
+        this.proc = spawn(this.shell, this.args, {
             env: this.env,
             cwd: this.cwd,
             windowsHide: true,
@@ -4569,6 +4602,8 @@ class TerminalSessionHandler {
         this.websocket = null;
         this.requestId = null;
         this.useNoise = true;
+        this.metaRequested = false;      // 面板请求 welcome 元数据帧 (meta=1)
+        this.incognitoRequested = false; // 面板请求原生无痕会话 (incognito=1)
         
         // 🚀 核心防丢包机制：消息队列
         this.phase = 'handshake';
@@ -4692,9 +4727,11 @@ class TerminalSessionHandler {
         return '/bin/sh';
     }
 
-    async startSession(ws, requestId, token) {
+    async startSession(ws, requestId, token, metaRequested = false, incognitoRequested = false) {
         this.websocket = ws;
         this.requestId = requestId;
+        this.metaRequested = metaRequested;
+        this.incognitoRequested = incognitoRequested;
         const log = (msg) => Logger.info(`[终端会话 ${requestId}] ${msg}`);
         
         this.useNoise = !token; 
@@ -4723,6 +4760,20 @@ class TerminalSessionHandler {
         env.TERM = 'xterm-256color';
         if (!env.LANG) env.LANG = 'C.UTF-8';
 
+        // 🕶️ 原生无痕模式 (0.5.5): 面板经 WS query incognito=1 请求后，在 spawn 现场
+        // 注入 HISTFILE=/dev/null（仅 Unix；bash/zsh/ash 均认该变量，退出时历史写往
+        // /dev/null，内存内 ↑↑ 历史保留），替代旧版面板的命令注入 hack
+        if (this.incognitoRequested && process.platform !== 'win32') {
+            env.HISTFILE = '/dev/null';
+        }
+
+        // 🕶️ 原生无痕: PowerShell 经启动参数禁用 PSReadLine 历史落盘（-Command 在
+        // profile 之后执行，可覆盖用户配置）；cmd.exe 无持久历史，无需处理
+        const shellArgs = (this.incognitoRequested && process.platform === 'win32' &&
+            path.basename(shell).toLowerCase() === 'powershell.exe')
+            ? ['-NoExit', '-Command', 'Set-PSReadLineOption -HistorySaveStyle SaveNothing']
+            : [];
+
         // Windows 下 USERPROFILE 优先，无则回退 HOME/当前目录 (对齐 py/Go)
         const cwd = resolveSafeCwd();
 
@@ -4736,18 +4787,23 @@ class TerminalSessionHandler {
 
             if (process.platform === 'win32') {
                 try {
-                    this.ptyProcess = pty.spawn(shell, [], spawnOpts);
+                    this.ptyProcess = pty.spawn(shell, shellArgs, spawnOpts);
                 } catch (e) {
                     // ConPTY 不可用/启动失败时回退管道模式 (对齐 py._PipeTerminal / Go.pipeTerminal)
                     log(`⚠️ ConPTY 启动失败，回退管道模式: ${e.message}`);
-                    this.ptyProcess = new PipeTerminalShim(shell, env, cwd);
+                    this.ptyProcess = new PipeTerminalShim(shell, env, cwd, shellArgs);
                     this.ptyProcess.spawn();
                 }
             } else {
-                this.ptyProcess = pty.spawn(shell, [], spawnOpts);
+                this.ptyProcess = pty.spawn(shell, shellArgs, spawnOpts);
             }
 
             log(`🚀 终端进程已启动 (PID: ${this.ptyProcess.pid || 'unknown'})`);
+
+            // welcome 帧先于 onData 挂载与队列回放: 面板永远先拿到 shell 元数据再见到首字节回显
+            if (this.metaRequested) {
+                this._sendWelcome(shell);
+            }
 
             // 🚀 状态切换：把握手期间积压的 Data 数据全部释放出来执行
             this.phase = 'terminal';
@@ -4784,6 +4840,42 @@ class TerminalSessionHandler {
             await this.cleanup();
             throw e;
         }
+    }
+
+    // welcome 帧用的 shell 归一化名: basename + 去 .exe 后缀 (powershell.exe -> powershell)
+    static normalizeShellName(shellPath) {
+        let name = path.basename(String(shellPath || '').trim()).toLowerCase();
+        if (name.endsWith('.exe')) name = name.slice(0, -4);
+        return name || 'sh';
+    }
+
+    // 本次 spawn 的 shell 是否已满足无痕要求 (面板据此决定是否退回命令注入 hack)。
+    // Windows: powershell 已带 SaveNothing 参数、cmd 本身无持久历史 -> true; 其余未知 shell -> false
+    static incognitoNativeApplied(shellPath) {
+        if (process.platform === 'win32') {
+            const base = path.basename(String(shellPath || '')).toLowerCase();
+            return base === 'powershell.exe' || base === 'cmd.exe';
+        }
+        return true;
+    }
+
+    // meta=1 时在 PTY 输出泵启动前主动推 welcome 元数据帧 (复刻心跳回包的加密发送路径)。
+    // WS 帧有序: 面板保证先收到本帧再见到首字节 shell 回显
+    _sendWelcome(shellPath) {
+        try {
+            let payload = Buffer.from(JSON.stringify({
+                type: "welcome",
+                shell: TerminalSessionHandler.normalizeShellName(shellPath),
+                path: shellPath,
+                incognito: !!(this.incognitoRequested && TerminalSessionHandler.incognitoNativeApplied(shellPath)),
+            }));
+            if (this.useNoise && this.cipher && this.cipher.handshakeFinished) {
+                payload = this.cipher.encrypt(payload);
+            }
+            if (this.websocket && this.websocket.readyState === 1) { // WebSocket.OPEN
+                this.websocket.send(payload);
+            }
+        } catch (e) {}
     }
 
     // 独立出数据处理逻辑，便于排队执行
@@ -5191,11 +5283,11 @@ async function main(options = {}) {
   app.post('/api/file/download', async (req, res) => {
     try {
       const result = await FileManager.downloadFile(req.body.path);
-      const fileBuffer = Buffer.from(result.content, 'base64');
+      // 🚀 0.5.6: downloadFile 已直返原始 Buffer, 去除 base64 解码往返
       res.set('x-file-size', result.size.toString());
       res.set('x-original-path', result.path);
       res.set('content-type', 'application/octet-stream');
-      return res.send(fileBuffer);
+      return res.send(result.content);
     } catch (e) {
       res.status(500).json({ status: 'error', message: e.message });
     }
@@ -5454,6 +5546,9 @@ async function main(options = {}) {
 
     const requestId = req.query.request_id;
     const token = req.query.token;
+    // meta=1: 面板可解析控制帧, 请求 welcome 元数据帧; incognito=1: 请求原生无痕会话
+    const metaFlag = req.query.meta === '1';
+    const incognitoFlag = req.query.incognito === '1';
 
     Logger.debug(`WebSocket connection attempt with request_id: ${requestId}`);
 
@@ -5478,7 +5573,7 @@ async function main(options = {}) {
     }
 
     const handler = new TerminalSessionHandler();
-    await handler.startSession(ws, requestId, token);
+    await handler.startSession(ws, requestId, token, metaFlag, incognitoFlag);
   });
   Logger.debug('WebSocket route configured');
 

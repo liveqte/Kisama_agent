@@ -48,6 +48,19 @@ TEST_REPORT = {"passed": 0, "failed": 0, "skipped": 0, "details": []}
 IS_PHP_SERVER = False  # 由 baseinfo 探测：version 含 "php" 时跳过任务相关测试
 
 SESSION_KEY = None
+AGENT_VERSION = None  # 由 baseinfo 响应捕获 (docs/API.MD 十二): 用于判定响应解密算法
+
+
+def _agent_supports_aes_response() -> bool:
+    """🔐 0.5.6 协议 (docs/API.MD 十二): 代理版本号数字前缀 >= 0.5.6 时,
+    非 /api/baseinfo 端点的加密响应改用 session_key AES-256-GCM; 旧版 (< 0.5.6) 仍为全 ECIES。
+    版本号形如 "0.5.6-python"/"0.5.6-go", 语言后缀不影响比较。"""
+    if not AGENT_VERSION:
+        return False
+    m = re.match(r"(\d+)\.(\d+)\.(\d+)", str(AGENT_VERSION))
+    if not m:
+        return False
+    return tuple(int(g) for g in m.groups()) >= (0, 5, 6)
 import re
 import os
 import json
@@ -200,12 +213,14 @@ def generate_auth_headers(ecdsa_sk, method: str = "", path: str = "", body: byte
 # ================= 响应处理 (带调试打印) =================
 
 def process_response(body_bytes: bytes, resp_headers, ecies_sk, label: str = "响应", 
-                     return_raw: bool = False, skip_print: bool = False):
+                     return_raw: bool = False, skip_print: bool = False, path: str = ""):
     """
     处理代理端响应: 打印原始内容 + 自动解密
     :param return_raw: 是否返回原始二进制 (用于文件下载)
     :param skip_print: 是否跳过调试打印 (测试模式用)
+    :param path: 请求路径 (0.5.6 协议: 用于区分 baseinfo 与其他端点的解密算法)
     """
+    global AGENT_VERSION
     body_str = body_bytes.decode("utf-8", errors="replace").strip()
     
     if not skip_print:
@@ -217,23 +232,43 @@ def process_response(body_bytes: bytes, resp_headers, ecies_sk, label: str = "�
         print(f"{'─'*60}")
     
     is_encrypted = resp_headers.get("X-Encrypted") == "true"
+    is_baseinfo = path.split("?", 1)[0].rstrip("/") == "/api/baseinfo"
     
     if is_encrypted:
+        # 🔐 0.5.6 协议 (docs/API.MD 十二): baseinfo 恒为 ECIES (密钥分发握手);
+        # 其余端点版本 >= 0.5.6 起改用 session_key AES-256-GCM, 旧版仍为 ECIES
+        use_aes = _agent_supports_aes_response() and not is_baseinfo
         if not skip_print:
-            print("🔒 响应标记为加密，正在解密...")
+            print(f"🔒 响应标记为加密，使用 {'session_key AES-GCM' if use_aes else 'ECIES'} 解密...")
         try:
-            ciphertext_b64 = body_str
-            if body_str.startswith('{'):
-                try:
-                    parsed = json.loads(body_str)
-                    ciphertext_b64 = parsed.get("_encrypted", body_str)
-                except json.JSONDecodeError:
-                    pass
-            
-            ciphertext = base64.b64decode(ciphertext_b64)
-
-            plaintext = ecies_decrypt(ecies_sk.secret, ciphertext)
-            data = json.loads(plaintext.decode("utf-8"))
+            if use_aes:
+                if not SESSION_KEY:
+                    raise RuntimeError(
+                        "代理 >= 0.5.6 使用 session_key 加密响应，但本地尚未取得 session_key"
+                        "（请先调用 baseinfo 完成握手；控制端与代理版本混布时需成对升级）"
+                    )
+                raw = json.loads(base64.b64decode(body_str).decode("utf-8"))
+                plaintext = aes_gcm_open(
+                    SESSION_KEY,
+                    base64.b64decode(raw["nonce"]),
+                    base64.b64decode(raw["tag"]),
+                    base64.b64decode(raw["ciphertext"]),
+                ).decode("utf-8")
+            else:
+                ciphertext_b64 = body_str
+                if body_str.startswith('{'):
+                    try:
+                        parsed = json.loads(body_str)
+                        ciphertext_b64 = parsed.get("_encrypted", body_str)
+                    except json.JSONDecodeError:
+                        pass
+                
+                ciphertext = base64.b64decode(ciphertext_b64)
+                plaintext = ecies_decrypt(ecies_sk.secret, ciphertext).decode("utf-8")
+            data = json.loads(plaintext)
+            # 捕获代理版本号 (baseinfo 响应携带, 供后续请求的解密算法判定)
+            if is_baseinfo and isinstance(data, dict) and data.get("version"):
+                AGENT_VERSION = str(data.get("version"))
             if not skip_print:
                 print("✅ 解密成功！")
                 print(f"{'─'*60}")
@@ -243,13 +278,19 @@ def process_response(body_bytes: bytes, resp_headers, ecies_sk, label: str = "�
         except Exception as e:
             if not skip_print:
                 print(f"❌ 解密失败: {e}")
+                if not use_aes and not is_baseinfo and _agent_supports_aes_response():
+                    print("💡 提示: 该端点在 0.5.6+ 代理上应为 session_key AES 密文，请确认代理版本与握手流程")
             return None
     else:
         if not skip_print:
             print("📄 响应为明文 (DEBUG模式或未加密)")
         try:
             if body_str.startswith('{'):
-                return json.loads(body_str)
+                data = json.loads(body_str)
+                # 捕获代理版本号 (DEBUG 明文 baseinfo 同样携带 version)
+                if is_baseinfo and isinstance(data, dict) and data.get("version"):
+                    AGENT_VERSION = str(data.get("version"))
+                return data
             else:
                 return {"raw": body_str} if not return_raw else body_bytes
         except json.JSONDecodeError:
@@ -274,7 +315,16 @@ def _make_request(method: str, endpoint: str, params: dict = None,
                   ecies_sk=None, label: str = "", skip_print: bool = False,
                   return_raw: bool = False, extra_headers: dict = None):
     """通用请求辅助函数 - 极简加密集成版"""
-    global SESSION_KEY
+    global SESSION_KEY, AGENT_VERSION
+    
+    # 🔐 0.5.6 协议 (docs/API.MD 十二): 非 baseinfo 请求在未取得代理版本前先完成一次
+    # baseinfo 握手 (拿到版本号判定响应解密算法, 顺带取得 session_key 供请求体加密)。
+    # 无密钥 (DEBUG 探测场景) 或网络异常时静默跳过, 保持旧的明文请求行为。
+    if endpoint.split("?", 1)[0].rstrip("/") != "/api/baseinfo" and AGENT_VERSION is None:
+        try:
+            fetch_baseinfo(skip_print=True)
+        except Exception:
+            pass
     
     # --- 先构造 body，再生成绑定 method/path/body 的签名 (R2 防重放) ---
     body = b''
@@ -308,9 +358,10 @@ def _make_request(method: str, endpoint: str, params: dict = None,
             if return_raw and headers.get("X-Encrypted") != "true":
                 return body_bytes
             
-            # 注意：process_response 内部需要根据 headers 决定是否用 SESSION_KEY 解密
+            # 注意：process_response 内部需要根据 headers/path/版本 决定解密算法 (0.5.6 协议)
             return process_response(body_bytes, headers, ecies_sk or load_control_keys()[1], 
-                                  label=label, skip_print=skip_print, return_raw=return_raw)
+                                  label=label, skip_print=skip_print, return_raw=return_raw,
+                                  path=endpoint)
     except urllib.error.HTTPError as e:
         if not skip_print:
             print(f"❌ HTTP {e.code}: {e.read().decode()[:200]}")
@@ -425,7 +476,7 @@ def file_upload(local_file: str, remote_path: str, remote_filename: str = None, 
             
             # 使用原有的响应处理器解析返回的 JSON
             return process_response(body_bytes, headers, ecies_sk, 
-                                  label="upload", skip_print=skip_print)
+                                  label="upload", skip_print=skip_print, path="/api/fileraw")
     except urllib.error.HTTPError as e:
         if not skip_print:
             print(f"❌ HTTP {e.code}: {e.read().decode()[:200]}")
@@ -601,6 +652,89 @@ def test_status():
     # ❌ 都不匹配
     return _test_result("status 返回有效数据", False, 
                        f"未知格式: {list(result.keys()) if isinstance(result, dict) else type(result)}")
+
+
+def _raw_request(method: str, endpoint: str, params: dict = None):
+    """发送认证请求并返回 (body_bytes, headers), 不做解密处理 (0.5.6 协议格式断言用)"""
+    ecdsa_sk, _ = load_control_keys()
+    body = b''
+    aes_flag = False
+    if params is not None:
+        plaintext = json.dumps(params)
+        if SESSION_KEY:
+            body = encrypt_data(plaintext, SESSION_KEY).encode('utf-8')
+            aes_flag = True
+        else:
+            body = plaintext.encode('utf-8')
+    auth_headers = generate_auth_headers(ecdsa_sk, method, endpoint, body)
+    auth_headers["Content-Type"] = "application/json"
+    if aes_flag:
+        auth_headers["X-AES-Encrypted"] = "true"
+    request = urllib.request.Request(f"{CONFIG['proxy_url']}{endpoint}", data=body,
+                                     headers=auth_headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=CONFIG["timeout"] + 60) as resp:
+            return resp.read(), resp.headers
+    except urllib.error.HTTPError as e:
+        return e.read(), e.headers
+
+
+def test_protocol_aes():
+    """0.5.6 响应加密协议断言 (docs/API.MD 十二): /api/baseinfo 恒为 ECIES, 其余认证
+    端点版本 >= 0.5.6 起为 session_key AES-256-GCM。用密文首字节判别线上格式:
+    AES 容器 Base64 解码后为 '{' (0x7b); ECIES 密文解码后为 65 字节非压缩公钥 (0x04)。"""
+    print("\n🔹 测试: 0.5.6 响应加密协议")
+    is_aes_agent = _agent_supports_aes_response()
+
+    # 1. baseinfo 密文格式 (任何版本均应为 ECIES)
+    body, headers = _raw_request("GET", "/api/baseinfo")
+    ok_baseinfo_ecies = False
+    try:
+        ok_baseinfo_ecies = (headers.get("X-Encrypted") == "true"
+                             and base64.b64decode(body.strip())[:1] == b"\x04")
+    except Exception:
+        pass
+    _test_result("baseinfo 响应为 ECIES 密文 (0x04 非压缩公钥头)", ok_baseinfo_ecies,
+                 f"version={AGENT_VERSION}")
+
+    # 旧版代理 (< 0.5.6): 非 baseinfo 端点仍为 ECIES, 跳过 AES 断言
+    if not is_aes_agent:
+        _test_result("非 baseinfo 端点响应格式 (旧版 ECIES)", True,
+                     f"version={AGENT_VERSION} < 0.5.6, 按旧协议跳过 AES 断言")
+        return
+
+    if not SESSION_KEY:
+        _test_result("非 baseinfo 端点响应格式 (0.5.6 AES)", False, "session_key 缺失")
+        return
+
+    # 2. 非 baseinfo 端点 (/api/status) 密文格式
+    body2, headers2 = _raw_request("GET", "/api/status")
+    ok_status_aes = False
+    payload = None
+    try:
+        decoded = base64.b64decode(body2.strip())
+        payload = json.loads(decoded.decode('utf-8'))
+        ok_status_aes = (headers2.get("X-Encrypted") == "true"
+                         and decoded[:1] == b"{"
+                         and all(k in payload for k in ("nonce", "tag", "ciphertext")))
+    except Exception:
+        pass
+    _test_result("非 baseinfo 端点响应为 session_key AES 容器 (JSON{nonce,tag,ct})", ok_status_aes)
+
+    # 3. session_key AES-GCM 解密往返
+    ok_decrypt = False
+    if payload is not None:
+        try:
+            plaintext = aes_gcm_open(
+                SESSION_KEY,
+                base64.b64decode(payload["nonce"]),
+                base64.b64decode(payload["tag"]),
+                base64.b64decode(payload["ciphertext"]),
+            )
+            ok_decrypt = isinstance(json.loads(plaintext.decode('utf-8')), dict)
+        except Exception:
+            pass
+    _test_result("session_key AES-GCM 解密非 baseinfo 响应", ok_decrypt)
 
 
 def test_exec():
@@ -1015,6 +1149,9 @@ def run_all_tests():
     # 🔹 基础信息接口
     test_baseinfo()
     
+    # 🔹 0.5.6 响应加密协议断言 (baseinfo=ECIES / 其余端点=session_key AES, docs/API.MD 十二)
+    test_protocol_aes()
+    
     # 🔹 状态接口
     test_status()
     
@@ -1035,6 +1172,10 @@ def run_all_tests():
 
     # 🔹 超级终端接口 (模块 24: Noise 加密 / token 认证 / 非法 token 拒绝)
     test_ws_terminal()
+
+    # 🔹 超级终端 welcome 元数据帧与原生无痕 (0.5.5: shell 类型上报 + incognito=1)
+    test_ws_shell_meta()
+    test_ws_incognito()
 
     # 输出报告
     _print_test_report()
@@ -1639,6 +1780,256 @@ def test_ws_terminal():
         except Exception as e:
             _test_result("ws: token 认证终端回显", False, f"异常: {e}")
             tests_passed = False
+
+    return tests_passed
+
+
+# ============================================================================
+# 🕶️ 超级终端 welcome 元数据帧 + 原生无痕 (0.5.5, API.MD 模块 24 增补)
+# ============================================================================
+
+KNOWN_SHELL_NAMES = {"bash", "zsh", "ash", "sh", "dash", "ksh", "csh", "tcsh",
+                     "fish", "powershell", "pwsh", "cmd"}
+
+# CSI 转义序列 (PSReadLine 渲染输入行时会在字符间插入光标移动/显隐序列)
+_ANSI_ESCAPE_RE = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def _ws_recv_welcome(ws: WsClient, use_noise: bool, proto, deadline_seconds: float = 12.0):
+    """从终端 WS 读帧直到解析出 welcome 元数据帧 (meta=1 时 agent 在 PTY 输出前发送)。
+    返回 welcome dict 或 None"""
+    deadline = time.time() + deadline_seconds
+    while time.time() < deadline:
+        try:
+            opcode, data = ws.recv()
+        except (socket.timeout, TimeoutError, ConnectionError, OSError):
+            return None
+        if opcode == WsClient.OP_CLOSE:
+            return None
+        if not data:
+            continue
+        try:
+            plain = proto.decrypt(data) if use_noise else data
+        except Exception:
+            continue
+        text = plain.decode("utf-8", errors="replace").strip()
+        if text.startswith("{") and '"welcome"' in text:
+            try:
+                frame = json.loads(text)
+                if frame.get("type") == "welcome":
+                    return frame
+            except Exception:
+                pass
+    return None
+
+
+def _ws_send_line(ws: WsClient, use_noise: bool, proto, command: str):
+    payload = proto.encrypt(command.encode()) if use_noise else command.encode()
+    ws.send(payload, WsClient.OP_BINARY)
+
+
+def _ws_run_command(ws: WsClient, use_noise: bool, proto, command: str, expect_marker: str,
+                    deadline_seconds: float = 20.0, diag: dict = None) -> bool:
+    """向终端发送一行命令并等待回显出现 (5 秒未命中自动重发一次, 兼容 PTY 初始化丢首行)。
+
+    - recv 以 1s 短超时轮询: WsClient 缺省 20s 阻塞读会让 5s 重发条件永远轮不到检查
+      (PowerShell 带 -Command 启动期间写入的输入可能被渲染但不执行, 重发是唯一恢复手段)
+    - 标记匹配同时检查 ANSI 剥离后的字节流: PSReadLine 渲染折行输入时会在标记中间插入
+      光标移动/显隐转义序列 (长提示符下必然折行), 裸字节匹配会漏报"""
+    _ws_send_line(ws, use_noise, proto, command)
+    collected = b""
+    deadline = time.time() + deadline_seconds
+    resent = False
+    old_timeout = ws.sock.gettimeout()
+    ws.sock.settimeout(1.0)
+    try:
+        while time.time() < deadline:
+            if not resent and time.time() > deadline - deadline_seconds + 5 and expect_marker.encode() not in collected:
+                _ws_send_line(ws, use_noise, proto, command)
+                resent = True
+            try:
+                opcode, data = ws.recv()
+            except (socket.timeout, TimeoutError):
+                continue
+            except (ConnectionError, OSError):
+                break
+            if opcode == WsClient.OP_CLOSE:
+                break
+            if not data:
+                continue
+            try:
+                plain = proto.decrypt(data) if use_noise else data
+            except Exception:
+                continue
+            collected += plain
+            if diag is not None:
+                diag["collected"] = collected
+            if expect_marker.encode() in collected or expect_marker.encode() in _ANSI_ESCAPE_RE.sub(b"", collected):
+                return True
+    finally:
+        ws.sock.settimeout(old_timeout)
+    return expect_marker.encode() in collected or expect_marker.encode() in _ANSI_ESCAPE_RE.sub(b"", collected)
+
+
+def _ws_wait_close(ws: WsClient, deadline_seconds: float = 15.0) -> bool:
+    """等待服务端关闭帧 (shell 优雅退出后 agent 结束会话)"""
+    deadline = time.time() + deadline_seconds
+    while time.time() < deadline:
+        try:
+            opcode, _ = ws.recv()
+        except (socket.timeout, TimeoutError, ConnectionError, OSError):
+            return False
+        if opcode == WsClient.OP_CLOSE:
+            return True
+    return False
+
+
+def _history_check_command() -> str:
+    """读取交互 shell 历史文件的 /api/exec 命令。
+    verify_all 场景下 agent 与 control 同机, 路径按 control 所在平台展开"""
+    if os.name == "nt":
+        hist = os.path.join(os.environ.get("APPDATA", ""),
+                            "Microsoft", "Windows", "PowerShell", "PSReadLine", "ConsoleHost_history.txt")
+        return f'type "{hist}"'
+    return "cat ~/.bash_history 2>/dev/null; echo __HIST_END__"
+
+
+def test_ws_shell_meta():
+    """测试 /api/ws welcome 元数据帧 (0.5.5): meta=1 时 agent 在 PTY 输出前回报 shell 类型与无痕状态"""
+    print("\n🔹 测试: 超级终端 welcome 帧 (shell 类型上报)")
+    tests_passed = True
+
+    if not NOISE_LIB_OK:
+        return _test_result("ws-meta: noise 库可用", False, "缺少依赖: pip install noise")
+
+    info = fetch_baseinfo(skip_print=True)
+    if not info:
+        return _test_result("ws-meta: 获取 noise_key", False, "baseinfo 不可用")
+    nk = info.get("noise_key") or {}
+    ctrl_priv = (nk.get("controller") or {}).get("private") if isinstance(nk, dict) else None
+    agent_pub = (nk.get("agent") or {}).get("public") if isinstance(nk, dict) else None
+    if not ctrl_priv or not agent_pub:
+        return _test_result("ws-meta: 获取 noise_key", False, "baseinfo 未下发 noise_key (未认证?)")
+
+    host, port = _ws_host_port()
+    rid = int(time.time())
+
+    # ── 用例 A: Noise 模式 meta=1 (未请求无痕) → welcome 帧结构完整且 incognito=false ──
+    try:
+        ws = WsClient(host, port, f"/api/ws/terminal?request_id=wsmeta1{rid}&meta=1")
+        proto = _noise_initiator(ctrl_priv, agent_pub)
+        ws.send(proto.write_message(), WsClient.OP_BINARY)
+        _, msg2 = ws.recv()
+        proto.read_message(msg2)
+        ws.send(proto.write_message(), WsClient.OP_BINARY)
+        welcome = _ws_recv_welcome(ws, True, proto)
+        ok = (isinstance(welcome, dict)
+              and welcome.get("shell") in KNOWN_SHELL_NAMES
+              and bool(welcome.get("path"))
+              and welcome.get("incognito") is False)
+        _test_result("ws-meta: Noise welcome 帧上报", ok,
+                     f"shell={welcome.get('shell')} path={welcome.get('path')}" if ok else f"welcome={welcome}")
+        if not ok:
+            tests_passed = False
+        ws.close()
+    except Exception as e:
+        _test_result("ws-meta: Noise welcome 帧上报", False, f"异常: {e}")
+        tests_passed = False
+
+    # ── 用例 B: token 明文模式 meta=1 → 同样回报 welcome ──
+    session_key = info.get("session_key") if isinstance(info, dict) else None
+    if not session_key:
+        _test_result("ws-meta: token welcome 帧上报", False, "baseinfo 未下发 session_key (未认证?)")
+        tests_passed = False
+    else:
+        try:
+            ws_token = _ws_downgrade_token(session_key)
+            ws = WsClient(host, port,
+                          f"/api/ws/terminal?request_id=wsmeta2{rid}&meta=1&token={urllib.parse.quote(ws_token)}")
+            welcome = _ws_recv_welcome(ws, False, None)
+            ok = (isinstance(welcome, dict)
+                  and welcome.get("shell") in KNOWN_SHELL_NAMES
+                  and welcome.get("incognito") is False)
+            _test_result("ws-meta: token welcome 帧上报", ok,
+                         f"shell={welcome.get('shell')}" if ok else f"welcome={welcome}")
+            if not ok:
+                tests_passed = False
+            ws.close()
+        except Exception as e:
+            _test_result("ws-meta: token welcome 帧上报", False, f"异常: {e}")
+            tests_passed = False
+
+    return tests_passed
+
+
+def test_ws_incognito():
+    """测试 /api/ws 原生无痕模式 (0.5.5): incognito=1 → welcome 确认 + 命令历史零落盘"""
+    print("\n🔹 测试: 超级终端原生无痕 (incognito=1)")
+    tests_passed = True
+
+    if not NOISE_LIB_OK:
+        return _test_result("ws-incog: noise 库可用", False, "缺少依赖: pip install noise")
+
+    info = fetch_baseinfo(skip_print=True)
+    if not info:
+        return _test_result("ws-incog: 获取 noise_key", False, "baseinfo 不可用")
+    nk = info.get("noise_key") or {}
+    ctrl_priv = (nk.get("controller") or {}).get("private") if isinstance(nk, dict) else None
+    agent_pub = (nk.get("agent") or {}).get("public") if isinstance(nk, dict) else None
+    if not ctrl_priv or not agent_pub:
+        return _test_result("ws-incog: 获取 noise_key", False, "baseinfo 未下发 noise_key (未认证?)")
+
+    host, port = _ws_host_port()
+    rid = int(time.time())
+    marker = f"KISAMAINCOG{rid}X"
+
+    try:
+        ws = WsClient(host, port, f"/api/ws/terminal?request_id=wsinc{rid}&meta=1&incognito=1")
+        proto = _noise_initiator(ctrl_priv, agent_pub)
+        ws.send(proto.write_message(), WsClient.OP_BINARY)
+        _, msg2 = ws.recv()
+        proto.read_message(msg2)
+        ws.send(proto.write_message(), WsClient.OP_BINARY)
+
+        # ① welcome 帧确认原生无痕已生效
+        welcome = _ws_recv_welcome(ws, True, proto)
+        ok = isinstance(welcome, dict) and welcome.get("incognito") is True
+        if not _test_result("ws-incog: welcome 确认无痕生效", ok,
+                            "incognito=true" if ok else f"welcome={welcome}"):
+            tests_passed = False
+            ws.close()
+            return tests_passed
+
+        # ② 会话内执行标记命令 (等待回显), 再优雅退出让 shell 走正常的退出落盘路径
+        # (PowerShell 冷启动 + -Command 参数加载偏慢, 回显等待放宽到 30s)
+        _diag = {"collected": b""}
+        if not _ws_run_command(ws, True, proto, f"echo {marker}", marker, deadline_seconds=30.0, diag=_diag):
+            seen = _ANSI_ESCAPE_RE.sub(b"", _diag["collected"]).decode("utf-8", errors="replace")
+            _test_result("ws-incog: 标记命令回显", False,
+                         f"输出未包含 {marker}; 实际收到 {len(_diag['collected'])} 字节: {seen[-400:]!r}")
+            tests_passed = False
+            ws.close()
+            return tests_passed
+        _test_result("ws-incog: 标记命令回显", True)
+        _ws_send_line(ws, True, proto, "exit\r\n")
+        _ws_wait_close(ws, 15.0)
+        ws.close()
+    except Exception as e:
+        _test_result("ws-incog: 会话流程", False, f"异常: {e}")
+        tests_passed = False
+        return tests_passed
+
+    # ③ 历史文件零落盘: 经 /api/exec (独立 shell, 不污染交互历史) 读取历史文件断言无标记
+    try:
+        result = exec_command(_history_check_command(), skip_print=True)
+        hist_text = (result or {}).get("result", "") or ""
+        ok = marker not in hist_text
+        if not _test_result("ws-incog: 历史文件零落盘", ok,
+                            "" if ok else f"历史文件中发现标记 {marker} (原生无痕失效!)"):
+            tests_passed = False
+    except Exception as e:
+        _test_result("ws-incog: 历史文件零落盘", False, f"异常: {e}")
+        tests_passed = False
 
     return tests_passed
 

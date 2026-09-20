@@ -838,7 +838,7 @@ class Config:
     KPATH = os.getenv("KPATH", "")
 
     # 代理版本信息
-    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.5.4-python")
+    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.5.6-python")
     
     # ================= 启动校验 =================
     
@@ -1272,6 +1272,24 @@ class CryptoManager:
             Logger.error(f"❌ 异常: {e}")
             return None
 
+    @staticmethod
+    def encrypt_data(plaintext: bytes, key: bytes) -> str:
+        """
+        使用 AES-256-GCM 加密 (decrypt_data 的对称操作, 0.5.6 响应加密用, docs/API.MD 十二)
+        :param plaintext: 明文字节
+        :param key: 32字节密钥
+        :return: Base64(JSON{nonce, tag, ciphertext}) 密文字符串, nonce 每次随机 12 字节
+        """
+        nonce = get_random_bytes(12)
+        cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+        ciphertext, tag = cipher.encrypt_and_digest(plaintext)
+        payload = {
+            "nonce": base64.b64encode(nonce).decode('ascii'),
+            "tag": base64.b64encode(tag).decode('ascii'),
+            "ciphertext": base64.b64encode(ciphertext).decode('ascii'),
+        }
+        return base64.b64encode(json.dumps(payload, separators=(',', ':')).encode('utf-8')).decode('ascii')
+
 
 # 全局加密管理器实例
 crypto = None
@@ -1503,8 +1521,9 @@ class AuthEncryptMiddleware(BaseHTTPMiddleware):
             if tkm is not None:
                 temp_vk = tkm.get_active_ecdsa_vk()
 
-            key_source = crypto.identify_signer(request.method, path, body_hash,
-                                                nonce, timestamp, auth_token, temp_vk)
+            key_source = await asyncio.to_thread(
+                crypto.identify_signer, request.method, path, body_hash,
+                nonce, timestamp, auth_token, temp_vk)
 
             # ✨ 唯一步骤：只有当椭圆曲线点乘验签彻底通过时，才在此处将身份显式改为 True
             request.state.is_authenticated = True
@@ -1579,19 +1598,26 @@ class AuthEncryptMiddleware(BaseHTTPMiddleware):
             original_body = b"".join(body_parts)
             
             try:
-                original_data = json.loads(original_body.decode('utf-8'))
-                
                 # 根据中间件最终确立的真伪身份标签，决定是否在出口裹上密文外衣
                 if getattr(request.state, "is_authenticated", False):
-                    # 🔑 按验签来源选择对应 ECIES 公钥: 静态密钥->静态公钥, 临时密钥->临时公钥
-                    response_pubkey = crypto.ecies_pubkey
-                    if getattr(request.state, "key_source", "static") == "temp":
-                        tkm = getattr(request.app.state, "temp_key_manager", None)
-                        if tkm is not None:
-                            response_pubkey = tkm.get_active_ecies_pub() or response_pubkey
-                    encrypted_content = crypto.encrypt_response(original_data, response_pubkey)
-                    encoded = encrypted_content.encode('utf-8')
-                    if not Config.DEBUG:
+                    # 🔐 0.5.6 响应加密分流 (docs/API.MD 十二): /api/baseinfo 恒走 ECIES
+                    # (密钥分发握手, 静态签名->静态公钥 / 临时签名->临时公钥); 其余认证端点
+                    # 用 session_key 对原始响应字节做 AES-256-GCM 加密 (省一次 parse/stringify)
+                    if path == "/api/baseinfo" or Config.DEBUG:
+                        original_data = json.loads(original_body.decode('utf-8'))
+                        # 🔑 按验签来源选择对应 ECIES 公钥: 静态密钥->静态公钥, 临时密钥->临时公钥
+                        response_pubkey = crypto.ecies_pubkey
+                        if getattr(request.state, "key_source", "static") == "temp":
+                            tkm = getattr(request.app.state, "temp_key_manager", None)
+                            if tkm is not None:
+                                response_pubkey = tkm.get_active_ecies_pub() or response_pubkey
+                        encrypted_content = crypto.encrypt_response(original_data, response_pubkey)
+                        encoded = encrypted_content.encode('utf-8')
+                        if not Config.DEBUG:
+                            response.headers["x-encrypted"] = "true"
+                            response.headers["x-agent-version"] = Config.AGENT_VERSION
+                    else:
+                        encoded = CryptoManager.encrypt_data(original_body, Config._raw_key).encode('utf-8')
                         response.headers["x-encrypted"] = "true"
                         response.headers["x-agent-version"] = Config.AGENT_VERSION
                 else:
@@ -1980,18 +2006,24 @@ class SystemInfoCollector:
     async def _get_tcp_connections(self) -> int:
         try:
             if platform.system() == "Windows":
-                result = subprocess.run(['netstat', '-n', '-p', 'tcp'], capture_output=True, text=True, timeout=5)
+                # 🚀 性能: netstat 子进程移入线程池, 不阻塞事件循环
+                result = await asyncio.to_thread(
+                    subprocess.run, ['netstat', '-n', '-p', 'tcp'],
+                    capture_output=True, text=True, timeout=5)
                 return len([line for line in result.stdout.split('\n') if 'ESTABLISHED' in line])
             connections = psutil.net_connections(kind='tcp')
             return len([conn for conn in connections if conn.status == 'ESTABLISHED'])
         except Exception as e:
             Logger.debug(f"获取TCP连接数失败: {e}", 12)
             return 0
-    
+
     async def _get_udp_connections(self) -> int:
         try:
             if platform.system() == "Windows":
-                result = subprocess.run(['netstat', '-n', '-p', 'udp'], capture_output=True, text=True, timeout=5)
+                # 🚀 性能: netstat 子进程移入线程池, 不阻塞事件循环
+                result = await asyncio.to_thread(
+                    subprocess.run, ['netstat', '-n', '-p', 'udp'],
+                    capture_output=True, text=True, timeout=5)
                 return len([line for line in result.stdout.split('\n') if 'UDP' in line and line.strip()])
             return len(psutil.net_connections(kind='udp'))
         except Exception as e:
@@ -2353,18 +2385,29 @@ class FileManager:
                 if not target.exists():
                     results.append({"path": p, "status": "not_found"})
                     continue
-                if target.is_dir():
-                    shutil.rmtree(target)
-                else:
-                    target.unlink()
+                # 🛡️ Windows 上新建文件/目录可能被杀软/索引器短暂占用句柄, 立即
+                # unlink/rmtree 会偶发 PermissionError; 短延迟重试一次吸收瞬态锁
+                # (仅重试一次, 持续锁定仍按 error 返回, 不改变原有语义)
+                try:
+                    self._delete_target(target)
+                except (PermissionError, OSError):
+                    time.sleep(0.3)
+                    self._delete_target(target)
                 results.append({"path": p, "status": "deleted"})
                 self._audit("delete", p, "ok")
             except HTTPException as e:
                 results.append({"path": p, "status": "error", "error": str(e.detail)})
             except Exception as e:
                 results.append({"path": p, "status": "error", "error": str(e)})
-        
+
         return {"status": "ok", "results": results}
+
+    @staticmethod
+    def _delete_target(target):
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
     
     # 在 FileManager 类中添加:
 
@@ -2970,12 +3013,13 @@ if _IS_WINDOWS:
     class _ConPtyTerminal:
         """基于 Windows Pseudo Console (ConPTY) 的真实终端实现"""
 
-        def __init__(self, shell: str, env: Dict[str, str], rows: int, cols: int, cwd: str = None):
+        def __init__(self, shell: str, env: Dict[str, str], rows: int, cols: int, cwd: str = None, args: list = None):
             self.shell = shell
             self.env = env
             self.rows = rows
             self.cols = cols
             self.cwd = cwd
+            self.args = list(args or [])
             self._hpc = None          # HPCON 句柄
             self._attr_list = None    # PROC_THREAD_ATTRIBUTE_LIST 缓冲区
             self._in_r = self._in_w = None   # 输入管道: ConPTY 读端 + 本进程写端
@@ -3005,6 +3049,8 @@ if _IS_WINDOWS:
 
                 # 通过 STARTUPINFOEX 属性列表把伪控制台挂到子进程
                 cmdline = f'"{self.shell}"' if ' ' in self.shell else self.shell
+                for _arg in self.args:
+                    cmdline += ' ' + (f'"{_arg}"' if ' ' in _arg else _arg)
                 env_block = _windows_env_block(self.env)
                 si = _STARTUPINFOEX()
                 si.cb = ctypes.sizeof(_STARTUPINFOEX)
@@ -3095,10 +3141,11 @@ if _IS_WINDOWS:
     class _PipeTerminal:
         """旧版 Windows 管道回退实现 (无 ConPTY): 无真实终端, resize 为 no-op"""
 
-        def __init__(self, shell: str, env: Dict[str, str], rows: int, cols: int, cwd: str = None):
+        def __init__(self, shell: str, env: Dict[str, str], rows: int, cols: int, cwd: str = None, args: list = None):
             self.shell = shell
             self.env = env
             self.cwd = cwd
+            self.args = list(args or [])
             self._in_w = self._out_r = None
             self._proc = None
             self.pid = 0
@@ -3107,7 +3154,7 @@ if _IS_WINDOWS:
             in_r, in_w = os.pipe()
             out_r, out_w = os.pipe()
             self._proc = subprocess.Popen(
-                [self.shell], stdin=in_r, stdout=out_w, stderr=out_w,
+                [self.shell] + self.args, stdin=in_r, stdout=out_w, stderr=out_w,
                 env=self.env, cwd=self.cwd, creationflags=_CREATE_NO_WINDOW_FLAG)
             os.close(in_r)
             os.close(out_w)
@@ -3151,11 +3198,11 @@ if _IS_WINDOWS:
         def kill_tree(self):
             _taskkill(self.pid)
 
-    def _create_windows_backend(shell: str, env: Dict[str, str], rows: int, cols: int, cwd: str = None):
+    def _create_windows_backend(shell: str, env: Dict[str, str], rows: int, cols: int, cwd: str = None, args: list = None):
         """与 Go newTerminalSession 一致: ConPTY 可用优先, 否则管道回退"""
         if _KERNEL32 is not None:
-            return _ConPtyTerminal(shell, env, rows, cols, cwd)
-        return _PipeTerminal(shell, env, rows, cols, cwd)
+            return _ConPtyTerminal(shell, env, rows, cols, cwd, args)
+        return _PipeTerminal(shell, env, rows, cols, cwd, args)
 
     def _windows_default_shell() -> str:
         """优先 PowerShell, 退而求其次使用系统默认 cmd.exe (对齐 Go defaultTerminalShell)"""
@@ -3182,6 +3229,8 @@ class TerminalSessionHandler:
         self.master_fd = None
         self.slave_fd = None
         self.terminal = None  # Windows 终端后端 (ConPTY/管道回退)
+        self.meta_requested = False        # 面板请求 welcome 元数据帧 (meta=1)
+        self.incognito_requested = False   # 面板请求原生无痕会话 (incognito=1)
         self.websocket: WebSocket = None
         self.request_id: str = None
         
@@ -3287,10 +3336,13 @@ class TerminalSessionHandler:
             log(f"💥 握手失败: {e}")
             raise RuntimeError("加密握手失败")
 
-    async def start_session(self, websocket: WebSocket, request_id: str, use_noise: bool = True):
+    async def start_session(self, websocket: WebSocket, request_id: str, use_noise: bool = True,
+                            meta_requested: bool = False, incognito_requested: bool = False):
         self.websocket = websocket
         self.request_id = request_id
         self.use_noise = use_noise
+        self.meta_requested = meta_requested
+        self.incognito_requested = incognito_requested
         log = lambda msg: Logger.info(f"[终端会话 {request_id}] {msg}")
         
         log("终端会话已建立，等待接受连接...")
@@ -3321,12 +3373,42 @@ class TerminalSessionHandler:
             return _windows_default_shell()
         for sh_name in ['bash', 'zsh', 'ash']:
             sh_path = shutil.which(sh_name)
-            if sh_path: 
+            if sh_path:
                 return sh_path
         env_shell = os.environ.get('SHELL')
         if env_shell and os.path.exists(env_shell) and os.access(env_shell, os.X_OK):
             return env_shell
         return shutil.which('sh') or '/bin/sh'
+
+    @staticmethod
+    def _normalize_shell_name(shell_path: str) -> str:
+        """welcome 帧用的 shell 归一化名: 取 basename, 去掉 .exe 后缀 (powershell.exe -> powershell)"""
+        name = os.path.basename(shell_path or '').strip()
+        if name.lower().endswith('.exe'):
+            name = name[:-4]
+        return (name or 'sh').lower()
+
+    @staticmethod
+    def _incognito_native_applied(shell_path: str) -> bool:
+        """本次 spawn 的 shell 是否已满足无痕要求 (面板据此决定是否退回命令注入 hack)。
+        Unix: HISTFILE=/dev/null 已注入 -> True; Windows: powershell 已带 SaveNothing 启动参数,
+        cmd.exe 本身无持久历史 -> True; 其余未知 shell (可能落盘历史) -> False"""
+        if _IS_WINDOWS:
+            return os.path.basename(shell_path or '').lower() in ('powershell.exe', 'cmd.exe')
+        return True
+
+    async def _send_welcome(self, websocket: WebSocket, shell_path: str):
+        """meta=1 时在 PTY 输出泵启动前主动推 welcome 元数据帧 (复刻心跳回包的加密发送路径)。
+        WS 帧有序: 面板保证先收到本帧再见到首字节 shell 回显"""
+        if not self.meta_requested:
+            return
+        payload = json.dumps({
+            "type": "welcome",
+            "shell": self._normalize_shell_name(shell_path),
+            "path": shell_path,
+            "incognito": bool(self.incognito_requested and self._incognito_native_applied(shell_path)),
+        }).encode('utf-8')
+        await self._send_ws_bytes(websocket, payload)
 
     def set_pty_size(self, rows: int, cols: int):
         backend = getattr(self, 'terminal', None)
@@ -3355,12 +3437,18 @@ class TerminalSessionHandler:
                 await self._run_terminal_windows(websocket, request_id, log, env)
                 return
 
+            # 🕶️ 原生无痕模式 (0.5.5): 面板经 WS query incognito=1 请求后，在 spawn 现场
+            # 注入 HISTFILE=/dev/null —— bash/zsh/ash 均认该变量，退出时历史写往 /dev/null，
+            # 内存内 ↑↑ 历史保留；替代旧版面板的命令注入 hack
+            if self.incognito_requested:
+                env['HISTFILE'] = '/dev/null'
+
             self.master_fd, self.slave_fd = pty.openpty()
             self.set_pty_size(24, 80)
 
             shell = self.get_available_shell()
             log(f"🐚 使用 Shell 路径: {shell}")
-            
+
             def pty_preexec():
                 import termios, fcntl
                 os.setsid()
@@ -3374,6 +3462,9 @@ class TerminalSessionHandler:
                 env=env, preexec_fn=pty_preexec
             )
             log(f"🚀 终端进程已启动 (PID: {self.process.pid})")
+
+            # welcome 帧先于输出泵: 面板永远先拿到 shell 元数据再见到首字节回显
+            await self._send_welcome(websocket, shell)
 
             if self.slave_fd is not None:
                 os.close(self.slave_fd)
@@ -3407,12 +3498,21 @@ class TerminalSessionHandler:
             shell = self.get_available_shell()
             log(f"🐚 使用 Shell 路径: {shell}")
 
+            # 🕶️ 原生无痕 (0.5.5): PowerShell 经启动参数禁用 PSReadLine 历史落盘
+            # (-Command 在 profile 之后执行, 可覆盖用户配置); cmd.exe 无持久历史, 无需处理
+            shell_args = []
+            if self.incognito_requested and os.path.basename(shell).lower() == 'powershell.exe':
+                shell_args = ['-NoExit', '-Command', 'Set-PSReadLineOption -HistorySaveStyle SaveNothing']
+
             cwd = _resolve_safe_cwd()
-            backend = _create_windows_backend(shell, env, 24, 80, cwd)
+            backend = _create_windows_backend(shell, env, 24, 80, cwd, shell_args)
             backend.start()
             self.terminal = backend
             self.process = None
             log(f"🚀 终端进程已启动 (PID: {backend.pid})")
+
+            # welcome 帧先于输出泵: 面板永远先拿到 shell 元数据再见到首字节回显
+            await self._send_welcome(websocket, shell)
 
             tasks = [
                 asyncio.create_task(self._handle_windows_output(websocket, backend, log)),
@@ -5406,8 +5506,10 @@ async def exec_command(
         exec_kwargs["env"] = {**os.environ, **env_override}
 
     # 4. 执行并利用 ExecResponse 自动序列化返回
+    # 🚀 性能: subprocess.run 为阻塞调用, 移入线程池执行, 长命令不再冻结事件循环
+    # (此前 async handler 内直接同步执行, 一条慢命令会停摆全部 API/WS 终端/隧道)
     try:
-        res = subprocess.run(cmd, **exec_kwargs)
+        res = await asyncio.to_thread(subprocess.run, cmd, **exec_kwargs)
         return {
             "result": res.stdout,
             "exitcode": res.returncode,
@@ -6168,7 +6270,8 @@ async def set_onetime_tasks(
     }
     # 3. 触发立即执行逻辑
     if Config.InitTask and tasks:
-        res["executed"] = request.app.state.task_manager.run_onetime_tasks()
+        # 🚀 性能: 任务为阻塞 subprocess 循环, 移入线程池避免冻结事件循环
+        res["executed"] = await asyncio.to_thread(request.app.state.task_manager.run_onetime_tasks)
     return res
 
 
@@ -6221,7 +6324,8 @@ async def execute_onetime_tasks(request: Request):
     
     # 临时标记为待执行
     Config.InitTask = True
-    results = request.app.state.task_manager.run_onetime_tasks()
+    # 🚀 性能: 任务为阻塞 subprocess 循环, 移入线程池避免冻结事件循环
+    results = await asyncio.to_thread(request.app.state.task_manager.run_onetime_tasks)
     return {"status": "ok", "executed": len(results), "results": results}
 # ============================================================================
 # 📋 任务模块: 日志查询路由
@@ -6306,7 +6410,8 @@ async def root():
     }
 #超级终端
 @app.websocket("/api/ws/{path:path}")
-async def terminal_websocket(websocket: WebSocket, path: str, request_id: str = Query(...),token: str = Query(None)):
+async def terminal_websocket(websocket: WebSocket, path: str, request_id: str = Query(...),token: str = Query(None),
+                             meta: str = Query(None), incognito: str = Query(None)):
     handler = TerminalSessionHandler()
     use_noise = True
     
@@ -6321,7 +6426,10 @@ async def terminal_websocket(websocket: WebSocket, path: str, request_id: str = 
             return
         
         Logger.info(f"✅ [终端会话 {request_id}] Token 认证通过 (HTTPS 降级模式)")
-    await handler.start_session(websocket, request_id, use_noise)
+    # meta=1: 面板可解析控制帧, 请求 welcome 元数据帧; incognito=1: 请求原生无痕会话
+    await handler.start_session(websocket, request_id, use_noise,
+                                meta_requested=(meta == '1'),
+                                incognito_requested=(incognito == '1'))
 
 # 全局异常处理
 @app.exception_handler(HTTPException)

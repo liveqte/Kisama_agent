@@ -46,7 +46,10 @@ func newAuthTestRouterWithKey(t *testing.T) (*gin.Engine, *ecdsa.PrivateKey) {
 	if err != nil {
 		t.Fatalf("create crypto manager: %v", err)
 	}
-	cfg := &config.Config{Debug: false, TimestampWindow: 300, SessionKey: "dGVzdA=="}
+	// 🔐 0.5.6 起: 非 baseinfo 端点的认证响应为 session_key AES-256-GCM (docs/API.MD 十二),
+	// 测试夹具必须提供与生产一致的 32 字节 session_key (此前 4 字节占位值会让 AES 路径 500)
+	cfg := &config.Config{Debug: false, TimestampWindow: 300,
+		SessionKey: base64.StdEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))}
 	tk := tempkey.New()
 
 	router := gin.New()
@@ -115,6 +118,50 @@ func TestUnauthenticatedRequestRejected(t *testing.T) {
 
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("POST /api/exec without auth: got status %d, want 401", w.Code)
+	}
+}
+
+// 回归测试 (0.5.6 协议, docs/API.MD 十二)：已认证非 baseinfo 响应为 session_key
+// AES-256-GCM 容器 (Base64(JSON{nonce,tag,ciphertext})), 可用 session_key 解密回原文
+func TestAESResponseRoundTrip(t *testing.T) {
+	router, priv := newAuthTestRouterWithKey(t)
+
+	sessionKey := base64.StdEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))
+	const origBody = `{"cmd":"echo hi"}`
+	ts := fmt.Sprintf("%d", time.Now().Unix())
+	nonce := base64.StdEncoding.EncodeToString([]byte("0123456789abcdef"))
+	bodySum := sha256.Sum256([]byte(origBody))
+	message := fmt.Sprintf("POST\n/api/exec\n%s\n%s\n%s", hex.EncodeToString(bodySum[:]), nonce, ts)
+	digest := sha256.Sum256([]byte(message))
+	sig, err := ecdsa.SignASN1(rand.Reader, priv, digest[:])
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/exec", strings.NewReader(origBody))
+	req.Header.Set("x-nonce", nonce)
+	req.Header.Set("x-timestamp", ts)
+	req.Header.Set("x-auth-token", base64.StdEncoding.EncodeToString(sig))
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("authenticated /api/exec: got status %d, want 200", w.Code)
+	}
+	if got := w.Header().Get("x-encrypted"); got != "true" {
+		t.Fatalf("x-encrypted header: got %q, want true", got)
+	}
+
+	cm, err := crypto.NewCryptoManager("", "")
+	if err != nil {
+		t.Fatalf("create crypto manager: %v", err)
+	}
+	plaintext, err := cm.DecryptData(w.Body.String(), sessionKey)
+	if err != nil {
+		t.Fatalf("session_key AES decrypt failed: %v (body prefix: %.40s)", err, w.Body.String())
+	}
+	if !strings.Contains(plaintext, `"ok"`) {
+		t.Fatalf("decrypted payload missing handler field: %s", plaintext)
 	}
 }
 

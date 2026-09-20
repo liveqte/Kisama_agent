@@ -38,19 +38,28 @@ func GetBaseInfo(c *gin.Context) {
 	cfg := config.Get()
 	now := time.Now().Unix()
 
-	// 1. 加锁进行缓存有效期核验，阻断高并发下的惊群效应 (Cache Stampede)
+	// 1. 先锁内快检缓存命中, 未命中则锁外重建 (🚀 0.5.6: utils.GetSystemInfo 含外网 IP
+	//    探测等慢操作, 原实现持锁构建会让并发请求全部排队; 现构建移出临界区, 仅指针
+	//    替换与快照复制在锁内)
 	baseInfoMu.Lock()
-	if baseInfoCacheTime == 0 || (now-baseInfoCacheTime) > 3600 {
-		// 触发底层能耗较高的系统组件抓取
+	cacheValid := baseInfoCacheTime != 0 && (now-baseInfoCacheTime) <= 3600
+	var response models.BaseInfoResponse
+	if cacheValid {
+		// 通过值复制（Shallow Copy）派生出当前请求的独立副本，随后立即解锁释放协程
+		response = baseInfoCache
+	}
+	baseInfoMu.Unlock()
+
+	if !cacheValid {
+		// 触发底层能耗较高的系统组件抓取 (锁外执行, 不阻塞并发请求)
 		sysInfo, err := utils.GetSystemInfo()
 		if err != nil {
-			baseInfoMu.Unlock()
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get system info"})
 			return
 		}
 
 		// 缓存不含敏感密钥的纯净系统快照
-		baseInfoCache = models.BaseInfoResponse{
+		rebuilt := models.BaseInfoResponse{
 			BaseResponse:   models.BaseResponse{Status: "ok"},
 			Arch:           runtime.GOARCH,
 			CPUCores:       runtime.NumCPU(),
@@ -66,12 +75,16 @@ func GetBaseInfo(c *gin.Context) {
 			Version:        cfg.AgentVersion,
 			Virtualization: sysInfo.Virtualization,
 		}
-		baseInfoCacheTime = now
-	}
 
-	// 通过值复制（Shallow Copy）派生出当前请求的独立副本，随后立即解锁释放协程
-	response := baseInfoCache
-	baseInfoMu.Unlock()
+		baseInfoMu.Lock()
+		// 双检: 并发线程可能已完成重建, 避免慢构建的旧数据覆盖新缓存
+		if baseInfoCacheTime == 0 || (now-baseInfoCacheTime) > 3600 {
+			baseInfoCache = rebuilt
+			baseInfoCacheTime = now
+		}
+		response = baseInfoCache
+		baseInfoMu.Unlock()
+	}
 
 	// 2. ✨ 安全隔离层：根据当前请求的鉴权状态，动态组装或初始化为标准的 nil 指针
 	var sessionKeyPtr *string
@@ -112,17 +125,25 @@ func GetBaseInfo(c *gin.Context) {
 func GetStatus(c *gin.Context) {
 	now := time.Now().Unix()
 
+	// 🚀 0.5.6: 锁内快检命中, 未命中锁外重建 (utils.GetSystemStatus 含 1s CPU 采样等
+	// 慢操作, 原实现持锁构建会让并发请求全部排队)
 	statusMu.Lock()
-	if statusCacheTime == 0 || (now-statusCacheTime) > 30 {
-		// 重新读取频繁变动的 /proc/net 或者是系统状态文件
+	cacheValid := statusCacheTime != 0 && (now-statusCacheTime) <= 30
+	var response models.StatusResponse
+	if cacheValid {
+		response = statusCache
+	}
+	statusMu.Unlock()
+
+	if !cacheValid {
+		// 重新读取频繁变动的 /proc/net 或者是系统状态文件 (锁外执行)
 		status, err := utils.GetSystemStatus()
 		if err != nil {
-			statusMu.Unlock()
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get system status"})
 			return
 		}
 
-		statusCache = models.StatusResponse{
+		rebuilt := models.StatusResponse{
 			BaseResponse: models.BaseResponse{Status: "ok"},
 			CPU: models.CPUStatus{
 				Usage: status.CPUUsage,
@@ -158,11 +179,16 @@ func GetStatus(c *gin.Context) {
 			Process: status.ProcessCount,
 			Message: "",
 		}
-		statusCacheTime = now
-	}
 
-	response := statusCache
-	statusMu.Unlock()
+		statusMu.Lock()
+		// 双检: 并发线程可能已完成重建, 避免慢构建的旧数据覆盖新缓存
+		if statusCacheTime == 0 || (now-statusCacheTime) > 30 {
+			statusCache = rebuilt
+			statusCacheTime = now
+		}
+		response = statusCache
+		statusMu.Unlock()
+	}
 
 	c.Set("responseBody", response)
 	c.JSON(http.StatusOK, response)

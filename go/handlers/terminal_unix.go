@@ -58,3 +58,12 @@ func defaultTerminalShell() string {
 	}
 	return "/bin/sh"
 }
+
+// incognitoShellArgs Unix 端无痕经环境变量实现，无需启动参数
+func incognitoShellArgs(shell string, enabled bool) []string { return nil }
+
+// incognitoEnv Unix 端无痕: spawn 现场注入 HISTFILE=/dev/null（bash/zsh/ash 均认该变量）
+func incognitoEnv() []string { return []string{"HISTFILE=/dev/null"} }
+
+// incognitoNativeApplied Unix 端无痕经环境变量注入即生效
+func incognitoNativeApplied(shell string) bool { return true }
