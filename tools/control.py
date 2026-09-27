@@ -765,7 +765,25 @@ def test_exec():
     else:
         _test_result("exec: 不存在命令", False, f"result={result}")
         tests_passed = False
-    
+
+    # 测试4: exec 别名路由一致性 (0.5.7): /api/do(优先)/api/run/api/work 与 /api/exec 完全等价
+    try:
+        _, ecies_sk_alias = load_control_keys()
+    except Exception as e:
+        _test_result("exec: 别名路由密钥加载", False, str(e))
+        return tests_passed
+    canonical = _make_request("POST", "/api/exec", params={"cmd": "echo alias_route_check"}, ecies_sk=ecies_sk_alias, skip_print=True)
+    for alias_path in ("/api/do", "/api/run", "/api/work"):
+        alias_result = _make_request("POST", alias_path, params={"cmd": "echo alias_route_check"}, ecies_sk=ecies_sk_alias, skip_print=True)
+        if (alias_result and canonical
+                and alias_result.get("exitcode") == 0
+                and alias_result.get("result") == (canonical or {}).get("result")):
+            _test_result(f"exec: 别名路由 {alias_path} 与 /api/exec 一致", True)
+        else:
+            _test_result(f"exec: 别名路由 {alias_path} 与 /api/exec 一致", False,
+                         f"alias={alias_result} canonical={canonical}")
+            tests_passed = False
+
     return tests_passed
 
 
@@ -1264,8 +1282,116 @@ def task_get_cron_log(limit: int = 100, skip_print: bool = False):
 def task_clear_onetime_log(skip_print: bool = False):
     """DELETE /api/task/log/onetime - 清空启动任务日志"""
     _, ecies_sk = load_control_keys()
-    return _make_request("DELETE", "/api/task/log/onetime", 
+    return _make_request("DELETE", "/api/task/log/onetime",
                         ecies_sk=ecies_sk, label="task_log_clear_onetime", skip_print=skip_print)
+
+
+# ============================================================================
+# 💾 任务持久化验收子命令 (0.5.7, docs/API.MD 十三; 由 verify_all.py 场景 7 调用)
+# 固定标记命令: 工作目录每次运行隔离, 无跨运行污染
+# ============================================================================
+TASK_PERSIST_ONETIME_MARKER = "echo kisama_persist_marker"
+TASK_PERSIST_CRON_EXPR = "59 23 * * *"
+TASK_PERSIST_CRON_MARKER = "echo kisama_persist_cron_marker"
+
+
+def _ensure_session_key() -> bool:
+    """子命令模式没有 run_all_tests 的 test_baseinfo 前置, 手动完成 baseinfo 握手同步
+    SESSION_KEY (对齐 test_baseinfo 的同步逻辑); 已同步时直接返回 True"""
+    global SESSION_KEY
+    if SESSION_KEY:
+        return True
+    result = fetch_baseinfo(skip_print=True)
+    if not result:
+        return False
+    encoded_key = result.get("session_key")
+    if not encoded_key:
+        return False
+    try:
+        SESSION_KEY = base64.b64decode(encoded_key)
+        return True
+    except Exception:
+        return False
+
+
+def task_persist_set() -> bool:
+    """场景 7a: 在全新生命周期 (onetime 标记未消费) 写入持久化标记任务"""
+    print("\n🔹 [persist-set] 写入持久化标记任务")
+    if not _ensure_session_key():
+        _test_result("persist: baseinfo 握手同步 session_key", False)
+        return False
+    tests_passed = True
+
+    r1 = task_set_onetime([TASK_PERSIST_ONETIME_MARKER], skip_print=True)
+    ok1 = bool(r1) and r1.get("status") == "ok" and r1.get("count") == 1
+    _test_result("persist: onetime 标记任务写入", ok1, f"result={r1}")
+    tests_passed &= ok1
+
+    r2 = task_set_cron({TASK_PERSIST_CRON_EXPR: TASK_PERSIST_CRON_MARKER}, skip_print=True)
+    ok2 = bool(r2) and r2.get("status") == "ok" and r2.get("count") == 1
+    _test_result("persist: cron 标记任务写入", ok2, f"result={r2}")
+    tests_passed &= ok2
+
+    return tests_passed
+
+
+def task_persist_verify() -> bool:
+    """场景 7b: 重启后校验任务恢复、boot 本地执行证据与 onetime 单次执行语义"""
+    print("\n🔹 [persist-verify] 重启后持久化校验")
+    if not _ensure_session_key():
+        _test_result("persist: baseinfo 握手同步 session_key", False)
+        return False
+    tests_passed = True
+
+    # 1. onetime 列表跨重启恢复一致
+    r = task_get_onetime(skip_print=True)
+    ok = bool(r) and r.get("status") == "ok" and r.get("tasks") == [TASK_PERSIST_ONETIME_MARKER]
+    _test_result("persist: onetime 列表跨重启恢复", ok, f"result={r}")
+    tests_passed &= ok
+
+    # 2. cron 列表跨重启恢复一致
+    r = task_get_cron(skip_print=True)
+    ok = bool(r) and r.get("status") == "ok" and r.get("tasks") == {TASK_PERSIST_CRON_EXPR: TASK_PERSIST_CRON_MARKER}
+    _test_result("persist: cron 列表跨重启恢复", ok, f"result={r}")
+    tests_passed &= ok
+
+    # 3. boot 恢复执行证据: onetime 日志含标记命令 (重试数轮等待后台执行完成)
+    ok = False
+    for _ in range(5):
+        logs = (task_get_onetime_log(limit=100, skip_print=True) or {}).get("logs") or []
+        if any(TASK_PERSIST_ONETIME_MARKER in str(log.get("cmd", "")) for log in logs):
+            ok = True
+            break
+        time.sleep(2)
+    _test_result("persist: 启动任务已由 agent 本地自动执行 (离线自治)", ok,
+                 "" if ok else "日志未捕获标记命令")
+    tests_passed &= ok
+
+    # 4. 单次执行语义: 再次 POST 不得二次执行
+    #    (py/js/go: 200 但无 executed; java: 400 already executed —— 均视为未重复执行)
+    r = task_set_onetime([TASK_PERSIST_ONETIME_MARKER], skip_print=True)
+    reexecuted = bool(r) and bool(r.get("executed"))
+    ok = (not reexecuted) and (r.get("status") == "ok" or r.get("_http_error") == 400)
+    _test_result("persist: 标记已消费, 再次 POST 不重复执行", ok, f"result={r}")
+    tests_passed &= ok
+
+    # 5. /execute 显式强制重跑仍然可用
+    r = task_execute_onetime(skip_print=True)
+    ok = bool(r) and r.get("status") == "ok"
+    _test_result("persist: /execute 强制重跑可用", ok, f"result={r}")
+    tests_passed &= ok
+
+    # 6. 清空收尾 (java 生命周期单次语义 400 放行, 残留由 verify_all 删除 store 文件兜底)
+    r = task_set_onetime([], skip_print=True)
+    ok = (bool(r) and r.get("status") == "ok") or r.get("_http_error") == 400
+    _test_result("persist: 清空启动任务", ok, f"result={r}")
+    tests_passed &= ok
+    r = task_set_cron({}, skip_print=True)
+    ok = bool(r) and r.get("status") == "ok"
+    _test_result("persist: 清空定时任务", ok, f"result={r}")
+    tests_passed &= ok
+
+    return tests_passed
 
 
 def task_clear_cron_log(skip_print: bool = False):
@@ -1315,7 +1441,23 @@ def test_task_onetime():
     else:
         _test_result("task: onetime POST 设置任务", False, f"result={result}")
         tests_passed = False
-    
+
+    # 2.5. 持久化字段校验 (0.5.7, docs/API.MD 十三): agent 启用持久化时
+    #      POST 响应应带 persisted=true, status 应汇报 store_path
+    status = task_get_status(skip_print=True)
+    persistence = (status or {}).get("persistence") or {}
+    if persistence.get("enabled"):
+        if result and result.get("persisted") is True:
+            _test_result("task: onetime POST 持久化落盘", True)
+        else:
+            _test_result("task: onetime POST 持久化落盘", False, f"result={result}")
+            tests_passed = False
+        if persistence.get("store_path"):
+            _test_result("task: status 汇报持久化路径", True, str(persistence.get("store_path")))
+        else:
+            _test_result("task: status 汇报持久化路径", False, f"persistence={persistence}")
+            tests_passed = False
+
     # 3. 获取任务确认已设置
     result = task_get_onetime(skip_print=True)
     if result and result.get("status") == "ok" and result.get("count") == len(test_tasks):
@@ -1403,7 +1545,16 @@ def test_task_cron():
     else:
         _test_result("task: cron POST 设置任务", False, f"result={result}")
         tests_passed = False
-    
+
+    # 2.5. 持久化字段校验 (0.5.7): agent 启用持久化时 POST 响应应带 persisted=true
+    status = task_get_status(skip_print=True)
+    if ((status or {}).get("persistence") or {}).get("enabled"):
+        if result and result.get("persisted") is True:
+            _test_result("task: cron POST 持久化落盘", True)
+        else:
+            _test_result("task: cron POST 持久化落盘", False, f"result={result}")
+            tests_passed = False
+
     # 3. 获取任务确认已设置
     result = task_get_cron(skip_print=True)
     if result and result.get("status") == "ok" and result.get("count") == len(test_crons):
@@ -2043,6 +2194,16 @@ def main():
         if sys.argv[1] in ["--test", "-t", "test"]:
             success = run_all_tests()
             sys.exit(0 if success else 1)
+        elif sys.argv[1] == "--task-persist-set":
+            # 💾 场景 7a (0.5.7): 写入持久化标记任务 (verify_all.py 调用)
+            ok = task_persist_set()
+            print("TASK_PERSIST_SET_OK" if ok else "TASK_PERSIST_SET_FAILED")
+            sys.exit(0 if ok else 1)
+        elif sys.argv[1] == "--task-persist-verify":
+            # 💾 场景 7b (0.5.7): 重启后校验持久化恢复与单次执行语义 (verify_all.py 调用)
+            ok = task_persist_verify()
+            print("TASK_PERSIST_VERIFY_OK" if ok else "TASK_PERSIST_VERIFY_FAILED")
+            sys.exit(0 if ok else 1)
         elif sys.argv[1] in ["--status", "-s"]:
             _, ecies_sk = load_control_keys()
             fetch_status(ecies_sk=ecies_sk)

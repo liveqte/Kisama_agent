@@ -27,6 +27,7 @@ type TaskManager struct {
 	maxLogSize        int
 	cronActive        bool
 	lastExecutionTime time.Time
+	store             *taskStore
 }
 
 var taskManager *TaskManager
@@ -42,6 +43,26 @@ func InitTaskManager(maxLogSize int) {
 		cronTaskLogs:    []models.TaskLogEntry{},
 		maxLogSize:      maxLogSize,
 		cronActive:      false,
+	}
+
+	// 💾 持久化恢复 (0.5.7, docs/API.MD 十三): 文件缺失/损坏一律安全降级为空表, 绝不影响启动
+	taskManager.store = initTaskStore()
+	restoredOnetime, restoredCron := taskManager.store.load()
+	if len(restoredOnetime) > 0 {
+		taskManager.oneTimeTasks = restoredOnetime
+	}
+	if len(restoredCron) > 0 {
+		taskManager.cronTasks = restoredCron
+		taskManager.registerCronEntries()
+	}
+
+	// 恢复出的启动任务后台执行一次 (不阻塞 HTTP 就绪); 完成后消费 InitTask 标记,
+	// 远端再 POST /api/task/onetime 不会二次触发 (单次执行语义)
+	if len(taskManager.oneTimeTasks) > 0 && config.Get().InitTask {
+		go func() {
+			taskManager.runOnetimeTasksOnce()
+			config.Get().InitTask = false
+		}()
 	}
 }
 
@@ -71,20 +92,54 @@ func SetOneTimeTasks(c *gin.Context) {
 	taskManager.oneTimeTasks = req
 	taskManager.mu.Unlock()
 
-	// Execute tasks
+	// 💾 单次执行语义 (0.5.7, docs/API.MD 十三): InitTask 已消费 (boot 恢复执行过
+	// 或本生命周期已执行过) 则只更新列表+落盘, 不再自动触发; 空列表不消费标记
 	var executed []models.ExecutedTask
-	for i, cmd := range req {
+	cfg := config.Get()
+	if cfg.InitTask && len(req) > 0 {
+		executed = taskManager.runOnetimeTasksOnce()
+		cfg.InitTask = false
+	}
+
+	taskManager.mu.RLock()
+	curOne, curCron := taskManager.oneTimeTasks, taskManager.cronTasks
+	taskManager.mu.RUnlock()
+
+	response := models.OneTimeTaskSetResponse{
+		BaseResponse: models.BaseResponse{Status: "ok"},
+		Count:        len(req),
+		Tasks:        req,
+		Executed:     executed,
+		Persisted:    taskManager.store.save(curOne, curCron),
+	}
+
+	c.JSON(http.StatusOK, response)
+}
+
+// runOnetimeTasksOnce 执行当前全部启动任务并写日志, 返回执行结果
+func (tm *TaskManager) runOnetimeTasksOnce() []models.ExecutedTask {
+	tm.mu.RLock()
+	tasks := make([]string, len(tm.oneTimeTasks))
+	copy(tasks, tm.oneTimeTasks)
+	tm.mu.RUnlock()
+
+	results := make([]models.ExecutedTask, 0, len(tasks))
+	for i, cmd := range tasks {
 		result := executeTask(cmd)
-		executed = append(executed, models.ExecutedTask{
+		status := "error"
+		if result.Timeout {
+			status = "timeout"
+		} else if result.ExitCode == 0 {
+			status = "ok"
+		}
+		results = append(results, models.ExecutedTask{
 			Index:    i,
 			Cmd:      cmd,
 			ExitCode: result.ExitCode,
 			Output:   result.Output,
-			Status:   "ok",
+			Status:   status,
 		})
-
-		// Log
-		taskManager.logTask(models.TaskLogEntry{
+		tm.logTask(models.TaskLogEntry{
 			Timestamp: time.Now().Format(time.RFC3339),
 			Cmd:       cmd,
 			Output:    result.Output,
@@ -92,15 +147,7 @@ func SetOneTimeTasks(c *gin.Context) {
 			Type:      "onetime",
 		})
 	}
-
-	response := models.OneTimeTaskSetResponse{
-		BaseResponse: models.BaseResponse{Status: "ok"},
-		Count:        len(req),
-		Tasks:        req,
-		Executed:     executed,
-	}
-
-	c.JSON(http.StatusOK, response)
+	return results
 }
 
 // GetCronTasks retrieves cron tasks
@@ -129,12 +176,6 @@ func SetCronTasks(c *gin.Context) {
 	taskManager.mu.Lock()
 	defer taskManager.mu.Unlock()
 
-	// Stop existing cron tasks
-	for _, entryID := range taskManager.cronEntries {
-		taskManager.cronRunner.Remove(entryID)
-	}
-	taskManager.cronEntries = make(map[string]cron.EntryID)
-
 	// Clear tasks if empty
 	if len(req) == 0 {
 		taskManager.cronTasks = make(map[string]string)
@@ -145,16 +186,38 @@ func SetCronTasks(c *gin.Context) {
 			BaseResponse: models.BaseResponse{Status: "ok"},
 			Count:        0,
 			Tasks:        make(map[string]string),
+			Persisted:    taskManager.store.save(taskManager.oneTimeTasks, taskManager.cronTasks),
 		})
 		return
 	}
 
 	// Add new cron tasks
-	for schedule, cmd := range req {
+	taskManager.cronTasks = req
+	taskManager.registerCronEntries()
+
+	response := models.CronTaskResponse{
+		BaseResponse: models.BaseResponse{Status: "ok"},
+		Count:        len(req),
+		Tasks:        req,
+		Persisted:    taskManager.store.save(taskManager.oneTimeTasks, taskManager.cronTasks),
+	}
+
+	c.JSON(http.StatusOK, response)
+}
+
+// registerCronEntries 依据 cronTasks 重建 robfig/cron 调度项 (调用方需持有 mu 或处于初始化阶段)
+func (tm *TaskManager) registerCronEntries() {
+	// Stop existing cron tasks
+	for _, entryID := range tm.cronEntries {
+		tm.cronRunner.Remove(entryID)
+	}
+	tm.cronEntries = make(map[string]cron.EntryID)
+
+	for schedule, cmd := range tm.cronTasks {
 		cronCmd := cmd
-		entryID, err := taskManager.cronRunner.AddFunc(schedule, func() {
+		entryID, err := tm.cronRunner.AddFunc(schedule, func() {
 			result := executeTask(cronCmd)
-			taskManager.logTask(models.TaskLogEntry{
+			tm.logTask(models.TaskLogEntry{
 				Timestamp: time.Now().Format(time.RFC3339),
 				Cmd:       cronCmd,
 				Output:    result.Output,
@@ -165,23 +228,14 @@ func SetCronTasks(c *gin.Context) {
 		})
 
 		if err == nil {
-			taskManager.cronEntries[schedule] = entryID
+			tm.cronEntries[schedule] = entryID
 		}
 	}
 
-	taskManager.cronTasks = req
-	if len(req) > 0 {
-		taskManager.cronActive = true
-		taskManager.cronRunner.Start()
+	if len(tm.cronEntries) > 0 {
+		tm.cronActive = true
+		tm.cronRunner.Start()
 	}
-
-	response := models.CronTaskResponse{
-		BaseResponse: models.BaseResponse{Status: "ok"},
-		Count:        len(req),
-		Tasks:        req,
-	}
-
-	c.JSON(http.StatusOK, response)
 }
 
 // GetTaskStatus retrieves task status
@@ -198,6 +252,11 @@ func GetTaskStatus(c *gin.Context) {
 	response.Cron.Active = taskManager.cronActive
 	response.Cron.Count = len(taskManager.cronTasks)
 	response.Cron.CheckInterval = config.Get().CronCheckInterval
+
+	enabled, storePath, lastSavedAt := taskManager.store.statusSnapshot()
+	response.Persistence.Enabled = enabled
+	response.Persistence.StorePath = storePath
+	response.Persistence.LastSavedAt = lastSavedAt
 
 	c.JSON(http.StatusOK, response)
 }

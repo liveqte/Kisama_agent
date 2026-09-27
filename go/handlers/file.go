@@ -29,7 +29,13 @@ import (
 // 相对路径、symlink 逃逸。对尚不存在的目标 (上传/新建), 校验其最深已存在祖先的
 // realpath, 剩余段为纯名称拼接 (filepath.Join/Join 已消除 ..)。
 func isPathInsideFileRoot(root, target string) bool {
-	rootReal, err := filepath.EvalSymlinks(root)
+	// EvalSymlinks 对相对输入返回相对结果 (Go 文档保证), 而 target 已绝对化;
+	// root 未先 Abs 时 Rel 必失败 → 相对 FileRoot 会让所有文件接口误判 403
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return false
+	}
+	rootReal, err := filepath.EvalSymlinks(rootAbs)
 	if err != nil {
 		return false
 	}

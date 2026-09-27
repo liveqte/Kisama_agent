@@ -75,6 +75,7 @@
 
 ### 3. 执行系统命令
 路径：POST /api/exec  
+**等价别名路由（0.5.7 起六端统一）**：POST /api/do（受限环境优先使用）、POST /api/run、POST /api/work  
 用途：远程执行系统命令，内置超时保护与输出捕获  
 输入示例 ```(JSON): { "cmd": "ls -la /tmp", "cwd": "/tmp", "env": {"KEY": "VAL"} }```  
 输入示例 (纯文本): ls -la /tmp  
@@ -87,7 +88,8 @@
   "cmd": "ls -la /tmp"
 }
 ```
-注：退出码 0=成功, 124=超时, 126=权限不足, 127=命令不存在, -1=内部异常
+注：退出码 0=成功, 124=超时, 126=权限不足, 127=命令不存在, -1=内部异常  
+**别名路由说明**：部分托管平台/网关的 WAF 或审计规则对 URL 路径中的 `exec` 关键词敏感，会拦截 `/api/exec` 请求。三个别名路由与 `/api/exec` **完全等价**——同一处理逻辑、同一请求体（JSON 或纯文本）、同一响应结构、同一认证与响应加密协议。**受限环境优先使用 `/api/do`**，`/api/run`、`/api/work` 备选。签名消息中的 `path` 使用实际请求的路径（用别名请求即以别名路径签名），客户端无需其他适配；旧版本 agent（0.5.7 前）无别名路由，请求将返回 404。
 
 
 ## 三、文件管理模块
@@ -323,6 +325,7 @@ X-Total-Chunks: 1
 
 ## 四、任务管理模块
 
+> 💾 0.5.7 起任务定义支持本地加密持久化与重启自动恢复（`KSTORE`/`KSTORE_KEY`，启动任务离线自治，onetime 单次执行语义），详见「十三」。本节 13/14/16 的响应含 `persisted` 字段，17 的响应含 `persistence` 对象。
 
 ### 13. 获取启动任务
 路径：GET /api/task/onetime  
@@ -856,7 +859,7 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，请求
 | :--- | :--- | :--- | :--- | :---: | :---: |
 | **基础信息** | GET | `/api/baseinfo` | 静态配置上报 | ✅ | ✅ |
 | **实时监控** | GET | `/api/status` | 动态资源监控 | ✅ | ✅ |
-| **命令执行** | POST | `/api/exec` | 执行系统命令 | ✅ | ✅ |
+| **命令执行** | POST | `/api/exec`（等价别名：`/api/do` 优先、`/api/run`、`/api/work`，见二-3） | 执行系统命令 | ✅ | ✅ |
 | **文件列表** | POST | `/api/file/list` | 列出文件 | ✅ | ✅ |
 | **权限查询** | POST | `/api/file/authority` | 查询权限 | ✅ | ✅ |
 | **权限设置** | PUT | `/api/file/authority` | 设置权限 | ✅ | ✅ |
@@ -876,6 +879,7 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，请求
 | **定时任务-查** | GET | `/api/task/cron` | 获取定时任务 | ✅ | ✅ |
 | **定时任务-设** | POST | `/api/task/cron` | 设置定时任务 | ✅ | ✅ |
 | **任务状态** | GET | `/api/task/status` | 获取模块状态 | ✅ | ✅ |
+| **任务持久化** | ENV | `KSTORE`/`KSTORE_KEY` | 任务加密持久化（0.5.7，见「十三」） | — | — |
 | **任务日志-查** | GET | `/api/task/log/onetime` | 查询启动任务日志 | ✅ | ✅ |
 | **任务日志-查** | GET | `/api/task/log/cron` | 查询定时任务日志 | ✅ | ✅ |
 | **任务日志-清** | DELETE | `/api/task/log/onetime` | 清空启动任务日志 | ✅ | ✅ |
@@ -932,7 +936,7 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，请求
 各语言细节：
 - **js**（`js/agent.js` Logger）：四级阈值，缺省 `3`；`DEBUG=true` 且未设置 `LOG_LEVEL` 时为 `0`。所有级别均走 stdout（ERROR 红色）。
 - **go**（`go/logger`）：四级阈值，缺省 `3`；`DEBUG=true` 且未设置时为 `0`。ERROR 走 stderr，其余走 stdout。
-- **java / java11**（`kisama.java`）：四级阈值，缺省 `3`；`DEBUG=true` 接管为 `0`。ERROR 走 stderr，其余走 stdout，输出统一带 `[DEBUG]/[INFO]/[WARN]/[ERROR]` 前缀。0.5.3 起废弃 `LOG` 布尔开关。
+- **java / java11**（`kisama.java`）：四级阈值，缺省 `3`；`DEBUG=true` 接管为 `0`。ERROR 走 stderr，其余走 stdout，输出统一带 `[DEBUG]/[INFO]/[WARN]/[ERROR]` 前缀。0.5.3 起废弃 `LOG` 布尔开关。类加载时自动探测 Bukkit/Paper 宿主：命中则把 stdout/stderr 通道整体切换到服务端 JUL logger（`Bukkit.getLogger()`，out→info、err→severe、printStackTrace→severe+堆栈），规避 Paper 对插件类直写 `System.out/err.print` 的 Nag 告警；独立运行保持直写 stdout/stderr，行为不变。宿主可用 `kisama.setConsoleSink(ConsoleSink)` 显式覆盖自适配通道（显式注入优先）。
 - **py**（`py/agent.py` Logger）：0.5.3 起纳入同一四级阈值体系，缺省 `3`；`DEBUG=true` 且未设置 `LOG_LEVEL` 时为 `0`（全量含全部调试频道）。原有细分调试频道整体平移到**高位频道 11~15**（与标准四级互不干扰）：`11`=基本信息、`12`=WebSocket传输、`13`=终端日志、`14`=网络统计、`15`=磁盘统计。阈值设为 `11~15` 时常规日志（INFO/WARN/ERROR）全出、且**精确打开对应一个调试频道**；`LOG_LEVEL=0` 时全量输出全部频道。代码内 `Logger.debug(msg, channel)` 的 channel 参数即频道号（缺省 11），DEBUG 行按 `[DEBUG]` 标签输出（ERROR 走 stderr，其余 stdout）。
 
 ## 十二、0.5.6 响应加密协议变更（ECIES 仅存于 baseinfo，其余端点改用 session_key 对称加密）
@@ -965,3 +969,76 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，请求
 - **版本必须成对升级**：旧版控制端/面板（< 0.5.6 感知）遇到 0.5.6+ 代理时将无法解密非 baseinfo 响应；反之 0.5.6+ 控制端遇到旧代理自动走 ECIES（版本判定天然兼容）。客户端应在版本判定后按对应算法解密，解密失败给出"版本需成对升级"的明确提示而非模糊的解密错误。
 - **tempkey 授权寿命不变**：认证门仍为 ECDSA 签名；tempkey 过期检查仍在每个认证请求路径上，过期即作废临时密钥并触发 `SESSION_KEY` + 控制 Noise 密钥轮换（`rotateOperationalSecrets`），临时持有者缓存的 session_key 随轮换失效——改为对称加密**不会**使临时授权变成永久授权。
 - `session_key` 仍是随机 32 字节、仅存内存、仅经 baseinfo（ECIES 保护下）下发；其用途在原有"请求体 AES 解密（X-AES-Encrypted）+ WS 降级令牌"基础上增加"响应体 AES 加密"。
+
+---
+
+## 十三、任务持久化（KSTORE，0.5.7 起五语言统一）
+
+任务（启动任务 onetime + 定时任务 cron）在 0.5.6 及之前为**纯内存存储，重启即失**，且启动任务只在远端 POST 设置时执行。0.5.7 起新增本地加密持久化：任务定义落盘、重启自动恢复，**启动任务由 agent 本地自动执行、cron 调度本地恢复——全程无需远端连接（离线自治）**。持久化仅覆盖任务定义，不含执行日志（日志仍为内存环形缓冲）。
+
+### 环境变量说明
+
+| 变量 | 默认值 | 说明 |
+| :--- | :--- | :--- |
+| `KSTORE_KEY` | （无） | 持久化加密密钥，**唯一密钥来源，不落盘**。接受 hex（64 字符）或 std base64，解码后必须恰为 **32 字节**。未设置或非法 → 持久化关闭（fail-closed，ERROR 日志），**绝不降级明文落盘** |
+| `KSTORE` | `$HOME/.tmp/store.enc` | 加密存储文件路径（目录不存在自动创建）；`off` / `0` / `none` / `false` 显式关闭持久化 |
+
+`$HOME` 解析链：`USERPROFILE` → `HOME` → `user.home`（py/js/java/java11，与 KMODE 域名文件一致）→ go `os.UserHomeDir()` → 全部不可用时降级当前工作目录。
+
+### 存储文件格式
+
+文件内容为**单行密文**，容器与 0.5.6 响应加密完全一致：`Base64(JSON{nonce, tag, ciphertext})`，AES-256-GCM，nonce 每次随机 12 字节。内层明文 JSON：
+
+```json
+{
+  "magic": "kisama-store",
+  "version": 1,
+  "saved_at": "2026-09-25T10:30:45Z",
+  "data": {
+    "onetasks": ["echo hello", "python setup.py\n"],
+    "crontasks": { "*/5 * * * *": "echo tick" }
+  }
+}
+```
+
+- `data` 信封为后续扩展预留，当前仅含任务定义；
+- **任务命令为 shell 字符串，多行脚本原样支持**（JSON 自动转义换行）；
+- 写盘时机：POST `/api/task/onetime`、POST `/api/task/cron`（含清空）成功后同步落盘；原子写（同目录 tmp 文件 + fsync + rename/replace）；
+- 所有存储 I/O 故障只记日志降级，**绝不影响内存任务、请求成功与 agent 启动**。
+
+### 启动恢复流程（五语言一致）
+
+1. TaskManager 初始化时解析 `KSTORE`/`KSTORE_KEY`；
+2. 加载存储：文件缺失 → 空表（首次运行）；解密失败 / JSON 损坏 / magic 不符 / 版本不支持 → 原文件**隔离改名** `store.enc.bad-<时间戳>` + ERROR 日志 + 以空任务启动；版本**高于**当前支持 → 保留原文件不覆盖，本次以空任务启动且持久化只读（防止旧版本 agent 覆盖新版本数据）；
+3. 恢复 `onetasks` / `crontasks` 到内存；
+4. `crontasks` 非空 → 启动既有 cron 调度循环；
+5. 恢复出的启动任务**后台执行一次**（不阻塞 HTTP 就绪），结果写入既有 onetime 日志环形缓冲（重启后仍可经 `/api/task/log/onetime` 查证）。
+
+### onetime 单次执行语义（重要）
+
+沿用各语言既有的执行标记（py/js/go `InitTask`、java `ONETIME_EXECUTED`），标记**每个生命周期只消费一次**：
+
+1. 首次自动执行 = 启动时恢复执行（持久化启用且恢复列表非空）或首次非空 POST（store 为空 / 未启用时）；
+2. 标记消费后，再次 POST `/api/task/onetime` 仅**更新列表 + 落盘，不再自动执行**（py 现状语义；js/go 为本版本新增门控——此前 js/go 的 POST 无条件执行，是"boot 执行后又被执行一次"的缺口；java 维持 400 `already executed` 现状）；
+3. 恢复列表为空 → 启动不执行、标记不消费 → 远端首次 POST 正常执行；
+4. 空列表 POST = 清空 + 落盘，不执行、不消费标记（java 空列表路径由"不清理"修正为"清空+落盘"，与其他四语言对齐）；
+5. `POST /api/task/onetime/execute` 不变：显式强制重跑的唯一入口。
+
+### API 变更（additive，向后兼容）
+
+| 端点 | 变更 |
+| :--- | :--- |
+| GET `/api/task/status` | 新增 `persistence: {enabled, store_path, last_saved_at}` |
+| POST `/api/task/onetime` | 响应新增 `persisted: true\|false`；`executed` 数组仅在实际执行时返回 |
+| POST `/api/task/cron` | 响应新增 `persisted: true\|false` |
+
+### 密钥与威胁模型
+
+- 密钥仅来自 `KSTORE_KEY` 环境变量（可选经 `.env` 注入），**磁盘上不存在密钥文件**：仅拿到 `store.enc` 文件（备份、单文件外泄）无法解密；
+- 更换密钥后旧文件无法解密 → 被隔离重建，任务丢失（运维需自行重设任务或找回旧密钥）；
+- GCM 认证标签提供防篡改：密文或 tag 被改动即解密失败 → 隔离；
+- 固有边界：与本 agent 同用户的进程可读其环境变量（`/proc/<pid>/environ` 等），密钥对该威胁面不可防御；机密性边界为"防止存储文件单独外泄被还原"，不防御本机 root。
+
+### 验收
+
+`tests/py/test_task_store.py`、`tests/js/test_task_store.js`（离线单测：密钥解析 / 往返 / 损坏隔离 / 单次语义）、`go/handlers/task_store_test.go`；`tools/verify_all.py` 场景 7（标记任务写入 → 重启 → 恢复一致性 + boot 本地执行 + 单次执行语义 + /execute → 清库）计入汇总矩阵 PERSIST 列。

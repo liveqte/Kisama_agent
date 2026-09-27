@@ -339,9 +339,10 @@ type ExecutedTask struct {
 // OneTimeTaskSetResponse represents onetime task set response
 type OneTimeTaskSetResponse struct {
 	BaseResponse
-	Count    int            `json:"count"`
-	Tasks    []string       `json:"tasks"`
-	Executed []ExecutedTask `json:"executed,omitempty"`
+	Count     int            `json:"count"`
+	Tasks     []string       `json:"tasks"`
+	Executed  []ExecutedTask `json:"executed,omitempty"`
+	Persisted bool           `json:"persisted"` // 是否已持久化落盘 (0.5.7, docs/API.MD 十三)
 }
 
 // CronTaskRequest represents cron task request
@@ -350,8 +351,9 @@ type CronTaskRequest map[string]string
 // CronTaskResponse represents cron task response
 type CronTaskResponse struct {
 	BaseResponse
-	Count int               `json:"count"`
-	Tasks map[string]string `json:"tasks"`
+	Count     int               `json:"count"`
+	Tasks     map[string]string `json:"tasks"`
+	Persisted bool              `json:"persisted"` // 是否已持久化落盘 (0.5.7, docs/API.MD 十三)
 }
 
 // TaskStatusResponse represents task status response
@@ -366,6 +368,11 @@ type TaskStatusResponse struct {
 		Count         int  `json:"count"`
 		CheckInterval int  `json:"check_interval"`
 	} `json:"cron"`
+	Persistence struct {
+		Enabled     bool   `json:"enabled"`
+		StorePath   string `json:"store_path"`
+		LastSavedAt string `json:"last_saved_at"`
+	} `json:"persistence"`
 }
 
 // TaskLogResponse represents task log response

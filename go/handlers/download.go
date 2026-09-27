@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/liveqte/kisama_agent/go/config"
@@ -22,13 +21,11 @@ func DownloadFile(c *gin.Context) {
 		return
 	}
 
-	// 2. 目录穿越安全校验
+	// 2. 目录穿越安全校验 (A-1 权威守卫)
 	cfg := config.Get()
-	rootDir := filepath.Clean(cfg.FileRoot)
-	fullPath := filepath.Join(rootDir, req.Path)
+	fullPath := filepath.Join(cfg.FileRoot, req.Path)
 
-	relPath, err := filepath.Rel(rootDir, fullPath)
-	if err != nil || strings.HasPrefix(relPath, "..") {
+	if !isPathInsideFileRoot(cfg.FileRoot, fullPath) {
 		c.JSON(http.StatusForbidden, gin.H{"status": "error", "message": "Access denied: path outside root"})
 		return
 	}
@@ -60,7 +57,11 @@ func DownloadFile(c *gin.Context) {
 	// 🚀 5. 100% 对齐 Node.js 的返回包设置
 	// 设置自定义文件大小及路径 Header
 	c.Header("x-file-size", fmt.Sprintf("%d", fi.Size()))
-	c.Header("x-original-path", filepath.ToSlash(relPath))
+	if rootAbs, err := filepath.Abs(cfg.FileRoot); err == nil {
+		if relPath, err := filepath.Rel(rootAbs, fullPath); err == nil {
+			c.Header("x-original-path", filepath.ToSlash(relPath))
+		}
+	}
 
 	// 使用 c.Data 灌入纯二进制流
 	// 它会自动帮我们把 Content-Type 设置为 'application/octet-stream' 并将裸数据写入 Body

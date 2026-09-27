@@ -212,6 +212,13 @@ func (cm *CryptoManager) EncryptResponse(data interface{}, debug bool) (string, 
 // DecryptData decrypts AES-256-GCM encrypted data
 // Expected format: Base64(JSON.stringify({nonce, tag, ciphertext}))
 func (cm *CryptoManager) DecryptData(encryptedBase64 string, keyB64 string) (string, error) {
+	return DecryptAES256GCM(encryptedBase64, keyB64)
+}
+
+// DecryptAES256GCM decrypts AES-256-GCM encrypted data (包级函数, 与 EncryptAES256GCM 对称;
+// 0.5.7 任务持久化等无需 CryptoManager 实例的场景复用, docs/API.MD 十三)
+// Expected format: Base64(JSON.stringify({nonce, tag, ciphertext}))
+func DecryptAES256GCM(encryptedBase64 string, keyB64 string) (string, error) {
 	// Decode the raw key
 	rawKey, err := base64.StdEncoding.DecodeString(keyB64)
 	if err != nil {

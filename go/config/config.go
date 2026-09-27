@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -158,7 +159,9 @@ func getConfigValue(envKey, filePath string) string {
 }
 
 // resolveFileRoot 校验 FILE_ROOT 候选目录真实存在，全部无效时降级到当前工作目录 (不自动创建)；
-// 同时避免 UserHomeDir 失败时产生空 FileRoot 导致路径前缀防护失效
+// 同时避免 UserHomeDir 失败时产生空 FileRoot 导致路径前缀防护失效。
+// 一律返回绝对路径: 相对 FileRoot (含降级得到的 ".") 会让 A-1 守卫的 filepath.Rel
+// 无法把绝对目标算成它的子路径，文件接口将逐请求 403。
 func resolveFileRoot() string {
 	home, _ := os.UserHomeDir()
 	candidates := []string{os.Getenv("FILE_ROOT"), home}
@@ -167,12 +170,23 @@ func resolveFileRoot() string {
 			continue
 		}
 		if info, err := os.Stat(dir); err == nil && info.IsDir() {
-			return dir
+			return absOrRaw(dir)
 		}
 		logger.Warnf("FILE_ROOT 候选目录不存在, 已跳过: %s", dir)
 	}
 	logger.Warnf("FILE_ROOT 全部候选无效, 降级到当前工作目录")
-	return "."
+	if wd, err := os.Getwd(); err == nil && wd != "" {
+		return absOrRaw(wd)
+	}
+	return absOrRaw(".")
+}
+
+// absOrRaw 把路径绝对化; 失败时原样返回 (交由守卫的 Abs 兜底)
+func absOrRaw(dir string) string {
+	if abs, err := filepath.Abs(dir); err == nil {
+		return abs
+	}
+	return dir
 }
 
 // New creates and returns a new Config instance
@@ -275,7 +289,7 @@ func New() (*Config, error) {
 
 	agentVersion := os.Getenv("AGENT_VERSION")
 	if agentVersion == "" {
-		agentVersion = "0.5.6-go"
+		agentVersion = "0.5.7-go"
 	}
 
 	tempKeyDefaultTTL := 24

@@ -55,3 +55,31 @@ KMODE=2 KNAME=env01a KNAME_KEY=s3cret-key python agent.py
 https://shz.al/~<KNAME>
 ```
 例如 `KNAME=env01a`，则 `curl https://shz.al/~env01a` 的响应体就是该环境的隧道域名；未上报时返回 404，轮询直至 200 即可。代理每次重启会自动覆盖更新同一 URL 的值（409→PUT），因此**预测 URL 永远指向最新域名**；持有 `KNAME_KEY` 的一方也可自行改写或删除该值。上报值 7 天后自动过期。
+---
+
+## 任务持久化（🆕 0.5.7 新增支持特性，五语言统一）
+
+启动任务与定时任务现在默认可以**加密持久化到本地**：agent 重启后任务自动恢复，启动任务由 agent **本地自动执行**、定时任务本地恢复调度，全程不需要远端连接（离线自治）。此前任务纯内存存储，重启即失。
+
+### 配置方法
+
+```bash
+# 必需：注入 32 字节持久化密钥（hex 64 字符或 base64，不落盘）
+export KSTORE_KEY=$(openssl rand -hex 32)
+
+# 可选：存储文件路径（缺省 $HOME/.tmp/store.enc，目录自动创建）
+export KSTORE=$HOME/.tmp/store.enc
+
+# 可选：显式关闭持久化
+export KSTORE=off
+```
+
+未设置 `KSTORE_KEY` 或密钥非法时，持久化自动关闭（fail-closed，绝不降级明文落盘），agent 其余功能不受影响。
+
+### 行为说明
+
+- 任务定义在每次 POST `/api/task/onetime`、`/api/task/cron`（含清空）后原子落盘；文件为 AES-256-GCM 加密密文（容器与 0.5.6 响应加密一致），**仅拿到存储文件无法还原任务内容**。
+- 重启后：任务列表自动恢复；启动任务在后台执行一次（结果可在 `/api/task/log/onetime` 查证）；定时任务恢复调度。
+- 启动任务每个生命周期只自动执行一次（启动恢复执行或首次 POST 执行二选一，不会叠加）；需要强制重跑用 `POST /api/task/onetime/execute`。
+- 存储文件损坏或密钥不匹配时自动隔离改名（`store.enc.bad-*`）并以空任务启动，绝不影响 agent 启动与运行。
+- 更换 `KSTORE_KEY` 后旧存储无法解密（任务丢失，需重新下发任务）。

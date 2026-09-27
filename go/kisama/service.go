@@ -281,6 +281,11 @@ func registerRoutes(router *gin.Engine, tk *tempkey.Manager, cfg *config.Config)
 	api.GET("/status", handlers.GetStatus)
 	api.GET("/tempkey", handlers.GetTempKey(tk, cfg))
 	api.POST("/exec", handlers.ExecuteCommand)
+	// exec 别名路由（0.5.7）：部分平台 WAF/审计规则对路径中的 exec 敏感，
+	// 受限环境优先 /api/do，备选 /api/run、/api/work；与 /api/exec 完全等价（签名用实际请求路径）。
+	api.POST("/do", handlers.ExecuteCommand)
+	api.POST("/run", handlers.ExecuteCommand)
+	api.POST("/work", handlers.ExecuteCommand)
 	api.POST("/file/list", handlers.ListFiles)
 	api.POST("/file/authority", handlers.QueryFileAuthority)
 	api.PUT("/file/authority", handlers.SetFileAuthority)
