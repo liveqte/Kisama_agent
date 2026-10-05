@@ -447,18 +447,18 @@ incognito：本次会话原生无痕是否实际生效（面板请求 incognito=
 
 
 ### 25. 获取临时密钥对
-路径：GET /api/tempkey?ttl=24  
+路径：GET /api/tempkey?ttl=24[&format=short]  
 用途：获取一对临时密钥（ECDSA + ECIES），用于临时授权第三方（如 AI Agent、其他协作者）连接本代理。  
-兼容实现：✅ Python 版（py/agent.py）、✅ JS 版（js/agent.js）、✅ Java 版（java/、java11/，0.4.2+）均提供该接口，语义一致。  
+兼容实现：✅ Python 版（py/agent.py）、✅ JS 版（js/agent.js）、✅ Java 版（java/、java11/，0.4.2+）、✅ Go 版、✅ PHP 版均提供该接口，语义一致。  
 行为约定：
 - 有效期内重复请求返回**同一份**密钥对（幂等，不重复生成，避免代理内部多头密钥管理负担）；
 - 密钥过期后（或首次请求）自动生成**新的**密钥对，旧密钥立即作废；
 - 该接口本身受认证保护（需控制端静态密钥签名），响应按控制端密钥加密。  
-密钥规格：
+密钥规格（缺省全格式）：
 - `ecdsa`：**ECDSA P-256**（secp256r1 / prime256v1，OID 1.2.840.10045.3.1.7），私钥为 **PKCS#8 PEM**（`-----BEGIN PRIVATE KEY-----`；部分部署版本可能返回 SEC1 格式 `-----BEGIN EC PRIVATE KEY-----`，两种均可被控制端解析），公钥为 SubjectPublicKeyInfo PEM；
 - `ecies`：secp256k1，私钥为 32 字节原始密钥的 hex（64 字符），公钥为 65 字节未压缩点 hex（130 字符）。  
-输入：`ttl`（小时，默认 24，范围 1~168，超出范围返回 422）  
-返回示例：
+输入：`ttl`（小时，默认 24，范围 1~168，超出范围返回 422）；`format`（**0.5.8 起六端统一**，缺省/`full`=全格式，`short`=短格式，其他值返回 422，详见「十四、临时密钥短格式」）  
+返回示例（缺省全格式）：
 ```
 {
   "status": "ok",
@@ -477,8 +477,27 @@ incognito：本次会话原生无痕是否实际生效（面板请求 incognito=
 }
 ```
 
+`format=short` 短格式（0.5.8，六端统一；JSON 结构与字段名不变，仅值编码不同，面向 AI 消费者，详见「十四」）：
+```
+{
+  "status": "ok",
+  "key_id": "3f9a0b2c4d5e6f78",
+  "ttl_seconds": 86400,
+  "created_at": "2026-08-08T10:00:00Z",
+  "expires_at": "2026-08-09T10:00:00Z",
+  "ecdsa": {
+    "private_key": "<hex 64字符 P-256私钥标量>",
+    "public_key": "<Base64 44字符 33字节SEC1压缩点>"
+  },
+  "ecies": {
+    "private_key": "<hex 64字符 临时ECIES私钥（与全格式一致）>",
+    "public_key": "<Base64 44字符 33字节SEC1压缩点>"
+  }
+}
+```
+
 临时密钥使用方式（与静态密钥完全一致的请求流程）：
-1. 调用方持有 `ecdsa.private_key`，按与静态密钥一致的 v2 五段签名消息（见「通用请求头要求」）做 ECDSA 签名，放入 `X-Auth-Token`（Raw 64 字节或 DER 格式均可）；
+1. 调用方持有 `ecdsa.private_key`（PEM 或 short 格式的 64 位 hex 标量均可，控制端脚本自动识别），按与静态密钥一致的 v2 五段签名消息（见「通用请求头要求」）做 ECDSA 签名，放入 `X-Auth-Token`（Raw 64 字节或 DER 格式均可）；
 2. 代理端验签时自动识别签名来源（静态密钥 → 临时密钥），响应体使用与来源**对应**的 ECIES 公钥加密；
 3. 临时调用方用 `ecies.private_key` 解密响应内容，无需任何额外请求头。
 
@@ -885,7 +904,7 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，请求
 | **任务日志-清** | DELETE | `/api/task/log/onetime` | 清空启动任务日志 | ✅ | ✅ |
 | **任务日志-清** | DELETE | `/api/task/log/cron` | 清空定时任务日志 | ✅ | ✅ |
 | **日志统计** | GET | `/api/task/log/summary` | 获取统计摘要 | ✅ | ✅ |
-| **临时密钥** | GET | `/api/tempkey` | 获取临时授权密钥对 | ✅ | ✅ |
+| **临时密钥** | GET | `/api/tempkey`（`format=short` 短格式，0.5.8 起） | 获取临时授权密钥对 | ✅ | ✅ |
 | **超级终端** | WS | `/api/ws/terminal` | 使用交互性终端 | ✅ | ✅ |
 | **代理转发** | ANY | `/kisamaproxy/*` | 转发至任意地址（仅GO） | ❌ | ❌ |
 | **临时隧道-查** | GET | `/api/argo` | 查询临时隧道列表（Py/Js） | ✅ | ✅ |
@@ -1042,3 +1061,32 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，请求
 ### 验收
 
 `tests/py/test_task_store.py`、`tests/js/test_task_store.js`（离线单测：密钥解析 / 往返 / 损坏隔离 / 单次语义）、`go/handlers/task_store_test.go`；`tools/verify_all.py` 场景 7（标记任务写入 → 重启 → 恢复一致性 + boot 本地执行 + 单次执行语义 + /execute → 清库）计入汇总矩阵 PERSIST 列。
+
+## 十四、临时密钥短格式（format=short，0.5.8 起六端统一）
+
+### 设计动机
+
+`/api/tempkey` 下发的 ECDSA 私钥为 PKCS#8 PEM 多行文本（`-----BEGIN PRIVATE KEY-----` 头尾 + 64 字符换行 Base64，整段约 250+ 字符），ECIES 公钥为 130 字符 hex。该格式面向网页控制端（浏览器原生可解析 P-256 结构化密钥），但接口的主要消费者是 **AI Agent（kisama-skill）**：AI 在读取、转录、传递多行 PEM 时易出现换行丢失、头尾截断、字符合并等抄写错误。0.5.8 参照控制面板部署命令的公钥压缩格式（33 字节 SEC1 压缩点 Base64），为接口增加短格式输出。
+
+### 契约
+
+`GET /api/tempkey?ttl=24&format=short`：
+
+- **JSON 结构与字段名与全格式完全一致**，仅值的编码不同——调用方（含 AI）无需改变解析逻辑；
+- `ecdsa.private_key`：64 位 hex（P-256 私钥标量 32 字节），单行纯 hex，可直接整串传入 kisama-skill 的 `--ecdsa-key`；
+- `ecdsa.public_key`：33 字节 SEC1 压缩点（`02/03||X`）的 Base64（44 字符），与面板部署命令的 `ECDSA_PUBKEY` 环境变量同构；
+- `ecies.private_key`：与全格式一致（64 位 hex，本就是单行短格式）；
+- `ecies.public_key`：33 字节 SEC1 压缩点 Base64，与 `keys/agent_ecies_pub.b64` 静态公钥格式同构；
+- `format` 缺省或 `full` → 现行全格式（行为零变化）；其他非法值 → 422；
+- 幂等性不受影响：同一 `key_id` 的密钥对，两种 format 随时可取、内容同源（同一密钥对不同编码）。
+
+### 兼容性与实现要点
+
+- **向后兼容**：不带 `format` 的请求行为逐字节不变；`short` 仅是同一密钥对的另一种下发编码，签验、ECIES 加解密、过期轮换等内部路径零改动（代理内存中始终持有完整密钥材料）；
+- **控制端兼容**：kisama-skill 与 tools/control.py 自 0.5.8 起自动识别 64 位 hex / Base64(32字节) 标量形式的 ECDSA 私钥（PEM/DER 继续支持），短格式私钥无需任何转换即可直接签名；
+- **PHP 版**：内部状态记录（`.kisama_tempkey_state.php`）恒为全格式，short 仅在响应构造时从全格式字段即时派生——baseinfo 的 temp ECIES 对端选择（65 字节未压缩点判断）与旧版状态文件天然兼容；
+- **实现**：py `_compress_point65` / go `elliptic.MarshalCompressed` + `ecies.PublicKey.Bytes(true)` / js noble-curves `toBytes(true)` / java+java11 BC `ECPoint.getEncoded(true)` / PHP `_pointCompressB64Hex`（y 末字节奇偶决定 `02/03` 前缀，各端一致）。
+
+### 验收
+
+`tests/py/test_tempkey_short.py`、`tests/js/test_tempkey_short.js`、`go/handlers/tempkey_test.go`（short 字段格式、与全格式同源交叉验证、非法 format 422、缺省行为不变）；PHP 四实现以 `php -l` + 本地 `php -S` 冒烟验证三种 format 响应；`tools/verify_all.py` tempkey short 场景覆盖五端格式断言与短私钥端到端签名连通。

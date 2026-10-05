@@ -22,7 +22,7 @@ from typing import List, Dict, Optional, Any, Callable
 
 # 加密依赖 (ECIES/AES 兼容层: 原生 coincurve/eciespy/pycryptodome 优先,
 # 缺失时(如 Python 3.14 无 wheel、无编译工具链)自动回退 ecdsa + cryptography 实现)
-from ecdsa import SigningKey
+from ecdsa import NIST256p, SigningKey
 from ecdsa.util import sigencode_der
 from kisama_crypto import (
     ecies_decrypt, ecies_encrypt, ECIESKey,
@@ -154,10 +154,22 @@ def load_control_keys():
     if raw_data:
         try:
             text = raw_data.decode("utf-8")
-            if "-----BEGIN" in text:
+            compact = re.sub(r"\s+", "", text)
+            # 0.5.8 短格式优先识别 (tempkey format=short): 64 位 hex / Base64(32字节) P-256 标量
+            if re.fullmatch(r"[0-9a-fA-F]{64}", compact):
+                ecdsa_sk = SigningKey.from_string(bytes.fromhex(compact), curve=NIST256p)
+            else:
+                b64 = compact + "=" * (-len(compact) % 4)
+                try:
+                    decoded = base64.b64decode(b64, validate=True)
+                except Exception:
+                    decoded = b""
+                if len(decoded) == 32:
+                    ecdsa_sk = SigningKey.from_string(decoded, curve=NIST256p)
+            if ecdsa_sk is None and "-----BEGIN" in text:
                 # 支持 PKCS#8 / EC PRIVATE KEY 等 PEM 格式
                 ecdsa_sk = SigningKey.from_pem(text)
-            else:
+            elif ecdsa_sk is None:
                 # 非 PEM 文本可能是 Base64 DER
                 der_bytes = base64.b64decode("".join(text.split()), validate=True)
                 ecdsa_sk = SigningKey.from_der(der_bytes)
@@ -1335,6 +1347,89 @@ def task_persist_set() -> bool:
     return tests_passed
 
 
+def tempkey_short_check() -> bool:
+    """🔑 场景 8 (0.5.8, docs/API.MD 十四): tempkey format=short 短格式下发 + 短私钥端到端验收
+
+    流程: 静态密钥签名调 GET /api/tempkey?format=short → 断言短格式字段规格与同源幂等 →
+    用下发的短格式私钥 (64 位 hex ECDSA 标量 + ecies hex) 以"临时持有者"身份再握手 baseinfo
+    (代理验签识别 temp 来源, 用临时 ECIES 公钥加密响应) → 短私钥端到端可用。
+    """
+    print("🔹 [tempkey-short] 短格式下发 + 短私钥端到端验收")
+    if not _ensure_session_key():
+        _test_result("tempkey-short: baseinfo 握手同步 session_key", False)
+        return False
+    tests_passed = True
+
+    # 1. 短格式字段规格
+    payload = _make_request("GET", "/api/tempkey?format=short", label="tempkey-short", skip_print=True)
+    ok = isinstance(payload, dict) and payload.get("status") == "ok"
+    _test_result("tempkey-short: 请求成功", ok, f"payload={str(payload)[:160]}")
+    tests_passed &= ok
+    if not ok:
+        return False
+
+    ecdsa = payload.get("ecdsa") or {}
+    ecies = payload.get("ecies") or {}
+    priv_hex, pub_b64 = ecdsa.get("private_key", ""), ecdsa.get("public_key", "")
+    ecies_priv_hex, ecies_pub_b64 = ecies.get("private_key", ""), ecies.get("public_key", "")
+
+    def _point33(b64str):
+        try:
+            raw = base64.b64decode(b64str)
+            return len(raw) == 33 and raw[0] in (2, 3)
+        except Exception:
+            return False
+
+    ok = re.fullmatch(r"[0-9a-f]{64}", priv_hex) is not None
+    _test_result("tempkey-short: ecdsa.private_key 为 64 位 hex 标量", ok, priv_hex[:80])
+    tests_passed &= ok
+    ok = _point33(pub_b64)
+    _test_result("tempkey-short: ecdsa.public_key 为 33 字节压缩点 Base64", ok, pub_b64)
+    tests_passed &= ok
+    ok = re.fullmatch(r"[0-9a-f]{64}", ecies_priv_hex) is not None
+    _test_result("tempkey-short: ecies.private_key 保持 64 位 hex", ok, ecies_priv_hex[:80])
+    tests_passed &= ok
+    ok = _point33(ecies_pub_b64)
+    _test_result("tempkey-short: ecies.public_key 为 33 字节压缩点 Base64", ok, ecies_pub_b64)
+    tests_passed &= ok
+
+    # 2. 幂等同源: 缺省全格式同取, PEM 私钥标量与短格式 hex 一致
+    full = _make_request("GET", "/api/tempkey", label="tempkey-full", skip_print=True)
+    same = isinstance(full, dict) and full.get("key_id") == payload.get("key_id")
+    _test_result("tempkey-short: 两种 format 幂等 (同 key_id)", same,
+                 f"short={payload.get('key_id')} full={(full or {}).get('key_id') if isinstance(full, dict) else full}")
+    tests_passed &= same
+    if same:
+        try:
+            pem_scalar = SigningKey.from_pem(full["ecdsa"]["private_key"]).to_string().hex()
+            ok = pem_scalar == priv_hex
+            _test_result("tempkey-short: 全格式 PEM 与短格式标量同源", ok)
+        except Exception as e:
+            ok = False
+            _test_result("tempkey-short: 全格式 PEM 解析", False, str(e))
+        tests_passed &= ok
+
+    # 3. 短私钥端到端: 以临时持有者身份用短格式私钥签名 baseinfo
+    try:
+        sk_short = SigningKey.from_string(bytes.fromhex(priv_hex), curve=NIST256p)
+        headers = generate_auth_headers(sk_short, "GET", "/api/baseinfo")
+        headers.setdefault("Accept", "application/json")
+        req = urllib.request.Request(f"{CONFIG['proxy_url']}/api/baseinfo", headers=headers)
+        with urllib.request.urlopen(req, timeout=CONFIG["timeout"] + 30) as resp:
+            body_bytes = resp.read()
+        plain = ecies_decrypt(bytes.fromhex(ecies_priv_hex), base64.b64decode(body_bytes.strip()))
+        data = json.loads(plain)
+        ok = isinstance(data, dict) and bool(data.get("session_key"))
+        _test_result("tempkey-short: 短私钥端到端 baseinfo 握手 (验签+ECIES)", ok,
+                     str(data)[:160] if isinstance(data, dict) else str(data))
+    except Exception as e:
+        ok = False
+        _test_result("tempkey-short: 短私钥端到端 baseinfo 握手 (验签+ECIES)", False, f"{type(e).__name__}: {e}")
+    tests_passed &= ok
+
+    return tests_passed
+
+
 def task_persist_verify() -> bool:
     """场景 7b: 重启后校验任务恢复、boot 本地执行证据与 onetime 单次执行语义"""
     print("\n🔹 [persist-verify] 重启后持久化校验")
@@ -2203,6 +2298,11 @@ def main():
             # 💾 场景 7b (0.5.7): 重启后校验持久化恢复与单次执行语义 (verify_all.py 调用)
             ok = task_persist_verify()
             print("TASK_PERSIST_VERIFY_OK" if ok else "TASK_PERSIST_VERIFY_FAILED")
+            sys.exit(0 if ok else 1)
+        elif sys.argv[1] == "--tempkey-short":
+            # 🔑 场景 8 (0.5.8): tempkey 短格式下发 + 短私钥端到端验收 (verify_all.py 调用)
+            ok = tempkey_short_check()
+            print("TEMPKEY_SHORT_OK" if ok else "TEMPKEY_SHORT_FAILED")
             sys.exit(0 if ok else 1)
         elif sys.argv[1] in ["--status", "-s"]:
             _, ecies_sk = load_control_keys()

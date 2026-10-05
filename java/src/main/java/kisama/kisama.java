@@ -190,7 +190,7 @@ public class kisama {
 
     private static final int TEMPKEY_DEFAULT_TTL_HOURS = Integer.parseInt(DOTENV.getOrDefault("TEMPKEY_TTL", "24"));
     private static final int TEMPKEY_MAX_TTL_HOURS = Integer.parseInt(DOTENV.getOrDefault("TEMPKEY_MAX_TTL", "168"));
-    private static final String AGENT_VERSION = "0.5.7-java";
+    private static final String AGENT_VERSION = "0.5.8-java";
 
     private Map<String, Object> baseInfoCache = null;
     private long lastBaseInfoCacheTime = 0;
@@ -620,6 +620,7 @@ public class kisama {
         // - 有效期内重复请求返回同一密钥对 (幂等, 不重复生成)
         // - 过期后自动生成新的密钥对, 旧密钥立即作废
         // - 响应按验签来源加密: 静态密钥->控制端静态公钥, 临时密钥->当前临时 ECIES 公钥
+        // - format=short 返回短格式 (0.5.8, AI 友好): ECDSA 私钥 64位hex、双公钥 33字节压缩点 Base64
         get("/api/tempkey", (req, res) -> {
             res.type("application/json");
             int ttl = TEMPKEY_DEFAULT_TTL_HOURS;
@@ -634,14 +635,20 @@ public class kisama {
                     halt(422, this.gson.toJson(Map.of("error", "ttl must be an integer between 1 and " + TEMPKEY_MAX_TTL_HOURS)));
                 }
             }
+            String fmt = req.queryParams("format");
+            fmt = fmt == null ? "" : fmt.trim().toLowerCase();
+            if (!fmt.isEmpty() && !fmt.equals("full") && !fmt.equals("short")) {
+                halt(422, this.gson.toJson(Map.of("error", "format must be 'full' or 'short'")));
+            }
+            boolean shortFormat = fmt.equals("short");
             try {
                 Map<String, Object> key = this.tempKeyManager.getKeys(ttl);
                 Map<String, String> ecdsa = new LinkedHashMap<>();
-                ecdsa.put("private_key", ((String) key.get("ecdsa_private_key")).trim());
-                ecdsa.put("public_key", ((String) key.get("ecdsa_public_key")).trim());
+                ecdsa.put("private_key", shortFormat ? (String) key.get("ecdsa_private_hex") : ((String) key.get("ecdsa_private_key")).trim());
+                ecdsa.put("public_key", shortFormat ? (String) key.get("ecdsa_public_b64") : ((String) key.get("ecdsa_public_key")).trim());
                 Map<String, String> ecies = new LinkedHashMap<>();
                 ecies.put("private_key", (String) key.get("ecies_private_key"));
-                ecies.put("public_key", (String) key.get("ecies_public_key"));
+                ecies.put("public_key", shortFormat ? (String) key.get("ecies_public_b64") : (String) key.get("ecies_public_key"));
                 Map<String, Object> payload = new LinkedHashMap<>();
                 payload.put("status", "ok");
                 payload.put("key_id", key.get("key_id"));
@@ -3038,6 +3045,10 @@ public class kisama {
         private String ecdsaPublicPem = "";
         private String eciesPrivateHex = "";
         private String eciesPublicHex = "";
+        // 下发字段 (format=short 短格式, 0.5.8 docs/API.MD 十四)
+        private String ecdsaPrivateHex = "";
+        private String ecdsaPublicB64 = "";
+        private String eciesPublicB64 = "";
         private PublicKey ecdsaVk = null;
         private byte[] eciesPub = null;
         // 🔐 凭证生命周期钩子: tempkey 过期被检测到时触发一次长期密钥轮换
@@ -3100,6 +3111,9 @@ public class kisama {
             m.put("ecdsa_public_key", ecdsaPublicPem);
             m.put("ecies_private_key", eciesPrivateHex);
             m.put("ecies_public_key", eciesPublicHex);
+            m.put("ecdsa_private_hex", ecdsaPrivateHex);
+            m.put("ecdsa_public_b64", ecdsaPublicB64);
+            m.put("ecies_public_b64", eciesPublicB64);
             return m;
         }
 
@@ -3119,10 +3133,19 @@ public class kisama {
             new SecureRandom().nextBytes(priv32);
             BigInteger d = new BigInteger(1, priv32);
             ECNamedCurveParameterSpec k1 = ECNamedCurveTable.getParameterSpec("secp256k1");
-            byte[] pub65 = k1.getG().multiply(d).normalize().getEncoded(false);
+            ECPoint eciesQ = k1.getG().multiply(d).normalize();
+            byte[] pub65 = eciesQ.getEncoded(false);
             this.eciesPrivateHex = toHex(priv32);
             this.eciesPublicHex = toHex(pub65);
             this.eciesPub = pub65;
+
+            // 3. 短格式下发字段 (0.5.8, docs/API.MD 十四): ECDSA 私钥标量 hex(64) +
+            //    双曲线 33 字节压缩公钥 Base64 (BC getEncoded(true), 与五端 short 契约一致)
+            java.security.interfaces.ECPrivateKey ecPriv = (java.security.interfaces.ECPrivateKey) pair.getPrivate();
+            ECPoint ecdsaQ = p256.getG().multiply(ecPriv.getS()).normalize();
+            this.ecdsaPrivateHex = toHex(bigIntToFixed32(ecPriv.getS()));
+            this.ecdsaPublicB64 = Base64.getEncoder().encodeToString(ecdsaQ.getEncoded(true));
+            this.eciesPublicB64 = Base64.getEncoder().encodeToString(eciesQ.getEncoded(true));
 
             byte[] id8 = new byte[8];
             new SecureRandom().nextBytes(id8);
@@ -3131,6 +3154,17 @@ public class kisama {
             long now = System.currentTimeMillis() / 1000;
             this.createdAt = now;
             this.expiresAt = now + (long) ttlHours * 3600;
+        }
+
+        private static byte[] bigIntToFixed32(BigInteger v) {
+            byte[] src = v.toByteArray();
+            byte[] out = new byte[32];
+            if (src.length >= 32) {
+                System.arraycopy(src, src.length - 32, out, 0, 32);
+            } else {
+                System.arraycopy(src, 0, out, 32 - src.length, src.length);
+            }
+            return out;
         }
 
         private static String pemWrap(byte[] der, String label) {

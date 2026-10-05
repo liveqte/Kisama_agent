@@ -277,14 +277,14 @@ class ExecResponse(BaseModel):
 
 # --- 临时密钥响应模型 ---
 class TempKeyEcdsaPair(BaseModel):
-    """临时 ECDSA 密钥对 (PEM 格式)"""
-    private_key: str = Field(..., description="临时 ECDSA 私钥 (PEM, 用于签名请求)", examples=["-----BEGIN PRIVATE KEY-----..."])
-    public_key: str = Field(..., description="临时 ECDSA 公钥 (PEM)", examples=["-----BEGIN PUBLIC KEY-----..."])
+    """临时 ECDSA 密钥对 (缺省 PEM; format=short 时私钥为 64位hex 标量、公钥为 33字节压缩点 Base64, 0.5.8)"""
+    private_key: str = Field(..., description="临时 ECDSA 私钥 (缺省 PEM / short 格式 64位hex, 用于签名请求)", examples=["-----BEGIN PRIVATE KEY-----..."])
+    public_key: str = Field(..., description="临时 ECDSA 公钥 (缺省 PEM / short 格式压缩点 Base64)", examples=["-----BEGIN PUBLIC KEY-----..."])
 
 class TempKeyEciesPair(BaseModel):
-    """临时 ECIES 密钥对 (十六进制格式)"""
+    """临时 ECIES 密钥对 (十六进制格式; format=short 时仅公钥换为 33字节压缩点 Base64)"""
     private_key: str = Field(..., description="临时 ECIES 私钥 (hex, 64字符=32字节, 用于解密响应)", examples=["ae68d0ec83e7ea0d47434a59c42656d30e6ebe1c92976b571859c8fcbdd04870"])
-    public_key: str = Field(..., description="临时 ECIES 公钥 (hex, 130字符=65字节, 供代理端加密响应)", examples=["04bcf71c67b9f36725f54c41f9652acf..."])
+    public_key: str = Field(..., description="临时 ECIES 公钥 (缺省 hex 130字符 / short 格式压缩点 Base64, 供代理端加密响应)", examples=["04bcf71c67b9f36725f54c41f9652acf..."])
 
 class TempKeyResponse(BaseModel):
     """获取临时密钥响应模型"""
@@ -847,7 +847,7 @@ class Config:
     KPATH = os.getenv("KPATH", "")
 
     # 代理版本信息
-    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.5.7-python")
+    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.5.8-python")
     
     # ================= 启动校验 =================
     
@@ -1374,6 +1374,18 @@ def _ecdsa_private_pkcs8_pem(sk: "SigningKey") -> str:
     return f"-----BEGIN PRIVATE KEY-----\n{wrapped}\n-----END PRIVATE KEY-----"
 
 
+def _compress_point65(pub65: bytes) -> bytes:
+    """将 65 字节未压缩点 (04||X||Y) 转为 33 字节 SEC1 压缩点 (02/03||X)。
+
+    适用于任意短 Weierstrass 曲线 (P-256 / secp256k1), 前缀奇偶取 Y 坐标末字节;
+    与 tools/kisama_crypto.py 的 pub_to_compressed 同逻辑 (0.5.8 短格式下发用)。
+    """
+    if len(pub65) != 65 or pub65[0] != 0x04:
+        raise ValueError("需要 65 字节未压缩点 (04||X||Y)")
+    prefix = b"\x03" if (pub65[64] & 1) else b"\x02"
+    return prefix + pub65[1:33]
+
+
 class TempKeyManager:
     """
     临时密钥管理器 (线程安全)
@@ -1453,16 +1465,22 @@ class TempKeyManager:
 
         now = int(time.time())
         ttl_seconds = int(ttl_hours) * 3600
+        # 短格式下发字段 (0.5.8, docs/API.MD 十四): ECDSA 私钥标量 hex + 双曲线压缩公钥 Base64
+        ecdsa_pub65 = b"\x04" + sk.get_verifying_key().to_string()
         return {
             "key_id": secrets.token_hex(8),
             "created_at": now,
             "expires_at": now + ttl_seconds,
             "ttl_seconds": ttl_seconds,
-            # 下发字段
+            # 下发字段 (缺省全格式)
             "ecdsa_private_key": ecdsa_priv_pem,
             "ecdsa_public_key": ecdsa_pub_pem,
             "ecies_private_key": ecies_priv.hex(),
             "ecies_public_key": ecies_pub.hex(),
+            # 下发字段 (format=short 短格式)
+            "ecdsa_private_hex": sk.to_string().hex(),
+            "ecdsa_public_b64": base64.b64encode(_compress_point65(ecdsa_pub65)).decode("ascii"),
+            "ecies_public_b64": base64.b64encode(_compress_point65(ecies_pub)).decode("ascii"),
             # 内存字段 (不下发)
             "ecdsa_vk": sk.get_verifying_key(),
             "ecies_pub": ecies_pub,
@@ -5565,19 +5583,56 @@ async def exec_command(
 # 🔑 临时密钥模块: RESTful 路由
 # ============================================================================
 
+def _resolve_tempkey_format(raw: str) -> str:
+    """解析 /api/tempkey 的 format 参数 (0.5.8, docs/API.MD 十四)。
+
+    缺省/"full" → "full" (现行 PEM/hex 全格式); "short" → 短格式
+    (ECDSA 私钥 64位hex 标量、双公钥 33字节压缩点 Base64); 其他值 422。
+    """
+    value = (raw or "").strip().lower()
+    if value in ("", "full"):
+        return "full"
+    if value == "short":
+        return "short"
+    raise HTTPException(status_code=422, detail="format must be 'full' or 'short'")
+
+
 @app.get("/api/tempkey", response_model=TempKeyResponse)
 async def get_tempkey(
     request: Request,
-    ttl: int = Query(Config.TEMPKEY_DEFAULT_TTL_HOURS, ge=1, le=Config.TEMPKEY_MAX_TTL_HOURS)
+    ttl: int = Query(Config.TEMPKEY_DEFAULT_TTL_HOURS, ge=1, le=Config.TEMPKEY_MAX_TTL_HOURS),
+    format: str = Query("", description="响应密钥编码: 缺省/full=PEM+hex 全格式, short=短格式 (0.5.8)")
 ):
     """
     获取临时密钥对 (ECDSA + ECIES)，用于临时授权第三方/AI Agent 访问本代理
     - 有效期内重复请求返回同一密钥对 (幂等, 不重复生成)
     - 过期后自动生成新的密钥对, 旧密钥立即作废
     - 临时持有者: 用 ecdsa.private_key 签名请求, 用 ecies.private_key 解密响应
+    - format=short 返回短格式 (AI 友好): ECDSA 私钥 64位hex、双公钥 33字节压缩点 Base64;
+      JSON 结构与字段名不变, 仅值编码不同 (0.5.8, docs/API.MD 十四)
     """
+    key_format = _resolve_tempkey_format(format)
     manager = request.app.state.temp_key_manager
     key = manager.get_or_create(ttl)
+
+    if key_format == "short":
+        ecdsa_pair = TempKeyEcdsaPair(
+            private_key=key["ecdsa_private_hex"],
+            public_key=key["ecdsa_public_b64"]
+        )
+        ecies_pair = TempKeyEciesPair(
+            private_key=key["ecies_private_key"],
+            public_key=key["ecies_public_b64"]
+        )
+    else:
+        ecdsa_pair = TempKeyEcdsaPair(
+            private_key=key["ecdsa_private_key"].strip(),
+            public_key=key["ecdsa_public_key"].strip()
+        )
+        ecies_pair = TempKeyEciesPair(
+            private_key=key["ecies_private_key"],
+            public_key=key["ecies_public_key"]
+        )
 
     return TempKeyResponse(
         status="ok",
@@ -5585,14 +5640,8 @@ async def get_tempkey(
         ttl_seconds=key["ttl_seconds"],
         created_at=datetime.utcfromtimestamp(key["created_at"]).isoformat() + "Z",
         expires_at=datetime.utcfromtimestamp(key["expires_at"]).isoformat() + "Z",
-        ecdsa=TempKeyEcdsaPair(
-            private_key=key["ecdsa_private_key"].strip(),
-            public_key=key["ecdsa_public_key"].strip()
-        ),
-        ecies=TempKeyEciesPair(
-            private_key=key["ecies_private_key"],
-            public_key=key["ecies_public_key"]
-        )
+        ecdsa=ecdsa_pair,
+        ecies=ecies_pair
     )
 
 

@@ -289,7 +289,7 @@ func New() (*Config, error) {
 
 	agentVersion := os.Getenv("AGENT_VERSION")
 	if agentVersion == "" {
-		agentVersion = "0.5.7-go"
+		agentVersion = "0.5.8-go"
 	}
 
 	tempKeyDefaultTTL := 24

@@ -34,10 +34,11 @@ type tempKeyPayload struct {
 	ECIES      tempKeyECIES `json:"ecies"`
 }
 
-// GetTempKey GET /api/tempkey?ttl=<小时> (1~168, 默认24, 超范围422)
+// GetTempKey GET /api/tempkey?ttl=<小时>&format=<full|short> (1~168, 默认24, 超范围422)
 // - 有效期内重复请求返回同一密钥对 (幂等, 不重复生成)
 // - 过期后自动生成新的密钥对, 旧密钥立即作废
 // - 响应按验签来源加密: 静态密钥->控制端静态公钥, 临时密钥->当前临时 ECIES 公钥
+// - format=short 返回短格式 (0.5.8, AI 友好): ECDSA 私钥 64位hex、双公钥 33字节压缩点 Base64
 func GetTempKey(tk *tempkey.Manager, cfg *config.Config) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		ttl := cfg.TempKeyDefaultTTL
@@ -50,10 +51,42 @@ func GetTempKey(tk *tempkey.Manager, cfg *config.Config) gin.HandlerFunc {
 			ttl = n
 		}
 
+		keyFormat := "full"
+		if q := c.Query("format"); q != "" {
+			switch q {
+			case "full":
+				keyFormat = "full"
+			case "short":
+				keyFormat = "short"
+			default:
+				c.JSON(422, gin.H{"error": "format must be 'full' or 'short'"})
+				return
+			}
+		}
+
 		entry, err := tk.GetOrCreate(ttl)
 		if err != nil {
 			c.JSON(500, gin.H{"error": "TempKey generation failed: " + err.Error()})
 			return
+		}
+
+		ecdsaPair := tempKeyECDSA{
+			PrivateKey: strings.TrimSpace(entry.EcdsaPrivatePEM),
+			PublicKey:  strings.TrimSpace(entry.EcdsaPublicPEM),
+		}
+		eciesPair := tempKeyECIES{
+			PrivateKey: entry.EciesPrivateHex,
+			PublicKey:  entry.EciesPublicHex,
+		}
+		if keyFormat == "short" {
+			ecdsaPair = tempKeyECDSA{
+				PrivateKey: entry.EcdsaPrivateHex,
+				PublicKey:  entry.EcdsaPublicB64,
+			}
+			eciesPair = tempKeyECIES{
+				PrivateKey: entry.EciesPrivateHex,
+				PublicKey:  entry.EciesPublicB64,
+			}
 		}
 
 		c.JSON(200, tempKeyPayload{
@@ -62,14 +95,8 @@ func GetTempKey(tk *tempkey.Manager, cfg *config.Config) gin.HandlerFunc {
 			TTLSeconds: entry.TTLSeconds,
 			CreatedAt:  time.Unix(entry.CreatedAt, 0).UTC().Format("2006-01-02T15:04:05Z"),
 			ExpiresAt:  time.Unix(entry.ExpiresAt, 0).UTC().Format("2006-01-02T15:04:05Z"),
-			ECDSA: tempKeyECDSA{
-				PrivateKey: strings.TrimSpace(entry.EcdsaPrivatePEM),
-				PublicKey:  strings.TrimSpace(entry.EcdsaPublicPEM),
-			},
-			ECIES: tempKeyECIES{
-				PrivateKey: entry.EciesPrivateHex,
-				PublicKey:  entry.EciesPublicHex,
-			},
+			ECDSA:      ecdsaPair,
+			ECIES:      eciesPair,
 		})
 	}
 }

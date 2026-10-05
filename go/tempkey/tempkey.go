@@ -5,6 +5,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
@@ -22,11 +23,17 @@ type Entry struct {
 	CreatedAt  int64
 	ExpiresAt  int64
 
-	// 下发字段
+	// 下发字段 (缺省全格式)
 	EcdsaPrivatePEM string
 	EcdsaPublicPEM  string
 	EciesPrivateHex string
 	EciesPublicHex  string
+
+	// 下发字段 (format=short 短格式, 0.5.8 docs/API.MD 十四):
+	// ECDSA 私钥标量 hex(64) + 双曲线 33 字节压缩公钥 Base64
+	EcdsaPrivateHex string
+	EcdsaPublicB64  string
+	EciesPublicB64  string
 
 	// 内存字段 (不下发)
 	EcdsaVK  *ecdsa.PublicKey
@@ -121,6 +128,10 @@ func generate(ttlHours int) (*Entry, error) {
 	}
 	eciesPrivHex := fmt.Sprintf("%064x", ep.D)
 
+	// 3. 短格式下发字段 (0.5.8): ECDSA 私钥标量定长 32 字节 hex + 压缩公钥 Base64
+	privScalar := make([]byte, 32)
+	priv.D.FillBytes(privScalar)
+
 	keyIDBytes := make([]byte, 8)
 	if _, err := rand.Read(keyIDBytes); err != nil {
 		return nil, fmt.Errorf("generate key_id: %w", err)
@@ -136,6 +147,9 @@ func generate(ttlHours int) (*Entry, error) {
 		EcdsaPublicPEM:  string(pubPEM),
 		EciesPrivateHex: eciesPrivHex,
 		EciesPublicHex:  hex.EncodeToString(ep.PublicKey.Bytes(false)),
+		EcdsaPrivateHex: hex.EncodeToString(privScalar),
+		EcdsaPublicB64:  base64.StdEncoding.EncodeToString(elliptic.MarshalCompressed(elliptic.P256(), priv.X, priv.Y)),
+		EciesPublicB64:  base64.StdEncoding.EncodeToString(ep.PublicKey.Bytes(true)),
 		EcdsaVK:         &priv.PublicKey,
 		EciesPub:        ep.PublicKey,
 	}, nil

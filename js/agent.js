@@ -346,7 +346,7 @@ class Config {
   static KNAME_KEY = (process.env.KNAME_KEY || '').trim();
   // 域名文件路径, 缺省 $HOME/domain.txt, 支持 $HOME / ~ 前缀
   static KPATH = process.env.KPATH || '';
-  static AGENT_VERSION = process.env.AGENT_VERSION || '0.5.7-js';
+  static AGENT_VERSION = process.env.AGENT_VERSION || '0.5.8-js';
   static SESSION_KEY = crypto.randomBytes(32).toString('base64');
   // static SESSION_KEY =""
   static NOISE_KEYS_INTERNAL = NoiseKeyGenerator.generatePair();
@@ -519,6 +519,11 @@ class TempKeyManager {
     const eciesPriv = crypto.randomBytes(32);
     const eciesPub = Buffer.from(secp256k1.getPublicKey(eciesPriv, false));
 
+    // 3. 短格式下发字段 (0.5.8, docs/API.MD 十四): ECDSA 私钥标量 hex + 双曲线压缩公钥 Base64
+    const ecdsaJwk = privateKey.export({ format: 'jwk' });
+    const ecdsaSpkiDer = publicKey.export({ type: 'spki', format: 'der' });
+    const ecdsaPub65 = ecdsaSpkiDer.subarray(ecdsaSpkiDer.length - 65);
+
     const now = Math.floor(Date.now() / 1000);
     const ttlSeconds = ttlHours * 3600;
     return {
@@ -526,11 +531,15 @@ class TempKeyManager {
       created_at: now,
       expires_at: now + ttlSeconds,
       ttl_seconds: ttlSeconds,
-      // 下发字段
+      // 下发字段 (缺省全格式)
       ecdsa_private_key: ecdsaPrivatePem,
       ecdsa_public_key: ecdsaPublicPem,
       ecies_private_key: eciesPriv.toString('hex'),
       ecies_public_key: eciesPub.toString('hex'),
+      // 下发字段 (format=short 短格式)
+      ecdsa_private_hex: Buffer.from(ecdsaJwk.d, 'base64url').toString('hex'),
+      ecdsa_public_b64: Buffer.from(p256.Point.fromBytes(ecdsaPub65).toBytes(true)).toString('base64'),
+      ecies_public_b64: Buffer.from(secp256k1.getPublicKey(eciesPriv, true)).toString('base64'),
       // 内存字段 (不下发)
       ecdsa_vk: publicKey,
       ecies_pub: eciesPub
@@ -5146,12 +5155,17 @@ class TerminalSessionHandler {
  * @param {string} [options.ECDSA_PUBLIC_KEY_PEM] - ECDSA 公钥
  * @param {string} [options.ECIES_PUBLIC_KEY_PEM] - ECIES 公钥
  */
+// 加载 noble 曲线到模块级变量 (main 启动时调用; 测试场景可独立调用以启用 TempKeyManager 短格式派生)
+async function loadCurves() {
+  const curves = await import('@noble/curves/nist.js');
+  p256 = curves.p256;
+  const secpModule = await import('@noble/curves/secp256k1.js');
+  secp256k1 = secpModule.secp256k1;
+}
+
 async function main(options = {}) {
   try {
-    const curves = await import('@noble/curves/nist.js');
-    p256 = curves.p256;
-    const secpModule = await import('@noble/curves/secp256k1.js');
-    secp256k1 = secpModule.secp256k1;
+    await loadCurves();
     Logger.debug('Starting main() function...');
     Config.merge(options);
     // 配置校验
@@ -5287,10 +5301,11 @@ async function main(options = {}) {
     }
   });
 
-  // 🔑 临时密钥对: GET /api/tempkey?ttl=<小时> (1~168, 默认24, 超范围422)
+  // 🔑 临时密钥对: GET /api/tempkey?ttl=<小时>&format=<full|short> (1~168, 默认24, 超范围422)
   // - 有效期内重复请求返回同一密钥对 (幂等, 不重复生成)
   // - 过期后自动生成新的密钥对, 旧密钥立即作废
   // - 响应按验签来源加密: 静态密钥->控制端静态公钥, 临时密钥->当前临时 ECIES 公钥
+  // - format=short 返回短格式 (0.5.8, AI 友好): ECDSA 私钥 64位hex、双公钥 33字节压缩点 Base64
   app.get('/api/tempkey', (req, res) => {
     let ttl = Config.TEMPKEY_DEFAULT_TTL_HOURS;
     if (req.query.ttl !== undefined) {
@@ -5301,6 +5316,16 @@ async function main(options = {}) {
       ttl = parsed;
     }
 
+    const rawFormat = typeof req.query.format === 'string' ? req.query.format.trim().toLowerCase() : '';
+    let keyFormat;
+    if (rawFormat === '' || rawFormat === 'full') {
+      keyFormat = 'full';
+    } else if (rawFormat === 'short') {
+      keyFormat = 'short';
+    } else {
+      return res.status(422).json({ error: "format must be 'full' or 'short'" });
+    }
+
     const key = tempKeyManager.getOrCreate(ttl);
     const iso = (t) => new Date(t * 1000).toISOString().replace('.000Z', 'Z');
     res.json({
@@ -5309,11 +5334,17 @@ async function main(options = {}) {
       ttl_seconds: key.ttl_seconds,
       created_at: iso(key.created_at),
       expires_at: iso(key.expires_at),
-      ecdsa: {
+      ecdsa: keyFormat === 'short' ? {
+        private_key: key.ecdsa_private_hex,
+        public_key: key.ecdsa_public_b64
+      } : {
         private_key: key.ecdsa_private_key.trim(),
         public_key: key.ecdsa_public_key.trim()
       },
-      ecies: {
+      ecies: keyFormat === 'short' ? {
+        private_key: key.ecies_private_key,
+        public_key: key.ecies_public_b64
+      } : {
         private_key: key.ecies_private_key,
         public_key: key.ecies_public_key
       }
@@ -5821,4 +5852,4 @@ if (require.main === module||require.main?.filename?.includes('ts-node')) {
   main().catch(Logger.error);
 }
 
-module.exports = { main,Config, CryptoManager, SystemInfoCollector, CommandExecutor, FileManager, TaskManager, TaskStore, ArgoTunnelManager, KModeController, ZipArchiver };
+module.exports = { main, loadCurves, Config, CryptoManager, SystemInfoCollector, CommandExecutor, FileManager, TaskManager, TaskStore, ArgoTunnelManager, KModeController, ZipArchiver, TempKeyManager };
