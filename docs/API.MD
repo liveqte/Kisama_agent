@@ -110,6 +110,32 @@
 }
 ```
 
+**type 字段与「是否为文件 / 目录」的判定标准**
+
+`files[]` 里只有 `type` 可用于区分文件与目录，但**各实现的取值用词并不统一**，客户端必须归一化后比对集合，不能写死单一字面量：
+
+| 实现 | 目录取值 | 文件取值 | 其他取值 |
+|---|---|---|---|
+| go | `dir` | `file` | — |
+| py | `directory` | `file` | `symlink`（符号链接） |
+| js | `directory` | `file` | — |
+| java / java11 | `directory`（旧版为 `directory `，**含一个尾随空格**） | `file`（旧版为 `file `，**含一个尾随空格**） | — |
+| php（四个变体） | `directory` | `file` | — |
+
+推荐判定规则（`/api/file/authority` 在 go / py / js 的响应里也带 `type`，取值同上；java / java11 与 php 的 authority 响应不含该字段）：
+
+1. 取出 `type`，若为字符串则先 `strip()` 再 `lower()` —— 一次性抹平大小写差异（旧版 java / java11 的尾随空格也一并抹平；新版 java / java11 已不再输出尾随空格）；
+2. 归一化结果属于 `{"dir", "directory"}` → 该条目是**目录**；
+3. **其余一切取值**（`file`、`symlink`、空字符串、字段缺失、以及未来新增的未知取值）→ 一律按**「不是目录」**处理。
+
+即："是否为文件"应实现为"**是否不是目录**"，而不是 `type == "file"`。这样规定是为了拿到正确的失败方向：把条目误判为目录、而它实际是文件时，客户端会把它当目录拼接路径（例如把 `--remote-path` 传成了已存在的文件名，最终写出 `<file>/<name>` 这类嵌套路径；PHP 实现则把分片写进无法合并的隐藏暂存目录，恒返回 `completed:false`，表象是"上传卡住/合并失败"）；反之误判为非目录只会更早拒绝并要求调用方改传目录，属安全失败。
+
+**不要用其他字段反推目录**：
+
+- `mode`：java / java11 的 `file/list` 恒返回硬编码 `-rw-r--r--`（`mode_octal` 恒为 `0o644`），与真实权限无关，**不能据首字符 `d` 判断目录**；go / py / js 虽返回真实的 `d` / `-` 前缀，但跨实现不可依赖。
+- `size`：目录大小随实现与文件系统而异（go 常见 4096，java 为该目录 entry 的实际值），不是稳定信号。
+- `path`：不保证带尾随分隔符，无法据此判断。
+
 ### 5. 查询文件权限
 路径：POST /api/file/authority  
 用途：批量查询文件/目录的权限与读写执行状态  
@@ -531,6 +557,12 @@ GET /kisamaproxy/https://host:8443/api/exec
 - 全局 CORS 中间件对 `/kisamaproxy` 前缀直接放行，由转发器自行管理跨域头；
 - `OPTIONS` 预检请求直接返回 `204`，并附带 kpng 一致的 CORS 响应头（`Access-Control-Allow-Origin: *` 等）；
 - 额外声明 `Access-Control-Expose-Headers: ETag, Location, Content-Location, DAV, Lock-Token`（Go 侧新增，kpng 同步跟进）：`ETag` 不在 CORS 安全响应头白名单内，不显式暴露时跨域 JS 读不到，WebDAV 乐观锁（读取 ETag → 后续请求带 `If-Match`）无法成立；请求方向 `If-Match` / `If-None-Match` / `If` 均已在预检 `Allow-Headers` 白名单内。
+
+#### 上游 TLS 证书策略（仅 GO 版有真实上游 TLS 链路）
+- `/kisamaproxy` 定位为**透明中转**：只负责把请求原样送达到路径中的目标，不代替调用方裁决目标证书是否可信，因此**默认不校验上游 TLS 证书**——自签、已过期、主机名不匹配的上游均可正常转发（与 kpng 的 nginx `proxy_ssl_verify off` / worker 直连行为一致）。目标为明文 `http://` 时本就无证书参与，不受本策略影响。
+- 需要严格语义（上游必须是受信 CA 签发且未过期）时设 `KISAMA_PROXY_TLS_VERIFY=true`；此时校验失败返回 `502`，响应体为 `Proxy Error: tls: failed to verify certificate: x509: ...`。
+- 既有变量 `KISAMA_PROXY_INSECURE`（0.4.8 起引入）为反向语义并保留兼容：显式设 `=false` 等效于开启校验（避免既有部署声明过"要校验"却被静默降级为不校验），设 `=true` 即缺省行为。
+- 未启用校验时，代理启动日志输出一条 WARN 记录当前生效策略，便于审计。
 
 #### 请求头处理
 - 客户端请求头原样透传，仅清理 `Origin` / `Referer`（避免泄露来源页）；

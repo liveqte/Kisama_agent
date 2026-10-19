@@ -847,7 +847,7 @@ class Config:
     KPATH = os.getenv("KPATH", "")
 
     # 代理版本信息
-    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.5.8-python")
+    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.5.9-python")
     
     # ================= 启动校验 =================
     

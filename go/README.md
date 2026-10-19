@@ -113,6 +113,7 @@ API端点的实现，分为多个文件按功能模块划分:
 - `ANY /kisamaproxy/*path` - 纯转发路由（对齐kpng的nginx/worker实现：合规检查/CORS/OPTIONS预检/WebSocket隧道/502兜底）
 - 白名单机制：仅放行含 `api` 的路由、WebDAV请求（专有方法/请求头/URL特征）及WebSocket握手，其余流量403拒绝
 - 不参与本Agent的认证体系（纯转发语义）
+- 上游 TLS：按**透明中转**定位默认**不校验**上游证书——自签、已过期、主机名不匹配的上游一律放行（与 kpng 的 `proxy_ssl_verify off` 一致）。中转只负责把请求原样送达，证书可信与否属调用方与目标之间的事务；需要"上游必须是受信CA签发且未过期"时显式设 `KISAMA_PROXY_TLS_VERIFY=true`
 
 #### tempkey.go
 - `GET /api/tempkey` - 下发临时密钥对（带TTL，供短期接入使用）
@@ -182,6 +183,10 @@ MAX_TASK_LOG=100         # 最大任务日志条数
 HOST=0.0.0.0            # 绑定地址
 PORT=8000               # 监听端口
 AGENT_VERSION=0.4.7-go  # 代理版本
+
+# 代理转发（/kisamaproxy 上游证书策略）
+KISAMA_PROXY_TLS_VERIFY=true  # 严格校验上游TLS证书；缺省(不设)=透明中转不校验，自签/过期/域名不匹配一律放行
+KISAMA_PROXY_INSECURE=false   # 0.4.8 起的既有变量（反向语义），=false 等效于 KISAMA_PROXY_TLS_VERIFY=true，仅用于兼容旧部署
 
 # 加密
 ECDSA_PUBKEY=...        # ECDSA公钥(可选，或从文件读取)

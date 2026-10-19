@@ -83,7 +83,7 @@ jobs:
           
           git add java/target/kisama-agent-java-0.1.0-obfuscated.jar
           git add java11/target/kisama-agent-java-0.1.0-obfuscated.jar
-          git add go/agent go/agent-darwin-arm64 go/agent-linux-arm64
+          git add go/agent go/agent-darwin-arm64 go/agent-linux-arm64 go/agent-windows-amd64.exe go/agent-windows-arm64.exe
           for so in go/libkisama.so go/libkisama-linux-amd64.so go/libkisama-linux-arm64.so go/libkisama-linux-amd64.h go/libkisama-linux-arm64.h; do
             if [ -f "$so" ]; then git add "$so"; fi
           done

@@ -294,46 +294,73 @@ func fetchIP(url string) (string, error) {
 	return ip, nil
 }
 
+// getLocalIPv4 通过 udp4 探测本机默认路由上使用的 IPv4 地址。
+// 显式限定 family: 纯 IPv6 主机上这里必须返回 "", 绝不能把 v6 地址当成 v4 回传。
 func getLocalIPv4() string {
-	conn, err := net.Dial("udp", "8.8.8.8:80")
+	conn, err := net.Dial("udp4", "8.8.8.8:80")
 	if err != nil {
 		return ""
 	}
 	defer conn.Close()
-	return conn.LocalAddr().(*net.UDPAddr).IP.String()
+	addr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok || addr.IP == nil {
+		return ""
+	}
+	return addr.IP.String()
 }
 
+// getLocalIPv6 通过 udp6 探测本机默认路由上使用的 IPv6 地址。
 func getLocalIPv6() string {
-	conn, err := net.Dial("udp", "[2001:4860:4860::8888]:80")
+	conn, err := net.Dial("udp6", "[2001:4860:4860::8888]:80")
 	if err != nil {
 		return ""
 	}
 	defer conn.Close()
-	return conn.LocalAddr().(*net.UDPAddr).IP.String()
+	addr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok || addr.IP == nil {
+		return ""
+	}
+	return addr.IP.String()
 }
 
+// isValidIPv4 严格判定"点分十进制 IPv4 文本"。
+//
+// 🚨 修复: 原实现只判断 net.ParseIP 非空且非回环, 而 net.ParseIP 对 IPv6 文本同样返回非 nil,
+// 于是纯 IPv6 主机上从 api.ipify.org / icanhazip.com 等(均有 AAAA 记录)取回的 IPv6 地址
+// 会被判为"合法 IPv4"并写入 baseinfo 的 ipv4 字段(ipv4 字段被填成 IPv6 值)。
+// 此处要求 To4() 非空、且文本不含 ':' —— 从根上切断任何跨 family 混入
+// (同时排除 "::ffff:1.2.3.4" 这类 IPv4-mapped 写法), 并过滤回环/未指定/多播/链路本地。
 func isValidIPv4(ip string) bool {
-	return net.ParseIP(ip) != nil && !net.ParseIP(ip).IsLoopback()
+	if ip == "" || strings.Contains(ip, ":") {
+		return false
+	}
+	parsed := net.ParseIP(ip)
+	if parsed == nil || parsed.To4() == nil {
+		return false
+	}
+	return !parsed.IsLoopback() &&
+		!parsed.IsUnspecified() &&
+		!parsed.IsMulticast() &&
+		!parsed.IsLinkLocalUnicast()
 }
 
+// isValidIPv6 严格判定"IPv6 文本"。
+// 与 isValidIPv4 对称: To4() 非空即说明这是 IPv4 文本或 "::ffff:" 映射形态, 一律拒绝;
+// 私有/链路本地/回环/未指定/多播改用 net.IP 谓词判定(替代原字符串前缀比较, 后者对
+// fec0::/10 站点本地、大小写、压缩写法均不严谨)。
 func isValidIPv6(ip string) bool {
-	parsedIP := net.ParseIP(ip)
-	if parsedIP == nil {
+	if ip == "" || !strings.Contains(ip, ":") {
 		return false
 	}
-	if !strings.Contains(ip, ":") {
+	parsed := net.ParseIP(ip)
+	if parsed == nil || parsed.To4() != nil {
 		return false
 	}
-	if strings.HasPrefix(strings.ToLower(ip), "fe80:") {
-		return false
-	}
-	if strings.HasPrefix(strings.ToLower(ip), "fc") || strings.HasPrefix(strings.ToLower(ip), "fd") {
-		return false
-	}
-	if ip == "::1" || ip == "::" {
-		return false
-	}
-	return true
+	return !parsed.IsLoopback() &&
+		!parsed.IsUnspecified() &&
+		!parsed.IsMulticast() &&
+		!parsed.IsLinkLocalUnicast() &&
+		!parsed.IsPrivate()
 }
 
 // GetProcessUser returns the user who owns the process

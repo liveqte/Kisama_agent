@@ -762,8 +762,8 @@ def test_exec():
         _test_result("exec: echo 命令", False, f"result={result}")
         tests_passed = False
     
-    # 测试2: 超时保护
-    result = exec_command("sleep 2", skip_print=True)
+    # 测试2: 超时保护 (Windows 无 sleep, 用 ping -n 2 等价短命令; Unix 用 sleep 2)
+    result = exec_command("ping -n 2 127.0.0.1" if IS_WINDOWS_AGENT else "sleep 2", skip_print=True)
     if result and result.get("exitcode") == 0:
         _test_result("exec: sleep 短命令", True)
     else:

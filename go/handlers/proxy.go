@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -176,16 +177,60 @@ func proxyErrorHandler(rw http.ResponseWriter, req *http.Request, err error) {
 	fmt.Fprintf(rw, "Proxy Error: %v", err)
 }
 
+// proxyUpstreamTLSVerify 决定 /kisamaproxy 是否校验上游 TLS 证书。
+//
+// 设计定位（Owner 决策）：/kisamaproxy 是**透明中转**——它只负责把请求原样送达到路径中
+// 指定的目标（HTTP 或 HTTPS），负责的是"转发"而不是"代替调用方判断该目标的证书是否可信"。
+// 上游用自签证书、证书已过期、主机名对不上、甚至目标根本就是明文 http，都属调用方与目标
+// 之间的事务：中转层替调用方做信任裁决，既超出职责，也直接让"中转内网设备/自签上游"这类
+// 正常用法不可用（0.4.8 起的严格默认即为此类误伤）。这与参考实现 kpng 一致
+// （nginx `proxy_ssl_verify off` / worker 直连，见 docs/API.MD 第 26 节），因此**默认不校验**。
+//
+// 需要恢复"上游必须是公网 CA 签发且未过期"的严格语义时（例如确要防链路中间人）：
+//
+//	KISAMA_PROXY_TLS_VERIFY=true   → 强制校验（推荐，语义明确）
+//	KISAMA_PROXY_INSECURE=false    → 同效，兼容 0.4.8 以来的既有变量语义，避免既有部署
+//	                                 显式声明过 INSECURE=false 却被静默降级为不校验
+//
+// 两个变量都未设置时按透明中转定位处理：不校验。
+var proxyUpstreamTLSVerify = resolveProxyUpstreamTLSVerify()
+
+func resolveProxyUpstreamTLSVerify() bool {
+	if v := strings.TrimSpace(os.Getenv("KISAMA_PROXY_TLS_VERIFY")); v != "" {
+		return strings.EqualFold(v, "true")
+	}
+	if v := strings.TrimSpace(os.Getenv("KISAMA_PROXY_INSECURE")); v != "" {
+		// 既有变量为反向语义: INSECURE=true 表示"豁免校验"
+		return !strings.EqualFold(v, "true")
+	}
+	return false
+}
+
 var kisamaProxyTransport = &http.Transport{
-	// 🔐 安全修复：默认校验上游 TLS 证书。修复前 InsecureSkipVerify 恒为 true，
-	// 中转的 HTTPS 流量 (含其携带的 Authorization 等凭证) 可被链路中间人截获/篡改。
-	// 中转节点确需使用自签/无效证书时，通过环境变量 KISAMA_PROXY_INSECURE=true 显式豁免。
-	TLSClientConfig:       &tls.Config{InsecureSkipVerify: strings.EqualFold(os.Getenv("KISAMA_PROXY_INSECURE"), "true")}, //nolint:gosec
+	// 上游证书校验策略见 proxyUpstreamTLSVerify 的说明: 默认按透明中转处理(不校验),
+	// 需要严格校验时用 KISAMA_PROXY_TLS_VERIFY=true 显式开启。
+	TLSClientConfig:       &tls.Config{InsecureSkipVerify: !proxyUpstreamTLSVerify}, //nolint:gosec
 	ResponseHeaderTimeout: 600 * time.Second,
 	TLSHandshakeTimeout:   10 * time.Second,
 	ExpectContinueTimeout: 5 * time.Second,
 	IdleConnTimeout:       90 * time.Second,
 	MaxIdleConns:          100,
+}
+
+// proxyTLSPolicyWarnOnce 保证策略提示每次进程只输出一次。
+// 注意不能用包级 init(): logger.Init() 在 main() 里才执行, 而包 init 早于 main,
+// 此时日志级别仍是兜底的 ERROR, WARN 会被阈值直接吞掉、任何 LOG_LEVEL 都看不到。
+var proxyTLSPolicyWarnOnce sync.Once
+
+// warnProxyUpstreamTLSPolicy 在首次实际转发时输出当前生效的上游证书策略(需 LOG_LEVEL<=2 或 DEBUG=true 可见)。
+func warnProxyUpstreamTLSPolicy() {
+	proxyTLSPolicyWarnOnce.Do(func() {
+		if proxyUpstreamTLSVerify {
+			logger.Infof("KisamaProxy 上游 TLS 校验已启用 (KISAMA_PROXY_TLS_VERIFY)")
+			return
+		}
+		logger.Warnf("KisamaProxy 上游 TLS 校验未启用(透明中转定位): 自签/过期/域名不匹配的上游证书一律放行; 需要严格校验请设 KISAMA_PROXY_TLS_VERIFY=true")
+	})
 }
 
 var kisamaProxy = &httputil.ReverseProxy{
@@ -198,6 +243,8 @@ var kisamaProxy = &httputil.ReverseProxy{
 
 // ProxyHandler 是 /kisamaproxy 转发路由的处理入口
 func ProxyHandler(c *gin.Context) {
+	warnProxyUpstreamTLSPolicy()
+
 	rawURI := c.Request.RequestURI
 	if rawURI == "" {
 		rawURI = c.Request.URL.RequestURI()

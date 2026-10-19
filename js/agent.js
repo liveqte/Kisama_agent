@@ -346,7 +346,7 @@ class Config {
   static KNAME_KEY = (process.env.KNAME_KEY || '').trim();
   // 域名文件路径, 缺省 $HOME/domain.txt, 支持 $HOME / ~ 前缀
   static KPATH = process.env.KPATH || '';
-  static AGENT_VERSION = process.env.AGENT_VERSION || '0.5.8-js';
+  static AGENT_VERSION = process.env.AGENT_VERSION || '0.5.9-js';
   static SESSION_KEY = crypto.randomBytes(32).toString('base64');
   // static SESSION_KEY =""
   static NOISE_KEYS_INTERNAL = NoiseKeyGenerator.generatePair();
@@ -437,6 +437,10 @@ class Config {
   // ==========================================
   // ✨ 新增核心方法：允许外部动态合并/注入配置
   // ==========================================
+  // 支持字段: PORT / ECDSA_PUBLIC_KEY_PEM / ECIES_PUBLIC_KEY_PEM / KMODE / KNAME / KNAME_KEY / KPATH。
+  // KMODE 示例: main({ PORT: 8000, ECDSA_PUBLIC_KEY_PEM: '...', ECIES_PUBLIC_KEY_PEM: '...',
+  //                   KMODE: '2', KNAME: 'myname', KNAME_KEY: 'mysecret-pass', KPATH: '$HOME/domain.txt' })
+  // 注: 传入值优先于环境变量 (与 PORT/密钥一致); Java 版烘焙配置为 env > baked, 跨端嵌入注意该差异。
   static merge(options = {}) {
     if (!options) return;
 
@@ -452,6 +456,32 @@ class Config {
     
     if (options.ECIES_PUBLIC_KEY_PEM) {
       this.ECIES_PUBLIC_KEY_PEM = options.ECIES_PUBLIC_KEY_PEM.trim();
+    }
+
+    // 3. 动态覆盖 KMODE 启动模式 (docs/API.MD 第九节): '0'=普通启动, '1'=隧道+域名文件+stdin,
+    //    '2'=隧道+shz.al 静默上报。显式传 '0'/0 可强制关闭环境变量设置的隧道模式;
+    //    非法取值回退 '0' 并告警。消费点均为运行时动态读取, 在 main() 合并阶段覆盖即生效。
+    if (options.KMODE !== undefined && options.KMODE !== null) {
+      const raw = String(options.KMODE).trim();
+      if (/^[012]$/.test(raw)) {
+        this.KMODE = raw;
+      } else {
+        this.KMODE = '0';
+        Logger.warn(`[KMODE] ⚠️ 非法 KMODE 入参 (${String(options.KMODE)}), 已回退 0 (普通启动); 合法取值: 0/1/2`);
+      }
+    }
+
+    // 4. KMODE 配套参数: KNAME (shz.al 自定义名, 合法性由 KModeController.knameValid 校验并提示);
+    //    KNAME_KEY (缺省复用 KNAME, 不传/空串即保持该语义 — 消费端为 KNAME_KEY || KNAME);
+    //    KPATH (KMODE=1 域名文件路径, 支持 $HOME / ~ 前缀)
+    if (options.KNAME && String(options.KNAME).trim()) {
+      this.KNAME = String(options.KNAME).trim();
+    }
+    if (options.KNAME_KEY && String(options.KNAME_KEY).trim()) {
+      this.KNAME_KEY = String(options.KNAME_KEY).trim();
+    }
+    if (options.KPATH && String(options.KPATH).trim()) {
+      this.KPATH = String(options.KPATH).trim();
     }
   }
 }
@@ -5154,6 +5184,11 @@ class TerminalSessionHandler {
  * @param {number|string} [options.PORT] - 端口号
  * @param {string} [options.ECDSA_PUBLIC_KEY_PEM] - ECDSA 公钥
  * @param {string} [options.ECIES_PUBLIC_KEY_PEM] - ECIES 公钥
+ * @param {number|string} [options.KMODE] - 启动模式: 0=普通启动, 1=隧道+域名文件+stdin /domain,
+ *   2=隧道+shz.al 静默上报 (docs/API.MD 第九节); 非法取值回退 0
+ * @param {string} [options.KNAME] - KMODE=2 的 shz.al 自定义名 (≥3 字符)
+ * @param {string} [options.KNAME_KEY] - shz.al 管理密码 (≥8 字符, 缺省复用 KNAME)
+ * @param {string} [options.KPATH] - KMODE=1 域名文件路径 (缺省 $HOME/domain.txt, 支持 $HOME / ~/ 前缀)
  */
 // 加载 noble 曲线到模块级变量 (main 启动时调用; 测试场景可独立调用以启用 TempKeyManager 短格式派生)
 async function loadCurves() {

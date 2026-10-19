@@ -190,7 +190,7 @@ public class kisama {
 
     private static final int TEMPKEY_DEFAULT_TTL_HOURS = Integer.parseInt(DOTENV.getOrDefault("TEMPKEY_TTL", "24"));
     private static final int TEMPKEY_MAX_TTL_HOURS = Integer.parseInt(DOTENV.getOrDefault("TEMPKEY_MAX_TTL", "168"));
-    private static final String AGENT_VERSION = "0.5.8-java";
+    private static final String AGENT_VERSION = "0.5.9-java";
 
     private Map<String, Object> baseInfoCache = null;
     private long lastBaseInfoCacheTime = 0;
@@ -2895,7 +2895,7 @@ public class kisama {
                     Map<String, Object> info = new LinkedHashMap<>();
                     info.put("name", p.getFileName().toString());
                     info.put("path", Paths.get(this.FILE_ROOT).relativize(p).toString());
-                    info.put("type", s.isDirectory() ? "directory " : "file ");
+                    info.put("type", s.isDirectory() ? "directory" : "file");
                     info.put("size", s.size());
                     info.put("mtime", new Date(s.lastModifiedTime().toMillis()).toString());
                     info.put("mode", "-rw-r--r--");

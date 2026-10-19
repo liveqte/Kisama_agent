@@ -1,12 +1,21 @@
 package handlers
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"io"
+	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -353,5 +362,180 @@ func TestProxyExposesEtagAndForwardsIfMatch(t *testing.T) {
 	}
 	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "https://panel.example.com" {
 		t.Errorf("Allow-Origin = %q, want echoed origin", got)
+	}
+}
+
+// ============================================================================
+// 上游 TLS 策略：/kisamaproxy 是透明中转，默认不替调用方校验上游证书。
+// 需要严格校验时用 KISAMA_PROXY_TLS_VERIFY=true（见 proxy.go 的 proxyUpstreamTLSVerify）。
+// 下面的测试显式设置开关，因此不依赖运行环境的 KISAMA_PROXY_* 变量。
+// ============================================================================
+
+// setProxyUpstreamTLSVerify 临时切换上游 TLS 校验开关与自定义信任根，测试结束自动还原
+func setProxyUpstreamTLSVerify(t *testing.T, verify bool) {
+	t.Helper()
+	oldInsecure := kisamaProxyTransport.TLSClientConfig.InsecureSkipVerify
+	oldRoots := kisamaProxyTransport.TLSClientConfig.RootCAs
+	kisamaProxyTransport.TLSClientConfig.InsecureSkipVerify = !verify
+	kisamaProxyTransport.TLSClientConfig.RootCAs = nil
+	t.Cleanup(func() {
+		kisamaProxyTransport.TLSClientConfig.InsecureSkipVerify = oldInsecure
+		kisamaProxyTransport.TLSClientConfig.RootCAs = oldRoots
+	})
+}
+
+// newSelfSignedTLSServer 启动一个使用指定有效期自签证书的 TLS 上游。
+// SAN 同时包含 127.0.0.1（供"仅过期"场景隔离主机名错误）与一个无关键名。
+func newSelfSignedTLSServer(t *testing.T, notBefore, notAfter time.Time) (*httptest.Server, *x509.Certificate) {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "kisama-upstream.invalid"},
+		NotBefore:    notBefore,
+		NotAfter:     notAfter,
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{"kisama-upstream.invalid"},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create certificate: %v", err)
+	}
+	leaf, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("parse certificate: %v", err)
+	}
+
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"upstream":"ok"}`)
+	}))
+	srv.TLS = &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}}
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+
+	return srv, leaf
+}
+
+// TestProxyAllowsSelfSignedUpstreamByDefault 锁定透明中转定位：默认不校验上游证书，
+// 自签 + 主机名不匹配的上游必须能正常转发（严格默认下会 502 "tls: failed to verify certificate"）。
+func TestProxyAllowsSelfSignedUpstreamByDefault(t *testing.T) {
+	setProxyUpstreamTLSVerify(t, false)
+	up := newUpstream(t, true) // httptest.NewTLSServer：自签且 SAN 不含 127.0.0.1
+	r := newProxyRouter()
+
+	resp, body := doProxyRequest(t, r, http.MethodGet, "/kisamaproxy/"+up.server.URL+"/api/echo", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for self-signed upstream, got %d body=%s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, `"upstream":"ok"`) {
+		t.Fatalf("unexpected body: %s", body)
+	}
+}
+
+// TestProxyAllowsExpiredUpstreamCertificateByDefault 复现并锁定实际报错场景：
+// 上游证书已过期（"current time ... is after ..."）时，中转仍必须正常转发。
+func TestProxyAllowsExpiredUpstreamCertificateByDefault(t *testing.T) {
+	setProxyUpstreamTLSVerify(t, false)
+
+	now := time.Now()
+	srv, leaf := newSelfSignedTLSServer(t, now.Add(-48*time.Hour), now.Add(-24*time.Hour))
+	if !leaf.NotAfter.Before(now) {
+		t.Fatalf("test certificate must be expired, NotAfter=%s", leaf.NotAfter)
+	}
+
+	r := newProxyRouter()
+	resp, body := doProxyRequest(t, r, http.MethodGet, "/kisamaproxy/"+srv.URL+"/api/echo", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for expired upstream certificate, got %d body=%s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, `"upstream":"ok"`) {
+		t.Fatalf("unexpected body: %s", body)
+	}
+}
+
+// TestProxyStrictModeRejectsSelfSigned 验证 KISAMA_PROXY_TLS_VERIFY=true 的严格语义仍可用：
+// 自签上游被拒绝为 502，且响应体带 x509 失败原因（本次改动不得把"可选严格"一并拆掉）。
+func TestProxyStrictModeRejectsSelfSigned(t *testing.T) {
+	setProxyUpstreamTLSVerify(t, true)
+
+	// 注意：不能用 newUpstream(t, true)，它会把 InsecureSkipVerify 置回 true
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		io.WriteString(w, `{"upstream":"ok"}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	r := newProxyRouter()
+	resp, body := doProxyRequest(t, r, http.MethodGet, "/kisamaproxy/"+srv.URL+"/api/echo", nil, nil)
+
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("expected 502 in strict mode, got %d body=%s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "x509") {
+		t.Errorf("body = %q, want an x509 verification error", body)
+	}
+}
+
+// TestProxyStrictModeReportsExpiredCertificate 精确复现运维看到的报错文案：
+// 证书链被信任但已过期时，严格模式必须报 "certificate has expired"。
+// 这条用例同时证明"过期"确实是本次修复要放行的场景之一，而非被误当成配置错误。
+func TestProxyStrictModeReportsExpiredCertificate(t *testing.T) {
+	setProxyUpstreamTLSVerify(t, true)
+
+	now := time.Now()
+	srv, leaf := newSelfSignedTLSServer(t, now.Add(-48*time.Hour), now.Add(-24*time.Hour))
+
+	// 把该证书本身作为信任根，使唯一失败原因是有效期（而非未知签发者/主机名）
+	pool := x509.NewCertPool()
+	pool.AddCert(leaf)
+	kisamaProxyTransport.TLSClientConfig.RootCAs = pool
+
+	r := newProxyRouter()
+	resp, body := doProxyRequest(t, r, http.MethodGet, "/kisamaproxy/"+srv.URL+"/api/echo", nil, nil)
+
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("expected 502, got %d body=%s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "certificate has expired") {
+		t.Errorf("body = %q, want 'certificate has expired' (the reported production error)", body)
+	}
+}
+
+// TestResolveProxyUpstreamTLSVerify 锁定上游证书校验策略的取值与优先级：
+// 缺省不校验（透明中转），KISAMA_PROXY_TLS_VERIFY 优先，
+// 既有 KISAMA_PROXY_INSECURE=false 必须仍然表示"要校验"（避免静默降级）。
+func TestResolveProxyUpstreamTLSVerify(t *testing.T) {
+	cases := []struct {
+		name      string
+		tlsVerify string
+		insecure  string
+		want      bool
+	}{
+		{"缺省: 透明中转不校验", "", "", false},
+		{"TLS_VERIFY=true", "true", "", true},
+		{"TLS_VERIFY 大小写不敏感", "TRUE", "", true},
+		{"TLS_VERIFY 非 true 即不校验", "yes", "", false},
+		{"TLS_VERIFY 优先于 INSECURE", "true", "true", true},
+		{"既有 INSECURE=true 等同缺省行为", "", "true", false},
+		{"既有 INSECURE=false 表示要校验(防静默降级)", "", "false", true},
+		{"TLS_VERIFY=false 覆盖 INSECURE=false", "false", "false", false},
+		{"空白值按未设置处理", "  ", "  ", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("KISAMA_PROXY_TLS_VERIFY", tc.tlsVerify)
+			t.Setenv("KISAMA_PROXY_INSECURE", tc.insecure)
+			if got := resolveProxyUpstreamTLSVerify(); got != tc.want {
+				t.Errorf("resolveProxyUpstreamTLSVerify() = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
