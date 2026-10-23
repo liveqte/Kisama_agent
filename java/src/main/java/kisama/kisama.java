@@ -13,6 +13,7 @@ import java.lang.management.ManagementFactory;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
@@ -105,8 +106,8 @@ public class kisama {
             byte[] sk = new byte[32];
             rand.nextBytes(sk);
             this.SESSION_KEY = sk;
-            // baseinfo/status 有缓存, 必须同步失效, 否则轮换后仍会吐出旧密钥
-            synchronized (baseInfoCacheLock) { baseInfoCache = null; lastBaseInfoCacheTime = 0; }
+            // status 有缓存且含动态数据, 必须同步失效; baseinfo 的 P/T 系统快照不含凭证,
+            // 轮换只换响应阶段装配的凭证, 不再清空 (docs/API.MD 16.4 第 4 条)
             synchronized (statusCacheLock) { statusCache = null; lastStatusCacheTime = 0; }
             log("[SECURITY] 🔄 临时密钥过期, 已轮换 SESSION_KEY 与控制端 Noise 密钥对 (合法控制端需重新认证获取 baseinfo 新密钥)");
         } catch (Exception e) {
@@ -152,7 +153,9 @@ public class kisama {
     private long totalNetworkDown = 0;
     private final Object netLock = new Object();
     // ==================== 🚀 新增：高性能防刷缓存槽与生命周期参数 ====================
-    private static final long BASEINFO_CACHE_TTL_MS = 3600 * 1000L; // 基础信息缓存 1 小时 (毫秒)
+    private static final long BASEINFO_CACHE_TTL_MS = 3600 * 1000L;   // baseinfo net 组缓存 1 小时 (毫秒, 沿用旧常量名)
+    private static final long BASEINFO_LOCAL_TTL_MS = 30 * 1000L;     // baseinfo local 组缓存 30 秒 (毫秒)
+    private static final long BASEINFO_FAIL_BACKOFF_MS = 60 * 1000L;  // T 组探测失败退避 60 秒 (毫秒)
     private static final long STATUS_CACHE_TTL_MS = 30 * 1000L;    // 实时状态缓存 30 秒 (毫秒)
     // ==================== .env 加载 ====================
     // 真实环境变量优先，.env 只填补空缺；只查 jar/class 同目录 (与 keys/ 同路径约定)，不存在或解析异常时静默跳过。
@@ -190,10 +193,17 @@ public class kisama {
 
     private static final int TEMPKEY_DEFAULT_TTL_HOURS = Integer.parseInt(DOTENV.getOrDefault("TEMPKEY_TTL", "24"));
     private static final int TEMPKEY_MAX_TTL_HOURS = Integer.parseInt(DOTENV.getOrDefault("TEMPKEY_MAX_TTL", "168"));
-    private static final String AGENT_VERSION = "0.5.9-java";
+    private static final String AGENT_VERSION = "0.6.0-java";
 
-    private Map<String, Object> baseInfoCache = null;
-    private long lastBaseInfoCacheTime = 0;
+    // baseinfo 三组快照 (docs/API.MD 十六): P 级进程内只建一次; T-local 30s; T-net 3600s.
+    // 快照只含系统字段, 凭证在路由层按请求装配, 轮换不再清空
+    private Map<String, Object> baseInfoPSnapshot = null;
+    private Map<String, Object> baseInfoLocalSnapshot = null;
+    private long lastBaseInfoLocalTime = 0;
+    private long baseInfoLocalFailTime = 0;
+    private Map<String, Object> baseInfoNetSnapshot = null;
+    private long lastBaseInfoNetTime = 0;
+    private long baseInfoNetFailTime = 0;
     private final Object baseInfoCacheLock = new Object();          // 基础信息并发复用锁
 
     private Map<String, Object> statusCache = null;
@@ -202,6 +212,9 @@ public class kisama {
    // ==================== 构造函数 ====================
     // 1. 无参构造函数：保持原汁原味，完全不改，全部通过原本的逻辑和全局提取初始化
     public kisama() {
+        // 门控先行: resolveLogLevel 必须装配于首个可能产生日志的初始化 (getKeyWithFallback 密钥检索) 之前,
+        // 否则构造前半段 logLevel 仍为 int 字段缺省值 0 (等效 LOG_LEVEL=0), 任何显式 LOG_LEVEL>=1 都拦不住前置 INFO
+        this.logLevel = resolveLogLevel();
         this.DEBUG = Boolean.parseBoolean(DOTENV.getOrDefault("DEBUG", "false"));
         this.HOST = DOTENV.getOrDefault("HOST", "0.0.0.0");
         this.PORT = Integer.parseInt(DOTENV.getOrDefault("KPORT",
@@ -221,7 +234,6 @@ public class kisama {
         this.KEYS_DIR = DOTENV.getOrDefault("KEYS_DIR", "./keys");
         this.ECDSA_PUBLIC_KEY_B64 = getKeyWithFallback("ECDSA_PUBKEY", "agent_ecdsa_pub.pem", "YOUR_HARDCODED_ECDSA_PUBLIC_KEY_HERE");
         this.ECIES_PUBLIC_KEY_B64 = getKeyWithFallback("ECIES_PUBKEY", "agent_ecies_pub.b64", "YOUR_HARDCODED_ECIES_PUBLIC_KEY_HERE");
-        this.logLevel = resolveLogLevel();
     }
 
     // 2. 有参构造函数（重载）：允许外部模块直接覆盖核心 3 要素，其余继续走默认初始化
@@ -234,6 +246,8 @@ public class kisama {
     // 烘焙参数传 null 或空串即视为"未提供", 不改变原有行为。
     public kisama(int port, String ecdsaPublicKeyB64, String eciesPublicKeyB64,
                   String bakedKmode, String bakedKpath, String bakedKname, String bakedKnameKey) {
+        // 门控先行 (同无参构造): 后续阶段若引入 log() 调用也受 LOG_LEVEL 约束, 依赖字段缺省值 0 属误用
+        this.logLevel = resolveLogLevel();
         // 覆盖你指定的三个必要参数
         this.PORT = port;
         this.ECDSA_PUBLIC_KEY_B64 = ecdsaPublicKeyB64;
@@ -251,7 +265,6 @@ public class kisama {
         this.KPATH = resolveSetting("KPATH", bakedKpath, "");
         this.FILE_ROOT = resolveSafeFileRoot();
         this.KEYS_DIR = DOTENV.getOrDefault("KEYS_DIR", "./keys");
-        this.logLevel = resolveLogLevel();
     }
 
     // 生效值 = DOTENV(环境变量 ∪ .env) 命中则用它, 否则用烘焙值, 再否则用内置缺省
@@ -564,34 +577,13 @@ public class kisama {
         // ==================== 🚀 包含高性能缓存防御机制的重构路由 ====================
         get("/api/baseinfo", (req, res) -> {
             res.type("application/json");
-            long now = System.currentTimeMillis();
-            Map<String, Object> clientResponseMap;
 
-            // 1. 缓存检查 + 锁外重建 (0.5.6 优化): buildRawBaseInfo 含外网 IP 探测/GPU 探测等
-            //    慢操作, 原实现持锁构建会让并发请求全部排队 5~15s; 改为锁外构建、锁内原子替换
-            //    (与 JS/py 版锁外构建同模式)
-            synchronized (baseInfoCacheLock) {
-                if (baseInfoCache != null && (now - lastBaseInfoCacheTime) <= BASEINFO_CACHE_TTL_MS) {
-                    log("[TRACE-CACHE] 📦 BaseInfo 命中有效缓存，直接输出。");
-                    // ⚠️ 安全关键点：浅拷贝解耦出一个全新的可变 Map 容器
-                    // 严禁直接修改 baseInfoCache 全局静态引用的属性，否则会导致敏感密钥永久越权暴露给匿名请求
-                    clientResponseMap = new LinkedHashMap<>(baseInfoCache);
-                } else {
-                    clientResponseMap = null;
-                }
-            }
-            if (clientResponseMap == null) {
-                Map<String, Object> rebuilt = buildRawBaseInfo();
-                synchronized (baseInfoCacheLock) {
-                    // 双检: 并发线程可能已完成重建, 避免慢构建的旧数据覆盖新缓存
-                    if (baseInfoCache == null || (System.currentTimeMillis() - lastBaseInfoCacheTime) > BASEINFO_CACHE_TTL_MS) {
-                        baseInfoCache = rebuilt;
-                        lastBaseInfoCacheTime = System.currentTimeMillis();
-                    }
-                    clientResponseMap = new LinkedHashMap<>(baseInfoCache != null ? baseInfoCache : rebuilt);
-                }
-                log("[TRACE-CACHE] 🔄 BaseInfo 缓存已过期，已重新调度生成。");
-            }
+            // 1. 三组快照分级复用 (docs/API.MD 十六): P 级进程内一次; local 30s; net 3600s;
+            //    慢探测 (IP/GPU) 在各组的锁外构建, 锁内只做双检与原子替换
+            Map<String, Object> pSnapshot = getBaseInfoPSnapshot();
+            Map<String, Object> localSnapshot = getBaseInfoLocalSnapshot();
+            Map<String, Object> netSnapshot = getBaseInfoNetSnapshot();
+            Map<String, Object> clientResponseMap = assembleBaseInfo(pSnapshot, localSnapshot, netSnapshot);
 
             // 2. 动态审查当前单次请求的认证标签状态，安全追加或剔除核心敏感凭证
             // 默认未认证：仅显式 true 才下发敏感密钥，防止 before 过滤器漏设属性导致越权泄露
@@ -1890,6 +1882,11 @@ public class kisama {
         logAt(LOG_LEVEL_INFO, message);
     }
 
+    // DEBUG 级日志: LOG_LEVEL=0 或 DEBUG=true 时输出
+    public void logDebug(String message) {
+        logAt(LOG_LEVEL_DEBUG, message);
+    }
+
     // WARN 级日志: LOG_LEVEL<=2 时输出
     public void logWarn(String message) {
         logAt(LOG_LEVEL_WARN, message);
@@ -2347,25 +2344,443 @@ public class kisama {
             return 0;
         }
     }
-    // 🌟 新增：提取纯净的基础系统信息生成器 (剔除身份鉴权与动态秘钥组装)
-    private Map<String, Object> buildRawBaseInfo() throws Exception {
-        Map<String, Object> obj = new LinkedHashMap<>();
-        Map<String, String> ips = getPrimaryIpAddresses();
+    // ==================== baseinfo P/T 分级快照 + marks 探测 (docs/API.MD 十五/十六) ====================
+    // 快照只含系统字段, 凭证在路由层按请求装配; P 级失败写兜底且进程内不重试,
+    // T 组失败沿用上次成功值且 60s 内不重试 (无历史值按类型兜底)
+    private long baseInfoNowMs() {
+        return System.nanoTime() / 1_000_000L;
+    }
 
-        obj.put("arch", normalizeArch(System.getProperty("os.arch", " ")));
-        obj.put("cpu_cores", Runtime.getRuntime().availableProcessors());
-        obj.put("cpu_name", getCpuName());
-        obj.put("disk_total", Files.getFileStore(Paths.get(this.FILE_ROOT)).getTotalSpace());
-        obj.put("gpu_name", getGpuName());
-        obj.put("ipv4", emptyToNull(ips.get("ipv4")));
-        obj.put("ipv6", emptyToNull(ips.get("ipv6")));
-        obj.put("mem_total", getTotalMemoryBytes());
-        obj.put("os", getOsPrettyName());
-        obj.put("kernel_version", getKernelVersion());
-        obj.put("swap_total", getTotalSwapBytes());
-        obj.put("version", AGENT_VERSION);
-        obj.put("virtualization", getVirtualization());
+    private Map<String, Object> getBaseInfoPSnapshot() {
+        synchronized (baseInfoCacheLock) {
+            if (baseInfoPSnapshot != null) return new LinkedHashMap<>(baseInfoPSnapshot);
+        }
+        Map<String, Object> built;
+        try {
+            built = collectBaseInfoP();
+        } catch (Exception e) {
+            logDebug("[TRACE-CACHE] ⚠️ BaseInfo P 级探测失败, 使用兜底值且不再重试: " + e.getMessage());
+            built = pFallbackFields();
+        }
+        synchronized (baseInfoCacheLock) {
+            if (baseInfoPSnapshot == null) baseInfoPSnapshot = built;
+            return new LinkedHashMap<>(baseInfoPSnapshot);
+        }
+    }
+
+    private Map<String, Object> getBaseInfoLocalSnapshot() {
+        long now = baseInfoNowMs();
+        synchronized (baseInfoCacheLock) {
+            if (baseInfoLocalSnapshot != null && (now - lastBaseInfoLocalTime) < BASEINFO_LOCAL_TTL_MS) {
+                return new LinkedHashMap<>(baseInfoLocalSnapshot);
+            }
+            if (baseInfoLocalFailTime > 0 && (now - baseInfoLocalFailTime) < BASEINFO_FAIL_BACKOFF_MS) {
+                return new LinkedHashMap<>(baseInfoLocalSnapshot != null ? baseInfoLocalSnapshot : localFallbackFields());
+            }
+        }
+        Map<String, Object> built;
+        try {
+            built = collectBaseInfoLocal();
+        } catch (Exception e) {
+            logDebug("[TRACE-CACHE] ⚠️ BaseInfo local 组探测失败, 沿用上次成功值: " + e.getMessage());
+            synchronized (baseInfoCacheLock) {
+                baseInfoLocalFailTime = baseInfoNowMs();
+                return new LinkedHashMap<>(baseInfoLocalSnapshot != null ? baseInfoLocalSnapshot : localFallbackFields());
+            }
+        }
+        synchronized (baseInfoCacheLock) {
+            baseInfoLocalSnapshot = built;
+            lastBaseInfoLocalTime = baseInfoNowMs();
+            baseInfoLocalFailTime = 0;
+            return new LinkedHashMap<>(baseInfoLocalSnapshot);
+        }
+    }
+
+    private Map<String, Object> getBaseInfoNetSnapshot() {
+        long now = baseInfoNowMs();
+        synchronized (baseInfoCacheLock) {
+            if (baseInfoNetSnapshot != null && (now - lastBaseInfoNetTime) < BASEINFO_CACHE_TTL_MS) {
+                return new LinkedHashMap<>(baseInfoNetSnapshot);
+            }
+            if (baseInfoNetFailTime > 0 && (now - baseInfoNetFailTime) < BASEINFO_FAIL_BACKOFF_MS) {
+                return new LinkedHashMap<>(baseInfoNetSnapshot != null ? baseInfoNetSnapshot : netFallbackFields());
+            }
+        }
+        Map<String, Object> built;
+        try {
+            built = collectBaseInfoNet();
+        } catch (Exception e) {
+            logDebug("[TRACE-CACHE] ⚠️ BaseInfo net 组探测失败, 沿用上次成功值: " + e.getMessage());
+            synchronized (baseInfoCacheLock) {
+                baseInfoNetFailTime = baseInfoNowMs();
+                return new LinkedHashMap<>(baseInfoNetSnapshot != null ? baseInfoNetSnapshot : netFallbackFields());
+            }
+        }
+        synchronized (baseInfoCacheLock) {
+            baseInfoNetSnapshot = built;
+            lastBaseInfoNetTime = baseInfoNowMs();
+            baseInfoNetFailTime = 0;
+            return new LinkedHashMap<>(baseInfoNetSnapshot);
+        }
+    }
+
+    private Map<String, Object> collectBaseInfoP() {
+        Map<String, Object> p = new LinkedHashMap<>();
+        p.put("arch", normalizeArch(System.getProperty("os.arch", " ")));
+        p.put("cpu_cores", Runtime.getRuntime().availableProcessors());
+        p.put("cpu_name", safeProbe(this::getCpuName, ""));
+        p.put("gpu_name", safeProbe(this::getGpuName, ""));
+        p.put("os", safeProbe(this::getOsPrettyName, ""));
+        p.put("kernel_version", safeProbe(this::getKernelVersion, ""));
+        p.put("version", AGENT_VERSION);
+        p.put("virtualization", safeProbe(this::getVirtualization, ""));
+        p.put("marks", safeProbe(this::detectMarks, new ArrayList<String>()));
+        return p;
+    }
+
+    private Map<String, Object> collectBaseInfoLocal() {
+        Map<String, Object> local = new LinkedHashMap<>();
+        long diskTotal = 0L;
+        try {
+            diskTotal = Files.getFileStore(Paths.get(this.FILE_ROOT)).getTotalSpace();
+        } catch (Exception e) {
+            logDebug("[TRACE-CACHE] ⚠️ 获取磁盘总容量失败: " + e.getMessage());
+        }
+        local.put("disk_total", diskTotal);
+        local.put("mem_total", getTotalMemoryBytes());
+        local.put("swap_total", getTotalSwapBytes());
+        return local;
+    }
+
+    private Map<String, Object> collectBaseInfoNet() {
+        Map<String, String> ips = getPrimaryIpAddresses();
+        Map<String, Object> net = new LinkedHashMap<>();
+        net.put("ipv4", emptyToNull(ips.get("ipv4")));
+        net.put("ipv6", emptyToNull(ips.get("ipv6")));
+        return net;
+    }
+
+    private <T> T safeProbe(java.util.function.Supplier<T> probe, T fallback) {
+        try {
+            T value = probe.get();
+            return value != null ? value : fallback;
+        } catch (Exception e) {
+            logDebug("[TRACE-CACHE] ⚠️ 系统信息字段探测失败(非致命): " + e.getMessage());
+            return fallback;
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> assembleBaseInfo(Map<String, Object> p, Map<String, Object> local, Map<String, Object> net) {
+        // 字段顺序固定, 便于面板 diff; 凭证不在此处装配
+        Map<String, Object> obj = new LinkedHashMap<>();
+        obj.put("arch", p.getOrDefault("arch", " "));
+        obj.put("cpu_cores", p.getOrDefault("cpu_cores", 0));
+        obj.put("cpu_name", p.getOrDefault("cpu_name", ""));
+        obj.put("disk_total", local.getOrDefault("disk_total", 0L));
+        obj.put("gpu_name", p.getOrDefault("gpu_name", ""));
+        obj.put("ipv4", net.get("ipv4"));
+        obj.put("ipv6", net.get("ipv6"));
+        obj.put("mem_total", local.getOrDefault("mem_total", 0L));
+        obj.put("os", p.getOrDefault("os", ""));
+        obj.put("kernel_version", p.getOrDefault("kernel_version", ""));
+        obj.put("swap_total", local.getOrDefault("swap_total", 0L));
+        obj.put("version", p.getOrDefault("version", AGENT_VERSION));
+        obj.put("virtualization", p.getOrDefault("virtualization", ""));
+        Object marks = p.get("marks");
+        obj.put("marks", marks instanceof List ? new ArrayList<>((List<String>) marks) : new ArrayList<String>());
         return obj;
+    }
+
+    private Map<String, Object> pFallbackFields() {
+        Map<String, Object> p = new LinkedHashMap<>();
+        p.put("arch", "");
+        p.put("cpu_cores", 0);
+        p.put("cpu_name", "");
+        p.put("gpu_name", "");
+        p.put("os", "");
+        p.put("kernel_version", "");
+        p.put("version", AGENT_VERSION);
+        p.put("virtualization", "");
+        p.put("marks", new ArrayList<String>());
+        return p;
+    }
+
+    private Map<String, Object> localFallbackFields() {
+        Map<String, Object> local = new LinkedHashMap<>();
+        local.put("disk_total", 0L);
+        local.put("mem_total", 0L);
+        local.put("swap_total", 0L);
+        return local;
+    }
+
+    private Map<String, Object> netFallbackFields() {
+        Map<String, Object> net = new LinkedHashMap<>();
+        net.put("ipv4", null);
+        net.put("ipv6", null);
+        return net;
+    }
+
+    // ---------------- 主机标记 marks 探测 (只读/无子进程/无网络, 见 API.MD 十五) ----------------
+    private static final String MARKS_PROC_ROOT = "/proc";
+    private static final String MARKS_DEV_ROOT = "/dev";
+    private static final String MARKS_ETC_ROOT = "/etc";
+    private static final String MARKS_RUN_ROOT = "/run";
+    private static final String MARKS_ROOT = "/";
+    private static final int MARKS_READ_LIMIT = 1024 * 1024;
+    private static final int MARKS_CHUNK = 8192;
+    private static final java.util.regex.Pattern MARKS_UUID_RE = java.util.regex.Pattern.compile(
+            "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$");
+
+    private List<String> detectMarks() {
+        List<String> marks = new ArrayList<>();
+        if (!System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("linux")) return marks;
+        Map<String, java.util.function.BooleanSupplier> probes = new LinkedHashMap<>();
+        probes.put("root", this::markRoot);
+        probes.put("kvm", this::markKvm);
+        probes.put("pterodactyl", this::markPterodactyl);
+        probes.put("systemd", this::markSystemd);
+        probes.put("fuse", this::markFuse);
+        for (Map.Entry<String, java.util.function.BooleanSupplier> probe : probes.entrySet()) {
+            try {
+                if (probe.getValue().getAsBoolean()) marks.add(probe.getKey());
+            } catch (Throwable t) {
+                logDebug("[TRACE-MARKS] marks 探测失败 [" + probe.getKey() + "]: " + t.getMessage());
+            }
+        }
+        // 仅输出标记名, 禁止打印 environ/mountinfo/passwd 原文
+        logDebug("[TRACE-MARKS] marks 命中: " + (marks.isEmpty() ? "(none)" : String.join(",", marks)));
+        return marks;
+    }
+
+    private boolean markRoot() {
+        String status = readLimitedText(MARKS_PROC_ROOT + "/self/status");
+        if (status == null) return false;
+        Long uid = null;
+        Long gid = null;
+        for (String line : status.split("\\R")) {
+            if (line.startsWith("Uid:")) uid = secondFieldAsLong(line);
+            else if (line.startsWith("Gid:")) gid = secondFieldAsLong(line);
+        }
+        return uid != null && uid == 0L && gid != null && gid == 0L;
+    }
+
+    private boolean markKvm() {
+        return charDeviceRW(MARKS_DEV_ROOT + "/kvm", 10, 232);
+    }
+
+    private boolean markFuse() {
+        if (!charDeviceRW(MARKS_DEV_ROOT + "/fuse", 10, 229)) return false;
+        if (capEffBit(21)) return true;
+        for (String relative : new String[]{"usr/bin/fusermount3", "bin/fusermount3", "usr/bin/fusermount", "bin/fusermount"}) {
+            try {
+                long mode = ((Number) Files.getAttribute(Paths.get(MARKS_ROOT, relative), "unix:mode")).longValue();
+                // 普通文件 + setuid + 至少一个可执行位 (当前用户可执行)
+                if ((mode & 0170000L) == 0100000L && (mode & 04000L) != 0 && (mode & 0111L) != 0) return true;
+            } catch (Exception ignored) {
+            }
+        }
+        return false;
+    }
+
+    private boolean markPterodactyl() {
+        // 强特征 1: mountinfo 源路径
+        if (fileContains(MARKS_PROC_ROOT + "/self/mountinfo",
+                "/var/lib/pterodactyl/".getBytes(StandardCharsets.UTF_8), MARKS_READ_LIMIT, MARKS_CHUNK)) {
+            return true;
+        }
+        // 强特征 2: environ 同时含两个 P_SERVER_* 键
+        for (String pid : new String[]{"self", "1"}) {
+            String raw = readLimitedText(MARKS_PROC_ROOT + "/" + pid + "/environ");
+            if (raw == null || raw.isEmpty()) continue;
+            boolean hasUuid = false;
+            boolean hasLocation = false;
+            for (String entry : raw.split("\0", -1)) {
+                if (entry.startsWith("P_SERVER_UUID=")) hasUuid = true;
+                else if (entry.startsWith("P_SERVER_LOCATION=")) hasLocation = true;
+            }
+            if (hasUuid && hasLocation) return true;
+        }
+        // 弱特征四条件必须全部满足: UUID hostname + /home/container + passwd 无 euid 条目 + 容器标记
+        String hostname = readLimitedText(MARKS_ETC_ROOT + "/hostname");
+        if (hostname == null) return false;
+        hostname = hostname.trim().toLowerCase(Locale.ROOT);
+        if (!MARKS_UUID_RE.matcher(hostname).matches()) return false;
+        if (!Files.isDirectory(Paths.get(MARKS_ROOT, "home", "container"))) return false;
+        String passwd = readLimitedText(MARKS_ETC_ROOT + "/passwd");
+        if (passwd == null) return false;
+        long euid = effectiveUid();
+        if (euid < 0) return false;
+        for (String line : passwd.split("\\R")) {
+            String[] fields = line.split(":", -1);
+            if (fields.length > 2) {
+                try {
+                    if (Long.parseLong(fields[2].trim()) == euid) return false;
+                } catch (NumberFormatException ignored) {
+                }
+            }
+        }
+        return Files.exists(Paths.get(MARKS_ROOT, ".dockerenv"))
+                || Files.exists(Paths.get(MARKS_RUN_ROOT, ".containerenv"));
+    }
+
+    private boolean markSystemd() {
+        if (!Files.isDirectory(Paths.get(MARKS_RUN_ROOT, "systemd", "system"))) return false;
+        if (!Files.exists(Paths.get(MARKS_RUN_ROOT, "systemd", "private"))
+                && !Files.exists(Paths.get(MARKS_RUN_ROOT, "dbus", "system_bus_socket"))) {
+            return false;
+        }
+        if (!systemctlLocatable()) return false;
+        String comm = readLimitedText(MARKS_PROC_ROOT + "/1/comm");
+        if (comm != null) {
+            String trimmed = comm.trim();
+            if (!trimmed.isEmpty()) return trimmed.toLowerCase(Locale.ROOT).contains("systemd");
+        }
+        try {
+            String exe = Files.readSymbolicLink(Paths.get(MARKS_PROC_ROOT, "1", "exe")).getFileName().toString();
+            if (!exe.isEmpty() && !exe.toLowerCase(Locale.ROOT).contains("systemd")) return false;
+        } catch (Exception ignored) {
+            // 读不到 /proc/1/exe 不否决
+        }
+        return true;
+    }
+
+    private boolean systemctlLocatable() {
+        for (String relative : new String[]{"usr/bin/systemctl", "bin/systemctl", "usr/local/bin/systemctl"}) {
+            if (executable(Paths.get(MARKS_ROOT, relative))) return true;
+        }
+        String pathEnv = System.getenv("PATH");
+        if (pathEnv != null) {
+            for (String dir : pathEnv.split(java.io.File.pathSeparator)) {
+                if (!dir.isEmpty() && executable(Paths.get(dir, "systemctl"))) return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean executable(Path p) {
+        try {
+            return Files.isRegularFile(p) && Files.isExecutable(p);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private boolean charDeviceRW(String path, long major, long minor) {
+        try {
+            Path p = Paths.get(path);
+            long mode = ((Number) Files.getAttribute(p, "unix:mode", LinkOption.NOFOLLOW_LINKS)).longValue();
+            if ((mode & 0170000L) != 0020000L) return false; // S_IFCHR
+            long rdev = ((Number) Files.getAttribute(p, "unix:rdev", LinkOption.NOFOLLOW_LINKS)).longValue();
+            if (devMajor(rdev) != major || devMinor(rdev) != minor) return false;
+            try (java.nio.channels.SeekableByteChannel ignored =
+                         Files.newByteChannel(p, EnumSet.of(StandardOpenOption.READ, StandardOpenOption.WRITE))) {
+                return true;
+            }
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private static long devMajor(long rdev) {
+        // Linux dev_t: major = ((rdev >> 8) & 0xfff) | ((rdev >> 32) & ~0xfff)
+        return ((rdev >> 8) & 0xfffL) | ((rdev >> 32) & ~0xfffL);
+    }
+
+    private static long devMinor(long rdev) {
+        return (rdev & 0xffL) | ((rdev >> 12) & 0xfff00L);
+    }
+
+    private boolean capEffBit(int bit) {
+        String status = readLimitedText(MARKS_PROC_ROOT + "/self/status");
+        if (status == null) return false;
+        for (String line : status.split("\\R")) {
+            if (line.startsWith("CapEff:")) {
+                String[] fields = line.trim().split("\\s+");
+                if (fields.length < 2) return false;
+                try {
+                    return ((Long.parseUnsignedLong(fields[1], 16) >>> bit) & 1L) == 1L;
+                } catch (NumberFormatException e) {
+                    return false;
+                }
+            }
+        }
+        return false;
+    }
+
+    private long effectiveUid() {
+        String status = readLimitedText(MARKS_PROC_ROOT + "/self/status");
+        if (status == null) return -1L;
+        for (String line : status.split("\\R")) {
+            if (line.startsWith("Uid:")) {
+                Long uid = secondFieldAsLong(line);
+                if (uid != null) return uid;
+            }
+        }
+        return -1L;
+    }
+
+    private String readLimitedText(String path) {
+        try (InputStream in = Files.newInputStream(Paths.get(path))) {
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            byte[] buf = new byte[8192];
+            int total = 0;
+            int n;
+            while (total < MARKS_READ_LIMIT
+                    && (n = in.read(buf, 0, Math.min(buf.length, MARKS_READ_LIMIT - total))) > 0) {
+                out.write(buf, 0, n);
+                total += n;
+            }
+            return out.toString(StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private boolean fileContains(String path, byte[] needle, int limit, int chunk) {
+        try (InputStream in = Files.newInputStream(Paths.get(path))) {
+            byte[] carry = new byte[0];
+            byte[] block = new byte[chunk];
+            int remaining = limit;
+            while (remaining > 0) {
+                int n = in.read(block, 0, Math.min(chunk, remaining));
+                if (n <= 0) break;
+                remaining -= n;
+                byte[] window = new byte[carry.length + n];
+                System.arraycopy(carry, 0, window, 0, carry.length);
+                System.arraycopy(block, 0, window, carry.length, n);
+                if (indexOf(window, needle) >= 0) return true;
+                int overlap = Math.max(0, needle.length - 1);
+                carry = overlap > 0 && window.length > overlap
+                        ? Arrays.copyOfRange(window, window.length - overlap, window.length)
+                        : new byte[0];
+            }
+        } catch (Exception e) {
+            return false;
+        }
+        return false;
+    }
+
+    private static int indexOf(byte[] haystack, byte[] needle) {
+        if (needle.length == 0) return 0;
+        outer:
+        for (int i = 0; i + needle.length <= haystack.length; i++) {
+            for (int j = 0; j < needle.length; j++) {
+                if (haystack[i + j] != needle[j]) continue outer;
+            }
+            return i;
+        }
+        return -1;
+    }
+
+    private static Long secondFieldAsLong(String line) {
+        String[] fields = line.trim().split("\\s+");
+        if (fields.length < 2) return null;
+        try {
+            return Long.parseLong(fields[1]);
+        } catch (NumberFormatException e) {
+            return null;
+        }
     }
     // 🌟 新增：提取高能耗的实时监控快照生成器 (涉及频繁读取 /proc/net 文件系统)
     private Map<String, Object> buildRawStatusInfo() throws Exception {
@@ -2416,40 +2831,6 @@ public class kisama {
         st.put("message", " ");
         return st;
     }
-    // 🌟 修改：为函数增加 boolean isAuthenticated 参数
-    private Map<String, Object> buildBaseInfo(boolean isAuthenticated) throws Exception {
-        Map<String, Object> obj = new LinkedHashMap<>();
-        Map<String, String> ips = getPrimaryIpAddresses();
-
-        obj.put("arch", normalizeArch(System.getProperty("os.arch", " ")));
-        obj.put("cpu_cores", Runtime.getRuntime().availableProcessors());
-        obj.put("cpu_name", getCpuName());
-        obj.put("disk_total", Files.getFileStore(Paths.get(this.FILE_ROOT)).getTotalSpace());
-        obj.put("gpu_name", getGpuName());
-        obj.put("ipv4", emptyToNull(ips.get("ipv4")));
-        obj.put("ipv6", emptyToNull(ips.get("ipv6")));
-        obj.put("mem_total", getTotalMemoryBytes());
-        obj.put("os", getOsPrettyName());
-        obj.put("kernel_version", getKernelVersion());
-        obj.put("swap_total", getTotalSwapBytes());
-        obj.put("version", AGENT_VERSION);
-        obj.put("virtualization", getVirtualization());
-
-        // 🌟 修改：根据是否通过验证状态，动态清空核心敏感凭证
-        if (isAuthenticated) {
-            obj.put("session_key", Base64.getEncoder().encodeToString(this.SESSION_KEY));
-            Map<String, Object> noise = Map.of(
-                    "controller", Map.of("private", this.CTRL_PRIVATE_KEY_B64),
-                    "agent", Map.of("public", this.AGENT_PUBLIC_KEY_B64)
-            );
-            obj.put("noise_key", noise);
-        } else {
-            obj.put("session_key", null);
-            obj.put("noise_key", null);
-        }
-        return obj;
-    }
-
     private String normalizeArch(String arch) {
         if (arch == null) return " ";
         String a = arch.toLowerCase(Locale.ROOT);
@@ -2649,18 +3030,9 @@ public class kisama {
     }
 
     private Map<String, String> getPrimaryIpAddresses() {
-        String ipv4 = null;
-        String ipv6 = null;
-        String extIp = fetchExternalIp();
-        if (extIp != null) {
-            if (extIp.contains(":")) {
-                ipv6 = extIp;
-                log("[TRACE-NET] 成功通过外部接口获取公网 IPv6: " + ipv6);
-            } else {
-                ipv4 = extIp;
-                log("[TRACE-NET] 成功通过外部接口获取公网 IPv4: " + ipv4);
-            }
-        }
+        // 对齐 go/py: v4/v6 分族探测——外部服务优先且内容须校验, 本地网卡只作兜底
+        String ipv4 = fetchExternalIp(false);
+        String ipv6 = fetchExternalIp(true);
         if (ipv4 == null || ipv6 == null) {
             try {
                 Enumeration<java.net.NetworkInterface> nics = java.net.NetworkInterface.getNetworkInterfaces();
@@ -2680,7 +3052,12 @@ public class kisama {
                         } else if (ipv6 == null && addr instanceof java.net.Inet6Address) {
                             String h = addr.getHostAddress();
                             int zone = h.indexOf('%');
-                            ipv6 = zone >= 0 ? h.substring(0, zone) : h;
+                            h = zone >= 0 ? h.substring(0, zone) : h;
+                            // 本地兜底只接受公网全局单播 (2000::/3): ULA(fc00::/7)/多播/映射地址一律跳过,
+                            // 避免 docker 内网 IPv6 (如 fdXX::) 冒充公网 IPv6 上报 (0.6.0 实测线上 fdBA:: 泄漏)
+                            if (isGlobalUnicastIpv6Text(h)) {
+                                ipv6 = h;
+                            }
                         }
                         if (ipv4 != null && ipv6 != null) {
                             break;
@@ -2699,16 +3076,25 @@ public class kisama {
         return result;
     }
 
-    private String fetchExternalIp() {
-        String[] services = {
-                "https://api.ipify.org",
-                "https://icanhazip.com",
-                "https://checkip.amazonaws.com",
-                "https://ifconfig.me/ip",
-                "https://ipecho.net/plain",
-                "https://ipinfo.io/ip",
-                "https://myexternalip.com/raw"
-        };
+    private String fetchExternalIp(boolean wantV6) {
+        // v6 用专用服务列表 (api6/v6.ident/api64 均解析或回显 v6), 探测结果还须通过全局单播校验;
+        // 无公网 IPv6 时返回 null, baseinfo/status 据此对该字段报 null (对齐 go/py/js)
+        String[] services = wantV6
+                ? new String[]{
+                        "https://api6.ipify.org",
+                        "https://v6.ident.me",
+                        "https://api64.ipify.org",
+                        "https://icanhazip.com"
+                }
+                : new String[]{
+                        "https://api.ipify.org",
+                        "https://icanhazip.com",
+                        "https://checkip.amazonaws.com",
+                        "https://ifconfig.me/ip",
+                        "https://ipecho.net/plain",
+                        "https://ipinfo.io/ip",
+                        "https://myexternalip.com/raw"
+                };
         java.net.http.HttpClient client = java.net.http.HttpClient.newBuilder()
                 .connectTimeout(java.time.Duration.ofSeconds(2))
                 .build();
@@ -2726,7 +3112,13 @@ public class kisama {
                 );
                 if (response.statusCode() == 200) {
                     String ip = response.body().trim();
-                    if (!ip.isBlank() && !ip.contains("<") && !ip.contains(" ") && ip.length() <= 45) {
+                    boolean valid = wantV6 ? isGlobalUnicastIpv6Text(ip) : isValidIpv4Text(ip);
+                    if (valid) {
+                        if (wantV6) {
+                            log("[TRACE-NET] 成功通过外部接口获取公网 IPv6: " + ip);
+                        } else {
+                            log("[TRACE-NET] 成功通过外部接口获取公网 IPv4: " + ip);
+                        }
                         return ip;
                     }
                 }
@@ -2737,6 +3129,26 @@ public class kisama {
             }
         }
         return null;
+    }
+
+    // 严格点分十进制 IPv4 文本校验: 拒绝含 ':' 的 v6 文本与越界八位组 (语义对齐 go isValidIPv4)
+    private static boolean isValidIpv4Text(String ip) {
+        if (ip == null || ip.contains(":")) return false;
+        if (!ip.matches("(\\d{1,3}\\.){3}\\d{1,3}")) return false;
+        for (String p : ip.split("\\.", -1)) {
+            if (Integer.parseInt(p) > 255) return false;
+        }
+        return true;
+    }
+
+    // 公网全局单播 IPv6 文本校验 (2000::/3): 剥离 %zone 后首个 hextet 须以 2/3 开头且满 4 位;
+    // 排除 ULA(fc00::/7)/链路本地(fe80::/10)/多播(ff00::/8)/回环/未指定/IPv4-mapped 等内网形态
+    private static boolean isGlobalUnicastIpv6Text(String ip) {
+        if (ip == null || ip.isBlank() || !ip.contains(":")) return false;
+        if (!ip.matches("[0-9a-fA-F:]+")) return false;
+        if (ip.indexOf('%') >= 0 || ip.indexOf('.') >= 0) return false;
+        String first = ip.substring(0, ip.indexOf(':'));
+        return first.matches("[23][0-9a-fA-F]{3}");
     }
 
     private String getGpuName() {

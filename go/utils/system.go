@@ -30,6 +30,29 @@ type SystemInfo struct {
 	KernelVersion  string
 	SwapTotal      int64
 	Virtualization string
+	Marks          []string
+}
+
+// SystemStaticInfo is the P-level (process-static) part of baseinfo.
+type SystemStaticInfo struct {
+	CPUName        string
+	OS             string
+	KernelVersion  string
+	Virtualization string
+	Marks          []string
+}
+
+// SystemLocalInfo is the T-local (30s) part of baseinfo.
+type SystemLocalInfo struct {
+	DiskTotal int64
+	MemTotal  int64
+	SwapTotal int64
+}
+
+// SystemNetInfo is the T-net (3600s) part of baseinfo.
+type SystemNetInfo struct {
+	IPv4 *string
+	IPv6 *string
 }
 
 // SystemStatus represents real-time system status
@@ -54,75 +77,86 @@ type SystemStatus struct {
 	ProcessCount     int
 }
 
-// GetSystemInfo retrieves basic system information
+// GetSystemInfo retrieves basic system information (compatibility wrapper:
+// combines P/local/net groups; handlers use the split functions for caching).
 func GetSystemInfo() (*SystemInfo, error) {
+	static := GetSystemStatic()
+	local := GetSystemLocal()
+	netInfo := GetSystemNet()
+	return &SystemInfo{
+		CPUName:        static.CPUName,
+		DiskTotal:      local.DiskTotal,
+		IPv4:           netInfo.IPv4,
+		IPv6:           netInfo.IPv6,
+		MemTotal:       local.MemTotal,
+		OS:             static.OS,
+		KernelVersion:  static.KernelVersion,
+		SwapTotal:      local.SwapTotal,
+		Virtualization: static.Virtualization,
+		Marks:          static.Marks,
+	}, nil
+}
+
+// GetSystemStatic retrieves P-level fields: cpu/os/kernel/virtualization/marks.
+// It is intended to run once per process and never be retried on failure.
+func GetSystemStatic() *SystemStaticInfo {
+	static := &SystemStaticInfo{Virtualization: "None", Marks: []string{}}
+
 	cpuInfo, _ := cpu.Info()
-	cpuName := ""
 	if len(cpuInfo) > 0 {
-		cpuName = cpuInfo[0].ModelName
-	}
-
-	diskInfo, _ := disk.Usage("/")
-	diskTotal := int64(0)
-	if diskInfo != nil {
-		diskTotal = int64(diskInfo.Total)
-	}
-
-	memInfo, _ := mem.VirtualMemory()
-	memTotal := int64(0)
-	if memInfo != nil {
-		memTotal = int64(memInfo.Total)
-	}
-
-	memSwap, _ := mem.SwapMemory()
-	swapTotal := int64(0)
-	if memSwap != nil {
-		swapTotal = int64(memSwap.Total)
+		static.CPUName = cpuInfo[0].ModelName
 	}
 
 	osInfo, _ := host.Info()
-	osName := ""
-	kernelVersion := ""
-	virtualization := "None"
 	if osInfo != nil {
 		// 优先使用具体的发行版名称（如 ubuntu），如果没有则用大类（如 linux）兜底
 		sysName := osInfo.Platform
 		if sysName == "" {
 			sysName = osInfo.OS
 		}
-
-		// 如果想让首字母大写（比如 ubuntu 变成 Ubuntu），可以加上 strings.Title
-		// 但直接用 sysName 也完全没问题
-		osName = fmt.Sprintf("%s %s", sysName, osInfo.PlatformVersion)
-
-		kernelVersion = osInfo.KernelVersion
-		virtualization = osInfo.VirtualizationSystem
+		static.OS = fmt.Sprintf("%s %s", sysName, osInfo.PlatformVersion)
+		static.KernelVersion = osInfo.KernelVersion
+		static.Virtualization = osInfo.VirtualizationSystem
 	}
 
-	// Get IP addresses
-	var ipv4, ipv6 *string
+	static.Marks = DetectMarks()
+	return static
+}
 
-	// Try to get public IPv4
+// GetSystemLocal retrieves T-local fields: disk/mem/swap totals.
+func GetSystemLocal() *SystemLocalInfo {
+	local := &SystemLocalInfo{}
+
+	diskInfo, _ := disk.Usage("/")
+	if diskInfo != nil {
+		local.DiskTotal = int64(diskInfo.Total)
+	}
+
+	memInfo, _ := mem.VirtualMemory()
+	if memInfo != nil {
+		local.MemTotal = int64(memInfo.Total)
+	}
+
+	memSwap, _ := mem.SwapMemory()
+	if memSwap != nil {
+		local.SwapTotal = int64(memSwap.Total)
+	}
+
+	return local
+}
+
+// GetSystemNet retrieves T-net fields: public IPv4/IPv6.
+func GetSystemNet() *SystemNetInfo {
+	netInfo := &SystemNetInfo{}
+
 	if pubIPv4, err := GetPublicIPv4(); err == nil && pubIPv4 != "" {
-		ipv4 = &pubIPv4
+		netInfo.IPv4 = &pubIPv4
 	}
-
-	// Try to get public IPv6
 	if pubIPv6, err := GetPublicIPv6(); err == nil && pubIPv6 != "" {
-		ipv6 = &pubIPv6
+		netInfo.IPv6 = &pubIPv6
 	}
 
-	return &SystemInfo{
-		CPUName:        cpuName,
-		DiskTotal:      diskTotal,
-		IPv4:           ipv4,
-		IPv6:           ipv6,
-		MemTotal:       memTotal,
-		OS:             osName,
-		KernelVersion:  kernelVersion,
-		SwapTotal:      swapTotal,
-		Virtualization: virtualization,
-	}, nil
+	return netInfo
 }
 
 // GetSystemStatus retrieves real-time system status

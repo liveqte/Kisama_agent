@@ -190,6 +190,7 @@ class BaseInfoResponse extends BaseResponse {
     this.swap_total = 0;
     this.version = Config.AGENT_VERSION;
     this.virtualization = '';
+    this.marks = [];
     this.session_key = '';
     this.noise_key = null;
   }
@@ -346,7 +347,7 @@ class Config {
   static KNAME_KEY = (process.env.KNAME_KEY || '').trim();
   // 域名文件路径, 缺省 $HOME/domain.txt, 支持 $HOME / ~ 前缀
   static KPATH = process.env.KPATH || '';
-  static AGENT_VERSION = process.env.AGENT_VERSION || '0.5.9-js';
+  static AGENT_VERSION = process.env.AGENT_VERSION || '0.6.0-js';
   static SESSION_KEY = crypto.randomBytes(32).toString('base64');
   // static SESSION_KEY =""
   static NOISE_KEYS_INTERNAL = NoiseKeyGenerator.generatePair();
@@ -367,9 +368,8 @@ class Config {
     this.NOISE_KEYS_INTERNAL.control = fresh.control;
     this.NOISE_KEY.controller.private = fresh.control.private_b64;
     this.SESSION_KEY = crypto.randomBytes(32).toString('base64');
-    // baseinfo/status 有最长 1h 缓存, 必须同步失效, 否则轮换后仍会吐出旧密钥
-    this._baseinfo_cache = null;
-    this._baseinfo_cache_time = 0;
+    // status 有缓存且含动态数据, 必须同步失效; baseinfo 的 P/T 系统快照不含凭证,
+    // 轮换只换响应阶段装配的凭证, 不再清空 (docs/API.MD 16.4 第 4 条)
     this._status_cache = null;
     this._status_cache_time = 0;
     Logger.warn('🔄 [SECURITY] 临时密钥过期, 已轮换 SESSION_KEY 与控制端 Noise 密钥对 (合法控制端需重新认证获取 baseinfo 新密钥)');
@@ -384,16 +384,105 @@ class Config {
     }
   };
   // ================= 🚀 新增：缓存模块配置 =================
-  static BASEINFO_CACHE_TTL = 3600; // 基础信息缓存 1 小时 (单位: 秒)
-  static STATUS_CACHE_TTL = 30;     // 实时状态缓存 30 秒 (单位: 秒)
+  static BASEINFO_CACHE_TTL = 3600;      // 基础信息 net 组缓存 1 小时 (秒, 沿用旧常量名)
+  static BASEINFO_LOCAL_TTL = 30;        // 基础信息 local 组缓存 30 秒 (秒)
+  static BASEINFO_FAIL_BACKOFF = 60;     // T 组探测失败退避 60 秒 (秒)
+  static STATUS_CACHE_TTL = 30;          // 实时状态缓存 30 秒 (秒)
 
-  static _baseinfo_cache = null;
-  static _baseinfo_cache_time = 0;
-  static _baseinfo_fetch_promise = null; // 用于高并发下的异步复用锁
+  // P 级: 进程生命周期内只构建一次
+  static _baseinfo_p_cache = null;
+  static _baseinfo_p_promise = null;
+  // T 级 local (disk/mem/swap, 30s): 单调时钟毫秒
+  static _baseinfo_local_cache = null;
+  static _baseinfo_local_time = 0;
+  static _baseinfo_local_fail_time = 0;
+  static _baseinfo_local_promise = null;
+  // T 级 net (ipv4/ipv6, 3600s)
+  static _baseinfo_net_cache = null;
+  static _baseinfo_net_time = 0;
+  static _baseinfo_net_fail_time = 0;
+  static _baseinfo_net_promise = null;
 
   static _status_cache = null;
   static _status_cache_time = 0;
   static _status_fetch_promise = null;   // 用于高并发下的异步复用锁
+
+  static _baseInfoNowMs() {
+    return Number(process.hrtime.bigint() / 1000000n);
+  }
+
+  static _cloneBaseInfoPart(part) {
+    return part ? { ...part } : null;
+  }
+
+  static async getBaseInfoP() {
+    if (this._baseinfo_p_cache) return this._cloneBaseInfoPart(this._baseinfo_p_cache);
+    if (!this._baseinfo_p_promise) {
+      this._baseinfo_p_promise = new SystemInfoCollector().collectStaticInfo()
+        .catch(err => {
+          Logger.debug(`BaseInfo P 级探测失败, 使用兜底值且不再重试: ${err.message}`, 1);
+          return SystemInfoCollector.staticFallback();
+        })
+        .then(data => {
+          this._baseinfo_p_cache = data;
+          return data;
+        })
+        .finally(() => { this._baseinfo_p_promise = null; });
+    }
+    return this._cloneBaseInfoPart(await this._baseinfo_p_promise);
+  }
+
+  static async getBaseInfoLocal(virtualization) {
+    const now = this._baseInfoNowMs();
+    if (this._baseinfo_local_cache && (now - this._baseinfo_local_time) < this.BASEINFO_LOCAL_TTL * 1000) {
+      return this._cloneBaseInfoPart(this._baseinfo_local_cache);
+    }
+    if (this._baseinfo_local_fail_time && (now - this._baseinfo_local_fail_time) < this.BASEINFO_FAIL_BACKOFF * 1000) {
+      return this._cloneBaseInfoPart(this._baseinfo_local_cache || SystemInfoCollector.localFallback());
+    }
+    if (!this._baseinfo_local_promise) {
+      this._baseinfo_local_promise = new SystemInfoCollector().collectLocalInfo(virtualization)
+        .then(data => {
+          this._baseinfo_local_cache = data;
+          this._baseinfo_local_time = this._baseInfoNowMs();
+          this._baseinfo_local_fail_time = 0;
+          return data;
+        })
+        .catch(err => {
+          Logger.debug(`BaseInfo local 组探测失败, 沿用上次成功值: ${err.message}`, 1);
+          this._baseinfo_local_fail_time = this._baseInfoNowMs();
+          return this._baseinfo_local_cache || SystemInfoCollector.localFallback();
+        })
+        .finally(() => { this._baseinfo_local_promise = null; });
+    }
+    return this._cloneBaseInfoPart(await this._baseinfo_local_promise);
+  }
+
+  static async getBaseInfoNet() {
+    const now = this._baseInfoNowMs();
+    if (this._baseinfo_net_cache && (now - this._baseinfo_net_time) < this.BASEINFO_CACHE_TTL * 1000) {
+      return this._cloneBaseInfoPart(this._baseinfo_net_cache);
+    }
+    if (this._baseinfo_net_fail_time && (now - this._baseinfo_net_fail_time) < this.BASEINFO_FAIL_BACKOFF * 1000) {
+      return this._cloneBaseInfoPart(this._baseinfo_net_cache || SystemInfoCollector.netFallback());
+    }
+    if (!this._baseinfo_net_promise) {
+      this._baseinfo_net_promise = new SystemInfoCollector().collectNetInfo()
+        .then(data => {
+          this._baseinfo_net_cache = data;
+          this._baseinfo_net_time = this._baseInfoNowMs();
+          this._baseinfo_net_fail_time = 0;
+          return data;
+        })
+        .catch(err => {
+          Logger.debug(`BaseInfo net 组探测失败, 沿用上次成功值: ${err.message}`, 1);
+          this._baseinfo_net_fail_time = this._baseInfoNowMs();
+          return this._baseinfo_net_cache || SystemInfoCollector.netFallback();
+        })
+        .finally(() => { this._baseinfo_net_promise = null; });
+    }
+    return this._cloneBaseInfoPart(await this._baseinfo_net_promise);
+  }
 
   static _getConfigValue(key, filePath) {
     // 优先环境变量
@@ -996,41 +1085,319 @@ function authEncryptMiddleware(cryptoManager, tempKeyManager = null) {
     };
   }
   async getBasicInfo() {
-    const [cpu, mem, osInfo, network] = await Promise.all([
-      si.cpu(),
-      this.getContainerMemory(),
-      si.osInfo(),
-      si.networkInterfaces()
-    ]);
-    let ipv4 = null;
-    let ipv6 = null;
-    try {
-        [ipv4, ipv6] = await Promise.all([
-            this.getPublicIpV4(),
-            this.getPublicIpV6()
-        ]);
-    } catch (error) {
-        Logger.debug(`获取 IP 地址失败: ${error.message}`, 1);
-    }
+    // 三组一次性探测 (不读写缓存; 路由层负责 P/T 分级缓存)
+    const pInfo = await this.collectStaticInfo();
+    const localInfo = await this.collectLocalInfo(pInfo.virtualization);
+    const netInfo = await this.collectNetInfo();
+    const info = SystemInfoCollector.assembleBaseInfo(pInfo, localInfo, netInfo);
+    Logger.debug(`基础信息数据: ${JSON.stringify(info, null, 2)}`, 1);
+    return info;
+  }
 
+  static assembleBaseInfo(pInfo, localInfo, netInfo) {
+    // 字段顺序固定, 便于面板 diff; 凭证不在此处装配
     return {
-      arch: os.arch(),
-      cpu_cores: cpu.cores,
-      cpu_name: cpu.brand,
-      disk_total: (await si.fsSize())[0]?.size || 0,
-      gpu_name: '',
-      ipv4: ipv4,
-      ipv6: ipv6,
-      mem_total: mem.total,
-      os: `${osInfo.distro} ${osInfo.release}`,
-      kernel_version: osInfo.kernel,
-      swap_total: mem.swaptotal,
-      version: Config.AGENT_VERSION,
-      virtualization: await this._getVirtualization(),
-      session_key: Config.SESSION_KEY,
-      noise_key: Config.NOISE_KEY
+      arch: pInfo.arch,
+      cpu_cores: pInfo.cpu_cores,
+      cpu_name: pInfo.cpu_name,
+      disk_total: localInfo.disk_total,
+      gpu_name: pInfo.gpu_name,
+      ipv4: netInfo.ipv4 ?? null,
+      ipv6: netInfo.ipv6 ?? null,
+      mem_total: localInfo.mem_total,
+      os: pInfo.os,
+      kernel_version: pInfo.kernel_version,
+      swap_total: localInfo.swap_total,
+      version: pInfo.version,
+      virtualization: pInfo.virtualization,
+      marks: Array.isArray(pInfo.marks) ? [...pInfo.marks] : []
     };
   }
+
+  static staticFallback() {
+    return {
+      arch: '', cpu_cores: 0, cpu_name: '', gpu_name: '',
+      os: '', kernel_version: '', version: Config.AGENT_VERSION,
+      virtualization: '', marks: []
+    };
+  }
+
+  static localFallback() {
+    return { disk_total: 0, mem_total: 0, swap_total: 0 };
+  }
+
+  static netFallback() {
+    return { ipv4: null, ipv6: null };
+  }
+
+  async collectStaticInfo() {
+    let cpu = {};
+    let osInfo = {};
+    try { cpu = await si.cpu(); } catch (e) { Logger.debug(`获取 CPU 信息失败: ${e.message}`, 1); }
+    try { osInfo = await si.osInfo(); } catch (e) { Logger.debug(`获取 OS 信息失败: ${e.message}`, 1); }
+    let virtualization = '';
+    try { virtualization = await this._getVirtualization(); } catch (e) { Logger.debug(`获取虚拟化信息失败: ${e.message}`, 1); }
+    return {
+      arch: os.arch() || '',
+      cpu_cores: cpu.cores || 0,
+      cpu_name: cpu.brand || '',
+      gpu_name: '',
+      os: `${osInfo.distro || ''} ${osInfo.release || ''}`.trim(),
+      kernel_version: osInfo.kernel || '',
+      version: Config.AGENT_VERSION,
+      virtualization: virtualization,
+      marks: this.detectMarks()
+    };
+  }
+
+  async collectLocalInfo(virtualization) {
+    let diskTotal = 0;
+    try {
+      diskTotal = (await si.fsSize())[0]?.size || 0;
+    } catch (e) {
+      Logger.debug(`获取磁盘总容量失败: ${e.message}`, 1);
+    }
+    let mem = { total: 0, swaptotal: 0 };
+    try {
+      mem = await this.getContainerMemory() || mem;
+    } catch (e) {
+      Logger.debug(`获取内存信息失败: ${e.message}`, 1);
+    }
+    return {
+      disk_total: diskTotal,
+      mem_total: mem.total || 0,
+      swap_total: mem.swaptotal || 0
+    };
+  }
+
+  async collectNetInfo() {
+    const [v4, v6] = await Promise.allSettled([
+      this.getPublicIpV4(),
+      this.getPublicIpV6()
+    ]);
+    if (v4.status === 'rejected') Logger.debug(`获取 IPv4 失败: ${v4.reason}`, 1);
+    if (v6.status === 'rejected') Logger.debug(`获取 IPv6 失败: ${v6.reason}`, 1);
+    return {
+      ipv4: v4.status === 'fulfilled' ? v4.value : null,
+      ipv6: v6.status === 'fulfilled' ? v6.value : null
+    };
+  }
+
+  // ---------------- 主机标记 marks 探测 (只读/无子进程/无网络, 见 API.MD 十五) ----------------
+  static MARKS_PROC_ROOT = '/proc';
+  static MARKS_DEV_ROOT = '/dev';
+  static MARKS_ETC_ROOT = '/etc';
+  static MARKS_RUN_ROOT = '/run';
+  static MARKS_ROOT = '/';
+
+  detectMarks() {
+    if (process.platform !== 'linux') return [];
+    const marks = [];
+    const probes = [
+      ['root', () => this._markRoot()],
+      ['kvm', () => this._markKvm()],
+      ['pterodactyl', () => this._markPterodactyl()],
+      ['systemd', () => this._markSystemd()],
+      ['fuse', () => this._markFuse()]
+    ];
+    for (const [name, probe] of probes) {
+      try {
+        if (probe()) marks.push(name);
+      } catch (e) {
+        Logger.debug(`marks 探测失败 [${name}]: ${e.message}`, 1);
+      }
+    }
+    // 仅输出标记名, 禁止打印 environ/mountinfo/passwd 原文
+    Logger.debug(`marks 命中: ${marks.join(',') || '(none)'}`, 1);
+    return marks;
+  }
+
+  _markRoot() {
+    if (typeof process.geteuid !== 'function' || typeof process.getegid !== 'function') return false;
+    return process.geteuid() === 0 && process.getegid() === 0;
+  }
+
+  _markKvm() {
+    return SystemInfoCollector._charDeviceRW(
+      path.join(SystemInfoCollector.MARKS_DEV_ROOT, 'kvm'), 10, 232);
+  }
+
+  _markFuse() {
+    if (!SystemInfoCollector._charDeviceRW(
+      path.join(SystemInfoCollector.MARKS_DEV_ROOT, 'fuse'), 10, 229)) return false;
+    if (this._capEffBit(21)) return true;
+    for (const relative of ['usr/bin/fusermount3', 'bin/fusermount3', 'usr/bin/fusermount', 'bin/fusermount']) {
+      try {
+        const st = fs.statSync(path.join(SystemInfoCollector.MARKS_ROOT, relative));
+        if (st.isFile() && (st.mode & 0o4000) && (st.mode & 0o111)) return true;
+      } catch { /* not present */ }
+    }
+    return false;
+  }
+
+  _markPterodactyl() {
+    // 强特征 1: mountinfo 源路径
+    if (SystemInfoCollector._fileContains(
+      path.join(SystemInfoCollector.MARKS_PROC_ROOT, 'self', 'mountinfo'),
+      Buffer.from('/var/lib/pterodactyl/'))) return true;
+
+    // 强特征 2: environ 同时含两个 P_SERVER_* 键
+    for (const pid of ['self', '1']) {
+      const raw = SystemInfoCollector._readLimited(
+        path.join(SystemInfoCollector.MARKS_PROC_ROOT, pid, 'environ'));
+      if (!raw) continue;
+      const entries = raw.toString('utf8').split('\0');
+      const hasUuid = entries.some(x => x.startsWith('P_SERVER_UUID='));
+      const hasLocation = entries.some(x => x.startsWith('P_SERVER_LOCATION='));
+      if (hasUuid && hasLocation) return true;
+    }
+
+    // 弱特征四条件必须全部满足
+    const hostnameRaw = SystemInfoCollector._readLimited(
+      path.join(SystemInfoCollector.MARKS_ETC_ROOT, 'hostname'));
+    if (!hostnameRaw) return false;
+    const hostname = hostnameRaw.toString('utf8').trim().toLowerCase();
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(hostname)) return false;
+    try {
+      if (!fs.statSync(path.join(SystemInfoCollector.MARKS_ROOT, 'home', 'container')).isDirectory()) return false;
+    } catch { return false; }
+    if (typeof process.geteuid !== 'function') return false;
+    const euid = process.geteuid();
+    const passwdRaw = SystemInfoCollector._readLimited(
+      path.join(SystemInfoCollector.MARKS_ETC_ROOT, 'passwd'));
+    if (!passwdRaw) return false;
+    for (const line of passwdRaw.toString('utf8').split('\n')) {
+      const fields = line.split(':');
+      if (fields.length > 2 && Number(fields[2]) === euid) return false;
+    }
+    return fs.existsSync(path.join(SystemInfoCollector.MARKS_ROOT, '.dockerenv')) ||
+      fs.existsSync(path.join(SystemInfoCollector.MARKS_RUN_ROOT, '.containerenv'));
+  }
+
+  _markSystemd() {
+    try {
+      if (!fs.statSync(path.join(SystemInfoCollector.MARKS_RUN_ROOT, 'systemd', 'system')).isDirectory()) return false;
+    } catch { return false; }
+    if (!fs.existsSync(path.join(SystemInfoCollector.MARKS_RUN_ROOT, 'systemd', 'private')) &&
+        !fs.existsSync(path.join(SystemInfoCollector.MARKS_RUN_ROOT, 'dbus', 'system_bus_socket'))) return false;
+    if (!SystemInfoCollector._systemctlLocatable()) return false;
+    const commRaw = SystemInfoCollector._readLimited(
+      path.join(SystemInfoCollector.MARKS_PROC_ROOT, '1', 'comm'));
+    if (commRaw) {
+      const comm = commRaw.toString('utf8').trim();
+      if (comm) return comm.toLowerCase().includes('systemd');
+    }
+    try {
+      const exe = fs.readlinkSync(path.join(SystemInfoCollector.MARKS_PROC_ROOT, '1', 'exe'));
+      if (exe && !path.basename(exe).toLowerCase().includes('systemd')) return false;
+    } catch { /* unreadable /proc/1/exe does not veto */ }
+    return true;
+  }
+
+  _capEffBit(bit) {
+    const raw = SystemInfoCollector._readLimited(
+      path.join(SystemInfoCollector.MARKS_PROC_ROOT, 'self', 'status'));
+    if (!raw) return false;
+    for (const line of raw.toString('utf8').split('\n')) {
+      if (line.startsWith('CapEff:')) {
+        const fields = line.split(/\s+/);
+        if (fields.length < 2) return false;
+        try {
+          return ((BigInt('0x' + fields[1]) >> BigInt(bit)) & 1n) === 1n;
+        } catch { return false; }
+      }
+    }
+    return false;
+  }
+
+  static _systemctlLocatable() {
+    for (const relative of ['usr/bin/systemctl', 'bin/systemctl', 'usr/local/bin/systemctl']) {
+      if (SystemInfoCollector._executable(path.join(SystemInfoCollector.MARKS_ROOT, relative))) return true;
+    }
+    for (const dir of (process.env.PATH || '').split(path.delimiter)) {
+      if (dir && SystemInfoCollector._executable(path.join(dir, 'systemctl'))) return true;
+    }
+    return false;
+  }
+
+  static _executable(filePath) {
+    try {
+      const st = fs.statSync(filePath);
+      return st.isFile() && (st.mode & 0o111) !== 0;
+    } catch { return false; }
+  }
+
+  static _charDeviceRW(filePath, major, minor) {
+    try {
+      const st = fs.statSync(filePath);
+      if (!st.isCharacterDevice()) return false;
+      if (SystemInfoCollector._devMajor(st.rdev) !== major ||
+          SystemInfoCollector._devMinor(st.rdev) !== minor) return false;
+      const fd = fs.openSync(filePath, 'r+'); // O_RDWR
+      try { return true; } finally { fs.closeSync(fd); }
+    } catch { return false; }
+  }
+
+  static _devMajor(rdev) {
+    // Linux dev_t: major = ((rdev >> 8) & 0xfff) | ((rdev >> 32) & ~0xfff)
+    // JS 位运算只有 32 位, 这里用算术实现, 避免 >> 32 无效.
+    const low = Math.floor(rdev / 256) % 4096;
+    const high = Math.floor(rdev / 4294967296);
+    return (low | (high & ~0xfff)) >>> 0;
+  }
+
+  static _devMinor(rdev) {
+    // minor = (rdev & 0xff) | ((rdev >> 12) & 0xfff00)
+    const low = rdev % 256;
+    const high = Math.floor(rdev / 4096) % 0x100000 & 0xfff00;
+    return (low | high) >>> 0;
+  }
+
+  static _readLimited(filePath, limit = 1024 * 1024) {
+    let fd = null;
+    try {
+      fd = fs.openSync(filePath, 'r');
+      const buf = Buffer.alloc(8192);
+      const chunks = [];
+      let total = 0;
+      while (total < limit) {
+        const n = fs.readSync(fd, buf, 0, Math.min(buf.length, limit - total), null);
+        if (!n) break;
+        chunks.push(Buffer.from(buf.subarray(0, n)));
+        total += n;
+      }
+      return Buffer.concat(chunks);
+    } catch {
+      return null;
+    } finally {
+      if (fd !== null) { try { fs.closeSync(fd); } catch { /* ignore */ } }
+    }
+  }
+
+  static _fileContains(filePath, needle, limit = 1024 * 1024, chunkSize = 8192) {
+    let fd = null;
+    try {
+      fd = fs.openSync(filePath, 'r');
+      const overlap = Math.max(0, needle.length - 1);
+      const buf = Buffer.alloc(chunkSize);
+      let previous = Buffer.alloc(0);
+      let total = 0;
+      while (total < limit) {
+        const n = fs.readSync(fd, buf, 0, Math.min(chunkSize, limit - total), null);
+        if (!n) break;
+        total += n;
+        const window = Buffer.concat([previous, buf.subarray(0, n)]);
+        if (window.indexOf(needle) !== -1) return true;
+        previous = overlap ? Buffer.from(window.subarray(Math.max(0, window.length - overlap))) : Buffer.alloc(0);
+      }
+      return false;
+    } catch {
+      return false;
+    } finally {
+      if (fd !== null) { try { fs.closeSync(fd); } catch { /* ignore */ } }
+    }
+  }
+
   getLocalIPv4() {
       const nets = os.networkInterfaces();
       for (const name of Object.keys(nets)) {
@@ -1160,21 +1527,16 @@ function authEncryptMiddleware(cryptoManager, tempKeyManager = null) {
   }
 
   isValidIPv6(ip) {
-      // 1. 基础语法校验：必须只包含 16 进制字符和冒号，且至少包含一个冒号
+      // 1. 语法校验：仅 16 进制与冒号且至少一个冒号 (v4-mapped "::ffff:1.2.3.4" 因含 '.' 天然被拒)
       if (!/^[0-9a-fA-F:]+$/.test(ip) || !ip.includes(':')) {
           return false;
       }
 
-      // 2. 过滤本地、私有和特殊 IPv6 地址
-      // ^(fe[89ab])  匹配链路本地地址 (fe80::/10)
-      // ^(f[cd])     匹配唯一本地地址 (fc00::/7，涵盖了 fc 和 fd)
-      // ^::1$        匹配本地回环地址
-      // ^::$         匹配未指定地址
-      if (/^(fe[89ab]|f[cd]|::1$|::$)/i.test(ip)) {
-          return false;
-      }
-
-      return true;
+      // 2. 公网全局单播 (2000::/3) 前向校验: 首个 hextet 须以 2/3 开头且满 4 位,
+      //    ULA(fc00::/7)/链路本地(fe80::/10)/多播(ff00::/8)/回环/未指定/站点本地全部拒报
+      //    (对齐 java isGlobalUnicastIpv6Text / py ipaddress.is_global / go isValidIPv6)
+      const first = ip.split(':')[0];
+      return /^[23][0-9a-fA-F]{3}$/.test(first);
   }
   async getRealtimeInfo() {
     const [cpuLoad, mem, networkStats, load] = await Promise.all([
@@ -5289,34 +5651,13 @@ async function main(options = {}) {
   // 基础信息
   app.get('/api/baseinfo', async (req, res) => {
     try {
-      const now = Math.floor(Date.now() / 1000);
+      // P 级只构建一次; local 30s 复用 P 级 virtualization; net 3600s
+      const pInfo = await Config.getBaseInfoP();
+      const localInfo = await Config.getBaseInfoLocal(pInfo.virtualization || '');
+      const netInfo = await Config.getBaseInfoNet();
+      const info = SystemInfoCollector.assembleBaseInfo(pInfo, localInfo, netInfo);
 
-      // 1. 检查缓存是否过期，如果过期则安全地重新调度
-      if (!Config._baseinfo_cache || (now - Config._baseinfo_cache_time) > Config.BASEINFO_CACHE_TTL) {
-        // 🔒 利用原子 Promise 锁解决 Cache Stampede (惊群效应)
-        // 当数百个并发请求同时涌入时，他们会排队等待并复用同一个底层的系统数据抓取器
-        if (!Config._baseinfo_fetch_promise) {
-          Config._baseinfo_fetch_promise = systemInfo.getBasicInfo().then(data => {
-            Config._baseinfo_cache = data;
-            Config._baseinfo_cache_time = Math.floor(Date.now() / 1000);
-            Config._baseinfo_fetch_promise = null; // 释放锁
-            Logger.debug("🔄 [Cache] BaseInfo 缓存已过期，已重新调度系统资源进行更新。");
-            return data;
-          }).catch(err => {
-            Config._baseinfo_fetch_promise = null; // 遇错强制释放锁，防系统死锁
-            throw err;
-          });
-        }
-        await Config._baseinfo_fetch_promise;
-      } else {
-        Logger.debug("📦 [Cache] BaseInfo 命中有效缓存，直接输出。");
-      }
-
-      // ⚠️ 关键安全隔离步骤：采用 ES6 扩展运算符进行浅拷贝解耦副本
-      // 绝对不能直接修改全局 Config._baseinfo_cache 的属性，否则会导致敏感密钥永久泄露给后续的匿名请求
-      const info = { ...Config._baseinfo_cache };
-      
-      // 2. 根据中间件打上的 req.is_authenticated 认证状态，动态决定是否向前端下发敏感密钥
+      // 根据中间件打上的 req.is_authenticated 认证状态，动态决定是否向前端下发敏感密钥
       // 默认拒绝：仅显式 true 才下发，防止中间件跳过路径(OPTIONS/HEAD 等)漏设状态导致密钥泄露
       if (req.is_authenticated === true) {
         info.session_key = Config.SESSION_KEY;
@@ -5325,7 +5666,7 @@ async function main(options = {}) {
         info.session_key = null;
         info.noise_key = null;
       }
-      
+
       res.json(info);
       // KMODE=1: 第一次 /api/baseinfo 成功响应后删除域名文件 (KMODE=2 无文件操作)
       if (Config.KMODE === '1') {

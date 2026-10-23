@@ -86,7 +86,8 @@ func NewService(opts Options) (*Service, error) {
 	}
 
 	tk := tempkey.New()
-	// 🔐 凭证生命周期: tempkey 过期 → 轮换 SESSION_KEY 与控制端 Noise 密钥对, 并失效 baseinfo/status 缓存
+	// 🔐 凭证生命周期: tempkey 过期 → 轮换 SESSION_KEY 与控制端 Noise 密钥对。
+	// baseinfo 的 P/T 系统快照不含凭证, 轮换只失效 status 缓存 (docs/API.MD 16.4 第 4 条)。
 	tk.OnExpired = func() {
 		if err := cfg.RotateOperationalSecrets(); err != nil {
 			logger.Errorf("🔄 [SECURITY] 临时密钥过期轮换失败: %v", err)

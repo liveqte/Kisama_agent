@@ -622,9 +622,30 @@ def test_baseinfo():
         global IS_PHP_SERVER, IS_WINDOWS_AGENT
         IS_PHP_SERVER = "php" in version.lower()
         IS_WINDOWS_AGENT = "windows" in str(result.get("os", "")).lower()
-        
-        return _test_result("baseinfo 返回基础字段", True, 
-                           f"{arch} | {cpu}... | {mem_gb:.1f}GB | v{version}")
+
+        # additive 字段 marks (docs/API.MD 十五): 存在时校验"数组 / 无重复 / 已知取值顺序固定",
+        # 字段缺失 (旧版 / PHP emulator 副本) 跳过不阻断; 未知取值按前向兼容忽略
+        marks_state = "marks: 缺省(跳过)"
+        if "marks" in result:
+            marks = result["marks"]
+            marks_order = ["root", "kvm", "pterodactyl", "systemd", "fuse"]
+            marks_problem = None
+            if not isinstance(marks, list):
+                marks_problem = f"marks 非数组: {type(marks).__name__}"
+            elif any(not isinstance(x, str) for x in marks):
+                marks_problem = f"marks 含非字符串元素: {marks}"
+            elif len(marks) != len(set(marks)):
+                marks_problem = f"marks 含重复项: {marks}"
+            else:
+                known = [m for m in marks if m in marks_order]
+                if known != [m for m in marks_order if m in known]:
+                    marks_problem = f"marks 顺序不符: {marks}"
+            if marks_problem:
+                return _test_result("baseinfo marks 契约", False, marks_problem)
+            marks_state = f"marks={marks}"
+
+        return _test_result("baseinfo 返回基础字段", True,
+                           f"{arch} | {cpu}... | {mem_gb:.1f}GB | v{version} | {marks_state}")
     else:
         missing = [f for f in required_fields if f not in result]
         return _test_result("baseinfo 返回基础字段", False, f"缺少: {missing}")

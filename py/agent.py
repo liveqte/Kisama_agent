@@ -6,6 +6,7 @@ import os
 import sys
 import json
 import time
+import re
 import base64
 import hashlib
 import hmac
@@ -97,6 +98,7 @@ import platform
 import psutil
 import aiohttp
 import socket
+import ipaddress
 ## 执行模块
 import subprocess
 import shlex
@@ -250,6 +252,7 @@ class BaseInfoResponse(BaseModel):
     swap_total: int = Field(..., description="交换分区总量(字节)", examples=[0])
     version: str = Field(..., description="代理版本", examples=["0.0.1"])
     virtualization: str = Field(..., description="虚拟化环境", examples=["None"])
+    marks: List[str] = Field(default_factory=list, description="主机标记 (root/kvm/pterodactyl/systemd/fuse, 顺序固定)", examples=[["root", "kvm", "systemd", "fuse"]])
     session_key: Optional[bytes] = Field(None, description="本次会话的动态 AES-256 密钥 (明文，由中间件负责加密)", examples=["k7Bv9...32位密钥字符串或Base64"] )
     noise_key: Optional[Dict[str, Any]] = Field(
         None, 
@@ -767,9 +770,8 @@ class Config:
         cls.NOISE_KEY['controller']['private'] = fresh['control'].private_b64
         cls._raw_key = get_random_bytes(32)
         cls.SESSION_KEY = base64.b64encode(cls._raw_key).decode('utf-8')
-        # baseinfo/status 有缓存, 必须同步失效, 否则轮换后仍会吐出旧密钥
-        cls._baseinfo_cache = None
-        cls._baseinfo_cache_time = 0.0
+        # status 有缓存且含动态数据, 必须同步失效; baseinfo 系统快照 (P/T) 不含凭证,
+        # 轮换只换响应阶段装配的凭证, 不再清空 (docs/API.MD 16.4 第 4 条)
         cls._status_cache = None
         cls._status_cache_time = 0.0
         Logger.warning('🔄 [SECURITY] 临时密钥过期, 已轮换 SESSION_KEY 与控制端 Noise 密钥对 (合法控制端需重新认证获取 baseinfo 新密钥)')
@@ -820,19 +822,100 @@ class Config:
     # 临时密钥最大有效期(小时), 防止无期限授权
     TEMPKEY_MAX_TTL_HOURS = int(os.getenv("TEMPKEY_MAX_TTL", "168"))
     # ================= 🚀 新增：缓存模块配置 =================
-    BASEINFO_CACHE_TTL = 3600  # 基础信息缓存 1 小时 (单位: 秒)
-    STATUS_CACHE_TTL = 30     # 实时状态缓存 30 秒 (单位: 秒)
-    
-    # 基础信息缓存槽
-    _baseinfo_cache: Optional[Dict[str, Any]] = None
-    _baseinfo_cache_time: float = 0.0
-    _baseinfo_lock: Optional[asyncio.Lock] = None  # 采用延迟加载，规避异步 Loop 错配风险
-    
+    # BaseInfo P 级: 进程生命周期内只探测一次 (arch/cpu/os/marks 等静态字段)
+    # BaseInfo T 级: local 组 30s (disk/mem/swap), net 组 3600s (ipv4/ipv6)
+    BASEINFO_CACHE_TTL = 3600      # 基础信息 net 组缓存 1 小时 (单位: 秒, 沿用旧常量名)
+    BASEINFO_LOCAL_TTL = 30        # 基础信息 local 组缓存 30 秒 (单位: 秒)
+    BASEINFO_FAIL_BACKOFF = 60     # T 组探测失败退避 60 秒 (单位: 秒)
+    STATUS_CACHE_TTL = 30          # 实时状态缓存 30 秒 (单位: 秒)
+
+    # 基础信息 P 级快照 (纯系统字段, 不含任何凭证)
+    _baseinfo_p_snapshot: Optional[Dict[str, Any]] = None
+    # 基础信息 T 级 local 组快照 (disk_total/mem_total/swap_total)
+    _baseinfo_local_snapshot: Optional[Dict[str, Any]] = None
+    _baseinfo_local_at: float = 0.0
+    _baseinfo_local_fail_at: float = 0.0
+    # 基础信息 T 级 net 组快照 (ipv4/ipv6)
+    _baseinfo_net_snapshot: Optional[Dict[str, Any]] = None
+    _baseinfo_net_at: float = 0.0
+    _baseinfo_net_fail_at: float = 0.0
+    # P/local/net 三组各自 single-flight (延迟创建, 规避异步 Loop 错配风险)
+    _baseinfo_p_lock: Optional[asyncio.Lock] = None
+    _baseinfo_local_lock: Optional[asyncio.Lock] = None
+    _baseinfo_net_lock: Optional[asyncio.Lock] = None
+
     # 实时监控缓存槽
     _status_cache: Optional[Dict[str, Any]] = None
     _status_cache_time: float = 0.0
     _status_lock: Optional[asyncio.Lock] = None    # 采用延迟加载
     # =========================================================
+
+    # ---------------- BaseInfo 分级缓存访问器 ----------------
+    # 说明: P 级只构建一次且失败不重试; T 组各自 single-flight, 失败保留上次成功值并退避 60s.
+    @classmethod
+    async def get_baseinfo_p_snapshot(cls) -> Dict[str, Any]:
+        """取 P 级快照 (进程生命周期内只构建一次, 不随轮换/TTL 失效)"""
+        if cls._baseinfo_p_snapshot is not None:
+            return dict(cls._baseinfo_p_snapshot)
+        if cls._baseinfo_p_lock is None:
+            cls._baseinfo_p_lock = asyncio.Lock()
+        async with cls._baseinfo_p_lock:
+            if cls._baseinfo_p_snapshot is None:
+                try:
+                    cls._baseinfo_p_snapshot = SystemInfoCollector().collect_p_fields()
+                except Exception as e:
+                    Logger.debug(f"BaseInfo P 级探测失败, 使用兜底值且不再重试: {e}", 11)
+                    cls._baseinfo_p_snapshot = SystemInfoCollector.p_fallback_fields()
+        return dict(cls._baseinfo_p_snapshot)
+
+    @classmethod
+    async def get_baseinfo_local_snapshot(cls, virtualization: str) -> Dict[str, Any]:
+        """取 T 级 local 组快照 (30s TTL), 探测时复用 P 级 virtualization, 不重复探测"""
+        if cls._baseinfo_local_lock is None:
+            cls._baseinfo_local_lock = asyncio.Lock()
+        now = time.monotonic()
+        async with cls._baseinfo_local_lock:
+            snapshot = cls._baseinfo_local_snapshot
+            if snapshot is not None and (now - cls._baseinfo_local_at) < cls.BASEINFO_LOCAL_TTL:
+                return dict(snapshot)
+            if cls._baseinfo_local_fail_at and (now - cls._baseinfo_local_fail_at) < cls.BASEINFO_FAIL_BACKOFF:
+                return dict(snapshot) if snapshot is not None else SystemInfoCollector.local_fallback_fields()
+            try:
+                snapshot = await SystemInfoCollector().collect_local_fields(virtualization)
+                cls._baseinfo_local_snapshot = snapshot
+                cls._baseinfo_local_at = now
+                cls._baseinfo_local_fail_at = 0.0
+            except Exception as e:
+                Logger.debug(f"BaseInfo local 组探测失败, 沿用上次成功值: {e}", 11)
+                cls._baseinfo_local_fail_at = now
+                if snapshot is None:
+                    snapshot = SystemInfoCollector.local_fallback_fields()
+            return dict(snapshot)
+
+    @classmethod
+    async def get_baseinfo_net_snapshot(cls) -> Dict[str, Any]:
+        """取 T 级 net 组快照 (3600s TTL), 失败保留上次成功值并退避 60s"""
+        if cls._baseinfo_net_lock is None:
+            cls._baseinfo_net_lock = asyncio.Lock()
+        now = time.monotonic()
+        async with cls._baseinfo_net_lock:
+            snapshot = cls._baseinfo_net_snapshot
+            if snapshot is not None and (now - cls._baseinfo_net_at) < cls.BASEINFO_CACHE_TTL:
+                return dict(snapshot)
+            if cls._baseinfo_net_fail_at and (now - cls._baseinfo_net_fail_at) < cls.BASEINFO_FAIL_BACKOFF:
+                return dict(snapshot) if snapshot is not None else SystemInfoCollector.net_fallback_fields()
+            try:
+                snapshot = await SystemInfoCollector().collect_net_fields()
+                cls._baseinfo_net_snapshot = snapshot
+                cls._baseinfo_net_at = now
+                cls._baseinfo_net_fail_at = 0.0
+            except Exception as e:
+                Logger.debug(f"BaseInfo net 组探测失败, 沿用上次成功值: {e}", 11)
+                cls._baseinfo_net_fail_at = now
+                if snapshot is None:
+                    snapshot = SystemInfoCollector.net_fallback_fields()
+            return dict(snapshot)
+
     # 服务监听配置
     HOST = os.getenv("HOST", "0.0.0.0")
     PORT = int(os.getenv("KPORT") or os.getenv("PORT") or os.environ.get('SERVER_PORT') or 8000)
@@ -847,7 +930,7 @@ class Config:
     KPATH = os.getenv("KPATH", "")
 
     # 代理版本信息
-    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.5.9-python")
+    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.6.0-python")
     
     # ================= 启动校验 =================
     
@@ -1666,6 +1749,110 @@ class AuthEncryptMiddleware(BaseHTTPMiddleware):
         for item in items:
             yield item
 # ============================================================================
+#  主机标记 (marks) 探测常量与只读工具 (docs/API.MD 第十五节)
+#  所有根路径集中为模块级变量, 便于离线单测注入临时夹具目录;
+#  探测只读本地文件/系统调用, 零子进程、零网络, 日志不得输出文件原文.
+# ============================================================================
+MARKS_PROC_ROOT = "/proc"
+MARKS_DEV_ROOT = "/dev"
+MARKS_ETC_ROOT = "/etc"
+MARKS_RUN_ROOT = "/run"
+MARKS_ROOT = "/"
+
+_MARKS_READ_LIMIT = 1024 * 1024
+_MARKS_CHUNK = 8192
+_UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+
+
+def _marks_read_text(path: str, limit: int = _MARKS_READ_LIMIT) -> Optional[str]:
+    """限长读取文本; 读取失败返回 None (调用方按"无法确认"处理)"""
+    try:
+        with open(path, 'rb') as f:
+            return f.read(limit).decode('utf-8', errors='ignore')
+    except Exception:
+        return None
+
+
+def _marks_file_contains(path: str, needle: bytes, limit: int = _MARKS_READ_LIMIT,
+                         chunk: int = _MARKS_CHUNK) -> bool:
+    """分块查找关键词, 保留 len(needle)-1 重叠防跨块漏判, 单文件上限 1 MiB"""
+    overlap = max(0, len(needle) - 1)
+    try:
+        with open(path, 'rb') as f:
+            previous = b''
+            remaining = limit
+            while remaining > 0:
+                block = f.read(min(chunk, remaining))
+                if not block:
+                    break
+                remaining -= len(block)
+                if needle in previous + block:
+                    return True
+                previous = (previous + block)[-overlap:] if overlap else b''
+    except Exception:
+        return False
+    return False
+
+
+def _marks_char_device_rw(path: str, major: int, minor: int) -> bool:
+    """字符设备 + 设备号校验 + O_RDWR 实际可打开 (失败即未命中)"""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    if not stat.S_ISCHR(st.st_mode):
+        return False
+    try:
+        if os.major(st.st_rdev) != major or os.minor(st.st_rdev) != minor:
+            return False
+    except Exception:
+        return False
+    try:
+        fd = os.open(path, os.O_RDWR)
+        try:
+            return True
+        finally:
+            os.close(fd)
+    except OSError:
+        return False
+
+
+def _marks_cap_eff_bit(bit: int) -> bool:
+    """读取 /proc/self/status 的 CapEff, 判断指定 capability 位"""
+    raw = _marks_read_text(os.path.join(MARKS_PROC_ROOT, "self", "status"))
+    if not raw:
+        return False
+    for line in raw.splitlines():
+        if line.startswith("CapEff:"):
+            try:
+                return bool((int(line.split()[1], 16) >> bit) & 1)
+            except (IndexError, ValueError):
+                return False
+    return False
+
+
+def _marks_executable(path: str) -> bool:
+    """只 stat 不执行: 普通文件且带可执行位"""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    return stat.S_ISREG(st.st_mode) and bool(st.st_mode & 0o111)
+
+
+def _marks_systemctl_locatable() -> bool:
+    """固定 3 路径 + PATH 各目录探测 systemctl (不执行)"""
+    for relative in ("usr/bin/systemctl", "bin/systemctl", "usr/local/bin/systemctl"):
+        if _marks_executable(os.path.join(MARKS_ROOT, relative)):
+            return True
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        if not directory:
+            continue
+        if _marks_executable(os.path.join(directory, "systemctl")):
+            return True
+    return False
+
+# ============================================================================
 #  获取系统信息类
 # ============================================================================
 class SystemInfoCollector:
@@ -1684,46 +1871,216 @@ class SystemInfoCollector:
         pass
     
     async def get_basic_info(self) -> Dict[str, Any]:
-        """获取基础系统信息"""
-        dist_info = self._get_linux_distribution()
-        
+        """获取基础系统信息 (三组一次性探测, 不读写缓存; 路由层负责 P/T 分级缓存)"""
+        p_fields = self.collect_p_fields()
+        local_fields = await self.collect_local_fields(p_fields["virtualization"])
+        net_fields = await self.collect_net_fields()
+        info = self.assemble_base_info(p_fields, local_fields, net_fields)
+        Logger.debug(f"基础信息数据: {json.dumps(info, indent=2)}", 11)
+        return info
+
+    @staticmethod
+    def assemble_base_info(p_fields: Dict[str, Any],
+                           local_fields: Dict[str, Any],
+                           net_fields: Dict[str, Any]) -> Dict[str, Any]:
+        """按固定字段顺序合并 P/local/net 快照 (响应稳定性, 便于面板 diff)"""
+        return {
+            "arch": p_fields.get("arch", ""),
+            "cpu_cores": p_fields.get("cpu_cores", 0),
+            "cpu_name": p_fields.get("cpu_name", ""),
+            "disk_total": local_fields.get("disk_total", 0),
+            "gpu_name": p_fields.get("gpu_name", ""),
+            "ipv4": net_fields.get("ipv4"),
+            "ipv6": net_fields.get("ipv6"),
+            "mem_total": local_fields.get("mem_total", 0),
+            "os": p_fields.get("os", ""),
+            "kernel_version": p_fields.get("kernel_version", ""),
+            "swap_total": local_fields.get("swap_total", 0),
+            "version": p_fields.get("version", Config.AGENT_VERSION),
+            "virtualization": p_fields.get("virtualization", ""),
+            "marks": list(p_fields.get("marks") or []),
+        }
+
+    @staticmethod
+    def p_fallback_fields() -> Dict[str, Any]:
+        """P 级探测整体失败时的类型兜底 (进程内不再重试)"""
+        return {
+            "arch": "", "cpu_cores": 0, "cpu_name": "", "gpu_name": "",
+            "os": "", "kernel_version": "", "version": Config.AGENT_VERSION,
+            "virtualization": "", "marks": [],
+        }
+
+    @staticmethod
+    def local_fallback_fields() -> Dict[str, Any]:
+        """local 组无历史成功值时的类型兜底"""
+        return {"disk_total": 0, "mem_total": 0, "swap_total": 0}
+
+    @staticmethod
+    def net_fallback_fields() -> Dict[str, Any]:
+        """net 组无历史成功值时的类型兜底 (IP 为 null)"""
+        return {"ipv4": None, "ipv6": None}
+
+    def collect_p_fields(self) -> Dict[str, Any]:
+        """P 级字段: 进程生命周期内只探测一次 (不含凭证/不含 TTL 字段)"""
+        dist_info = self._safe_p(self._get_linux_distribution, {'name': 'Unknown', 'version': 'Unknown'})
+        os_name = f"{dist_info['name']} {dist_info['version']}" if dist_info.get('name') != 'Unknown' else self._safe_p(platform.system, "")
+        return {
+            "arch": self._safe_p(platform.machine, ""),
+            "cpu_cores": self._safe_p(lambda: psutil.cpu_count() or 0, 0),
+            "cpu_name": self._safe_p(self._get_cpu_name, ""),
+            "gpu_name": "",
+            "os": os_name,
+            "kernel_version": self._safe_p(platform.release, ""),
+            "version": Config.AGENT_VERSION,
+            "virtualization": self._safe_p(self._get_virtualization, ""),
+            "marks": self._safe_p(self._detect_marks, []),
+        }
+
+    async def collect_local_fields(self, virtualization: str) -> Dict[str, Any]:
+        """T 级 local 组 (30s): disk/mem/swap; 复用 P 级 virtualization, 不得重探"""
+        disk_total = 0
+        try:
+            disk_info = await self._get_disk_info(virtualization)
+            disk_total = int(disk_info.get("total", 0))
+        except Exception as e:
+            Logger.debug(f"获取磁盘总容量失败: {e}", 15)
+        return {
+            "disk_total": disk_total,
+            "mem_total": self._safe_p(self._get_container_mem_limit, 0),
+            "swap_total": self._safe_p(lambda: psutil.swap_memory().total, 0),
+        }
+
+    async def collect_net_fields(self) -> Dict[str, Any]:
+        """T 级 net 组 (3600s): 公网 IPv4/IPv6, 失败按族回退 null"""
         ipv4, ipv6 = await asyncio.gather(
             self._get_public_ip_v4(),
             self._get_public_ip_v6(),
             return_exceptions=True
         )
-        
-        ipv4 = ipv4 if not isinstance(ipv4, Exception) else None
-        ipv6 = ipv6 if not isinstance(ipv6, Exception) else None
-        
         if isinstance(ipv4, Exception):
             Logger.debug(f"获取 IPv4 失败: {ipv4}", 11)
             ipv4 = None
         if isinstance(ipv6, Exception):
             Logger.debug(f"获取 IPv6 失败: {ipv6}", 11)
             ipv6 = None
-        
-        os_name = f"{dist_info['name']} {dist_info['version']}" if dist_info['name'] != 'Unknown' else platform.system()
-        
-        info = {
-            "arch": platform.machine(),
-            "cpu_cores": psutil.cpu_count(),
-            "cpu_name": self._get_cpu_name(),
-            "disk_total": await self._get_disk_total(),
-            "gpu_name": "",  
-            "ipv4": ipv4,
-            "ipv6": ipv6,
-            "mem_total": self._get_container_mem_limit(),  
-            "os": os_name,
-            "kernel_version": platform.release(),
-            "swap_total": psutil.swap_memory().total,  
-            "version": Config.AGENT_VERSION,
-            "virtualization": self._get_virtualization()
-        }
-        
-        Logger.debug(f"基础信息数据: {json.dumps(info, indent=2)}", 11)
-        return info
-    
+        return {"ipv4": ipv4 if isinstance(ipv4, str) else None,
+                "ipv6": ipv6 if isinstance(ipv6, str) else None}
+
+    @staticmethod
+    def _safe_p(func, fallback):
+        """单字段探测隔离: 任一 P/local 字段失败只回退该字段"""
+        try:
+            return func()
+        except Exception as e:
+            Logger.debug(f"系统信息字段探测失败(非致命): {e}", 11)
+            return fallback
+
+    # ---------------- 主机标记 marks 探测 (只读/无子进程/无网络, 见 API.MD 十五) ----------------
+    def _detect_marks(self) -> List[str]:
+        """按固定顺序探测五类主机标记; 单个标记异常只丢弃该项"""
+        if platform.system() != "Linux":
+            return []
+        marks: List[str] = []
+        for name, probe in (
+            ("root", self._mark_root),
+            ("kvm", self._mark_kvm),
+            ("pterodactyl", self._mark_pterodactyl),
+            ("systemd", self._mark_systemd),
+            ("fuse", self._mark_fuse),
+        ):
+            try:
+                if probe():
+                    marks.append(name)
+            except Exception as e:
+                Logger.debug(f"marks 探测失败 [{name}]: {e}", 11)
+        # 仅输出标记名, 禁止打印 environ/mountinfo/passwd 原文
+        Logger.debug(f"marks 命中: {','.join(marks) if marks else '(none)'}", 11)
+        return marks
+
+    def _mark_root(self) -> bool:
+        """effective uid 与 gid 均为 0; 无 POSIX API 的平台不报"""
+        geteuid = getattr(os, "geteuid", None)
+        getegid = getattr(os, "getegid", None)
+        if geteuid is None or getegid is None:
+            return False
+        return geteuid() == 0 and getegid() == 0
+
+    def _mark_kvm(self) -> bool:
+        """ /dev/kvm 为字符设备 10:232 且 O_RDWR 可打开 """
+        return _marks_char_device_rw(os.path.join(MARKS_DEV_ROOT, "kvm"), 10, 232)
+
+    def _mark_pterodactyl(self) -> bool:
+        """强特征: mountinfo 源路径 / environ 双键; 弱特征: 四项同时满足 """
+        if _marks_file_contains(os.path.join(MARKS_PROC_ROOT, "self", "mountinfo"),
+                                b"/var/lib/pterodactyl/"):
+            return True
+        for pid in ("self", "1"):
+            raw = _marks_read_text(os.path.join(MARKS_PROC_ROOT, pid, "environ"))
+            if not raw:
+                continue
+            parts = raw.split('\0')
+            has_uuid = any(p.startswith("P_SERVER_UUID=") for p in parts)
+            has_location = any(p.startswith("P_SERVER_LOCATION=") for p in parts)
+            if has_uuid and has_location:
+                return True
+        # 弱特征四条件: UUID hostname + /home/container + passwd 无 euid 条目 + 容器标记
+        hostname = (_marks_read_text(os.path.join(MARKS_ETC_ROOT, "hostname")) or "").strip().lower()
+        if not _UUID_RE.match(hostname):
+            return False
+        if not os.path.isdir(os.path.join(MARKS_ROOT, "home", "container")):
+            return False
+        geteuid = getattr(os, "geteuid", None)
+        if geteuid is None:
+            return False
+        euid = geteuid()
+        passwd = _marks_read_text(os.path.join(MARKS_ETC_ROOT, "passwd"))
+        if passwd is None:
+            return False
+        for line in passwd.splitlines():
+            fields = line.split(':')
+            if len(fields) > 2 and fields[2].isdigit() and int(fields[2]) == euid:
+                return False
+        return (os.path.exists(os.path.join(MARKS_ROOT, ".dockerenv"))
+                or os.path.exists(os.path.join(MARKS_RUN_ROOT, ".containerenv")))
+
+    def _mark_systemd(self) -> bool:
+        """ /run/systemd/system 目录 + 控制通道 + systemctl 可定位; PID1 明确非 systemd 否决 """
+        if not os.path.isdir(os.path.join(MARKS_RUN_ROOT, "systemd", "system")):
+            return False
+        if not (os.path.exists(os.path.join(MARKS_RUN_ROOT, "systemd", "private"))
+                or os.path.exists(os.path.join(MARKS_RUN_ROOT, "dbus", "system_bus_socket"))):
+            return False
+        if not _marks_systemctl_locatable():
+            return False
+        comm = _marks_read_text(os.path.join(MARKS_PROC_ROOT, "1", "comm"))
+        if comm and comm.strip() and "systemd" not in comm.strip().lower():
+            return False
+        if not comm:
+            try:
+                exe = os.readlink(os.path.join(MARKS_PROC_ROOT, "1", "exe"))
+            except OSError:
+                exe = ""
+            if exe and "systemd" not in os.path.basename(exe).lower():
+                return False
+        return True
+
+    def _mark_fuse(self) -> bool:
+        """ /dev/fuse 10:229 可读写, 且 CapEff bit21 或 setuid fusermount 助手可用 """
+        if not _marks_char_device_rw(os.path.join(MARKS_DEV_ROOT, "fuse"), 10, 229):
+            return False
+        if _marks_cap_eff_bit(21):
+            return True
+        for relative in ("usr/bin/fusermount3", "bin/fusermount3",
+                         "usr/bin/fusermount", "bin/fusermount"):
+            path = os.path.join(MARKS_ROOT, relative)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            if stat.S_ISREG(st.st_mode) and (st.st_mode & stat.S_ISUID) and os.access(path, os.X_OK):
+                return True
+        return False
+
     async def get_realtime_info(self) -> Dict[str, Any]:
         """获取实时监控信息"""
         cpu_usage = await self._get_cpu_usage()
@@ -1954,13 +2311,15 @@ class SystemInfoCollector:
             Logger.debug(f"获取磁盘信息失败: {e}", 15)
             return {"total": 0, "used": 0}
 
-    async def _get_disk_info(self) -> Dict[str, int]:
-        if self._get_virtualization() in ['Docker', 'Lxc', 'Podman']:
+    async def _get_disk_info(self, virtualization: Optional[str] = None) -> Dict[str, int]:
+        if virtualization is None:
+            virtualization = self._get_virtualization()
+        if virtualization in ['Docker', 'Lxc', 'Podman']:
             return self._get_container_disk_info()
         return await self._get_host_disk_info()
 
-    async def _get_disk_total(self) -> int:
-        disk_info = await self._get_disk_info()
+    async def _get_disk_total(self, virtualization: Optional[str] = None) -> int:
+        disk_info = await self._get_disk_info(virtualization)
         return disk_info["total"]
     
     def _is_physical_disk(self, device: str) -> bool:
@@ -2135,10 +2494,15 @@ class SystemInfoCollector:
         except socket.error: return False
     
     def _is_valid_ipv6(self, ip: str) -> bool:
+        # 仅公网全局单播 (2000::/3): ULA(fc00::/7)/链路本地/回环/多播/IPv4-mapped 一律拒报
+        # (对齐 go isValidIPv6 与 java isGlobalUnicastIpv6Text; 0.6.0 实测线上 java 曾把 docker ULA 冒充公网上报)
         try:
-            socket.inet_pton(socket.AF_INET6, ip)
-            return True
-        except socket.error: return False
+            a = ipaddress.IPv6Address(ip.split('%')[0])
+        except (ipaddress.AddressValueError, ValueError):
+            return False
+        if a.ipv4_mapped is not None:
+            return False
+        return a.is_global and not a.is_multicast
 # ============================================================================
 # 📁 文件模块: FileManager 类 (面向对象封装)
 # ============================================================================
@@ -5445,31 +5809,15 @@ async def get_smart_payload(request: Request) -> ExecRequestJSON:
 async def get_baseinfo(request: Request):
     """
     获取代理端基础信息
-    🔐 带 1 小时高性能缓存机制
+    🔐 P 级进程快照 + T 级 local(30s)/net(3600s) 分组快照 (docs/API.MD 第十六节)
     🔐 有认证头时返回完整加密信息，无认证头时返回基础明文（剔除动态密钥）
     """
-    now = time.time()
-    
-    # 确保异步锁已安全初始化
-    if Config._baseinfo_lock is None:
-        Config._baseinfo_lock = asyncio.Lock()
-        
-    async with Config._baseinfo_lock:
-        # 检查缓存是否失效或从未加载过
-        if (Config._baseinfo_cache is None or 
-                now - Config._baseinfo_cache_time > Config.BASEINFO_CACHE_TTL):
-            
-            # 真正触发底层高能耗的资源收集器
-            Config._baseinfo_cache = await SystemInfoCollector().get_basic_info()
-            Config._baseinfo_cache_time = now
-            Logger.debug("🔄 [Cache] BaseInfo 缓存已过期，已重新调度系统资源进行更新。")
-        else:
-            Logger.debug("📦 [Cache] BaseInfo 命中有效缓存，直接输出。")
-            
-        # ⚠️ 关键安全步骤：使用 .copy() 浅拷贝出一份副本进行上层组装
-        # 确保动态追加的凭证不会污染全局静态缓存，防止越权暴露
-        basic_info = Config._baseinfo_cache.copy()
-    
+    # P 级只探测一次; local 组复用 P 级 virtualization; net 组独立 3600s
+    p_fields = await Config.get_baseinfo_p_snapshot()
+    local_fields = await Config.get_baseinfo_local_snapshot(p_fields.get("virtualization", ""))
+    net_fields = await Config.get_baseinfo_net_snapshot()
+    basic_info = SystemInfoCollector.assemble_base_info(p_fields, local_fields, net_fields)
+
     # 根据中间件标记的当前单次请求认证状态，动态决定是否下发敏感密钥
     # 默认未认证：仅显式 true 才下发敏感密钥，防止中间件漏设状态导致越权泄露
     if getattr(request.state, "is_authenticated", False):

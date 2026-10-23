@@ -12,81 +12,173 @@ import (
 	"github.com/liveqte/kisama_agent/go/utils"
 )
 
-// 定义线程安全的响应模型缓存槽与时间戳
+// BaseInfo 分级缓存 (docs/API.MD 第十六节):
+//
+//	P     = 进程级静态, 只探测一次, 轮换/TTL 均不清空;
+//	local = disk/mem/swap, 30s TTL;
+//	net   = ipv4/ipv6, 3600s TTL.
+//
+// 三组各自持锁 single-flight; 慢探测不跨组阻塞.
+type baseInfoPFields struct {
+	CPUName        string
+	OS             string
+	KernelVersion  string
+	Virtualization string
+	Marks          []string
+}
+
+type baseInfoLocalFields struct {
+	DiskTotal int64
+	MemTotal  int64
+	SwapTotal int64
+}
+
+type baseInfoNetFields struct {
+	IPv4 *string
+	IPv6 *string
+}
+
+const (
+	baseInfoLocalTTL    = 30 * time.Second
+	baseInfoNetTTL      = 3600 * time.Second
+	baseInfoFailBackoff = 60 * time.Second
+)
+
+// Probe entry points are variables so offline tests can replace them and count calls.
 var (
-	baseInfoCache     models.BaseInfoResponse
-	baseInfoCacheTime int64
-	baseInfoMu        sync.Mutex // 基础信息互斥锁，防止并发击穿
+	getSystemStaticFn = utils.GetSystemStatic
+	getSystemLocalFn  = utils.GetSystemLocal
+	getSystemNetFn    = utils.GetSystemNet
+	baseInfoNowFn     = time.Now
+)
+
+var (
+	baseInfoPMu    sync.Mutex
+	baseInfoP      baseInfoPFields
+	baseInfoPReady bool
+
+	baseInfoLocalMu     sync.Mutex
+	baseInfoLocal       baseInfoLocalFields
+	baseInfoLocalAt     time.Time
+	baseInfoLocalFailAt time.Time
+
+	baseInfoNetMu     sync.Mutex
+	baseInfoNet       baseInfoNetFields
+	baseInfoNetAt     time.Time
+	baseInfoNetFailAt time.Time
 
 	statusCache     models.StatusResponse
 	statusCacheTime int64
 	statusMu        sync.Mutex // 实时监控互斥锁，防止并发击穿
 )
 
-// InvalidateSecretCaches 🔐 密钥轮换后失效 baseinfo/status 缓存, 防止轮换后仍返回旧密钥
+// InvalidateSecretCaches 密钥轮换后仅失效 status 缓存。
+// baseinfo 的 P/T 快照不含任何凭证, 轮换只替换响应阶段装配的 session_key/noise_key,
+// 因此不得清空系统快照, 也不得触发任何重探 (docs/API.MD 16.4 第 4 条)。
 func InvalidateSecretCaches() {
-	baseInfoMu.Lock()
-	baseInfoCacheTime = 0
-	baseInfoMu.Unlock()
 	statusMu.Lock()
 	statusCacheTime = 0
 	statusMu.Unlock()
 }
 
-// GetBaseInfo retrieves basic system information (带 1 小时高性能缓存机制)
+func getBaseInfoP() baseInfoPFields {
+	baseInfoPMu.Lock()
+	defer baseInfoPMu.Unlock()
+	if baseInfoPReady {
+		return baseInfoP
+	}
+	static := getSystemStaticFn()
+	baseInfoP = baseInfoPFields{
+		CPUName:        static.CPUName,
+		OS:             static.OS,
+		KernelVersion:  static.KernelVersion,
+		Virtualization: static.Virtualization,
+		Marks:          append([]string{}, static.Marks...),
+	}
+	if baseInfoP.Marks == nil {
+		baseInfoP.Marks = []string{}
+	}
+	// P 级失败也只写兜底值并置 ready, 进程内不再重试.
+	baseInfoPReady = true
+	return baseInfoP
+}
+
+func getBaseInfoLocal(virtualization string) baseInfoLocalFields {
+	baseInfoLocalMu.Lock()
+	defer baseInfoLocalMu.Unlock()
+	now := baseInfoNowFn()
+	if !baseInfoLocalAt.IsZero() && now.Sub(baseInfoLocalAt) < baseInfoLocalTTL {
+		return baseInfoLocal
+	}
+	if !baseInfoLocalFailAt.IsZero() && now.Sub(baseInfoLocalFailAt) < baseInfoFailBackoff {
+		return baseInfoLocal
+	}
+	local := getSystemLocalFn()
+	if local != nil {
+		baseInfoLocal = baseInfoLocalFields{
+			DiskTotal: local.DiskTotal,
+			MemTotal:  local.MemTotal,
+			SwapTotal: local.SwapTotal,
+		}
+		baseInfoLocalAt = now
+		baseInfoLocalFailAt = time.Time{}
+	} else {
+		baseInfoLocalFailAt = now
+	}
+	return baseInfoLocal
+}
+
+func getBaseInfoNet() baseInfoNetFields {
+	baseInfoNetMu.Lock()
+	defer baseInfoNetMu.Unlock()
+	now := baseInfoNowFn()
+	if !baseInfoNetAt.IsZero() && now.Sub(baseInfoNetAt) < baseInfoNetTTL {
+		return baseInfoNet
+	}
+	if !baseInfoNetFailAt.IsZero() && now.Sub(baseInfoNetFailAt) < baseInfoFailBackoff {
+		return baseInfoNet
+	}
+	netInfo := getSystemNetFn()
+	if netInfo != nil {
+		baseInfoNet = baseInfoNetFields{IPv4: netInfo.IPv4, IPv6: netInfo.IPv6}
+		baseInfoNetAt = now
+		baseInfoNetFailAt = time.Time{}
+	} else {
+		baseInfoNetFailAt = now
+	}
+	return baseInfoNet
+}
+
+// GetBaseInfo retrieves basic system information (P + local + net 分级缓存)
 func GetBaseInfo(c *gin.Context) {
 	cfg := config.Get()
-	now := time.Now().Unix()
 
-	// 1. 先锁内快检缓存命中, 未命中则锁外重建 (🚀 0.5.6: utils.GetSystemInfo 含外网 IP
-	//    探测等慢操作, 原实现持锁构建会让并发请求全部排队; 现构建移出临界区, 仅指针
-	//    替换与快照复制在锁内)
-	baseInfoMu.Lock()
-	cacheValid := baseInfoCacheTime != 0 && (now-baseInfoCacheTime) <= 3600
-	var response models.BaseInfoResponse
-	if cacheValid {
-		// 通过值复制（Shallow Copy）派生出当前请求的独立副本，随后立即解锁释放协程
-		response = baseInfoCache
+	p := getBaseInfoP()
+	local := getBaseInfoLocal(p.Virtualization)
+	netInfo := getBaseInfoNet()
+
+	response := models.BaseInfoResponse{
+		BaseResponse:   models.BaseResponse{Status: "ok"},
+		Arch:           runtime.GOARCH,
+		CPUCores:       runtime.NumCPU(),
+		CPUName:        p.CPUName,
+		DiskTotal:      local.DiskTotal,
+		GPUName:        "",
+		IPv4:           netInfo.IPv4,
+		IPv6:           netInfo.IPv6,
+		MemTotal:       local.MemTotal,
+		OS:             p.OS,
+		KernelVersion:  p.KernelVersion,
+		SwapTotal:      local.SwapTotal,
+		Version:        cfg.AgentVersion,
+		Virtualization: p.Virtualization,
+		Marks:          append([]string{}, p.Marks...),
 	}
-	baseInfoMu.Unlock()
-
-	if !cacheValid {
-		// 触发底层能耗较高的系统组件抓取 (锁外执行, 不阻塞并发请求)
-		sysInfo, err := utils.GetSystemInfo()
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get system info"})
-			return
-		}
-
-		// 缓存不含敏感密钥的纯净系统快照
-		rebuilt := models.BaseInfoResponse{
-			BaseResponse:   models.BaseResponse{Status: "ok"},
-			Arch:           runtime.GOARCH,
-			CPUCores:       runtime.NumCPU(),
-			CPUName:        sysInfo.CPUName,
-			DiskTotal:      sysInfo.DiskTotal,
-			GPUName:        "",
-			IPv4:           sysInfo.IPv4,
-			IPv6:           sysInfo.IPv6,
-			MemTotal:       sysInfo.MemTotal,
-			OS:             sysInfo.OS,
-			KernelVersion:  sysInfo.KernelVersion,
-			SwapTotal:      sysInfo.SwapTotal,
-			Version:        cfg.AgentVersion,
-			Virtualization: sysInfo.Virtualization,
-		}
-
-		baseInfoMu.Lock()
-		// 双检: 并发线程可能已完成重建, 避免慢构建的旧数据覆盖新缓存
-		if baseInfoCacheTime == 0 || (now-baseInfoCacheTime) > 3600 {
-			baseInfoCache = rebuilt
-			baseInfoCacheTime = now
-		}
-		response = baseInfoCache
-		baseInfoMu.Unlock()
+	if response.Marks == nil {
+		response.Marks = []string{}
 	}
 
-	// 2. ✨ 安全隔离层：根据当前请求的鉴权状态，动态组装或初始化为标准的 nil 指针
+	// ✨ 安全隔离层：根据当前请求的鉴权状态，动态组装或初始化为标准的 nil 指针
 	var sessionKeyPtr *string
 	var noiseKeyPtr *models.NoiseKeyConfig
 
@@ -123,7 +215,7 @@ func GetBaseInfo(c *gin.Context) {
 
 // GetStatus retrieves real-time system status (带 30 秒防刷流控缓存)
 func GetStatus(c *gin.Context) {
-	now := time.Now().Unix()
+	now := baseInfoNowFn().Unix()
 
 	// 🚀 0.5.6: 锁内快检命中, 未命中锁外重建 (utils.GetSystemStatus 含 1s CPU 采样等
 	// 慢操作, 原实现持锁构建会让并发请求全部排队)

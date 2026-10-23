@@ -39,6 +39,7 @@
   "swap_total": 0,
   "version": "0.0.1",
   "virtualization": "None",
+  "marks": ["root", "kvm", "systemd", "fuse"],
   "session_key": "",
   "noise_key:":{
       controller: {
@@ -50,7 +51,14 @@
     }
   }
 ```
-> **session_key 下发规则（与运行模式相关）**：生产模式（`DEBUG=false`）已认证请求返回真实 `session_key`（供控制端 AES-GCM 加密请求体）；**生产明文模式（`PLAIN_MODE=true`，PHP 独有）恒返回 `session_key: null`**（即使已认证）——控制端据此判定请求体改发明文 JSON，不再尝试 AES 加密（详见「十、x-encrypted 响应模式头规范」）；DEBUG 模式（`DEBUG=true`）同样恒为 `null`。
+> **session_key 下发规则（与运行模式相关）**：生产模式（`DEBUG=false`）已认证请求返回真实 `session_key`（供控制端 AES-GCM 加密请求体）；**生产明文模式（`PLAIN_MODE=true`，PHP 独有）恒返回 `session_key: null`**（即使已认证）——控制端据此判定请求体改发明文 JSON，不再尝试 AES 加密（详见「十、x-encrypted 响应模式头规范」）；**DEBUG 模式（`DEBUG=true`）恒返回真实 `session_key` 与完整 `noise_key`（含控制端私钥，明文直出）**——认证全豁免，凭据不做遮蔽，下发的意图与边界见第十节「调试模式下的密钥下发（设计意图）」。
+
+> **ipv4/ipv6 上报口径（五语言统一语义）**：`ipv4`/`ipv6` 均以专用外部服务探测优先且对返回文本做族校验——`ipv6` 只接受**公网全局单播**（2000::/3；ULA(fc00::/7)、链路本地(fe80::/10)、多播、回环、未指定、IPv4-mapped、站点本地一律拒绝），本地网卡地址仅在外部探测全失败时兜底（v6 兜底同样必须全局单播）。**无公网 IPv6 时 `ipv6` 报 `null`，不会用容器内网地址（如 docker 网络的 fdXX::）回填**。
+
+> **marks 主机标记（可选字段，additive）**：字符串数组，标识当前进程视角下**已确认成立**的主机能力，当前取值为 `root`、`kvm`、`pterodactyl`、`systemd`、`fuse`（可同时出现多个，顺序固定）。**字段可能缺失**（旧版代理未实现 / 非 Linux 平台），缺失与空数组语义不同：缺失 = 未探测或不适用，`[]` = 已探测且无命中；`null` 非法，客户端按缺失处理。客户端必须忽略未知取值。判据、实现方式、性能与误报边界见「十五、`/api/baseinfo` 可选字段 `marks`（主机标记）探测规范」。
+
+> **字段缓存分级（P 级 / T 级）**：baseinfo 系统信息按字段分两级缓存——**P 级（进程级静态）**如 `marks`、`virtualization`、`os`、`kernel_version`、`arch` 等，在进程生命周期内只探测一次并一直复用快照（TTL 过期与密钥轮换都不重探）；**T 级（TTL 快照）**按各自 TTL 重探：`disk_total`/`mem_total`/`swap_total` 为 30 秒，`ipv4`/`ipv6` 为 3600 秒。`session_key`/`noise_key` 属每请求凭证材料，**绝不进入任何快照**。完整字段表、失效规则与验收断言见「十六、`/api/baseinfo` 字段分级缓存与快照语义」。
+
 ### 2. 获取实时监控信息  
 路径：GET /api/status  
 用途：获取代理端动态资源使用率（CPU/内存/磁盘/网络/连接数）  
@@ -876,6 +884,23 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，请求
 - 优先级：`DEBUG=true` 时以 DEBUG 为准（一切响应 `false`），`PLAIN_MODE` 失效；
 - 风险提示：请求（含命令输入）与响应（含 `/api/tempkey` 私钥、命令输出）全程明文，必须确保部署在 HTTPS/TLS 链路内；请求仅凭 ECDSA 签名防篡改，不提供机密性。
 
+### 调试模式下的密钥下发（设计意图，五端一致）
+
+`DEBUG=true` 是认证与加密全部豁免的坦诚调试模式：HTTP 中间件将认证标识整体置真、跳过请求验签与请求体解密、响应全部明文（`x-encrypted: false`）。此时 `/api/baseinfo` 恒返回真实 `session_key` 与完整 `noise_key`（`controller.private` + `agent.public`），**明文直出、不做 `null` 遮蔽**——这是有意设计，不是实现偏差，五端（py/js/go/java/java11）行为一致（DEBUG 置真：py `agent.py:1593-1597`、js `agent.js:963-966`、go `middleware/auth.go:80-83`、java/java11 `kisama.java:496-505`；baseinfo 按认证标识下发：py `agent.py:5823-5828`、js `agent.js:5662-5668`、go `handlers/baseinfo.go:185-205`、java `kisama.java:590-601`）。
+
+下发的意图：`/api/ws/*` 超级终端**不经过 HTTP 认证中间件**，其凭证在 DEBUG 模式下仍然真实生效——
+
+1. **明文降级终端**：`token=HMAC-SHA256(SESSION_KEY, "kisama-ws-token-v1")` 校验在 DEBUG 模式下不豁免（py `agent.py:7022-7026`、go `websocket.go:301-311`、js `agent.js:6180-6189`、java `kisama.java:3767-3773`，均为常数时间比较，任何模式一致）；
+2. **Noise XX 加密终端**：握手在 WS 层独立完成，控制端身份需要 `noise_key.controller.private`（msg3），对端钉扎需要 `noise_key.agent.public`（msg2）。
+
+五端 `session_key` 与 Noise 密钥对均为**每次启动随机生成**、不落盘，控制端凭证只能从 baseinfo 现取。若 DEBUG 模式下改发 `null`，HTTP 层无任何损失，但上述两种终端在 DEBUG 部署形态下均不可用；中间件在 DEBUG 下把认证标识拉满信任的实际用途即服务该凭证链。
+
+边界与前提：DEBUG 模式的既有暴露面本就包含**全部接口匿名可调**（含 `/api/exec`、`/api/tempkey`），凭证明文下发与其同档，不构成额外的独立风险面；密钥每次启动重新生成，重启进程即终结泄露窗口。控制端观测到 `x-encrypted: false` 即按下方判定表停止签名/加密通信并 UI 显著警示。
+
+部署前提与风险提示：凭据与该模式全部通信均为明文，与「生产明文认证模式」同一条红线——只应在可信内网/回环或 TLS 链路内临时使用。
+
+与 PLAIN_MODE 的对比：PLAIN_MODE（PHP 独有）= 验签照常、双向体加密关闭、密钥**恒不下发**；DEBUG = 验签也豁免、密钥**照常下发**、全部明文。优先级：`DEBUG=true` 以 DEBUG 为准（一切响应 `false`），`PLAIN_MODE` 失效。
+
 ### 控制端判定表
 
 | 观测 | 判定 | 客户端动作 |
@@ -1122,3 +1147,396 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，请求
 ### 验收
 
 `tests/py/test_tempkey_short.py`、`tests/js/test_tempkey_short.js`、`go/handlers/tempkey_test.go`（short 字段格式、与全格式同源交叉验证、非法 format 422、缺省行为不变）；PHP 四实现以 `php -l` + 本地 `php -S` 冒烟验证三种 format 响应；`tools/verify_all.py` tempkey short 场景覆盖五端格式断言与短私钥端到端签名连通。
+
+## 十五、`/api/baseinfo` 可选字段 `marks`（主机标记）探测规范
+
+### 定位与动机
+
+`baseinfo` 现有字段（`os`、`kernel_version`、`virtualization`、`arch` 等）描述"这台机器是什么"，但不回答"这个节点能做什么"。控制端若靠这些字段推断能力，只能按发行版字符串和容器迹象猜测，且各端 `virtualization` 口径并不一致：py 在 `/proc/cpuinfo` 出现 `KVM`/`QEMU` 字样时返回 `QEMU`，go 返回 `kvm` 表示"本机是虚拟机"，二者与"本机能运行 KVM"恰好相反或无关。`marks` 把能力显式化为可枚举的短标记，供控制端做任务路由与降级（能否提权、能否跑 qemu-kvm、是否翼龙托管容器、能否用 systemctl 管服务、能否用 FUSE 挂载网络存储），避免继续靠字符串猜。
+
+`marks` 与 `virtualization` 并存、互不推导：任何实现不得用 `virtualization` 反推 `marks`。
+
+### 15.1 字段契约
+
+- 类型 `string[]`，元素为小写 ASCII 短名，当前定义五个值：`root`、`kvm`、`pterodactyl`、`systemd`、`fuse`，语义见 15.3–15.7。
+- 顺序固定为 `root` → `kvm` → `pterodactyl` → `systemd` → `fuse`（新增标记一律追加在末尾），同一标记只出现一次；客户端必须按集合处理，不得依赖顺序。
+- 语义：每一项都表示"在 **agent 进程视角**下已确认成立"的客观事实，不表示程度，也不代表宿主机或其它命名空间的状态（见 15.3）。
+- 缺失 / 空数组 / null 三态语义：
+  - **字段缺失**：代理未实现该字段（旧版）、平台不适用（非 Linux）、部署方禁用，或低权限模拟器副本不实现探测（PHP 两个 emulator 副本按此例外省略字段，不得用 `[]` 冒充"已探测且无命中"）→ 控制端按"未知"处理，不得假设无能力；
+  - **`[]`**：已完成探测，未命中任何标记；
+  - **`null`**：非法值，实现不得输出；客户端遇到时按"字段缺失"处理。
+- 前向兼容：客户端遇到未知取值必须忽略（不得报错，也不得因此丢弃整个响应）。
+- 客户端读取（零依赖）：baseinfo 响应本身就是 JSON，`marks` 是标准 JSON 字符串数组，浏览器/Node 内置 `JSON.parse` 后即为原生 Array，不需要任何三方库：`const marks = Array.isArray(info.marks) ? info.marks : []; marks.includes('kvm')`（IE11 等旧环境用 `marks.indexOf('kvm') !== -1`）。**禁止**对原始响应文本做正则或字符串切分来提取该字段。
+- 平台：五项均为 Linux 语义；Windows / macOS / *BSD 返回 `[]` 或省略字段，不得伪造。
+- 可用性：additive 可选字段，五端（`0.6.0-*`）与 PHP 两个完整副本（`0.6.0-php`、`0.6.0-php-cpanel-ai`）已实现；两个 emulator 副本按上述例外省略字段。控制端以"字段是否存在"判定，不要求版本号门槛。
+- 生命周期：进程级静态属性（P 级）——进程启动后首次 baseinfo 计算一次并写入快照，生命周期内不再重探；**不随 T 级 TTL 过期、也不随临时密钥轮换而重跑**（见「十六」）。
+
+### 15.2 探测总则（准确优先、零子进程、零网络）
+
+1. **只用本地文件与系统调用**（`stat` / `open` / `read` / `readlink` / `geteuid` 等）。禁止 `fork`/`exec` 调 `id`、`ls`、`test`、`systemctl`、`fusermount`：共享主机常禁用 `exec`，Android/Termux 等环境无对应工具，每次进程创建 0.5–3 ms 起，且 `systemctl` 在无 daemon 时可阻塞数十秒。
+2. **零网络、零写操作、不做真实挂载/建 VM/改服务**；唯一例外是 15.4 的可选严格模式 `KVM_CREATE_VM`（默认关闭）。
+3. **只读、幂等、无副作用**：打开的设备/文件必须在正常与异常路径都关闭；baseinfo 可被反复请求，不得泄漏 fd。
+4. **只报确定命中**：任一步失败、权限不足、结果有歧义 → 不报该项。漏报（false negative）可接受，误报（false positive）不可接受——控制端会据此调度真实任务（例如在无 KVM 的机器上起虚拟机）。
+5. **异常隔离**：单个标记探测失败只丢弃该标记，不影响其它标记，也不得影响 baseinfo 其它字段；日志仅 DEBUG 级，不得产生 WARN/ERROR 噪声。
+6. **限长读取**：`/proc` 文件按 8 KiB 分块读取，命中关键词即停止，保留 `len(needle)-1` 字节重叠防止关键词跨块；单文件读取上限 1 MiB。
+
+### 15.3 `root` —— 进程具备 uid/gid 0
+
+判据（同时满足）：**有效**用户 ID 为 0 且**有效**组 ID 为 0。
+
+实现：优先系统调用（py `os.geteuid/getegid`、js `process.geteuid/getegid`、go `os.Geteuid/Getegid`）；无对应 API 的运行时读 `/proc/self/status` 的 `Uid:`/`Gid:` 行，取**第 2 个字段**（effective），例如 `Uid:\t0\t0\t0\t0`。
+
+排除与边界：
+
+- 环境变量 `USER=root`、`/etc/passwd` 首行、`$HOME=/root`、`real uid == 0` 均不足以判定：前三个可伪造，real uid 会在 `sudo`/setuid 场景失真；必须以 effective 为准。
+- **命名空间内 root ≠ 宿主机 root**：容器/用户命名空间里的 uid 0 只是该命名空间内的 root，标记不承诺任何逃逸能力，控制端不得据此推断宿主机权限。
+- uid 0 但 gid ≠ 0（少见）按定义不报。
+- Windows 无 POSIX uid/gid，一律不报。
+
+实测（2026-10-22）：root+KVM 主机 `id` 报 `uid=0(root) gid=0(root)`，`/proc/self/status` 的 `Uid/Gid` 四列全 0 → `root`；翼龙容器报 `uid=998 gid=998 groups=998` 且 `/etc/passwd` 无 998 条目 → 无 `root`。
+
+### 15.4 `kvm` —— 可运行 qemu-kvm 类程序的前提
+
+判据（同时满足，仅 Linux）：
+
+1. `/dev/kvm` 存在且为**字符设备**；
+2. 设备号为 **major 10 / minor 232**（KVM misc 设备固定号）；
+3. 进程能以 `O_RDWR` 成功 `open` 并 `close`。
+
+实现顺序：`stat` → 校验 `S_ISCHR` 与主次号 → `open(O_RDWR)` → `close`。任何一步失败即不报。
+
+不采用的做法：
+
+- `ls -l /dev/kvm`、`test -c /dev/kvm`：需要子进程，且只证明"存在"不证明"当前进程可用"；
+- `os.access` / `File.canRead()` 一类权限位推断：按 **real uid** 判定、忽略 device cgroup 与 LSM 的拒绝，会把"容器映射了设备节点但被 device cgroup 拦下"误判为可用；
+- 读 `/sys/module/kvm`、`/proc/misc`、`/proc/cpuinfo`：只证明驱动加载或 CPU 有虚拟化特性，不证明本进程能打开设备。
+
+可选严格模式（默认关闭）：`open` 成功后再做一次 `ioctl(fd, KVM_CREATE_VM, 0)`（x86_64/aarch64 为 `0xAE01`），成功才报。它排除"有 `/dev/kvm` 但嵌套虚拟化被禁用/CPU 不支持 VMX-SVM"的机器（这类机器 `open` 成功而 `KVM_CREATE_VM` 返回 `ENODEV`/`EIO`）。该 ioctl 只创建一个空 VM 上下文，随即 `close` 释放，无持久副作用；因常量按架构定义，不建议作为缺省路径。
+
+边界：本标记只回答"具备运行 qemu-kvm 的前提"，不保证性能、GPU 直通或嵌套虚拟机可用（严格模式除外）；Windows 的 Hyper-V / WHPX 不在本标记语义内。
+
+实测：root+KVM 主机 `/dev/kvm` 为 `crw-rw---- root:kvm 10, 232`，`open(O_RDWR)` 成功，`KVM_CREATE_VM` 返回成功 → `kvm`；翼龙容器无 `/dev/kvm`（`No such file or directory`）→ 无 `kvm`。
+
+### 15.5 `pterodactyl` —— 运行在翼龙面板管理的容器内
+
+判据：当前进程运行在 Pterodactyl 系面板（wings 调度）管理的 Docker 容器中。按下列顺序判定，任一**强特征**命中即报：
+
+1. **挂载源特征（强，且与进程 uid 无关）**：`/proc/self/mountinfo` 任一行第 4 段（挂载源路径）含 `/var/lib/pterodactyl/`。wings 缺省把服务器卷 `/var/lib/pterodactyl/volumes/<server-uuid>` 绑定挂载到容器 `/home/container`，实测行形如 `... /var/lib/pterodactyl/volumes/<uuid> /home/container rw,relatime - ext4 /dev/sda1 ...`。
+2. **环境变量特征（强）**：`/proc/self/environ` 同时出现 `P_SERVER_UUID=` 与 `P_SERVER_LOCATION=` 两个键；读不到或未命中时再读 `/proc/1/environ`（容器 init 为 `tini -> /entrypoint.sh`，环境同样完整；该文件权限为 0400 且属容器运行用户，需同 uid 或 root，`EACCES` 属正常，直接跳过）。两个键必须同时存在，避免把用户脚本自定义的单个变量当作证据。
+3. **兜底组合（弱，四项必须同时满足）**：`/etc/hostname` 为 36 字符小写 UUID（wings 用服务器 UUID 作 hostname，实测与 `P_SERVER_UUID` 一致）**且** `/home/container` 存在且为目录 **且** 当前 euid 在 `/etc/passwd` 中无对应条目（终端因此显示 `I have no name!`）**且** `/.dockerenv` 或 `/run/.containerenv` 存在。
+
+不采用的特征（已实测证伪或不稳）：
+
+- 容器提示符 `I have no name!@<uuid>:~$`：由 shell 提示符配置决定，agent 拿不到也不应解析；
+- `/proc/self/cgroup` 含 `docker`/`containerd`：cgroup v2 + 私有 cgroupns 下恒为 `0::/`（翼龙容器实测），完全不可用；
+- `/proc/1/comm == tini`：tini 是通用 init，大量非翼龙镜像同样使用；
+- 单个 `USER=container`、`HOME=/home/container`、缺 `/etc/passwd` 条目：都只说明镜像未建用户或惯例路径，非翼龙专有，必须与 UUID hostname 等组合；
+- 镜像名/镜像标签：容器内无法读取自身镜像元数据。
+
+边界：
+
+- wings 的 `system.data` 可自定义，此时特征 1 不命中，靠特征 2/3；
+- 翼龙镜像既有非 root（实测 uid/gid 998）也有 root，`pterodactyl` 与 `root` 可同时出现，互不排斥；
+- 衍生面板若沿用 `P_SERVER_*` 约定，会被本标记覆盖；需要区分时新增标记（见 15.11），不得改本标记语义。
+
+实测（翼龙容器，java 0.5.9，2026-10-22）：`/proc/self/mountinfo` 命中 `/var/lib/pterodactyl/volumes/19e68255-bb71-4a86-b4c8-6e328f59cdec`；`/proc/1/environ` 与 agent 进程环境均含 `P_SERVER_UUID=19e68255-...`、`P_SERVER_LOCATION=de`；`/etc/hostname` 与 `P_SERVER_UUID` 相同；euid 998 在 `/etc/passwd` 无条目；无 `/dev/kvm`、无 `systemctl`、无 `/dev/fuse`。
+
+### 15.6 `systemd` —— 环境能够驱动 systemd/systemctl 执行服务
+
+判据（同时满足，仅 Linux）：
+
+1. `/run/systemd/system` 存在且为目录（systemd `sd_booted()` 的官方判据，表示系统实例已接管当前 PID/挂载命名空间）；
+2. 控制通道存在：`/run/systemd/private` 或 `/run/dbus/system_bus_socket` 至少一个存在（`systemctl` 必须有其一才能下发指令）；
+3. `systemctl` 可定位：`/usr/bin/systemctl`、`/bin/systemctl`、`/usr/local/bin/systemctl` 任一存在，或在 `PATH` 各目录下存在同名可执行文件（只 `stat`，**不执行**）。
+
+辅助校验：若 `/proc/1/comm` 或 `readlink /proc/1/exe` 可读且**明确不是** systemd，则不报；读取失败（`/proc/1` 受限）不作为否决条件，仍按上述三条判定。
+
+排除：
+
+- 仅 `/run/systemd` 目录存在：Debian/Ubuntu 镜像装了 systemd 包但未作为 init 运行（实测翼龙容器即如此：`/run/systemd` 存在、`/run/systemd/system` 不存在）→ 不报；
+- 仅有 `systemctl` 二进制（Docker 镜像常见）→ 不报；
+- PID 1 可读且明确不是 systemd（`/proc/1/comm`/`exe` 指向非 systemd）→ 不报；`/proc/1` 不可读时不据此否决。
+
+边界：
+
+- 本标记是**环境能力**，不是权限：非 root 用户即使 systemd 在跑，改系统服务仍会被 polkit 拒绝。"可无交互管理服务"应判定为 `marks` 同时含 `systemd` 与 `root`。
+- 容器内让 systemd 作为 PID 1（privileged/nesting）同样命中，属预期语义。
+- 用户级实例（`/run/user/<euid>/systemd/private`，`systemctl --user`）**不单独构成** `systemd`：它只能管理用户服务，混入会让"能装/管系统服务"的判断失真；需要表达时新增独立标记（如 `systemd-user`）。
+
+实测：root+KVM 主机 `/run/systemd/system` 为目录、`/run/systemd/private` 与 `/run/dbus/system_bus_socket` 存在、`/usr/bin/systemctl` 存在、PID 1 为 `/usr/lib/systemd/systemd`、`systemctl is-system-running` 返回 `running` → `systemd`；翼龙容器三项全不满足 → 无 `systemd`。
+
+### 15.7 `fuse` —— 具备用 FUSE 挂载网络存储为本地磁盘的前提
+
+目的：判断该环境是否具备把网络/对象存储挂载成本地文件系统的能力前提（`rclone mount`、`sshfs`、`davfs2`、`s3fs`、JuiceFS 等均依赖 FUSE）。
+
+判据（同时满足，仅 Linux）：
+
+1. `/dev/fuse` 存在且为**字符设备**，设备号 **major 10 / minor 229**；
+2. 进程能以 `O_RDWR` 成功 `open` 并 `close`；
+3. 具备挂载执行路径（二者其一）：
+   - `/proc/self/status` 的 `CapEff` **第 21 位（CAP_SYS_ADMIN）为 1**；或
+   - 存在可用的 setuid 挂载助手：`/usr/bin/fusermount3`、`/bin/fusermount3`、`/usr/bin/fusermount`、`/bin/fusermount` 任一存在，`stat` 校验 setuid 位为 1 且对当前进程可执行。
+
+为什么必须有第 3 条：`/dev/fuse` 缺省为 `0666`，任何用户都能 `open`；真正建立挂载的 `mount(2)` 需要 `CAP_SYS_ADMIN`（或由 setuid 的 `fusermount` 代持）。只看设备可打开，会把「Docker 默认 capability 的 root 容器」误判为可挂载——这类容器 `CapBnd` 不含 `CAP_SYS_ADMIN`，即使映射了 `/dev/fuse` 也挂不上。
+
+不采用的做法：
+
+- `/proc/filesystems` 含 `fuse` 或 `/sys/module/fuse` 存在：只证明内核支持/模块加载，容器里常见"内核支持但设备未映射"；
+- 现有 `mountinfo` 里已有 fuse 挂载：只说明别的进程挂过，不代表当前进程有权限新建；
+- 依据 `root` 推断：root 容器可以没有 `CAP_SYS_ADMIN`（见上），非 root 也可以由 setuid 助手完成挂载，两者不可互相推导。
+
+边界：
+
+- 本标记只覆盖 **FUSE 类**挂载。CIFS/SMB（`mount.cifs`）与 NFS 走内核文件系统，不在本标记语义内；需要表达时新增独立标记，不得复用 `fuse`。
+- 不保证具体存储服务网络可达，也不保证对应的协议客户端（rclone/sshfs 等）已安装；标记只承诺"能建立 FUSE 挂载"的前提。
+- 不执行真实挂载：FUSE 挂载需要实现用户态协议守护进程，成本与副作用都不可接受。
+- 非 Linux 平台不报。
+
+实测：root+KVM+systemd 主机 `/dev/fuse` 为 `crw-rw-rw- root:root 10, 229`，`open(O_RDWR)` 成功，`CapEff=000001ffffffffff`（第 21 位为 1；该机未安装 `fusermount3`，root 直接挂载）→ `fuse`；翼龙容器无 `/dev/fuse`、`CapEff=0000000000000000`、`CapBnd=00000000000000e1`（无 `CAP_SYS_ADMIN`）→ 无 `fuse`。
+
+### 15.8 跨语言实现映射
+
+| 语义 | py | js | go | java / java11 | php |
+|---|---|---|---|---|---|
+| 有效 uid/gid | `os.geteuid()` / `os.getegid()` | `process.geteuid()` / `process.getegid()` | `os.Geteuid()` / `os.Getegid()` | 解析 `/proc/self/status` 的 `Uid:`/`Gid:` 第 2 字段 | `posix_geteuid()` / `posix_getegid()`，无 posix 扩展时解析 `/proc/self/status` |
+| 字符设备 + 设备号 | `os.stat` + `stat.S_ISCHR` + `os.major/os.minor(st.st_rdev)` | `fs.statSync().isCharacterDevice()` + `stats.rdev`（按 Linux `dev_t` 解码） | `os.Stat` + `fi.Mode()&os.ModeCharDevice` + `Stat_t.Rdev`（`unix.Major/Minor`，`golang.org/x/sys/unix` 已在依赖） | `Files.getAttribute(p,"unix:mode")` + `"unix:rdev"`，按 `S_IFCHR`(0020000) 与 `dev_t` 解码 | `stat()['mode'] & 0170000 == 0020000`，`stat()['rdev']` 按 `dev_t` 解码 |
+| 读写打开/关闭 | `os.open(p, os.O_RDWR)` / `os.close` | `fs.openSync(p,'r+')` / `fs.closeSync` | `os.OpenFile(p, os.O_RDWR, 0)` / `Close` | `Files.newByteChannel(p, READ, WRITE)` / `close` | `fopen(p,'r+')` / `fclose` |
+| 读 `/proc` 文本（限长） | `open(p,'rb')` 分块读 | `fs.readFileSync` / `createReadStream` | `os.ReadFile` / `os.Open` 分块 | `Files.readAllBytes` | `file_get_contents` / `fopen`+`fread` |
+| 目录 / 文件判断 | `os.path.isdir` / `os.stat` | `fs.statSync().isDirectory()` | `os.Stat` + `IsDir()` | `Files.isDirectory` | `is_dir` / `stat` |
+| 符号链接 | `os.readlink` | `fs.readlinkSync` | `os.Readlink` | `Files.readSymbolicLink` | `readlink` |
+| `/etc/passwd` 条目 | `pwd.getpwuid`（`KeyError` 即无条目） | 解析 `/etc/passwd` 文本（Node 无 getpwuid） | `os/user.LookupId`（错误即无条目） | 解析 `/etc/passwd` 文本 | `posix_getpwuid`，无扩展时解析文本 |
+| `CapEff` | 解析 `/proc/self/status` | 解析 `/proc/self/status` | 解析 `/proc/self/status` | 解析 `/proc/self/status` | 解析 `/proc/self/status` |
+
+> `dev_t` 解码：Linux 为 `major = ((rdev >> 8) & 0xfff) | ((rdev >> 32) & ~0xfff)`、`minor = (rdev & 0xff) | ((rdev >> 12) & 0xfff00)`；只在小设备号场景可退化为 `rdev == (major << 8) | minor`（`/dev/kvm` → 2792，`/dev/fuse` → 2789）。各语言运行时若只暴露原始 `rdev`，按上式解码后与 10:232 / 10:229 比较；确实拿不到可靠编码时，**至少校验字符设备类型**，不得把普通文件当作设备。
+
+### 15.9 性能预算与实测
+
+- 设计目标：五标记冷态全量探测 ≤ 5 ms；热态（缓存命中）≤ 0.5 ms；相对 baseinfo 现有外网 IP 探测（多个 HTTPS 请求，几十至几百 ms）可忽略。
+- 成本分项：`root` 1 次系统调用（java/php 需 1 次 `/proc/self/status` 读，可与 `fuse` 共用）；`kvm` 1 `stat` + 1 `open/close`；`fuse` 1 `stat` + 1 `open/close` + ≤4 次助手 `stat`；`pterodactyl` 1 次 `mountinfo` 读（实测 3–4 KB）+ 1–2 次 `environ` 读；`systemd` 4–5 次 `stat`（`/run/systemd/system`、两个控制通道、≤3 个 `systemctl` 候选路径）。全部为本地、可短路、无子进程。
+- 实测（2026-10-22）：
+  - root+KVM+systemd+fuse 主机（go 0.5.8）：`/proc/self/mountinfo` 3169 B、`/proc/1/environ` 93 B；Python 参考实现（root/kvm/pterodactyl/systemd 四项）200 次均值 **0.085 ms/次**（文件系统缓存热态）。
+  - 翼龙容器（java 0.5.9，uid 998）：`/proc/self/mountinfo` 3649 B、`/proc/1/environ` 567 B；容器内无 python3，未跑同款基准，读取量同量级。
+- 反例成本（禁止路径）：`systemctl is-system-running` 在无 daemon 的环境可阻塞数十秒；每次 `fork/exec` 额外 0.5–3 ms，PHP 共享主机常直接禁用。
+
+### 15.10 兼容性、暴露面与已知边界
+
+- **additive**：不改变 baseinfo 既有字段、端点、认证链、签名与响应加密；旧控制端忽略新字段，新控制端必须容忍字段缺失。
+- **暴露面**：`marks` 与 baseinfo 其余字段同策略下发。当前 baseinfo 位于匿名白名单，实测两台真机未认证 `GET /api/baseinfo` 均返回 200 与全量字段（无 `session_key`），因此 `marks` 同样对未认证方可读。它只含能力布尔值，不含凭证、密钥、路径或地址，敏感度低于已暴露的 `os`/`kernel_version`/`ipv4`。若后续执行 SECURITY-AUDIT 的 M2 / B-3（匿名端点瘦身），`marks` 与 `os`/`kernel_version` 同档处理，不做字段级特殊裁剪，也不新增端点。
+- **已知漏报（预期，不算缺陷）**：非 Linux；`/proc` 被 hidepid 或强隔离屏蔽；翼龙容器无读 `/proc/1/environ` 权限且未命中 `mountinfo`、兜底四条件不全；wings 自定义 `system.data` 且 hostname 非 UUID。
+- **已知误报边界（如实记录）**：`CapEff` 置位但 seccomp/LSM 另行拦截 `mount(2)` 时，`fuse` 仍会命中——本规范不做真实挂载（需实现 FUSE 守护进程，成本与副作用不可接受），接受该极窄误报；同理 `kvm` 在未启用严格模式时只保证"设备可打开"。
+- **误报防线**：弱特征必须四项同时满足；`kvm`/`fuse` 以"能打开设备"而非"路径存在"为准；`systemd` 三重条件；`root` 取 effective 而非 real。
+- **禁止用 `virtualization` 反推**：py 对 `/proc/cpuinfo` 中的 `KVM`/`QEMU` 字样返回 `QEMU`，go 的 `kvm` 表示"本机是虚拟机"，与"能运行 KVM"相反或无关。
+
+### 15.11 扩展规则
+
+1. 取值限定 `[a-z0-9-]+`，语义单一、可在本地验证，不表达程度或质量（不要 `kvm-fast`、`root-limited` 这类取值）。
+2. **additive**：新标记追加到输出末尾，不重命名、不合并、不改变既有标记语义；客户端忽略未知值。
+3. 每个新标记必须在本节补齐"判据 / 实现 / 排除条件 / 性能 / 真机证据"五项，缺一不得进文档。
+4. 平台专属能力（Windows 服务、macOS launchd）与其它挂载体系（CIFS/NFS）单独命名，不复用现有值。
+5. 标记表达"能力存在"的布尔事实；需要表达程度时用新增数值字段，不得塞进 `marks`。
+
+### 15.12 验收建议
+
+- 离线单测：把 `/proc`、`/dev`、`/etc` 根路径做成可注入常量（如 `PROC_ROOT`、`DEV_ROOT`），覆盖"命中 / 不命中 / 读取失败 / 权限拒绝 / 字段异常"五类用例；断言 `marks` 不含未知值、无重复、顺序固定。
+- 真机矩阵（交叉核对命令见下）：
+
+| 场景 | 期望 `marks` |
+|---|---|
+| 翼龙容器：998:998、无 `/dev/kvm`、无 `/dev/fuse`、无 systemd | `["pterodactyl"]` |
+| root + `/dev/kvm` 可读写 + systemd 运行 + `/dev/fuse` 可读写且有 `CAP_SYS_ADMIN` | `["root","kvm","systemd","fuse"]` |
+| Docker root 容器（默认 capability，无 `CAP_SYS_ADMIN`） | 不含 `fuse`（即使映射了 `/dev/fuse`）；无 `/dev/kvm` 时也不含 `kvm` |
+| 非 root、不在 `kvm` 组 | 不含 `kvm` |
+| 有 `systemctl` 但 `/run/systemd/system` 缺失 | 不含 `systemd` |
+| Windows 代理 | `[]` 或字段缺失 |
+
+- 交叉核对（只读命令）：`id -u; id -g; grep -E '^(CapEff|Uid|Gid)' /proc/self/status; stat -c '%F %t:%T %a' /dev/kvm /dev/fuse 2>&1; test -d /run/systemd/system && echo systemd-ok; tr '\0' '\n' < /proc/1/environ | grep -E '^P_SERVER_(UUID|LOCATION)='`。
+- 性能门限：冷态 ≤ 5 ms、热态 ≤ 0.5 ms；以 `strace -f -e trace=process` 断言探测路径零 `fork`/`clone`。
+- 一致性：五端（py/js/go/java/java11）对同一台真机必须给出相同集合（顺序按 15.1）；PHP 端不在本仓，以分发 dist 实测为准（两个 emulator 副本不探测、按 15.1 省略字段）。
+
+## 十六、`/api/baseinfo` 字段分级缓存与快照语义
+
+> **一句话**：`marks` 等 P 级字段在进程生命周期内只探测一次并永久复用；`disk_total`/`mem_total`/`swap_total` 每 30 秒重探（local 组）；`ipv4`/`ipv6` 每 3600 秒重探（net 组）；`session_key`/`noise_key` 每请求装配、绝不入快照。
+
+### 16.1 现状与问题（2026-10-22 代码实测）
+
+- 现行 baseinfo 的**系统信息整体快照 TTL 是 3600 秒**：py `Config.BASEINFO_CACHE_TTL`（`py/agent.py:824`）、js（`js/agent.js:387`）、go（`go/handlers/baseinfo.go:45`）、java（`java/src/main/java/kisama/kisama.java:155`）、java11（`java11/src/main/java/kisama/kisama.java:155`）。
+- **30 秒是 `/api/status` 的 TTL**（py `:825`、js `:388`、go `:131`、java `:156`、java11 `:156`），不是 baseinfo 的。因此"30 秒内重复调用返回快照"在现行代码里成立（1 小时内都命中），但"30 秒后重探 baseinfo"并不成立——现行是 1 小时后**整份**重建。
+- 真正造成无效 CPU 的三条路径：
+  1. **临时密钥轮换清空整份快照**：py `rotate_operational_secrets`（`:765-775`）、js（`:365-373`）、java/java11（`:107-110`）都把 baseinfo 快照置空，下一次调用要重跑全部字段（含最多 11 次外部 HTTPS 的 IP 探测：v4 4–7 个 + v6 2–4 个候选，失败逐个回退）。而凭证在响应阶段按认证状态装配/覆盖（py `:5479-5486`、js `:5314-5322`、go `:89-118`、java `:599-612`），轮换并不需要动系统信息快照。注意：js 的 `getBasicInfo()`（`:1030-1031`）目前也会把凭证写进返回对象，缓存前必须剥离——响应阶段本就会覆盖，当前不会直接泄露，但违反"快照不含凭证"的不变量；java/java11 的 `buildRawBaseInfo()`（java `:2354`、java11 `:2407`）已是纯系统字段，凭证在路由层附加（java `:599-612`），无需额外剥离。
+  2. **整份重建**：任一字段过期即重跑所有字段，`marks`、`virtualization`、`os`、`kernel_version` 等静态字段陪跑。
+  3. **进程启动首调**：全部字段一次跑满；容器平台频繁重启时这笔开销反复出现。
+- go 版已把"系统快照"与"凭证"分开：`go/handlers/baseinfo.go:61-87` 的缓存槽只存纯系统字段，`:89-118` 再按请求附加凭证；轮换时由 `go/kisama/service.go:90-96` 调用 `InvalidateSecretCaches`（`baseinfo.go:26-34`）清空快照——凭证分离结构可直接作为本次改造的参考模型，清空动作则应按 16.4 第 4 条去掉。
+
+### 16.2 两级缓存模型
+
+- **P 级（process-static，进程级静态）**：进程启动后首次 baseinfo 计算一次，写入不可变快照；之后无论间隔多久、是否发生密钥轮换，都直接复用，不再执行探测。只有进程重启（或未来显式的运维失效动作）可重置。
+- **T 级（ttl，快照过期重探）**：按字段组维护"上次探测时间 + 上次结果"；`now - probed_at >= ttl` 时重探该组，否则复用。各组独立计时、互不牵连。T 级分两个组：**local** = `disk_total`/`mem_total`/`swap_total`（30s）；**net** = `ipv4`/`ipv6`（3600s）。每组只维护一个时间戳，组内字段一起重探，不按字段各存一份时间戳。
+- **响应 = P 快照 + T 快照 + 每请求凭证材料**。T 组过期只重探该组；P 级不因 T 过期、密钥轮换或并发请求而重跑。
+
+### 16.3 字段分级
+
+| 字段 | 级别 | TTL | 探测成本 | 依据 |
+|---|---|---|---|---|
+| `arch` | P | 进程生命周期 | 极低（1 次系统调用/常量） | 进程内不变 |
+| `cpu_cores` | P | 进程生命周期 | 低 | CPU 热插拔属极端场景，不为此每请求读取；需要时重启刷新 |
+| `cpu_name` | P | 进程生命周期 | 低（解析 `/proc/cpuinfo`） | 进程内不变 |
+| `gpu_name` | P | 进程生命周期 | **可能高**（若走 `nvidia-smi` 等子进程） | 只允许探测一次；失败不重试 |
+| `os` | P | 进程生命周期 | 低（`/etc/os-release`） | 进程内不变 |
+| `kernel_version` | P | 进程生命周期 | 低（`uname`） | 进程内不变 |
+| `version` | P | 进程生命周期 | 常量 | 代理版本 |
+| `virtualization` | P | 进程生命周期 | 中（`/.dockerenv`、cgroup、mountinfo、cpuinfo） | 容器/虚拟化身份在进程内不变 |
+| `marks` | **P** | 进程生命周期 | 中（stat/open、mountinfo、environ） | 与第十五节一致：**进程全生命周期只探测一次** |
+| `disk_total` | T | **30s** | 低（`statvfs`） | 卷扩容后 30 秒内可见 |
+| `mem_total` | T | **30s** | 低（`/proc/meminfo` 或 cgroup 限额文件） | 容器限额调整后 30 秒内可见 |
+| `swap_total` | T | **30s** | 低（`/proc/meminfo` 或 cgroup 文件） | 同上 |
+| `ipv4` | T | **3600s** | **高**（多个外部 HTTPS + TLS） | 公网地址极少在 30 秒内变化；30 秒重探会把外部请求量放大 120 倍 |
+| `ipv6` | T | **3600s** | **高**（同上） | 同上 |
+| `session_key` | 每请求 | — | 低 | 凭证材料，**绝不进入快照** |
+| `noise_key` | 每请求 | — | 低 | 同上 |
+| `status` | 响应信封 | — | 常量 | go 版固定 `"ok"`，不参与分级 |
+
+补充规则：
+
+- `marks` 归 P 级是硬性要求：参考实现（root/kvm/pterodactyl/systemd 四类，不含 fuse）实测 0.085 ms/次，但包含 `stat`/`open`/`mountinfo`/`environ` 读取，不应随每次 baseinfo 调用执行。
+- `ipv4`/`ipv6` 单独保持 3600s：单次探测最多 11 个外部 HTTPS（v4 4–7 个 + v6 2–4 个候选，TLS 握手 + 加解密），与"降 CPU"目标直接冲突；确需更快刷新时只调小该组 TTL（不建议低于 300s），**不得**把 IP 并入 30 秒的本地组。
+- 新增字段必须先在本表定级并写明探测成本，未定级字段不得进入响应。
+- T 级 TTL 为各端实现常量；若后续开放配置，必须五端同名、同默认值，并另行登记文档。
+
+### 16.4 快照语义与失效规则
+
+1. **首次调用**：P 级全部字段 + T 级全部组各探测一次，按 16.3 分级合并响应；字段顺序沿用各端既有 baseinfo 响应，不因分级而重排。
+2. **全部命中**：P/T 均复用，不产生任何 `stat`/`open`/`read`/网络/子进程调用，只剩响应组装与加密。
+3. **T 组过期**：只重探该组——`disk_total`/`mem_total`/`swap_total` 为本地廉价组（30s），`ipv4`/`ipv6` 为网络组（3600s）；P 级原样复用。T 组重探不得顺带调用 P 级探测（py `_get_disk_info` 目前会调用 `_get_virtualization()`，`:1959`；拆分后必须复用 P 级结果）。
+4. **密钥轮换**：只替换响应中的 `session_key`/`noise_key`，**不得**清空 P/T 快照，也不得触发任何重探。前提是实现先把凭证从缓存对象中剥离（见 16.1 的 js 注记），凭证只在响应阶段装配。
+5. **进程重启**：所有层重建，这是唯一允许全量重探的时机。
+6. **时钟**：TTL 必须用单调时钟（py `time.monotonic`、go `time.Since`/`time.Now().Sub`、js `process.hrtime.bigint`、java/java11 `System.nanoTime`），不得用会被校时跳变的墙钟。
+7. **并发**：P 级与每个 T 组各自 single-flight；未命中时只允许一个探测执行，其余请求等待并复用其结果，不得串行重探（js 现有 `_baseinfo_fetch_promise` 即此模式，`js/agent.js:5291-5304`）。
+8. **失败策略**：P 级失败按字段类型写入兜底值（`marks` = `[]`、字符串 = 空串、数值 = 0）并在进程内不再重试，避免反复触发昂贵探测；T 级失败沿用上一次成功值，无历史值时按字段类型回退（`ipv4`/`ipv6` = `null`，数值 = 0），且失败后 60 秒内不再重试（失败退避），防止失败风暴。
+9. **响应稳定性**：同一 TTL 窗口内，系统信息字段的键值与顺序保持一致，便于面板做 diff/缓存；凭证字段除外。
+
+### 16.5 与 `/api/status` 的边界
+
+- `/api/status` 保持 30 秒 TTL 不变，继续提供 CPU/内存/磁盘**使用量**、连接数、负载等秒级数据。
+- baseinfo 的 T 级只提供**容量/身份**类慢变字段，不扩展为监控接口；需要 30 秒级使用率请调 `/api/status`。
+- 两者不得共享缓存，也不得互相触发失效。
+
+### 16.6 性能预算与验收
+
+- 稳态（全部命中）：零子进程、零网络、零 `/proc` 扫描，单次开销应与响应加密同量级。本规范只消除探测开销；响应序列化与加密仍按请求执行，若实现后 CPU 仍高，应单独测量加密路径（ECIES/AES-GCM）与会话密钥模式，不得把加密成本误归因于探测。
+- 30 秒组刷新：`statvfs` + `/proc/meminfo`（或 cgroup 文件），目标为毫秒级且不产生网络/子进程调用；py 的 host 磁盘路径会枚举分区（`_get_host_disk_info`，`:1929-1956`），成本高于单次 `statvfs`，拆分时必须复用 P 级 `virtualization`，不得每 30 秒重跑。
+- 网络组刷新（3600s）：外部 HTTPS 探测仍是主要成本，频率保持现状。
+- P 级一次性成本：`marks` 参考实现（四类，不含 fuse）实测 0.085 ms（2026-10-22，root 主机，200 次均值）；`virtualization` 含 3–4 KB mountinfo 读取；java `getGpuName`（`:2777`）会起 `nvidia-smi` 子进程，`gpu_name` 只允许在 P 级执行一次且失败不重试。
+- 验收断言（建议做成离线单测 + 探测计数埋点）：
+  1. 间隔 < 30s 连续 N 次调用：P 级整体只构建 1 次，local/net 组各刷新 1 次；
+  2. 等待 31s 后再调用：P 仍为 1，local = 2，net 仍为 1；
+  3. 触发一次临时密钥轮换后再调用：P/T 计数均不变，响应中的 `session_key`/`noise_key` 已更新；
+  4. 等待 > 3600s 后再调用：net +1，P 不变；
+  5. 稳态调用在 `strace -f -e trace=network,process` 下无网络与进程创建系统调用。
+
+### 16.7 各端落点（本轮不改代码）
+
+| 端 | 现行缓存位置 | 需调整点 |
+|---|---|---|
+| py | `py/agent.py:5463-5486`（读缓存 + 附加凭证）、`Config.BASEINFO_CACHE_TTL` `:824`、轮换 `:765-775` | 拆 P/T 层；T 组复用 P 级 `virtualization`（`_get_disk_info` 现于 `:1959` 重探）；轮换不再清空系统快照 |
+| js | `js/agent.js:5285-5322`（含 single-flight）、`:387`、轮换 `:365-373` | 拆 P/T 层；从 `getBasicInfo` 返回值剥离凭证（`:1030-1031`）后再入缓存；轮换不再清空系统快照 |
+| go | `go/handlers/baseinfo.go:37-118`（已分离凭证，仍是单一 3600s 快照）、`go/utils/system.go:58`（`GetSystemInfo`） | 把单一快照拆成 P/T 组；`InvalidateSecretCaches`（`baseinfo.go:26-34`，由 `go/kisama/service.go:95` 调用）改为不再清空系统快照 |
+| java | `java/src/main/java/kisama/kisama.java:570-619`、`:155`、`:107-110` | 拆 P/T 层；`buildRawBaseInfo` 已是纯系统字段（凭证在路由 `:599-612` 附加），保持；轮换不再清空系统快照 |
+| java11 | `java11/src/main/java/kisama/kisama.java:571`（缓存检查）、`:155-156`、`:109`；`buildRawBaseInfo` `:2407`（纯系统字段） | 与 java 对称（拆 P/T、保持 `buildRawBaseInfo` 纯净、轮换不清快照） |
+| php | 不在本仓（`kisamaphp` 四副本已同步实现） | 按 16.9 适配：P/local 每请求现算、net 组状态文件 3600s；两个 emulator 副本不探测 `marks` |
+
+### 16.8 兼容性
+
+- 响应字段集合与类型不变，仅明确各字段的"新鲜度契约"，旧客户端零适配。
+- 客户端不得假设 P 级字段在进程存活期间会变化；需要环境变化请重启代理后重取。
+- `marks` 的"可选、缺失、未知值忽略"契约（15.1）不变；本章把它的"进程级一次探测"从建议升格为规范。
+- 不新增环境变量；TTL 为各端常量。若未来开放配置，必须五端同名同默认并登记文档。
+
+### 16.9 PHP 实现适配口径（无跨请求用户态内存）
+
+PHP 端（`kisamaphp` 四个副本）每次请求一个生命周期，§16.2 的 P/T 模型按下述口径适配，不视为偏离规范：
+
+- **P 级 = 单请求内一次**：`arch`/`cpu_cores`/`cpu_name`/`gpu_name`/`os`/`kernel_version`/`version`/`virtualization`/`marks` 在每次 `getBasicInfo()` 内各现算一次、不落盘；单次请求内不重复探测，跨请求不承诺"进程生命周期一次"（PHP 无跨请求进程态）。
+- **T-local 每请求现算**：`disk_total`/`mem_total`/`swap_total` 直接现算，比 30 秒窗口更新鲜，成本可忽略（`disk_total_space` 与 `/proc/meminfo` 读取），不做文件缓存。
+- **T-net 用状态文件缓存 3600s**：`ipv4`/`ipv6` 缓存于 `.kisama_baseinfo_cache.php`（目录规则与既有状态文件一致：站点目录优先、系统临时目录兜底），文件为 `<?php exit(); ?>` 卫语句头 + JSON `{"v":1,"net":{"ipv4":...,"ipv6":...},"net_at":<unix秒>}`，只含公网 IP，无密钥、路径；命中（`time() - net_at < 3600`）时完全跳过 `_getPublicIp()` 的外部 HTTPS 探测，缺族时仍按旧口径做 `SERVER_ADDR` 兜底。文件损坏、版本不符、字段类型异常一律按未命中处理。
+- **并发与失败**：`fopen($file,'c+')` + `flock(LOCK_EX|LOCK_NB)`；抢到锁者探测，并以"临时文件 + `rename`"原子替换（Windows 下 flock 为强制锁，写缓存必须在解锁并关闭句柄后执行，否则会被截断为空；rename 失败退化为直接覆写）；未抢到锁者若有旧值直接复用（stale-while-revalidate，避免惊群），无旧值才自行探测；探测双族失败时保留旧值且不写盘（下次请求重试，不退避）；目录不可写 / `open_basedir` 拦截时静默退化为每请求探测，不影响响应。
+- **时钟**：跨请求无单调时钟可用，TTL 判定用墙钟 `time()`；校时跳变仅影响缓存提前/延后过期，不影响字段正确性。
+- **轮换**：PHP 无 tempkey 轮换逻辑，16.4 第 4 条在 PHP 侧 N/A；`session_key` 仍由 `StateManager` 持久化，行为不变。
+- **marks 例外**：两个 emulator 副本（低权限）不实现探测，按 15.1 以字段缺失表达"未探测"，禁止输出 `[]` 或 `null`；两个完整副本非 Linux 时输出 `[]`（字段存在性稳定）。
+- 除上述差异外，字段集合、顺序、类型与 15.1/16.3/16.8 一致；认证链、`PLAIN_MODE`/`DEBUG` 语义与 `/api/status` 逐请求现算均不变。
+
+---
+
+## 十七、控制端后台轮询与调度机制（Kisama Panel 对代理端点的周期调用口径）
+
+> **一句话**：面板打开即拉起三条常驻周期——节点任务维护（默认 5 分钟）、节点基础信息同步（默认 10 分钟）、配置云同步（默认 10 分钟；三者的周期与开关均可调，见 17.6）；调度统一为「欠账驱动」——tick 到点只查账（距上次发起 ≥ 门槛才执行），hidden 期间任务维护/节点探测跳过、配置云同步仍按欠账执行（1 次 GET 成本极低、后台尽力而为），回到前台对超门槛欠账各补跑一次；另有变更驱动的云同步防抖通道与切后台前冲刷；全部轮内作业单飞锁 + 并发上限，任何使用模式下请求总量 ≤ 固定间隔轮询版本。代理侧零配合、零新接口，本节回答「节点为什么隔几分钟被连一次」的运维排障口径。
+
+（截至 2026-10-23，面板 0.6.4 代码现状定稿。调度实现位于 kisama-panel 仓 `src/lib/task-daemon.ts` / `config-sync-scheduler.ts` / `node-backoff.ts`，本节只定契约语义，不登记面板行号。）
+
+### 17.1 定位与适用面
+
+- 面板（控制端）对代理端点的调用分两类：**用户动作**（手动刷新、任务保存/行内编辑、立即执行、节点转移、AI 助手操作等，发起即执行）与**后台守护调度**（本节）。用户动作不经守护进程、不受其门禁影响。
+- 守护调度完全运行在面板浏览器页内：页面挂载即 `taskDaemon.start()`，卸载即 `stop()`，无任何常驻服务端组件。即使页面切到后台标签页，也可能在节流窗口内继续连代理——trycloudflare / shz.al 按量计费隧道、低配共享主机、流量审计场景需明确默认节奏与喊停手段（17.6 开关）。
+
+### 17.2 三条常驻周期
+
+| 作业 | 默认周期 | 启动首跑（错峰） | 目标端点 / 数据面 | 节点范围 | 失败处置 |
+|---|---|---|---|---|---|
+| 🛡️ 节点任务维护 | 5 分钟（可调，17.6） | 启动后 10 秒 | 四、任务管理：13 GET 启动任务 + 15 GET 定时任务；仅「远端双向清单**全空**而本地非空」时按 14/16 整表回灌 | 仅 `status=online` 且非 PHP 探针节点 | 不适用退避；请求失败丢弃会话缓存重新握手后立即重试一轮 |
+| 🔄 节点基础信息同步 | 10 分钟（可调，17.6） | 启动后 20 秒（逐节点新鲜度门禁兜底 17.5） | 一.1 GET `/api/baseinfo`（会话建立 + 在线探测 + shz 域名解析汇聚点） | 全部活跃节点 | 逐节点指数退避（17.5）；每轮前先做中转站点池健康洗牌 |
+| ☁️ 配置云同步 | 10 分钟（可调，17.6） | 启动后 5 秒（启动即拉，先对齐云端一次） | 不走代理端点：WebDAV `kisama.json` 分域合并（push/pull/merge 幂等路由；内容一致走 in-sync 快速通道零写入） | —（不针对节点） | busy/error 有界重试（17.3）；未登录引擎内部零开销跳过 |
+
+- 节点遍历统一 worker 池并发上限 **4**，不占满浏览器并发连接域。
+- 三循环的开关与周期由用户可调（17.6）；「暂停开关」只管辖任务维护循环，任务维护的会话握手开销随其循环一同停。
+
+### 17.3 配置云同步的完整触发面（runConfigSync 幂等，重复调用无副作用）
+
+| 触发 | 时机 | 说明 |
+|---|---|---|
+| 登录首同步 | WebDAV 登录成功即刻 | 带 toast 通知 |
+| 周期兜底 | 每 10 分钟 | 面板时钟节拍 |
+| 变更驱动 | 任意「用户配置意图」写入点 → `scheduleConfigSync()` | 4 秒尾沿防抖把连续变更簇（批量导入、AI 批量修改）合并为一轮；busy/error 只做一次 20 秒有界重试，其余交给周期兜底；探测心跳/探活缓存等运行时数据不触发 |
+| 关键时刻冲刷 | 页面 hidden 前 | 挂起中的防抖触发立即发出，避免切走丢失上云时机 |
+| 切回补跑 | 回前台且距上次发起 ≥ 2 分钟 | 门槛远小于节点探测（补拉仅 1 次 GET）——分叉窗口最小化优先 |
+| 应用抑制 | 云同步把远端包应用到本地期间 | 应用走与用户变更相同的写入函数，期间 `scheduleConfigSync` 被抑制，防「同步触发同步」空转 |
+
+### 17.4 欠账驱动与分级后台策略（前台/后台分界）
+
+- **欠账驱动（统一判据）**：三作业各有「上次发起」时间戳，任何唤醒（周期 tick、切回事件、切回补跑）都先查账——`now - lastRunAt ≥ 门槛` 才执行，发起即记账；启动错峰首跑 force 直通（不查账，记账照常）。节流唤醒、冻结恢复的积压齐发 tick、切回补跑共用判据，任何唤醒形态至多放行一轮。
+- **分级后台（hidden 期间）**：
+  - 任务维护与节点探测：周期 tick 到点**一律跳过**且不记账（欠账持续累计）——一轮要对全部节点发起真实连接，后台代价大；
+  - 配置云同步：**豁免跳过**——tick 醒来照常查账执行（门槛 = 完整周期 10 分钟），1 次 GET 成本极低，后台未冻结时能更新就更新，前台回来欠账更少；变更驱动防抖与 hidden 冲刷不受影响。
+- **回到前台**：三条作业统一按各自门槛查账补跑——任务维护门槛 = **一个完整周期（5 分钟）**，节点同步 = **一个完整周期（10 分钟）**，配置同步 = **2 分钟**；快速 alt-tab / 窗口短暂遮挡零请求。
+- 后台节流与整页冻结（浏览器 Memory Saver、移动端切走）会让周期与防抖停止触发；欠账判据基于 `Date.now()` 墙钟，不受冻结影响不丢账；冻结恢复后浏览器积压 timer 齐发，查账 + 单飞锁保证只放行一轮、其余 no-op。
+- 设计不变式：分级后台 + 欠账补跑 + 单飞锁 ⇒ 任何使用模式的请求总量 ≤ 固定间隔轮询版本。
+
+### 17.5 并发、会话与退避预算
+
+- **单飞锁**：三条作业各自互斥；`setInterval` 不等待上一轮完成，锁防请求跨轮堆积占满浏览器连接池。
+- **会话客户端缓存**：`getBaseInfo` 建立的会话在 TTL **9 分钟**（约覆盖两个维护周期）内跨轮复用，例行维护不重复握手；隧道地址轮换（shz `resolvedUrl` 变化）按域名快照失效重建；写入类请求失败视为会话失效，丢弃缓存重新握手后立即重试一轮。
+- **节点同步退避**（仅探测作业，任务维护不用）：单节点轮内先带一次 800ms 延时重试，仍失败按指数退避 1/2/4/…分钟、封顶 **12 小时**；退避态为面板共享模块（`node-backoff.ts`），**任一入口同步成功立即清除**（手动刷新成功即纠偏下一轮自动调度），同步失败不动退避（死节点不因此回到高频轮询）。
+- **逐节点新鲜度门禁**：daemon 探测只针对 `lastConnected`——随节点持久化的「最后成功探测时刻」（仅成功写入，含手动刷新成功，UI 🕒 同源）——距今 ≥ 配置的轮询周期（可调，默认 10 分钟）的节点；新鲜节点直接跳过（粒度细于轮级欠账判据、跨刷新生效、手动劳动跨刷新被尊重）。无记录（从未探测、首探失败）视为欠账必探。适用于 daemon 的三种唤醒（周期 tick / 切回补跑 / 启动错峰首跑 force）；面板手动「全部同步 / 单节点刷新 / 只刷新离线主机」不经 daemon，不受门禁。
+
+### 17.6 「后台轮询」开关与可调周期（面板 0.6.3+ 开关 / 0.6.4+ 周期与开关全面可调，用户可控）
+
+- **控制入口三处**（同为设备本地运行态）：
+  - 全局任务中心页脚：任务维护「暂停/恢复」开关 + 任务维护「周期」选择器（1/2/3/5/10/15/30/60 分钟档）；
+  - 设置-通用设置「🔄 节点在线探测轮询」：探测的开关与周期（默认开/10 分钟），随设置弹窗「全局统一大保存」生效；
+  - WebDAV 登录弹窗（已登录横幅下方，仅登录后展示）：☁️ 云同步自动轮询开关 + 周期选择器（同款分钟档），芯片即改即生效无需保存。
+- **语义**：
+  - 任务维护暂停开关：仅停任务维护循环（visibility 切回补跑对暂停态同样静默跳过，不破例）；恢复 → 错峰 force 首跑 + 周期节拍；
+  - 探测开关：关 → 周期循环停（手动「🔄 全部同步 / 单节点刷新 / 只刷新离线主机」不受影响）；开 → 错峰 force 首跑，逐节点新鲜度门禁自动跳过刚探测过的节点；
+  - 云同步开关为**总闸**：关闭时周期循环、「变更即触发」的防抖 fire、页面隐藏前冲刷全部静默停止（后两者经 config-sync-scheduler 的自动同步闸）；WebDAV 登录首同步为显式动作不经闸门；重新开启 → 启动即拉补齐关闭期间积压的变更对齐。
+- **持久化与生效**：`kisama_task_daemon_paused`（暂停跨刷新保持）与 `kisama_task_poll_prefs`（三循环开关+周期一并 JSON）均为设备本地运行态——列入导出/云备份包**排除清单**且还原端硬跳过（换设备回落默认值才是安全态，同 0.6.3 暂停键裁决）；周期钳制 1..360 分钟整数，非法字段逐项回落默认；改「周期」即时生效并保留欠账时间戳（不做 force 首跑，调间距不触发一轮）。
+
+### 17.7 零轮询边界（面板刻意不发起请求的面）
+
+- 全局任务中心打开 = **零网络请求**（localStorage 本地镜像）；🔄 手动刷新才发起一轮全节点核对（远端与镜像有差异才采纳回镜像）；任务保存后仅对被改节点做一次确认性重拉。
+- `/api/status`（一.2）当前**未接入任何周期轮询**（面板定义了客户端但无调用点）。
+- 冻结节点（回收站）不在活跃列表，恢复前守护调度永不对其发起连接。
+- PHP 探针节点不参与任务维护（任务端点不支持）。
+
+### 17.8 请求预算不变式与已知边界
+
+- **不变式**：上述门禁叠加后，任何使用模式（常驻前台、切后台、暂停开关、浏览器冻结恢复）下的请求数均 ≤ 固定间隔轮询版本，且手动操作路径不受守护调度影响——0.5.3 轮询治理确立的目标至今保持。
+- **已知边界**：配置云同步的后台执行属尽力而为——整页冻结（Memory Saver/移动端切走）期间完全停摆，欠账回到前台按 2 分钟门槛补齐；10 分钟周期仅是兜底节拍，实时性承诺由变更驱动通道（17.3）承担。任务维护/节点探测在 hidden 期间不执行、回前台按完整周期门槛补跑，冻结/睡眠恢复的一个周期内缺口由该补跑覆盖。
+- **对代理端的唯一语义依赖**：任务回灌仅在远端**双向全空**且本地非空时触发（13/15 读 + 14/16 写、整表下发；语义见第十三节 KSTORE 启动恢复）。守护进程对**非空**远端任务清单零写请求——代理侧手工维护的任务不会被后台轮询抹掉；远端非空清单的差异性对账属面板手动刷新动作，不经守护调度。
