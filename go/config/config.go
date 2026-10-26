@@ -44,6 +44,8 @@ type Config struct {
 	MaxUploadSize  int64
 	FollowSymlinks bool
 	FileAuditLog   bool
+	// DownloadEncryptMax: 下载加密契约阈值(字节), 见 docs/API.MD 下载加密小节 (0=恒明文)
+	DownloadEncryptMax int64
 
 	// Tasks
 	InitTask          bool
@@ -247,6 +249,17 @@ func New() (*Config, error) {
 	followSymlinks := os.Getenv("FOLLOW_SYMLINKS") == "true"
 	fileAuditLog := os.Getenv("FILE_AUDIT_LOG") != "false"
 
+	// 🔐 0.6.1 M10 下载加密契约 (docs/API.MD 下载加密小节): x-dl-enc:1 且文件 ≤ 此值(字节)时,
+	// /api/file/download 响应走 0.5.6 AES-256-GCM(session_key) 容器并盖 x-encrypted: true;
+	// 其余 (无 opt-in 头/超阈值) 保持原始字节流——旧客户端零适配, 大文件不付 Base64+33% 与
+	// 整读内存的代价。0 = 关闭加密 (恒明文)。
+	downloadEncryptMax := int64(4194304)
+	if val := os.Getenv("DOWNLOAD_ENCRYPT_MAX"); val != "" {
+		if n, err := strconv.ParseInt(val, 10, 64); err == nil {
+			downloadEncryptMax = n
+		}
+	}
+
 	taskTimeout := 300
 	if val := os.Getenv("TASK_TIMEOUT"); val != "" {
 		if n, err := strconv.Atoi(val); err == nil {
@@ -289,7 +302,7 @@ func New() (*Config, error) {
 
 	agentVersion := os.Getenv("AGENT_VERSION")
 	if agentVersion == "" {
-		agentVersion = "0.6.0-go"
+		agentVersion = "0.6.1-go"
 	}
 
 	tempKeyDefaultTTL := 24
@@ -320,6 +333,7 @@ func New() (*Config, error) {
 		MaxUploadSize:     maxUploadSize,
 		FollowSymlinks:    followSymlinks,
 		FileAuditLog:      fileAuditLog,
+		DownloadEncryptMax: downloadEncryptMax,
 		InitTask:          true,
 		TaskTimeout:       taskTimeout,
 		CronCheckInterval: cronCheckInterval,

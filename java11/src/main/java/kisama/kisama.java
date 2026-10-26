@@ -193,7 +193,12 @@ public class kisama {
 
     private static final int TEMPKEY_DEFAULT_TTL_HOURS = Integer.parseInt(DOTENV.getOrDefault("TEMPKEY_TTL", "24"));
     private static final int TEMPKEY_MAX_TTL_HOURS = Integer.parseInt(DOTENV.getOrDefault("TEMPKEY_MAX_TTL", "168"));
-    private static final String AGENT_VERSION = "0.6.0-java11";
+    // 🔐 0.6.1 M10 下载加密契约 (docs/API.MD 下载加密小节): x-dl-enc:1 且文件 ≤ 此值(字节)时,
+    // /api/file/download 响应走 0.5.6 AES-256-GCM(session_key) 容器并盖 X-Encrypted: true;
+    // 其余 (无 opt-in 头/超阈值) 保持原始字节流——旧客户端零适配, 大文件不付 Base64+33% 与
+    // 整读内存的代价。0 = 关闭加密 (恒明文)。
+    private static final long DOWNLOAD_ENCRYPT_MAX = Long.parseLong(DOTENV.getOrDefault("DOWNLOAD_ENCRYPT_MAX", "4194304"));
+    private static final String AGENT_VERSION = "0.6.1-java11";
 
     // baseinfo 三组快照 (docs/API.MD 十六): P 级进程内只建一次; T-local 30s; T-net 3600s.
     // 快照只含系统字段, 凭证在路由层按请求装配, 轮换不再清空
@@ -488,7 +493,15 @@ public class kisama {
 
             // 🌟 1. 默认所有人都是未认证状态 (false)
             req.attribute("is_authenticated", false);
-            
+
+            // 🔐 0.6.1 C4 修复 (SECURITY-AUDIT 第十四节 14.1): 本协议从不使用 X-HTTP-Method-Override
+            // 头, 但 spark-core 路由匹配会优先采信该头 (MatcherFilter.getHttpMethodFrom), 与下方
+            // OPTIONS/HEAD 预检早退组合, 可让"过滤器按真实方法放行、路由按覆盖方法执行"绕过验签
+            // 直达 handler。携带即拒绝, 合法控制端 (control.py / kisama-skill) 永远不发该头。
+            if (req.headers("X-HTTP-Method-Override") != null) {
+                halt(400, this.gson.toJson(Map.of("error", "X-HTTP-Method-Override header is not allowed")));
+            }
+
             boolean isBypassPath = "/api/baseinfo".equals(endpoint) || "/api/status".equals(endpoint);
 
             // 🌟 2. 优先判定 DEBUG 模式：如果为 true 直接拉满信任并放行
@@ -927,11 +940,27 @@ public class kisama {
             String p = Objects.toString(body.getOrDefault("path", " "));
             Path full = Paths.get(this.FILE_ROOT).resolve(p).normalize();
             if (!isPathInsideFileRoot(full) || !Files.exists(full)) halt(404);
-            byte[] data = Files.readAllBytes(full);
+            // 🔐 0.6.1 M10 修复 (docs/API.MD 下载加密契约): x-dl-enc:1 且 ≤ DOWNLOAD_ENCRYPT_MAX
+            // → 响应走 AES-GCM(session_key) 容器并盖 X-Encrypted: true, 客户端按该响应头分支;
+            // 加密失败 fail-closed halt 500, 绝不静默降级明文。其余情形返回原始 byte[] ——
+            // res.body 保持 null, after 过滤器跳过加密, 由 Spark Body.serializeTo 裸流回写。
+            long dlSize;
+            try { dlSize = Files.size(full); } catch (Exception e) { halt(404); return ""; }
             res.type("application/octet-stream");
-            res.header("X-File-Size", String.valueOf(data.length));
+            res.header("X-File-Size", String.valueOf(dlSize));
             res.header("X-Original-Path", p);
-            return data;
+            if ("1".equals(req.headers("x-dl-enc")) && !this.DEBUG && DOWNLOAD_ENCRYPT_MAX > 0 && dlSize <= DOWNLOAD_ENCRYPT_MAX) {
+                try {
+                    byte[] enc = Files.readAllBytes(full);
+                    res.body(encryptAesPayload(enc, this.SESSION_KEY));
+                    res.header("X-Encrypted", "true");
+                    return ""; // 已手工置 body, 空 return 不覆盖; after 过滤器见 X-Encrypted 头不再二次加密
+                } catch (Exception e) {
+                    halt(500, this.gson.toJson(Map.of("error", "Download encryption failed")));
+                    return "";
+                }
+            }
+            return Files.readAllBytes(full);
         });
 
         delete("/api/file", (req, res) -> {
@@ -1305,7 +1334,8 @@ public class kisama {
                 boolean isAuthenticated = Boolean.TRUE.equals(req.attribute("is_authenticated"));
 
                 // 🌟 只有身份确实为已认证（true）状态，才在出口统一披上密文外衣
-                if (isAuthenticated) {
+                if (isAuthenticated && res.raw().getHeader("X-Encrypted") == null) {
+                    // 🔐 0.6.1 M10: 下载加密容器等 handler 已自行盖 X-Encrypted 的响应不再二次加密
                     try {
                         // 🔐 0.5.6 响应加密分流 (docs/API.MD 十二): /api/baseinfo 恒走 ECIES
                         // (密钥分发握手, 静态签名->静态公钥 / 临时签名->临时公钥); 其余认证端点

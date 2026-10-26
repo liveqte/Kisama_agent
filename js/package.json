@@ -1,6 +1,6 @@
 {
   "name": "kisama-js",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Kisama Agent - Node.js implementation",
   "main": "index.js",
   "scripts": {
@@ -33,7 +33,7 @@
   ],
   "overrides": {
     "express-ws": {
-      "ws": "^8.18.0"
+      "ws": "^8.21.0"
     }
   }
 }

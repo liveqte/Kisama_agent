@@ -258,13 +258,20 @@ X-Total-Chunks: 1
 ```
 ### 9. 下载文件
 路径：POST /api/file/download  
-用途：下载代理端文件（二进制流，自动加密传输）  
+用途：下载代理端文件（二进制流）  
 输入示例：
 ```
 { "path": "/tmp/backup.tar.gz" }  
 ```
-响应头：X-File-Size, X-Original-Path, X-Encrypted: true  
-响应体：blob二进制字节、base64编码的二进制内容。
+响应头：X-File-Size, X-Original-Path（+ 加密形态下的 X-Encrypted: true）  
+响应体：原始二进制字节；小文件 opt-in 加密形态下为 Base64(AES-GCM 容器) 文本。
+
+**下载加密契约（0.6.1，五端统一）**：M10 修复引入的按需加密形态——
+
+- **规则**：`加密 ⟺ 请求带 x-dl-enc: 1 头 且 文件大小 ≤ DOWNLOAD_ENCRYPT_MAX（缺省 4194304 = 4MiB，环境变量可调，0 = 恒明文）`。命中时响应体为 0.5.6 AES-256-GCM(session_key) 容器（Base64(JSON{nonce,tag,ciphertext})，与 JSON 通道同构，见第十二节）并盖 `X-Encrypted: true`；其余情形（无 opt-in 头 / 超阈值 / DEBUG 模式）响应为原始字节流且不发送 X-Encrypted。
+- **客户端判定**：**一律按 `X-Encrypted` 响应头分支**——有 `true` 则解密容器后落盘，否则原样落盘；绝不依据"自己是否发送过 opt-in 头"判定（旧代理会忽略该头回明文）。
+- **兼容矩阵**：旧控制端（不发头）→ 五端均回原始字节，行为与 0.6.0 完全一致，零适配；新控制端 + 旧代理 → 无该头回明文；新控制端 + 新代理 → 小文件密文 / 大文件明文。大文件（多为二进制/软件）明文直传为有意取舍：省去 Base64 +33% 传输膨胀与整文件加密的内存峰值。
+- **加密失败 fail-closed**：opt-in 命中但服务端加密出错 → 500（绝不静默降级明文），与第十节模式位规范一致。
 
 ### 10. 批量删除文件/目录  
 路径：DELETE /api/file  

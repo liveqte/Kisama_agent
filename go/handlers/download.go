@@ -8,6 +8,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/liveqte/kisama_agent/go/config"
+	"github.com/liveqte/kisama_agent/go/crypto"
 )
 
 // DownloadFile 处理安全文件下载，直接透传纯二进制流与自定义 Headers
@@ -61,6 +62,21 @@ func DownloadFile(c *gin.Context) {
 		if relPath, err := filepath.Rel(rootAbs, fullPath); err == nil {
 			c.Header("x-original-path", filepath.ToSlash(relPath))
 		}
+	}
+
+	// 🔐 0.6.1 M10 修复 (docs/API.MD 下载加密契约): x-dl-enc:1 且 ≤ DOWNLOAD_ENCRYPT_MAX 时,
+	// 响应改走 0.5.6 AES-256-GCM(session_key) 容器并盖 x-encrypted: true; 其余 (无 opt-in 头/
+	// 超阈值) 保持原始字节流——旧客户端零适配。加密失败 fail-closed 500, 与 JSON 通道模式位
+	// 规范一致, 绝不静默降级明文。
+	if c.GetHeader("x-dl-enc") == "1" && !cfg.Debug && cfg.DownloadEncryptMax > 0 && fi.Size() <= cfg.DownloadEncryptMax {
+		encrypted, encErr := crypto.EncryptAES256GCM(string(content), cfg.SessionKey)
+		if encErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "Download encryption failed"})
+			return
+		}
+		c.Header("x-encrypted", "true")
+		c.Data(http.StatusOK, "application/octet-stream", []byte(encrypted))
+		return
 	}
 
 	// 使用 c.Data 灌入纯二进制流

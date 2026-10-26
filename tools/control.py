@@ -260,12 +260,17 @@ def process_response(body_bytes: bytes, resp_headers, ecies_sk, label: str = "�
                         "（请先调用 baseinfo 完成握手；控制端与代理版本混布时需成对升级）"
                     )
                 raw = json.loads(base64.b64decode(body_str).decode("utf-8"))
-                plaintext = aes_gcm_open(
+                plaintext_bytes = aes_gcm_open(
                     SESSION_KEY,
                     base64.b64decode(raw["nonce"]),
                     base64.b64decode(raw["tag"]),
                     base64.b64decode(raw["ciphertext"]),
-                ).decode("utf-8")
+                )
+                # 🔐 0.6.1 下载加密契约: return_raw 载荷 (文件下载) 解密后直接返回原始字节,
+                # 不做 utf-8 文本化与 json.loads —— 载荷可能是任意二进制 (zip/密钥/软件)
+                if return_raw:
+                    return plaintext_bytes
+                plaintext = plaintext_bytes.decode("utf-8")
             else:
                 ciphertext_b64 = body_str
                 if body_str.startswith('{'):
@@ -276,7 +281,10 @@ def process_response(body_bytes: bytes, resp_headers, ecies_sk, label: str = "�
                         pass
                 
                 ciphertext = base64.b64decode(ciphertext_b64)
-                plaintext = ecies_decrypt(ecies_sk.secret, ciphertext).decode("utf-8")
+                plaintext_bytes = ecies_decrypt(ecies_sk.secret, ciphertext)
+                if return_raw:
+                    return plaintext_bytes
+                plaintext = plaintext_bytes.decode("utf-8")
             data = json.loads(plaintext)
             # 捕获代理版本号 (baseinfo 响应携带, 供后续请求的解密算法判定)
             if is_baseinfo and isinstance(data, dict) and data.get("version"):
@@ -334,7 +342,7 @@ def _make_request(method: str, endpoint: str, params: dict = None,
     # 无密钥 (DEBUG 探测场景) 或网络异常时静默跳过, 保持旧的明文请求行为。
     if endpoint.split("?", 1)[0].rstrip("/") != "/api/baseinfo" and AGENT_VERSION is None:
         try:
-            fetch_baseinfo(skip_print=True)
+            _ensure_session_key()  # 0.6.1: 顺带同步 SESSION_KEY, 供加密响应 (含下载加密契约) 解密
         except Exception:
             pass
     
@@ -499,13 +507,20 @@ def file_upload(local_file: str, remote_path: str, remote_filename: str = None, 
         return None
 
 
-def file_download(remote_path: str, local_file: str = None, skip_print: bool = False):
-    """POST /api/file/download - 下载文件"""
+def file_download(remote_path: str, local_file: str = None, skip_print: bool = False,
+                   dl_enc: bool = True):
+    """POST /api/file/download - 下载文件
+    dl_enc=True 时带 x-dl-enc:1 opt-in 头 (0.6.1 下载加密契约, docs/API.MD 下载加密小节):
+    文件 ≤ DOWNLOAD_ENCRYPT_MAX(缺省 4MiB) 的响应为 AES-GCM(session_key) 容器 (X-Encrypted: true,
+    _make_request 的 return_raw 分支会自动解密后落盘); 超阈值或旧代理则回原始字节, 同样直接落盘。
+    两种形态均按 X-Encrypted 响应头自动分支, 旧代理零适配。"""
     _, ecies_sk = load_control_keys()
+    extra = {"x-dl-enc": "1"} if dl_enc else None
     result = _make_request("POST", "/api/file/download",
                           params={"path": remote_path},
-                          ecies_sk=ecies_sk, label="download", 
-                          skip_print=skip_print, return_raw=True)
+                          ecies_sk=ecies_sk, label="download",
+                          skip_print=skip_print, return_raw=True,
+                          extra_headers=extra)
     
     if result and isinstance(result, bytes) and local_file:
         with open(local_file, 'wb') as f:
@@ -1366,6 +1381,81 @@ def task_persist_set() -> bool:
     tests_passed &= ok2
 
     return tests_passed
+
+
+def _download_probe(remote_path: str, dl_enc: bool):
+    """低层下载探测 (0.6.1 下载加密契约): 返回 (小写响应头dict, 明文bytes)。
+    X-Encrypted: true 时按 0.5.6 AES-GCM(session_key) 容器解密; 否则原样返回原始字节。"""
+    global SESSION_KEY
+    ecdsa_sk, _ = load_control_keys()
+    body = json.dumps({"path": remote_path}).encode()
+    headers = generate_auth_headers(ecdsa_sk, "POST", "/api/file/download", body)
+    headers["Content-Type"] = "application/json"
+    if dl_enc:
+        headers["x-dl-enc"] = "1"
+    req = urllib.request.Request(f"{CONFIG['proxy_url']}/api/file/download",
+                                 data=body, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=CONFIG["timeout"] + 120) as resp:
+        raw = resp.read()
+        resp_headers = {k.lower(): v for k, v in resp.headers.items()}
+    if resp_headers.get("x-encrypted") == "true":
+        if not SESSION_KEY:
+            raise RuntimeError("加密下载响应但本地无 session_key (先完成 baseinfo 握手)")
+        container = json.loads(base64.b64decode(raw.decode("ascii")).decode("utf-8"))
+        return resp_headers, aes_gcm_open(
+            SESSION_KEY,
+            base64.b64decode(container["nonce"]),
+            base64.b64decode(container["tag"]),
+            base64.b64decode(container["ciphertext"]),
+        )
+    return resp_headers, raw
+
+
+def download_enc_check() -> bool:
+    """🔐 场景 10 (0.6.1, docs/API.MD 下载加密小节): 下载加密契约三断言 (verify_all.py 调用)
+    10a 小文件(1KiB 全字节值二进制) + x-dl-enc:1 → X-Encrypted: true 且解密后逐字节一致
+    10b 5MiB 随机二进制 + x-dl-enc:1 → 无 X-Encrypted (超 4MiB 阈值明文) 且逐字节一致
+    10c 小文件不带 opt-in 头 (旧客户端形态) → 无 X-Encrypted 且逐字节一致"""
+    try:
+        # 握手: 同步 SESSION_KEY + 版本判定 (0.5.6 协议; 10a 密文解密依赖)
+        if not _ensure_session_key():
+            print("❌ FAIL baseinfo 握手未取得 session_key")
+            return False
+        small = bytes(range(256)) * 4        # 1024B, 覆盖全部字节值 (二进制安全断言)
+        big = os.urandom(5 * 1024 * 1024)    # 5MiB > 缺省阈值 4MiB
+        with tempfile.TemporaryDirectory() as td:
+            sp, bp = os.path.join(td, "dlenc_small.bin"), os.path.join(td, "dlenc_big.bin")
+            with open(sp, "wb") as f: f.write(small)
+            with open(bp, "wb") as f: f.write(big)
+            try:
+                file_mkdir("dlenc_dir", skip_print=True)
+            except Exception:
+                pass  # 目录已存在 (复跑) 时忽略
+            for local, name in ((sp, "dlenc_small.bin"), (bp, "dlenc_big.bin")):
+                r = file_upload(local, "dlenc_dir", name, skip_print=True)
+                if not (isinstance(r, dict) and r.get("status") == "ok"):
+                    print(f"❌ FAIL 上传 {name}: {r}")
+                    return False
+        ok_all = True
+        h1, d1 = _download_probe("dlenc_dir/dlenc_small.bin", dl_enc=True)
+        c1 = h1.get("x-encrypted") == "true" and d1 == small
+        print(("✅" if c1 else "❌ FAIL") + " 10a: 小文件+x-dl-enc → 密文回包且解密逐字节一致 "
+              f"(x-encrypted={h1.get('x-encrypted')}, len={len(d1)})")
+        ok_all = ok_all and c1
+        h2, d2 = _download_probe("dlenc_dir/dlenc_big.bin", dl_enc=True)
+        c2 = h2.get("x-encrypted") != "true" and d2 == big
+        print(("✅" if c2 else "❌ FAIL") + " 10b: 5MiB+x-dl-enc → 超阈值明文回包且逐字节一致 "
+              f"(x-encrypted={h2.get('x-encrypted')}, len={len(d2)})")
+        ok_all = ok_all and c2
+        h3, d3 = _download_probe("dlenc_dir/dlenc_small.bin", dl_enc=False)
+        c3 = h3.get("x-encrypted") != "true" and d3 == small
+        print(("✅" if c3 else "❌ FAIL") + " 10c: 小文件无 opt-in 头(旧客户端) → 明文回包且逐字节一致 "
+              f"(x-encrypted={h3.get('x-encrypted')}, len={len(d3)})")
+        ok_all = ok_all and c3
+        return ok_all
+    except Exception as e:
+        print(f"❌ FAIL download-enc 异常: {e}")
+        return False
 
 
 def tempkey_short_check() -> bool:
@@ -2324,6 +2414,11 @@ def main():
             # 🔑 场景 8 (0.5.8): tempkey 短格式下发 + 短私钥端到端验收 (verify_all.py 调用)
             ok = tempkey_short_check()
             print("TEMPKEY_SHORT_OK" if ok else "TEMPKEY_SHORT_FAILED")
+            sys.exit(0 if ok else 1)
+        elif sys.argv[1] == "--download-enc":
+            # 🔐 场景 10 (0.6.1): 下载加密契约三断言 (verify_all.py 调用)
+            ok = download_enc_check()
+            print("DOWNLOAD_ENC_OK" if ok else "DOWNLOAD_ENC_FAILED")
             sys.exit(0 if ok else 1)
         elif sys.argv[1] in ["--status", "-s"]:
             _, ecies_sk = load_control_keys()

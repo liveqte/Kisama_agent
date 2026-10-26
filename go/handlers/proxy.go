@@ -23,8 +23,8 @@ import (
 // 同理，为浏览器端 WebDAV 客户端补齐。kpng 侧配置需同步补上。
 var kisamaProxyCORSHeaders = map[string]string{
 	"Access-Control-Allow-Methods":  "GET, POST, OPTIONS, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, COPY, MOVE, LOCK, UNLOCK, HEAD",
-	"Access-Control-Allow-Headers":  "authorization,DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,x-nonce,x-timestamp,x-auth-token,x-aes-encrypted,x-file-path,x-file-name,x-chunk-id,x-total-chunks,Depth,Destination,Overwrite,If,If-Match,If-None-Match,Lock-Token,Timeout,Dav,Prefer,Brief,Compliance-Class",
-	"Access-Control-Expose-Headers": "ETag, Location, Content-Location, DAV, Lock-Token",
+	"Access-Control-Allow-Headers":  "authorization,DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,x-nonce,x-timestamp,x-auth-token,x-aes-encrypted,x-dl-enc,x-file-path,x-file-name,x-chunk-id,x-total-chunks,Depth,Destination,Overwrite,If,If-Match,If-None-Match,Lock-Token,Timeout,Dav,Prefer,Brief,Compliance-Class",
+	"Access-Control-Expose-Headers": "ETag, Location, Content-Location, DAV, Lock-Token, x-encrypted, x-agent-version, x-file-size, x-original-path",
 }
 
 // webdavMethods 定义 WebDAV 专有的 HTTP 扩展方法

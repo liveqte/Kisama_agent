@@ -786,7 +786,13 @@ class Config:
     
     # 是否允许操作符号链接
     FOLLOW_SYMLINKS = os.getenv("FOLLOW_SYMLINKS", "false").lower() == "true"
-    
+
+    # 🔐 0.6.1 M10 下载加密契约 (docs/API.MD 下载加密小节): 请求带 x-dl-enc:1 且文件大小
+    # ≤ 此值(字节) 时, /api/file/download 响应改走 0.5.6 AES-256-GCM(session_key) 容器并盖
+    # x-encrypted: true; 其余情形 (无 opt-in 头 / 超阈值) 保持原始字节流——旧客户端零适配,
+    # 大文件不付 Base64(+33%) 与整读内存的代价。0 = 关闭加密 (恒明文)。
+    DOWNLOAD_ENCRYPT_MAX = int(os.getenv("DOWNLOAD_ENCRYPT_MAX", "4194304"))
+
     # 是否记录文件操作审计日志
     FILE_AUDIT_LOG = os.getenv("FILE_AUDIT_LOG", "true").lower() == "true"
     # ================= 新增：任务模块配置 =================
@@ -930,7 +936,7 @@ class Config:
     KPATH = os.getenv("KPATH", "")
 
     # 代理版本信息
-    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.6.0-python")
+    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.6.1-python")
     
     # ================= 启动校验 =================
     
@@ -5424,8 +5430,10 @@ class KModeController:
         if not valid and not cls._SHZAL_KEY_HINT_SHOWN:
             cls._SHZAL_KEY_HINT_SHOWN = True
             # 走 Logger: 非 DEBUG (log_level=0) 时 INFO/WARNING 被吞=静默, DEBUG=true 时输出
+            # 🔐 L9 修复 (SECURITY-AUDIT 第四节 L9): KNAME_KEY 是 shz.al 覆盖上报管理凭证,
+            # 日志只输出"已设置(长度)", 不输出真实值 (与 js 端同构)
             Logger.warning(f"[KMODE] ⚠️ KMODE=2 未生效, 条件不满足: {'; '.join(reasons)} "
-                           f"(KNAME={name or '(未设置)'}, KNAME_KEY={Config.KNAME_KEY or '(未设置, 缺省复用 KNAME)'})")
+                           f"(KNAME={name or '(未设置)'}, KNAME_KEY={f'已设置(len={len(Config.KNAME_KEY)})' if Config.KNAME_KEY else '(未设置, 缺省复用 KNAME)'})")
             Logger.warning("[KMODE] 💡 修正: 设置 ≥8 字符的 KNAME 且 (可选) KNAME_KEY ≥8 字符, 例如: KNAME=myname KNAME_KEY=mysecret-pass")
         return valid
 
@@ -6712,7 +6720,25 @@ async def file_download(
     
     fm = request.app.state.file_manager
     file_path, mime_type, size = fm.download_file(body.path)
-    
+
+    # 🔐 0.6.1 M10 修复: x-dl-enc:1 且 ≤ DOWNLOAD_ENCRYPT_MAX → 响应走 AES-GCM(session_key) 容器;
+    # 客户端一律按 x-encrypted 响应头分支 (docs/API.MD 下载加密契约)。加密失败 fail-closed 500,
+    # 与 JSON 通道模式位规范一致, 绝不静默降级明文。
+    if not Config.DEBUG and request.headers.get("x-dl-enc") == "1" and 0 < Config.DOWNLOAD_ENCRYPT_MAX and size <= Config.DOWNLOAD_ENCRYPT_MAX:
+        try:
+            container = CryptoManager.encrypt_data(file_path.read_bytes(), Config._raw_key)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail="Download encryption failed") from exc
+        return Response(
+            content=container,
+            media_type="application/octet-stream",
+            headers={
+                "x-encrypted": "true",
+                "x-file-size": str(size),
+                "x-original-path": str(file_path.relative_to(Path(Config.FILE_ROOT))),
+            },
+        )
+
     from fastapi.responses import FileResponse
     return FileResponse(
         path=str(file_path),

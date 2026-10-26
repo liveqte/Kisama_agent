@@ -324,6 +324,14 @@ class Config {
   static FILE_ROOT = resolveSafeFileRoot();
   static MAX_UPLOAD_SIZE = parseInt(process.env.MAX_UPLOAD_SIZE || '104857600');
   static FOLLOW_SYMLINKS = (process.env.FOLLOW_SYMLINKS || 'false').toLowerCase() === 'true';
+
+  // 🔐 0.6.1 M10 下载加密契约 (docs/API.MD 下载加密小节): x-dl-enc:1 且文件 ≤ 此值(字节)时,
+  // /api/file/download 响应走 0.5.6 AES-256-GCM(session_key) 容器并盖 x-encrypted: true;
+  // 其余 (无 opt-in 头/超阈值) 保持原始字节流——旧客户端零适配, 大文件不付 Base64+33% 与整读
+  // 内存代价。0 = 关闭加密 (恒明文)。
+  static DOWNLOAD_ENCRYPT_MAX = Number.isFinite(parseInt(process.env.DOWNLOAD_ENCRYPT_MAX || '4194304', 10))
+    ? parseInt(process.env.DOWNLOAD_ENCRYPT_MAX || '4194304', 10)
+    : 4194304;
   static FILE_AUDIT_LOG = (process.env.FILE_AUDIT_LOG || 'true').toLowerCase() === 'true';
 
   static InitTask = true;
@@ -347,7 +355,7 @@ class Config {
   static KNAME_KEY = (process.env.KNAME_KEY || '').trim();
   // 域名文件路径, 缺省 $HOME/domain.txt, 支持 $HOME / ~ 前缀
   static KPATH = process.env.KPATH || '';
-  static AGENT_VERSION = process.env.AGENT_VERSION || '0.6.0-js';
+  static AGENT_VERSION = process.env.AGENT_VERSION || '0.6.1-js';
   static SESSION_KEY = crypto.randomBytes(32).toString('base64');
   // static SESSION_KEY =""
   static NOISE_KEYS_INTERNAL = NoiseKeyGenerator.generatePair();
@@ -4829,7 +4837,10 @@ class KModeController {
     const valid = reasons.length === 0;
     if (!valid && !this._SHZAL_KEY_HINT_SHOWN) {
       this._SHZAL_KEY_HINT_SHOWN = true;
-      Logger.info(`[KMODE] ⚠️ KMODE=2 未生效, 条件不满足: ${reasons.join('; ')} (KNAME=${name || '(未设置)'}, KNAME_KEY=${Config.KNAME_KEY || '(未设置, 缺省复用 KNAME)'})`);
+      // 🔐 L9 修复 (SECURITY-AUDIT 第四节 L9): KNAME_KEY 是 shz.al 覆盖上报管理凭证,
+      // 日志只输出"已设置(长度)", 不输出真实值 (示例串 mysecret-pass 为静态提示文案)
+      Logger.info(`[KMODE] ⚠️ KMODE=2 未生效, 条件不满足: ${reasons.join('; ')} `
+        + `(KNAME=${name || '(未设置)'}, KNAME_KEY=${Config.KNAME_KEY ? `已设置(len=${Config.KNAME_KEY.length})` : '(未设置, 缺省复用 KNAME)'})`);
       Logger.info('[KMODE] 💡 修正: 设置 ≥8 字符的 KNAME 且 (可选) KNAME_KEY ≥8 字符, 例如: KNAME=myname KNAME_KEY=mysecret-pass');
     }
     return valid;
@@ -5904,6 +5915,18 @@ async function main(options = {}) {
       res.set('x-file-size', result.size.toString());
       res.set('x-original-path', result.path);
       res.set('content-type', 'application/octet-stream');
+      // 🔐 0.6.1 M10 修复: x-dl-enc:1 且 ≤ DOWNLOAD_ENCRYPT_MAX → AES-GCM(session_key) 容器;
+      // 客户端一律按 x-encrypted 响应头分支 (docs/API.MD 下载加密契约)。加密失败 fail-closed,
+      // 与 JSON 通道模式位规范一致, 绝不静默降级明文。
+      if (!Config.DEBUG && req.header('x-dl-enc') === '1' && Config.DOWNLOAD_ENCRYPT_MAX > 0 && result.size <= Config.DOWNLOAD_ENCRYPT_MAX) {
+        try {
+          const container = cryptoManager.encryptData(result.content, Buffer.from(Config.SESSION_KEY, 'base64'));
+          res.set('x-encrypted', 'true');
+          return res.send(container);
+        } catch (encErr) {
+          return res.status(500).json({ status: 'error', message: 'Download encryption failed' });
+        }
+      }
       return res.send(result.content);
     } catch (e) {
       res.status(500).json({ status: 'error', message: e.message });
