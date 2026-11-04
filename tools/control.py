@@ -1343,6 +1343,20 @@ TASK_PERSIST_CRON_EXPR = "59 23 * * *"
 TASK_PERSIST_CRON_MARKER = "echo kisama_persist_cron_marker"
 
 
+def _strip_task_meta(script):
+    """🪪 0.6.2 任务元数据行契约 (docs/API.MD 第四节开篇): agent 在任务设置时给脚本首行
+    盖 `kisama-task: id=<ms> updated=<ms>` 注释 (Unix `#` / Windows `rem` 语法), GET 13/15
+    将该行作为脚本内容逐字往返。验收比对前剥离盖章行, 使断言与裸标记精确相等
+    (兼容 <0.6.2 未盖章的旧代理: 无行时原样返回)。仅剥首行且必须带 kisama-task: 标记。"""
+    if not isinstance(script, str) or "\n" not in script:
+        return script
+    first, _, rest = script.partition("\n")
+    lowered = first.strip().lower()
+    if lowered.startswith(("#", "rem")) and "kisama-task:" in lowered:
+        return rest
+    return script
+
+
 def _ensure_session_key() -> bool:
     """子命令模式没有 run_all_tests 的 test_baseinfo 前置, 手动完成 baseinfo 握手同步
     SESSION_KEY (对齐 test_baseinfo 的同步逻辑); 已同步时直接返回 True"""
@@ -1549,15 +1563,18 @@ def task_persist_verify() -> bool:
         return False
     tests_passed = True
 
-    # 1. onetime 列表跨重启恢复一致
+    # 1. onetime 列表跨重启恢复一致 (0.6.2 起 GET 回显带盖章行, 剥离后与裸标记精确比对)
     r = task_get_onetime(skip_print=True)
-    ok = bool(r) and r.get("status") == "ok" and r.get("tasks") == [TASK_PERSIST_ONETIME_MARKER]
+    got_tasks = [_strip_task_meta(t) for t in (r.get("tasks") or [])] if isinstance(r, dict) else None
+    ok = bool(r) and r.get("status") == "ok" and got_tasks == [TASK_PERSIST_ONETIME_MARKER]
     _test_result("persist: onetime 列表跨重启恢复", ok, f"result={r}")
     tests_passed &= ok
 
-    # 2. cron 列表跨重启恢复一致
+    # 2. cron 列表跨重启恢复一致 (同上, 剥离盖章行后比对)
     r = task_get_cron(skip_print=True)
-    ok = bool(r) and r.get("status") == "ok" and r.get("tasks") == {TASK_PERSIST_CRON_EXPR: TASK_PERSIST_CRON_MARKER}
+    got_cron = {expr: _strip_task_meta(script) for expr, script in (r.get("tasks") or {}).items()} \
+        if isinstance(r, dict) and isinstance(r.get("tasks"), dict) else None
+    ok = bool(r) and r.get("status") == "ok" and got_cron == {TASK_PERSIST_CRON_EXPR: TASK_PERSIST_CRON_MARKER}
     _test_result("persist: cron 列表跨重启恢复", ok, f"result={r}")
     tests_passed &= ok
 

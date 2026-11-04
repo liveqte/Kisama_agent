@@ -191,6 +191,7 @@ func setupTaskTest(t *testing.T, storeDir string) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	r.POST("/api/task/onetime", SetOneTimeTasks)
+	r.POST("/api/task/onetime/execute", ExecuteOneTimeTasks)
 	r.POST("/api/task/cron", SetCronTasks)
 	r.GET("/api/task/status", GetTaskStatus)
 	return r
@@ -238,11 +239,11 @@ func TestTaskOnetimeGateConsumesMarker(t *testing.T) {
 		t.Fatalf("标记已消费时不得再次执行, resp=%v", resp)
 	}
 
-	// 落盘内容应为最新列表
+	// 落盘内容应为最新列表 (🪪 0.6.2: 带 任务元数据行, 有效脚本不变)
 	fresh := initTaskStore()
 	one, _ := fresh.load()
-	if len(one) != 1 || one[0] != "echo again" {
-		t.Fatalf("落盘内容应为最新列表, got %#v", one)
+	if len(one) != 1 || stripTaskMetaLine(one[0]) != "echo again" || parseTaskMeta(one[0]) == nil {
+		t.Fatalf("落盘内容应为最新列表(含元数据行), got %#v", one)
 	}
 }
 

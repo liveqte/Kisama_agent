@@ -188,6 +188,10 @@ AGENT_VERSION=0.4.7-go  # 代理版本
 KISAMA_PROXY_TLS_VERIFY=true  # 严格校验上游TLS证书；缺省(不设)=透明中转不校验，自签/过期/域名不匹配一律放行
 KISAMA_PROXY_INSECURE=false   # 0.4.8 起的既有变量（反向语义），=false 等效于 KISAMA_PROXY_TLS_VERIFY=true，仅用于兼容旧部署
 
+# 内置加密 DNS（DoH，docs/API.MD 第十八节）
+KISAMA_DNS=off          # off=系统解析(缺省,零行为变化)；on=全部出站域名解析走 DoH 防污染
+KISAMA_DOH_SERVERS=     # 逗号分隔 DoH JSON API 基地址链；空=缺省链(阿里223.5.5.5→Cloudflare1.1.1.1→Google8.8.8.8)
+
 # 加密
 ECDSA_PUBKEY=...        # ECDSA公钥(可选，或从文件读取)
 ECIES_PUBKEY=...        # ECIES公钥(可选，或从文件读取)

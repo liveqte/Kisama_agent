@@ -304,8 +304,13 @@ func GetPublicIPv6() (string, error) {
 
 func fetchIP(url string) (string, error) {
 	// 设置 5 秒超时，防止某一个服务挂了导致整个程序卡住
+	// 拨号经 SecureDialContext 挂载 (KISAMA_DNS=on 时走内置 DoH, 见 utils/dns.go);
+	// Clone 自 DefaultTransport 保留环境代理等既有语义
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = SecureDialContext(&net.Dialer{Timeout: 5 * time.Second})
 	client := &http.Client{
-		Timeout: 5 * time.Second,
+		Timeout:   5 * time.Second,
+		Transport: transport,
 	}
 
 	resp, err := client.Get(url)

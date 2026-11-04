@@ -166,6 +166,7 @@ import http.client
 import queue
 import ssl
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 ## 生成noise密钥相关
@@ -927,16 +928,27 @@ class Config:
     PORT = int(os.getenv("KPORT") or os.getenv("PORT") or os.environ.get('SERVER_PORT') or 8000)
 
     # KMODE 启动模式: 1=启动时自动创建临时隧道并开启 stdin /domain 指令监听;
-    # 2=启动时自动创建临时隧道并把域名上报至 shz.al (全程静默) (详见 docs/API.MD 第九节)
-    KMODE = (os.getenv("KMODE", "0").strip() or "0")
+    # 2=启动时自动创建临时隧道并把域名上报至 shz.al (全程静默);
+    # 2q/2quic=2 且启动隧道走 QUIC (UDP/7844) 边缘传输 (详见 docs/API.MD 第九节)。
+    # KMODE 归一化为数字 ('2q'→'2'), KMODE_QUIC 是其后缀派生的内部开关 —— KMODE 只影响
+    # 启动行为; /api/argo 创建隧道时经请求体 quic 字段独立选择传输; '1q'/'0q' 等组合不存在
+    # (按非法值处理, 消费点等值比较落回 0)
+    KMODE = "2" if re.match(r"^2q(?:uic)?$", (os.getenv("KMODE", "0").strip() or "0"), re.IGNORECASE) else (os.getenv("KMODE", "0").strip() or "0")
+    KMODE_QUIC = bool(re.match(r"^2q(?:uic)?$", os.getenv("KMODE", "").strip(), re.IGNORECASE))
     # KMODE=2: shz.al 自定义名 (可预测 URL 的组成部分); KNAME_KEY 缺省复用 KNAME
     KNAME = os.getenv("KNAME", "").strip()
     KNAME_KEY = os.getenv("KNAME_KEY", "").strip()
     # 域名文件路径, 缺省 $HOME/domain.txt, 支持 $HOME / ~ 前缀
     KPATH = os.getenv("KPATH", "")
 
+    # 内置加密 DNS (DoH, docs/API.MD 第十八节): off=系统解析 (默认, 零行为变化);
+    # on=全部出站域名解析走 DoH JSON API 防污染。KISAMA_DOH_SERVERS 逗号分隔自定义
+    # DoH 服务器链, 缺省 阿里 223.5.5.5 → Cloudflare 1.1.1.1 → Google 8.8.8.8
+    DNS_MODE = os.getenv("KISAMA_DNS", "off").strip().lower()
+    DOH_SERVERS = os.getenv("KISAMA_DOH_SERVERS", "").strip()
+
     # 代理版本信息
-    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.6.1-python")
+    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.6.2-python")
     
     # ================= 启动校验 =================
     
@@ -1048,6 +1060,278 @@ class Logger:
         """错误日志"""
         if cls._enabled(cls.LEVEL_ERROR):
             cls._log(message, "ERROR")
+
+# ============================================================================
+# 🌐 内置加密 DNS (DoH): KISAMA_DNS=on 启用 (docs/API.MD 第十八节)
+# ============================================================================
+# 出站域名解析统一走 DNS-over-HTTPS JSON API, 防御本地 DNS 污染/劫持:
+# - 覆盖面: 包装 socket.getaddrinfo 即覆盖 aiohttp/urllib/http.client/socket 全部
+#   进程内出站解析 (含 argo edge 连接与 KMODE 上报), IP 字面量与 AI_NUMERICHOST 直通;
+# - 服务器链: 223.5.5.5(阿里) → 1.1.1.1(Cloudflare) → 8.8.8.8(Google), 可用
+#   KISAMA_DOH_SERVERS 覆盖; 全部失败回落系统解析并限频告警 (可用性优先);
+# - 缓存: 按 (主机, 地址族) 记忆应答, TTL 取应答值截断 [30,600]s, NXDOMAIN 负缓存 60s,
+#   单服务器请求失败退避 60s; 解析期间持锁 (single-flight, agent 出站 QPS 低可接受)。
+# - 安全: DoH 请求直连字面量 IP (空 ProxyHandler 不经环境代理), TLS 证书校验不降级;
+#   不新增监听面/端点, 默认关闭。
+
+DOH_SERVERS_DEFAULT = (
+    "https://223.5.5.5/resolve",      # 阿里 DoH (国内直连快)
+    "https://1.1.1.1/dns-query",      # Cloudflare DoH
+    "https://8.8.8.8/resolve",        # Google DoH
+)
+
+_IPV6_USABLE = None
+
+
+def _ipv6_usable():
+    """本机 IPv6 可用性探测 (懒缓存): 建一次 AF_INET6 UDP 套接字即可, 仅供双栈排序参考。"""
+    global _IPV6_USABLE
+    if _IPV6_USABLE is None:
+        try:
+            s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+            s.close()
+            _IPV6_USABLE = True
+        except OSError:
+            _IPV6_USABLE = False
+    return _IPV6_USABLE
+
+
+def _is_ip_literal(host):
+    """IP 字面量判定 (容忍 [::1] 方括号形式): 字面量直通, 不触发 DoH (防递归)。"""
+    if not isinstance(host, str) or not host:
+        return False
+    try:
+        ipaddress.ip_address(host.strip().strip('[]'))
+        return True
+    except ValueError:
+        return False
+
+
+class SecureDns:
+    """内置 DoH 解析器 (纯标准库, JSON API)。
+
+    resolve() 返回 None 表示 DoH 服务器全部失败 (调用方应回落系统解析);
+    返回 [] 表示 DoH 明确无记录 (NXDOMAIN/NODATA, 不回落以免被污染解析"复活")。
+    """
+
+    QUERY_TIMEOUT = 3.0     # 单 DoH 请求超时(秒)
+    TTL_MIN = 30            # 应答 TTL 截断下限(秒)
+    TTL_MAX = 600           # 应答 TTL 截断上限(秒)
+    NEGATIVE_TTL = 60       # NXDOMAIN 负缓存(秒)
+    SERVER_BACKOFF = 60     # 单服务器请求失败退避(秒)
+    WARN_INTERVAL = 300     # 回落系统解析的告警限频(秒)
+
+    def __init__(self, servers=None, query_fn=None):
+        parsed = [s.strip().rstrip('/') for s in (servers or DOH_SERVERS_DEFAULT) if s and s.strip()]
+        self.servers = parsed or list(DOH_SERVERS_DEFAULT)
+        self._fail_until = [0.0] * len(self.servers)
+        self._cache = {}                     # (host, af) -> (ips, expire_at)
+        self._lock = threading.Lock()
+        self._last_fallback_warn = 0.0
+        self._query_fn = query_fn or self._doh_query
+
+    # ---------------- 对外: 语义对齐 socket.getaddrinfo ----------------
+    def getaddrinfo(self, host, port, family=0, type=0, proto=0, flags=0, orig=None):
+        """域名经 DoH 解析后, 用原版 getaddrinfo 对 IP 生成规范结果元组 (完整保留
+        family/type/proto/flags 语义); 字面量/直通情形原样转发。"""
+        if orig is None:
+            orig = _original_getaddrinfo
+        if ((not isinstance(host, str)) or (not host) or _is_ip_literal(host)
+                or (flags & getattr(socket, 'AI_NUMERICHOST', 0))):
+            return orig(host, port, family, type, proto, flags)
+        af = family or socket.AF_UNSPEC
+        if af not in (socket.AF_INET, socket.AF_INET6, socket.AF_UNSPEC):
+            return orig(host, port, family, type, proto, flags)
+        ips = self.resolve(host, af)
+        if ips is None:
+            # DoH 全部服务器失败 → 回落系统解析 (可用性优先, 限频告警)
+            self._warn_fallback(host)
+            return orig(host, port, family, type, proto, flags)
+        if not ips:
+            # DoH 明确无记录: 不回落系统, 避免被污染解析复活
+            raise socket.gaierror(getattr(socket, 'EAI_NONAME', -2),
+                                  f'DNS: no record for {host} (secure dns)')
+        results = []
+        for ip in ips:
+            try:
+                results.extend(orig(ip, port, family, type, proto, flags))
+            except socket.gaierror:
+                continue
+        if results:
+            return results
+        # 解析出的 IP 组不出规范结果 (极罕见) → 交回系统按原语义兜底
+        return orig(host, port, family, type, proto, flags)
+
+    # ---------------- 解析 + 缓存 ----------------
+    def resolve(self, host, af):
+        """返回按优先级排序的 IP 列表; None=DoH 全失败, []=明确无记录。"""
+        key = (host, af)
+        now = time.monotonic()
+        with self._lock:
+            ent = self._cache.get(key)
+            if ent is not None and ent[1] > now:
+                return list(ent[0])
+        status, ips, ttl = self._query_all(host, af)
+        with self._lock:
+            if status == 'ok' and ips:
+                self._cache[key] = (list(ips), now + min(max(ttl, self.TTL_MIN), self.TTL_MAX))
+            elif status == 'nxdomain':
+                self._cache[key] = ([], now + self.NEGATIVE_TTL)
+            # 'error' 不缓存: 单服务器退避已防抖, 下次解析立即重试
+            if status == 'error':
+                return None
+            return list(ips)
+
+    def _query_all(self, host, af):
+        """按地址族查询 A/AAAA。返回 (status, ips, min_ttl), status ∈ ok/nxdomain/error。"""
+        want = []
+        if af in (socket.AF_INET, socket.AF_UNSPEC):
+            want.append((1, 4))      # A
+        if af in (socket.AF_INET6, socket.AF_UNSPEC):
+            want.append((28, 6))     # AAAA
+        collected = {4: [], 6: []}
+        ok_any = nxdomain_any = errored = False
+        min_ttl = self.TTL_MAX
+        for rtype, ver in want:
+            st, ips, ttl = self._query_one(host, rtype)
+            if st == 'ok' and ips:
+                ok_any = True
+                collected[ver] = ips
+                min_ttl = min(min_ttl, ttl)
+            elif st == 'nxdomain':
+                nxdomain_any = True
+            else:
+                errored = True
+        if ok_any:
+            return ('ok', self._order_addresses(collected[6], collected[4]), min_ttl)
+        if nxdomain_any and not errored:
+            return ('nxdomain', [], 0)
+        return ('error', [], 0)
+
+    def _query_one(self, host, rtype):
+        """按服务器链顺序查询单记录类型, 失败换下一台 (网络级失败退避 60s)。"""
+        name = self._to_ascii(host)
+        for idx, server in enumerate(self.servers):
+            with self._lock:
+                if time.monotonic() < self._fail_until[idx]:
+                    continue
+            try:
+                data = self._query_fn(server, name, rtype)
+            except Exception:
+                self._mark_fail(idx)
+                continue
+            status = data.get('Status', 0) if isinstance(data, dict) else 1
+            if status == 3:
+                return ('nxdomain', [], 0)
+            if status != 0:
+                continue    # SERVFAIL 等服务端错误: 换下一台, 不退避
+            ips, ttl = [], self.TTL_MAX
+            for ans in (data.get('Answer') or []):
+                if not isinstance(ans, dict) or ans.get('type') != rtype:
+                    continue    # CNAME 链等无关记录
+                ip = ans.get('data')
+                if not isinstance(ip, str) or not self._valid_literal(ip, rtype):
+                    continue
+                ips.append(ip)
+                try:
+                    ttl = min(ttl, int(ans.get('TTL', self.TTL_MAX)))
+                except (TypeError, ValueError):
+                    pass
+            if ips:
+                # 去重保序
+                return ('ok', list(dict.fromkeys(ips)), ttl)
+            return ('nxdomain', [], 0)     # 应答成功但无该类型记录 (NODATA)
+        return ('error', [], 0)
+
+    def _mark_fail(self, idx):
+        with self._lock:
+            self._fail_until[idx] = time.monotonic() + self.SERVER_BACKOFF
+
+    def _warn_fallback(self, host):
+        now = time.monotonic()
+        if now - self._last_fallback_warn >= self.WARN_INTERVAL:
+            self._last_fallback_warn = now
+            Logger.warning(f'🌐 KISAMA_DNS=on: 全部 DoH 服务器不可达, {host!r} 本次回落系统解析 (可用性优先)')
+
+    @staticmethod
+    def _order_addresses(v6, v4):
+        """双栈排序: 对齐系统 RFC6724 惯例 v6 优先; IPv6 不可用时 v4 优先减少无谓尝试。"""
+        v6, v4 = list(dict.fromkeys(v6)), list(dict.fromkeys(v4))
+        if not v6:
+            return v4
+        if not v4:
+            return v6
+        return (v6 + v4) if _ipv6_usable() else (v4 + v6)
+
+    @staticmethod
+    def _valid_literal(data, rtype):
+        try:
+            ip = ipaddress.ip_address(data)
+        except ValueError:
+            return False
+        return ip.version == (4 if rtype == 1 else 6)
+
+    @staticmethod
+    def _to_ascii(host):
+        if host.isascii():
+            return host
+        try:
+            return host.encode('idna').decode('ascii')
+        except (UnicodeError, UnicodeDecodeError):
+            return host
+
+    @staticmethod
+    def _doh_url(server, name, rtype):
+        return f"{server}?name={urllib.parse.quote(name, safe='')}&type={rtype}"
+
+    def _doh_query(self, server, name, rtype):
+        """请求单个 DoH 服务器 (JSON API), 返回解析后的 dict; 网络/格式错误抛异常。"""
+        url = self._doh_url(server, name, rtype)
+        req = urllib.request.Request(url, headers={
+            'accept': 'application/dns-json',
+            'user-agent': f'kisama-agent/{Config.AGENT_VERSION}',
+        })
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # 直连, 不经环境代理
+        with opener.open(req, timeout=self.QUERY_TIMEOUT) as resp:
+            if getattr(resp, 'status', 200) != 200:
+                raise OSError(f'doh http status {resp.status}')
+            return json.loads(resp.read().decode('utf-8'))
+
+
+# ---------- 全局安装 (KISAMA_DNS=on 时生效, import 期一次性执行) ----------
+_original_getaddrinfo = socket.getaddrinfo
+_dns_hook = None   # 当前全局 SecureDns 实例 (None=未安装)
+
+
+def install_dns_hook(force=None):
+    """按 KISAMA_DNS/KISAMA_DOH_SERVERS 安装全局 getaddrinfo 钩子。
+
+    off (默认): 不做任何事, 行为与系统解析完全一致; on: 包装 socket.getaddrinfo,
+    全部进程内出站域名解析 (aiohttp/urllib/http.client/socket) 改走 DoH。
+    幂等: 已安装时直接返回现有实例。返回 SecureDns 实例或 None。
+    """
+    global _dns_hook
+    if _dns_hook is not None:
+        return _dns_hook
+    mode = Config.DNS_MODE if force is None else str(force).strip().lower()
+    if mode != 'on':
+        return None
+    servers = None
+    if Config.DOH_SERVERS:
+        servers = [s.strip() for s in re.split(r'[,\s]+', Config.DOH_SERVERS) if s.strip()]
+    _dns_hook = SecureDns(servers=servers)
+    _dns = _dns_hook
+
+    def _patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        return _dns.getaddrinfo(host, port, family, type, proto, flags,
+                                orig=_original_getaddrinfo)
+
+    socket.getaddrinfo = _patched_getaddrinfo
+    Logger.info(f'🌐 内置加密 DNS 已启用 (DoH): {", ".join(_dns.servers)}')
+    return _dns_hook
+
+
+install_dns_hook()
 # ============================================================================
 # 🔐 加密模块: ECDSA签名验证 + ECIES加密
 # ============================================================================
@@ -4396,6 +4680,18 @@ class CapnpBuilder:
         for i, value in enumerate(values):
             self.write_bytes(items + i, value, True)
 
+    def write_struct_list(self, ptr_word, count, data_words, pointer_words, fill):
+        # Composite struct list (list type 7): 指针 offset 字段存元素数, size 字段存
+        # 每元素 data/pointer 字数; 目标处 tag 字重复元素数与布局供读取方解析
+        tag = self.alloc(1)
+        stride = data_words + pointer_words
+        items = self.alloc(count * stride)
+        offset = tag - ptr_word - 1
+        self.words[ptr_word] = (((offset << 2) | 1) & 0xFFFFFFFF) | (((count * stride) << 3 | 7) << 32)
+        self.words[tag] = (count << 2) | (data_words << 32) | (pointer_words << 48)
+        for index in range(count):
+            fill(index, items + index * stride)
+
     def finish(self):
         return struct.pack("<II", 0, len(self.words)) + b"".join(struct.pack("<Q", word) for word in self.words)
 
@@ -4456,7 +4752,10 @@ def capnp_messages(buffer):
     while len(buffer) - pos >= 8:
         segments_minus_one, first_words = struct.unpack_from("<II", buffer, pos)
         segments = segments_minus_one + 1
-        header_words = 2 + segments
+        # 标准 Cap'n Proto 流分帧: 段表 = 4B 段数-1 + 4B*段数, 8 字节对齐 —
+        # 单段消息表长 8B (曾误作 16B: 单段消息整体被多剥 8B, root 指针丢失导致
+        # QUIC 边缘注册应答永远解析失败; 双段消息两种算法同为 16B, h2 路径未暴露)
+        header_words = segments + 1
         header_size = header_words * 4
         if header_size % 8:
             header_size += 4
@@ -4507,29 +4806,112 @@ def capnp_text(words, pointer_word):
 
 
 def capnp_return_result(data):
-    if len(data) % 8 or len(data) < 24:
+    if len(data) % 8 or len(data) < 16:
         raise ValueError("short Cap'n Proto return")
     words = list(struct.unpack("<" + "Q" * (len(data) // 8), data))
     msg_target, msg_data, msg_ptrs = capnp_struct(words, 0)
     if msg_data < 1 or words[msg_target] & 0xFFFF != 3:
         raise ValueError("not an RPC return message")
+    # 标准 capnp RPC: Message{union: return@3} →
+    # Return{answerId:u32 @data0, releaseParamCaps:bool @data0.b4, union tag @data0.b6-7, ptr0}
     ret_target, ret_data, ret_ptrs = capnp_struct(words, msg_target + msg_data)
     which = (words[ret_target] >> 48) & 0xFFFF
-    if which == 1:
-        return {"ok": False, "error": capnp_text(words, ret_target + ret_data)}
+    if which == 4:
+        # exception@6: Exception{reason@0:Text, ...}
+        exc_target, exc_data, _ = capnp_struct(words, ret_target + ret_data)
+        return {"ok": False, "error": capnp_text(words, exc_target + exc_data) or "unknown error"}
     if which != 0:
         return {"ok": False, "error": "RPC return union %d" % which}
+    # results@0: Payload{content@ptr0, capTable@ptr1}
     payload_target, payload_data, payload_ptrs = capnp_struct(words, ret_target + ret_data)
-    content_target, content_data, content_ptrs = capnp_struct(words, payload_target + payload_data)
-    union = words[content_target]
-    union_which = union & 0xFFFF
-    if union_which == 0:
-        return {"ok": False, "error": capnp_text(words, content_target + content_data)}
-    if union_which != 1:
-        return {"ok": False, "error": "registration union %d" % union_which}
-    details_target, details_data, details_ptrs = capnp_struct(words, content_target + content_data)
-    location = capnp_text(words, details_target + details_data + 1)
-    return {"ok": True, "location": location, "remote_managed": bool(words[details_target] & 1)}
+    if not payload_ptrs:
+        return {"ok": False, "error": "empty RPC payload"}
+    content_ptr = words[payload_target + payload_data]
+    if content_ptr & 3 == 3:
+        # bootstrap 应答: content = CapDescriptor (capability 指针), 非注册结果
+        return {"ok": False, "bootstrap": True}
+    node, node_data, node_ptrs = capnp_struct(words, payload_target + payload_data)
+    # 边缘实机取证 (2026-10-31, QUIC 注册应答): content 外多一层信封 (data=0, ptrs=1),
+    # ConnectionResponse 在其 ptr0 — 信封存在时剥一层; h2 应答无信封 (data>=1) 不受影响
+    if node_data == 0 and node_ptrs == 1:
+        node, node_data, node_ptrs = capnp_struct(words, node + node_data)
+    # ConnectionResponse{result:union{error@0:ConnectionError, connectionDetails@1:ConnectionDetails}}
+    union_which = words[node] & 0xFFFF if node_data > 0 else 0
+    if union_which == 1:
+        # ConnectionDetails{uuid@0:Data, locationName@1:Text, tunnelIsRemotelyManaged@2:Bool}
+        details_target, details_data, _ = capnp_struct(words, node + node_data)
+        location = capnp_text(words, details_target + details_data + 1)
+        return {"ok": True, "location": location}
+    error = capnp_text(words, node + node_data)
+    return {"ok": False, "error": error or "unknown error"}
+
+
+def capnp_words(data):
+    return list(struct.unpack("<" + "Q" * (len(data) // 8), data))
+
+
+def capnp_struct_list(words, pointer_word):
+    # Composite struct list: list type 7 — 指针 offset 字段存元素数, size 字段存每元素
+    # data/pointer 字数; 目标处 tag 字重复元素数与布局
+    if pointer_word >= len(words):
+        return None
+    pointer = words[pointer_word]
+    if pointer & 3 != 1 or (pointer >> 32) & 7 != 7:
+        return None
+    offset = (pointer >> 2) & 0x3FFFFFFF
+    if offset & 0x20000000:
+        offset -= 0x40000000
+    target = pointer_word + 1 + offset
+    element_words = pointer >> 35
+    if target < 0 or target >= len(words):
+        return None
+    tag = words[target]
+    if tag & 3 != 0:
+        return None
+    data_words = (tag >> 32) & 0xFFFF
+    pointer_words = (tag >> 48) & 0xFFFF
+    count = (tag >> 2) & 0x3FFFFFFF
+    stride = data_words + pointer_words
+    if pointer_words < 2 or stride == 0 or stride * count != element_words:
+        return None
+    if target + 1 + stride * count > len(words):
+        return None
+    elements = []
+    for index in range(count):
+        base = target + 1 + index * stride
+        elements.append([capnp_text(words, base + data_words), capnp_text(words, base + data_words + 1)])
+    return elements
+
+
+# QUIC 数据流的 ConnectRequest: 前导之后的首个 capnp 消息, dest 携带完整请求 URL,
+# type 区分 http(0)/websocket(1)/tcp(2), metadata 以 (Key, Value) 文本对携带请求头。
+def capnp_connect_request(data):
+    words = capnp_words(data)
+    if not words:
+        raise ValueError("empty Cap'n Proto ConnectRequest")
+    target, data_words, pointer_words = capnp_struct(words, 0)
+    if data_words < 1 or pointer_words < 2:
+        raise ValueError("unexpected ConnectRequest layout")
+    return {
+        "dest": capnp_text(words, target + data_words),
+        "type": words[target] & 0xFFFF,
+        "metadata": capnp_struct_list(words, target + data_words + 1) or [],
+    }
+
+
+# ConnectResponse: errorText 非空表示该流被拒绝; metadata 携带 (HttpStatus, HttpHeader:name)
+# 响应头, 之后同流继续写原始响应体 (websocket 类型随后进入裸字节双向转发)。
+def capnp_connect_response(error_text, metadata):
+    msg = CapnpBuilder()
+    root = msg.alloc(1)
+    body = msg.alloc(2)
+    msg.struct_ptr(root, body, 0, 2)
+    msg.write_bytes(body, error_text or "", True)
+    msg.write_struct_list(body + 1, len(metadata), 0, 2, lambda index, base: (
+        msg.write_bytes(base, metadata[index][0], True),
+        msg.write_bytes(base + 1, metadata[index][1], True),
+    ))
+    return msg.finish()
 
 
 def infer_content_type(path):
@@ -4968,6 +5350,9 @@ class ControlStream:
         for message in messages:
             try:
                 result = capnp_return_result(message)
+                if result.get("bootstrap"):
+                    # bootstrap 应答 (Payload.content = capability): 非注册结果, 静默跳过
+                    continue
                 if result["ok"]:
                     self.log.info("tunnel connection registered at %s", result.get("location", "unknown"))
                     self.connection.registered = True
@@ -5114,6 +5499,2064 @@ def connect_edge(verify_certificate, logger):
 
 
 # ----------------------------------------------------------------------------
+# 🚀 QUIC 边缘传输 (移植自 cftunnel-product.js, 纯 Python 标准库 + cryptography)
+# 与 h2 路径同端口 7844, 但走 UDP: SNI 固定 quic.cftunnel.com, ALPN argotunnel。
+# 注册协议 (Cap'n Proto bootstrap/register) 与 h2 完全共用, 传输可按隧道独立选择。
+# 实机协议取证 (2026-10-31, AWS 干净网络, 与 js 端同源):
+#   - 传输参数整数值按 varint 变长编码 (边缘 quic-go 校验声明长度与 varint 自带长度一致)
+#   - 客户端所有 Initial 包必须填充至 1200 字节 (RFC 9000 §14.1), 否则 ServerHello 被
+#     PTO 无限重传 (过小的客户端 Initial 被 quic-go 丢弃)
+#   - 控制流 (流 0) 直接承载 capnp RPC, 不写 rpcStreamProtocolSignature 前导
+#   - websocket 类型响应经 ConnectResponse metadata 上报真实 101 (边缘字面转发)
+# ----------------------------------------------------------------------------
+QUIC_DATA_STREAM_SIGNATURE = bytes.fromhex("0a36cd12a13e")
+QUIC_RPC_STREAM_SIGNATURE = bytes.fromhex("52bb825cdb65")
+QUIC_DATA_STREAM_PREAMBLE = QUIC_DATA_STREAM_SIGNATURE + b"01"
+QUIC_RPC_STREAM_PREAMBLE = QUIC_RPC_STREAM_SIGNATURE + b"01"   # 仅 UDP session 等附加 RPC 流使用
+QUIC_CONNECTION_TYPE = {"http": 0, "websocket": 1, "tcp": 2}
+QUIC_META_METHOD = "HttpMethod"
+QUIC_META_HOST = "HttpHost"
+QUIC_META_STATUS = "HttpStatus"
+QUIC_META_HEADER = "HttpHeader"
+
+QUIC_VERSION = 0x00000001
+QUIC_ALPN = "argotunnel"
+# 边缘按该固定 SNI 选择证书与 QUIC 协议栈; 切勿改用 region 主机名 (边缘走另一套入口,
+# 1280B 填充 ServerHello 后停滞永不下发 flight — 实机确认)
+QUIC_SERVER_NAME = "quic.cftunnel.com"
+QUIC_INITIAL_SALT = bytes.fromhex("38762cf7f55934b34d179ae6a4c80cadccbb7f0a")
+QUIC_HRR_RANDOM = bytes.fromhex("cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c")
+QUIC_SAMPLE_SIZE = 16
+QUIC_PN_LEN = 4
+QUIC_MAX_PACKET = 1232
+QUIC_MIN_INITIAL = 1200
+QUIC_EPOCH_INITIAL, QUIC_EPOCH_HANDSHAKE, QUIC_EPOCH_APPLICATION = 0, 1, 2
+QUIC_EPOCH_NAMES = ("initial", "handshake", "one-rtt")
+QUIC_FRAME = {
+    "padding": 0x00, "ping": 0x01, "ack": 0x02, "ack_ecn": 0x03, "reset_stream": 0x04,
+    "stop_sending": 0x05, "crypto": 0x06, "new_token": 0x07, "stream": 0x08,
+    "max_data": 0x10, "max_stream_data": 0x11, "max_streams_bidi": 0x12,
+    "max_streams_uni": 0x13, "new_connection_id": 0x18, "retire_connection_id": 0x19,
+    "path_challenge": 0x1A, "path_response": 0x1B, "transport_close": 0x1C,
+    "application_close": 0x1D, "handshake_done": 0x1E, "datagram": 0x30, "datagram_len": 0x31,
+}
+QUIC_PARAM = {
+    "original_destination_connection_id": 0x00, "max_idle_timeout": 0x01,
+    "stateless_reset_token": 0x02, "max_udp_payload_size": 0x03,
+    "initial_max_data": 0x04, "initial_max_stream_data_bidi_local": 0x05,
+    "initial_max_stream_data_bidi_remote": 0x06, "initial_max_stream_data_uni": 0x07,
+    "initial_max_streams_bidi": 0x08, "initial_max_streams_uni": 0x09,
+    "ack_delay_exponent": 0x0A, "max_ack_delay": 0x0B, "disable_active_migration": 0x0C,
+    "active_connection_id_limit": 0x0E, "initial_source_connection_id": 0x0F,
+    "retry_source_connection_id": 0x10, "max_datagram_frame_size": 0x20,
+}
+
+
+def quic_varint_size(value):
+    v = int(value)
+    if v < 0x40:
+        return 1
+    if v < 0x4000:
+        return 2
+    if v < 0x40000000:
+        return 4
+    return 8
+
+
+def quic_write_varint(value):
+    v = int(value)
+    if v < 0x40:
+        return bytes([v])
+    if v < 0x4000:
+        return bytes([0x40 | (v >> 8), v & 0xFF])
+    if v < 0x40000000:
+        return bytes([0x80 | ((v >> 24) & 0x3F), (v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF])
+    return bytes([0xC0 | ((v >> 56) & 0x3F)]) + v.to_bytes(8, "big")[1:]
+
+
+def quic_read_varint(buffer, offset):
+    # 缓冲不足以容纳完整 varint 时返回 None
+    if len(buffer) - offset < 1:
+        return None
+    first = buffer[offset]
+    size = 1 << (first >> 6)
+    if len(buffer) - offset < size:
+        return None
+    v = first & 0x3F
+    for i in range(1, size):
+        v = (v << 8) | buffer[offset + i]
+    return v, size
+
+
+def _ranges_remove(ranges, start, end):
+    out = []
+    for item in ranges:
+        item_start, item_end = item["start"], item["start"] + item["length"]
+        if item_end <= start or item_start >= end:
+            out.append(item)
+            continue
+        if item_start < start:
+            out.append({"start": item_start, "length": start - item_start})
+        if item_end > end:
+            out.append({"start": end, "length": item_end - end})
+    return out
+
+
+def _ranges_union(a, b):
+    merged = sorted(a + b, key=lambda item: item["start"])
+    out = []
+    for item in merged:
+        item_end = item["start"] + item["length"]
+        if out and item["start"] <= out[-1]["start"] + out[-1]["length"]:
+            last = out[-1]
+            last["length"] = max(last["length"], item_end - last["start"])
+        else:
+            out.append({"start": item["start"], "length": item["length"]})
+    return out
+
+
+def _hkdf_extract(hash_name, salt, ikm):
+    return hmac.new(salt, ikm, hash_name).digest()
+
+
+def _hkdf_expand(hash_name, prk, info, length):
+    out = b""
+    previous = b""
+    counter = 1
+    while len(out) < length:
+        previous = hmac.new(prk, previous + info + bytes([counter]), hash_name).digest()
+        out += previous
+        counter += 1
+    return out[:length]
+
+
+def hkdf_expand_label(hash_name, secret, label, context, length):
+    full_label = b"tls13 " + (label.encode() if isinstance(label, str) else label)
+    ctx = context or b""
+    info = (
+        bytes([(length >> 8) & 0xFF, length & 0xFF])
+        + bytes([len(full_label)]) + full_label
+        + bytes([len(ctx)]) + ctx
+    )
+    return _hkdf_expand(hash_name, secret, info, length)
+
+
+class QuicKeys:
+    # 单向密钥: key/iv/hp 由 secret 经 HKDF-Expand-Label 派生 (RFC 9001 §5.1)
+    def __init__(self, hash_name, cipher_name, secret):
+        self.hash = hash_name
+        self.cipher_name = cipher_name
+        self.secret = secret
+        key_length = 32 if cipher_name == "aes-256-gcm" else 16
+        self.key = hkdf_expand_label(hash_name, secret, "quic key", b"", key_length)
+        self.iv = hkdf_expand_label(hash_name, secret, "quic iv", b"", 12)
+        self.hp_key = hkdf_expand_label(hash_name, secret, "quic hp", b"", key_length)
+        self.tag_size = 16
+
+    def _nonce(self, packet_number):
+        nonce = bytearray(self.iv)
+        rest = int(packet_number)
+        for i in range(8):
+            nonce[11 - i] ^= rest & 0xFF
+            rest >>= 8
+        return bytes(nonce)
+
+    def mask(self, sample):
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+        encryptor = Cipher(algorithms.AES(self.hp_key), modes.ECB()).encryptor()
+        return (encryptor.update(sample) + encryptor.finalize())[:5]
+
+    def seal(self, packet_number, plain_header, payload):
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+        return AESGCM(self.key).encrypt(self._nonce(packet_number), payload, plain_header)
+
+    def open(self, packet_number, plain_header, ciphertext):
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+        return AESGCM(self.key).decrypt(self._nonce(packet_number), ciphertext, plain_header)
+
+
+def quic_next_keys(keys, keep_header_protection=False):
+    # RFC 9001 §5.3: key update 派生下一 packet protection secret;
+    # argo 边缘跨 key update 保留原 header protection key, 需沿用保持互通
+    nxt = QuicKeys(keys.hash, keys.cipher_name, hkdf_expand_label(keys.hash, keys.secret, "quic ku", b"", len(keys.secret)))
+    if keep_header_protection:
+        nxt.hp_key = keys.hp_key
+    return nxt
+
+
+def quic_initial_keys(cid, is_client):
+    initial = _hkdf_extract("sha256", QUIC_INITIAL_SALT, cid)
+    send_label = b"client in" if is_client else b"server in"
+    recv_label = b"server in" if is_client else b"client in"
+    return {
+        "send": QuicKeys("sha256", "aes-128-gcm", hkdf_expand_label("sha256", initial, send_label, b"", 32)),
+        "recv": QuicKeys("sha256", "aes-128-gcm", hkdf_expand_label("sha256", initial, recv_label, b"", 32)),
+    }
+
+
+class QuicByteSender:
+    # 流/加密帧字节发送器: 待发区 + 未确认区 + Karn 规则的重传frontier
+    def __init__(self, connection):
+        self.connection = connection
+        self.data = b""
+        self.pending = []
+        self.unacked = []
+        self.frontier = 0
+        self.fin = False
+        self.fin_unacked = False
+
+    @property
+    def sent_end(self):
+        return len(self.data)
+
+    def append(self, payload, fin):
+        if payload:
+            self.data += payload
+            self.pending.append({"start": len(self.data) - len(payload), "length": len(payload)})
+        if fin:
+            self.fin = True
+            self.fin_unacked = True
+
+    def take(self, budget):
+        if not self.pending or budget <= 0:
+            return None
+        chunk_range = self.pending[0]
+        length = min(chunk_range["length"], budget)
+        chunk = {"start": chunk_range["start"], "length": length}
+        chunk_range["start"] += length
+        chunk_range["length"] -= length
+        if not chunk_range["length"]:
+            self.pending.pop(0)
+        chunk["bytes"] = self.data[chunk["start"]:chunk["start"] + length]
+        # frontier 以下的字节是重传 (Karn 规则: 其 ACK 不参与 RTT 采样)
+        chunk["retransmitted"] = chunk["start"] < self.frontier
+        self.frontier = max(self.frontier, chunk["start"] + length)
+        self.unacked = _ranges_union(self.unacked, [{"start": chunk["start"], "length": length}])
+        return chunk
+
+    def take_fin(self):
+        # 零长 FIN 需等全部字节确认后才能上路
+        if not self.fin or not self.fin_unacked or self.pending or self.unacked:
+            return False
+        self.fin_unacked = False
+        return True
+
+    def ack(self, start, length, include_fin):
+        self.unacked = _ranges_remove(self.unacked, start, start + length)
+        if include_fin and self.fin and start + length >= len(self.data):
+            self.fin_unacked = False
+        self.connection.on_send_progress()
+
+    def loss(self):
+        if self.unacked:
+            self.frontier = self.unacked[0]["start"]
+            self.pending = _ranges_union(self.pending, self.unacked)
+            self.pending.sort(key=lambda item: item["start"])
+            self.unacked = []
+        if self.fin:
+            self.fin_unacked = True
+
+    def loss_ranges(self, items):
+        for item in items:
+            if not item["length"]:
+                if item.get("fin") and self.fin:
+                    self.fin_unacked = True
+                continue
+            self.unacked = _ranges_remove(self.unacked, item["start"], item["start"] + item["length"])
+            self.pending = _ranges_union(self.pending, [{"start": item["start"], "length": item["length"]}])
+            self.pending.sort(key=lambda item: item["start"])
+
+    def idle(self):
+        return not self.pending and not self.unacked and not self.fin_unacked
+
+
+class QuicOffsetBuffer:
+    # 乱序偏移帧重组: 按偏移寻址重排为连续字节流 (重传是重复内容)
+    def __init__(self):
+        self.contiguous = 0
+        self.pending = []
+
+    def accept(self, start, payload):
+        if start > self.contiguous + 1048576:
+            return b""
+        if start < self.contiguous:
+            drop = self.contiguous - start
+            if drop >= len(payload):
+                return b""
+            payload = payload[drop:]
+            start = self.contiguous
+        if not payload:
+            return b""
+        if start != self.contiguous:
+            self.pending.append({"start": start, "bytes": bytes(payload)})
+            return b""
+        out = [payload]
+        self.contiguous += len(payload)
+        progress = True
+        while progress:
+            progress = False
+            for i, item in enumerate(self.pending):
+                if item["start"] == self.contiguous:
+                    out.append(item["bytes"])
+                    self.contiguous += len(item["bytes"])
+                    self.pending.pop(i)
+                    progress = True
+                    break
+        return b"".join(out)
+
+
+def _quic_apply_protection(keys, packet, pn_offset, is_long):
+    if len(packet) < pn_offset + 4 + QUIC_SAMPLE_SIZE:
+        return None
+    mask = keys.mask(packet[pn_offset + 4:pn_offset + 4 + QUIC_SAMPLE_SIZE])
+    out = bytearray(packet)
+    out[0] ^= mask[0] & (0x0F if is_long else 0x1F)
+    for i in range(QUIC_PN_LEN):
+        out[pn_offset + i] ^= mask[1 + i]
+    return bytes(out)
+
+
+def _quic_remove_protection(keys, packet, pn_offset, is_long):
+    if len(packet) < pn_offset + 4 + QUIC_SAMPLE_SIZE:
+        return None
+    mask = keys.mask(packet[pn_offset + 4:pn_offset + 4 + QUIC_SAMPLE_SIZE])
+    copy = bytearray(packet)
+    copy[0] ^= mask[0] & (0x0F if is_long else 0x1F)
+    pn_length = (copy[0] & 0x03) + 1
+    for i in range(pn_length):
+        copy[pn_offset + i] ^= mask[1 + i]
+    packet_number = 0
+    for i in range(pn_length):
+        packet_number = packet_number * 256 + copy[pn_offset + i]
+    return bytes(copy[:pn_offset + pn_length]), packet_number
+
+
+def _quic_decode_packet_number(largest, bits, truncated):
+    expected = largest + 1
+    mask = (1 << bits) - 1
+    candidate = (expected & ~mask) | truncated
+    half = 1 << (bits - 1)
+    if candidate + half <= expected:
+        candidate += 1 << bits
+    elif candidate > expected + half and candidate >= (1 << bits):
+        candidate -= 1 << bits
+    return candidate
+
+
+def _quic_encode_ack(ranges):
+    out = bytearray([QUIC_FRAME["ack"]])
+    sorted_ranges = sorted(ranges, key=lambda item: item["start"])
+    last = sorted_ranges[-1]
+    largest = last["start"] + last["length"] - 1
+
+    def varint(value):
+        return quic_write_varint(value)
+
+    out += varint(largest)
+    out += varint(0)
+    out += varint(len(sorted_ranges) - 1)
+    out += varint(largest - last["start"])
+    smallest = last["start"]
+    for r in reversed(sorted_ranges[:-1]):
+        end = r["start"] + r["length"] - 1
+        out += varint(smallest - end - 2)
+        out += varint(end - r["start"])
+        smallest = r["start"]
+    return bytes(out)
+
+
+def _quic_ranges_from_ack(reader):
+    largest = reader["number"](reader)
+    ack_delay = reader["number"](reader)
+    range_count = reader["number"](reader)
+    first = reader["number"](reader)
+    out = [{"start": largest - first, "length": first + 1}]
+    smallest = largest - first
+    for _ in range(range_count):
+        gap = reader["number"](reader)
+        length = reader["number"](reader)
+        end = smallest - gap - 2
+        out.append({"start": end - length, "length": length + 1})
+        smallest = end - length
+    out.append({"ack_delay": ack_delay / 1000})
+    return out
+
+
+def _quic_decode_transport_parameters(buffer):
+    out = {}
+    pos = 0
+    while pos < len(buffer):
+        parsed = quic_read_varint(buffer, pos)
+        if parsed is None:
+            break
+        param_id, pos = parsed[0], pos + parsed[1]
+        parsed = quic_read_varint(buffer, pos)
+        if parsed is None:
+            break
+        length, pos = parsed[0], pos + parsed[1]
+        if len(buffer) - pos < length:
+            break
+        value = buffer[pos:pos + length]
+        pos += length
+        if length in (1, 2, 4, 8):
+            parsed = 0
+            for byte in value:
+                parsed = parsed * 256 + byte
+            out[param_id] = parsed
+        else:
+            out[param_id] = bytes(value)
+    return out
+
+
+def _quic_encode_transport_parameters(entries):
+    # RFC 9000 §16: 整数传输参数按 varint 变长编码 — 边缘 quic-go 校验声明长度与
+    # varint 自带长度一致, 不一致即 TRANSPORT_PARAMETER_ERROR (实机确认)
+    out = bytearray()
+    for param_id, value in entries:
+        if isinstance(value, (bytes, bytearray)):
+            body = bytes(value)
+        elif value is True:
+            body = b""
+        else:
+            body = quic_write_varint(value)
+        out += quic_write_varint(param_id)
+        out += quic_write_varint(len(body))
+        out += body
+    return bytes(out)
+
+
+class QuicTlsClient:
+    # 手写 TLS 1.3 握手 (QUIC-TLS): ClientHello/ServerHello/EncryptedExtensions/
+    # Certificate/CertificateVerify/Finished, 密钥调度按 RFC 8446 §7.1
+    def __init__(self, server_name, alpn, parameters):
+        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+        from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+        self.server_name = server_name
+        self.alpn = alpn
+        self.parameters = parameters
+        self.key_pair = X25519PrivateKey.generate()
+        self.public_key = self.key_pair.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+        self.hash = "sha256"
+        self.hash_length = 32
+        self.cipher = "aes-128-gcm"
+        self.messages = []
+        self.state = "start"
+        self.remote_parameters = None
+        self.negotiated_alpn = None
+        self.leaf_cert = None   # Certificate 消息中的叶子证书 DER, 供边缘软校验
+
+    def transcript(self, limit=None):
+        digest = hashlib.new(self.hash)
+        for message in (self.messages if limit is None else self.messages[:limit]):
+            digest.update(message)
+        return digest.digest()
+
+    def build_client_hello(self):
+        name = self.server_name.encode()
+        server_name_body = (
+            len(name) + 3
+        ).to_bytes(2, "big") + b"\x00" + len(name).to_bytes(2, "big") + name
+        groups = (4).to_bytes(2, "big") + (0x001D).to_bytes(2, "big") + (0x0017).to_bytes(2, "big")
+        signatures = (
+            (8).to_bytes(2, "big")
+            + (0x0403).to_bytes(2, "big") + (0x0804).to_bytes(2, "big")
+            + (0x0401).to_bytes(2, "big") + (0x0807).to_bytes(2, "big")
+        )
+        versions = b"\x02" + (0x0304).to_bytes(2, "big")
+        key_share = (
+            (4 + len(self.public_key)).to_bytes(2, "big")
+            + (0x001D).to_bytes(2, "big")
+            + len(self.public_key).to_bytes(2, "big")
+            + self.public_key
+        )
+        alpn_list = bytes([len(self.alpn)]) + self.alpn.encode()
+        alpn = len(alpn_list).to_bytes(2, "big") + alpn_list
+        psk_modes = b"\x01\x01"
+
+        def ext(ext_type, body):
+            return ext_type.to_bytes(2, "big") + len(body).to_bytes(2, "big") + body
+
+        extensions = b"".join([
+            ext(0x0000, server_name_body),
+            ext(0x000A, groups),
+            ext(0x000D, signatures),
+            ext(0x002B, versions),
+            ext(0x0033, key_share),
+            ext(0x0010, alpn),
+            ext(0x002D, psk_modes),
+            ext(0xFF01, b"\x00"),
+            ext(0x0039, self.parameters),
+        ])
+        suites = bytes([0x00, 0x04, 0x13, 0x01, 0x13, 0x02])
+        body = (
+            bytes([0x03, 0x03])
+            + secrets.token_bytes(32)
+            + b"\x00"
+            + suites
+            + bytes([0x01, 0x00])
+            + len(extensions).to_bytes(2, "big")
+            + extensions
+        )
+        message = bytes([1]) + len(body).to_bytes(3, "big") + body
+        self.messages.append(message)
+        self.state = "awaiting-server-hello"
+        return message
+
+    def server_hello_complete(self, buffer):
+        if len(buffer) < 4:
+            return None
+        if buffer[0] != 2:
+            raise ValueError("expected TLS ServerHello")
+        length = int.from_bytes(buffer[1:4], "big")
+        if len(buffer) < 4 + length:
+            return None
+        return buffer[:4 + length]
+
+    def handle_server_hello(self, message):
+        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
+        from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+        body = message[4:]
+        pos = 2
+        random = body[pos:pos + 32]
+        pos += 32
+        if random == QUIC_HRR_RANDOM:
+            raise ValueError("edge requested a HelloRetryRequest, which is not supported")
+        session_len = body[pos]
+        pos += 1 + session_len
+        cipher_suite = int.from_bytes(body[pos:pos + 2], "big")
+        pos += 2
+        pos += 1   # compression method
+        ext_count = int.from_bytes(body[pos:pos + 2], "big")
+        pos += 2
+        server_key = None
+        seen = 0
+        while seen < ext_count and len(body) - pos >= 4:
+            ext_type = int.from_bytes(body[pos:pos + 2], "big")
+            ext_len = int.from_bytes(body[pos + 2:pos + 4], "big")
+            value = body[pos + 4:pos + 4 + ext_len]
+            pos += 4 + ext_len
+            seen += 1
+            if ext_type == 0x0033 and len(value) >= 4:
+                group = int.from_bytes(value[:2], "big")
+                key_len = int.from_bytes(value[2:4], "big")
+                server_key = {"group": group, "key": value[4:4 + key_len]}
+            elif ext_type == 0x002B and len(value) >= 2:
+                if int.from_bytes(value[:2], "big") != 0x0304:
+                    raise ValueError("edge selected an unsupported TLS version")
+        if server_key is None:
+            raise ValueError("ServerHello has no key_share")
+        if server_key["group"] != 0x001D:
+            raise ValueError("edge selected unsupported key share group %d" % server_key["group"])
+        if cipher_suite == 0x1301:
+            self.hash, self.hash_length, self.cipher = "sha256", 32, "aes-128-gcm"
+        elif cipher_suite == 0x1302:
+            self.hash, self.hash_length, self.cipher = "sha384", 48, "aes-256-gcm"
+        else:
+            raise ValueError("edge selected unsupported cipher suite %04x" % cipher_suite)
+        self.messages.append(message)
+        shared = self.key_pair.exchange(X25519PublicKey.from_public_bytes(server_key["key"]))
+        zeros = bytes(self.hash_length)
+        early = _hkdf_extract(self.hash, zeros, zeros)
+        derived = hkdf_expand_label(self.hash, early, "derived", hashlib.new(self.hash).digest(), self.hash_length)
+        self.handshake_secret = _hkdf_extract(self.hash, derived, shared)
+        sh_hash = self.transcript()
+        self.client_handshake_secret = hkdf_expand_label(self.hash, self.handshake_secret, "c hs traffic", sh_hash, self.hash_length)
+        self.server_handshake_secret = hkdf_expand_label(self.hash, self.handshake_secret, "s hs traffic", sh_hash, self.hash_length)
+        self.state = "awaiting-handshake"
+        return {
+            "send": QuicKeys(self.hash, self.cipher, self.client_handshake_secret),
+            "recv": QuicKeys(self.hash, self.cipher, self.server_handshake_secret),
+        }
+
+    def handle_handshake_message(self, message):
+        self.messages.append(message)
+        msg_type = message[0]
+        if msg_type == 8:   # EncryptedExtensions
+            body = message[4:]
+            pos = 2
+            count = int.from_bytes(body[:2], "big")
+            seen = 0
+            while seen < count and len(body) - pos >= 4:
+                ext_type = int.from_bytes(body[pos:pos + 2], "big")
+                ext_len = int.from_bytes(body[pos + 2:pos + 4], "big")
+                value = body[pos + 4:pos + 4 + ext_len]
+                pos += 4 + ext_len
+                seen += 1
+                if ext_type == 0x0039:
+                    self.remote_parameters = _quic_decode_transport_parameters(value)
+                elif ext_type == 0x0010 and len(value) >= 3:
+                    self.negotiated_alpn = value[3:].decode("utf-8", "replace")
+            return None
+        if msg_type == 11:
+            # Certificate: 提取第一个条目 (叶子证书 DER) 供连接级软校验
+            body = message[4:]
+            if len(body) >= 4:
+                pos = 1 + body[0]
+                if pos + 3 <= len(body):
+                    list_len = int.from_bytes(body[pos:pos + 3], "big")
+                    if pos + 3 + list_len <= len(body) and list_len >= 3:
+                        cert_len = int.from_bytes(body[pos + 3:pos + 6], "big")
+                        if cert_len > 0 and pos + 6 + cert_len <= len(body):
+                            self.leaf_cert = bytes(body[pos + 6:pos + 6 + cert_len])
+            return None
+        if msg_type in (15, 4):
+            return None
+        if msg_type != 20:
+            return None
+        # Finished: 校验服务器 Finished, 生成客户端 Finished 与应用密钥
+        server_finished = self.messages[-1]
+        verify_data = server_finished[4:]
+        hash_before = self.transcript(len(self.messages) - 1)
+        server_finished_key = hkdf_expand_label(self.hash, self.server_handshake_secret, "finished", b"", self.hash_length)
+        expected = hmac.new(server_finished_key, hash_before, self.hash).digest()
+        verified = len(expected) == len(verify_data) and hmac.compare_digest(expected, verify_data)
+        client_finished_key = hkdf_expand_label(self.hash, self.client_handshake_secret, "finished", b"", self.hash_length)
+        client_verify = hmac.new(client_finished_key, self.transcript(), self.hash).digest()
+        finished = bytes([20]) + len(client_verify).to_bytes(3, "big") + client_verify
+        zeros = bytes(self.hash_length)
+        derived = hkdf_expand_label(self.hash, self.handshake_secret, "derived", hashlib.new(self.hash).digest(), self.hash_length)
+        master = _hkdf_extract(self.hash, derived, zeros)
+        app_hash = self.transcript()
+        self.messages.append(finished)
+        client_app = hkdf_expand_label(self.hash, master, "c ap traffic", app_hash, self.hash_length)
+        server_app = hkdf_expand_label(self.hash, master, "s ap traffic", app_hash, self.hash_length)
+        self.state = "complete"
+        return {
+            "verified": verified,
+            "finished": finished,
+            "send": QuicKeys(self.hash, self.cipher, client_app),
+            "recv": QuicKeys(self.hash, self.cipher, server_app),
+        }
+
+
+def verify_edge_quic_certificate(der):
+    # 🔐 QUIC 模式边缘证书软校验: 与 h2 路径 verify_edge_certificate 同级 (issuer O/OU/CN +
+    # SAN, 非链式验证 — Cloudflare 私有 CA 不在公共信任库)。SAN 期望 quic.cftunnel.com。
+    if not der:
+        return "no edge certificate in TLS handshake"
+    from cryptography import x509
+
+    cert = x509.load_der_x509_certificate(der)
+
+    def _attr(name, oid):
+        attrs = name.get_attributes_for_oid(oid)
+        return attrs[0].value if attrs else None
+
+    issuer_o = _attr(cert.issuer, x509.oid.NameOID.ORGANIZATION_NAME)
+    issuer_ou = _attr(cert.issuer, x509.oid.NameOID.ORGANIZATIONAL_UNIT_NAME)
+    subject_cn = _attr(cert.subject, x509.oid.NameOID.COMMON_NAME)
+    if issuer_o != "CloudFlare, Inc.":
+        return "issuer O mismatch: %r" % issuer_o
+    if not str(issuer_ou or "").startswith("CloudFlare Origin SSL"):
+        return "issuer OU mismatch: %r" % issuer_ou
+    if subject_cn != "CloudFlare Origin Certificate":
+        return "subject CN mismatch: %r" % subject_cn
+    try:
+        san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+        dns_names = san.get_values_for_type(x509.DNSName)
+    except x509.ExtensionNotFound:
+        dns_names = []
+    host = "quic.cftunnel.com"
+    for name in dns_names:
+        name = str(name).lower()
+        if name in {host, "cftunnel.com"} or (name.startswith("*.") and host.endswith(name[1:])):
+            return None
+    return "SAN does not cover quic.cftunnel.com"
+
+
+class QuicStream:
+    def __init__(self, connection, stream_id, initiator):
+        self.connection = connection
+        self.id = stream_id
+        self.initiator = initiator
+        self.send = QuicByteSender(connection)
+        self.sent_end = 0
+        self.recv = b""
+        self.receiver = QuicOffsetBuffer()
+        self.ended = False
+        self.reset = False
+        self.consumed = 0
+        self.peer_limit = 0
+        self.local_limit = connection.local_stream_data
+        self.user_data = None
+
+    def write(self, payload, end=False):
+        self.send.append(payload, bool(end))
+        self.connection.mark_send_ready(self)
+
+
+class QuicConnection:
+    # 手写 QUIC v1 连接: UDP socket 单线程读循环 (20ms 超时兼 tick), RFC 9002 丢包恢复
+    def __init__(self, host, port, logger, server_name=None, alpn=QUIC_ALPN,
+                 idle_timeout=30000, verify_certificate=False):
+        self.log = logger
+        self.host = host
+        self.port = port
+        self.server_name = server_name or host
+        self.alpn = alpn
+        self.max_packet = QUIC_MAX_PACKET
+        self.idle_timeout = idle_timeout
+        self.keep_alive = 1000
+        self.max_inflight = 256
+        self.local_max_data = 1 << 22
+        self.local_stream_data = 1 << 20
+        self.verify_certificate = verify_certificate
+        self.on_ready = lambda: None
+        self.on_stream = lambda stream: None
+        self.on_stream_data = lambda stream, data: None
+        self.on_stream_end = lambda stream: None
+        self.on_close = lambda err: None
+        self.our_cid = secrets.token_bytes(8)
+        self.peer_cid = secrets.token_bytes(8)
+        self.receive_window = 1 << 20
+        self._stopped_flag = False
+        self.local_parameters = _quic_encode_transport_parameters([
+            (QUIC_PARAM["max_idle_timeout"], self.idle_timeout),
+            (QUIC_PARAM["initial_max_data"], self.local_max_data),
+            (QUIC_PARAM["initial_max_stream_data_bidi_local"], self.local_stream_data),
+            (QUIC_PARAM["initial_max_stream_data_bidi_remote"], self.local_stream_data),
+            (QUIC_PARAM["initial_max_stream_data_uni"], self.local_stream_data),
+            (QUIC_PARAM["initial_max_streams_bidi"], 1 << 24),
+            (QUIC_PARAM["initial_max_streams_uni"], 1 << 24),
+            (QUIC_PARAM["max_udp_payload_size"], self.max_packet),
+            (QUIC_PARAM["active_connection_id_limit"], 8),
+            (QUIC_PARAM["initial_source_connection_id"], self.our_cid),
+        ])
+        self.tls = QuicTlsClient(self.server_name, self.alpn, self.local_parameters)
+        self.sock = None
+        self.closed = None
+        self.closing = False
+        self.close_reason = None
+        self.settle = None
+        self.handshake_event = threading.Event()
+        self.keys = [None, None, None]
+        self.app_recv_gens = []     # key update 代次 (新→旧), 旧代次保序接受跨代乱序
+        self.app_send_keys = [None, None]
+        self.app_key_phase = 0
+        self.pn_send = [0, 0, 0]
+        self.largest_recv = [-1, -1, -1]
+        self.recv_ranges = [[], [], []]
+        self.ack_pending = [False, False, False]
+        self.in_flight = [[], [], []]
+        self.crypto_send = [QuicByteSender(self) for _ in range(3)]
+        self.tls_offsets = [QuicOffsetBuffer() for _ in range(3)]
+        self.server_hello = b""
+        self.handshake_bytes = b""
+        self.streams = {}
+        self.send_ready = []
+        self.next_local_stream = 0
+        self.peer_max_data = 0
+        self.peer_stream_remote = 0
+        self.peer_stream_local = 0
+        self.connection_sent = 0
+        self.consumed_total = 0
+        self.credit_max_data = False
+        self.credit_ready = []
+        self.pending_one_off = []
+        self.handshake_complete = False
+        self.finished_sent = False
+        self.confirmed = False
+        self.registered = False     # 注册结果由 ControlStream 写回 (与 H2Connection 同名语义)
+        self.registration_failed = False
+        self.pto = 250
+        self.retransmits = 0
+        self.initial_window = 10 * self.max_packet
+        self.min_window = 2 * self.max_packet
+        self.congestion_window = self.initial_window
+        self.slow_start_threshold = float("inf")
+        self.max_window = self.max_inflight * self.max_packet
+        self.srtt = None
+        self.rttvar = None
+        self.peer_max_ack_delay = 25
+        self.pto_count = 0
+        self.k_packet_threshold = 3
+        self.last_received = 0.0
+        self.last_eliciting = 0.0
+        self.ping_pending = False
+        self.initial_sent = 0
+        self.peer_token = b""
+        self.remote_parameters = None
+        self.stats = {"rx": 0, "tx": 0, "rx_bytes": 0, "tx_bytes": 0, "dropped": 0, "retransmits": 0}
+        self._thread = None
+        self._finish_timer = None
+
+    # ControlStream 在注册失败时置 connection.stopped = True (与 H2Connection 同名语义):
+    # 对 QUIC 连接该赋值直接触发应用层关闭, 交还重连循环计失败数
+    @property
+    def stopped(self):
+        return self._stopped_flag
+
+    @stopped.setter
+    def stopped(self, value):
+        self._stopped_flag = bool(value)
+        if self._stopped_flag and not self.closed and not self.closing:
+            self.close("registration failed")
+
+    def connect(self, timeout=20):
+        # 建连 + 等待握手完成; 失败抛 OSError
+        self.settle = self.handshake_event
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(("0.0.0.0", 0))
+        # 读循环复用为 20ms tick 时钟: recv 超时驱动丢包检测/重传/keepalive
+        self.sock.settimeout(0.02)
+        # 发送目标固定为 connect 时解析到的单一 IP: sendto(域名) 会反复解析并可能轮转
+        # 到不同边缘服务器, 1-RTT 包落在非所属服务器上会被静默丢弃 (实机取证)
+        addr_info = socket.getaddrinfo(self.host, self.port, socket.AF_INET, socket.SOCK_DGRAM)[0][4]
+        self._send_addr = (addr_info[0], self.port)
+        self.keys[QUIC_EPOCH_INITIAL] = quic_initial_keys(self.peer_cid, True)
+        self.crypto_send[QUIC_EPOCH_INITIAL].append(self.tls.build_client_hello(), False)
+        now = time.time() * 1000
+        self.last_received = now
+        self.last_eliciting = now
+        self.log.debug("quic dial %s:%d alpn=%s dcid=%s", self.host, self.port, self.alpn, self.peer_cid.hex())
+        self._thread = threading.Thread(target=self._run_loop, daemon=True, name="quic-conn")
+        self._thread.start()
+        if not self.handshake_event.wait(timeout):
+            if not self.closed:
+                self._fail("handshake timeout")
+            raise OSError("quic handshake failed: %s" % (self.closed or "timeout"))
+        if self.closed:
+            raise OSError("quic handshake failed: %s" % self.closed)
+        return self
+
+    def _run_loop(self):
+        # 单线程循环: 20ms recv 超时兼作 tick 时钟
+        try:
+            while not self.closed:
+                try:
+                    data, _addr = self.sock.recvfrom(65536)
+                except socket.timeout:
+                    data = None
+                except OSError:
+                    break
+                try:
+                    if data:
+                        self._on_datagram(data)
+                    if not self.closed:
+                        self._tick()
+                except Exception as exc:
+                    self._fail("receive failed: %r" % (exc,))
+        finally:
+            sock = self.sock
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+    def on_send_progress(self):
+        self.retransmits = 0
+        self.pto_count = 0
+
+    def open_stream(self):
+        stream = QuicStream(self, self.next_local_stream, "local")
+        self.next_local_stream += 4
+        self.streams[stream.id] = stream
+        return stream
+
+    def send_data(self, stream_id, payload, end_stream=False):
+        stream = self.streams.get(stream_id)
+        if stream is None:
+            raise ValueError("unknown stream %d" % stream_id)
+        stream.write(payload, end_stream)
+
+    def mark_send_ready(self, stream):
+        if stream not in self.send_ready:
+            self.send_ready.append(stream)
+
+    def close(self, reason=None):
+        if self.closed:
+            return
+        self.closing = True
+        self.close_reason = reason or "close"
+        self._tick()
+        self._finish_timer = threading.Timer(0.2, self._finish, args=(None,))
+        self._finish_timer.daemon = True
+        self._finish_timer.start()
+
+    def _tick(self):
+        if self.closed:
+            return
+        now = time.time() * 1000
+        self._check_loss(now)
+        if self.keep_alive and self.handshake_complete and now - self.last_eliciting >= self.keep_alive:
+            self.ping_pending = True
+        sent = 0
+        while (
+            sent < 16
+            and self._total_in_flight() < self.max_inflight
+            and (self._in_flight_bytes() < self._send_window() or self._ack_due() or self.closing)
+        ):
+            built = self._build_packet()
+            if built is None:
+                break
+            self._transmit(built)
+            sent += 1
+        if now - self.last_received > max(self.idle_timeout, 15000):
+            self._fail("peer idle for %dms" % int(now - self.last_received))
+
+    def _total_in_flight(self):
+        return sum(len(self.in_flight[epoch]) for epoch in range(3))
+
+    def _ack_due(self):
+        for epoch in range(3):
+            if self.keys[epoch] is not None and self.ack_pending[epoch] and self.recv_ranges[epoch]:
+                return True
+        return False
+
+    def _in_flight_bytes(self):
+        return sum(entry["bytes"] for epoch in range(3) for entry in self.in_flight[epoch])
+
+    def _send_window(self):
+        return self.congestion_window if self.handshake_complete else float("inf")
+
+    def _pto_duration(self):
+        return max(self.pto * (2 ** self.pto_count), 20)
+
+    def _record_rtt_sample(self, sample):
+        if self.srtt is None:
+            self.srtt = sample
+            self.rttvar = sample / 2
+        else:
+            self.rttvar = (self.rttvar * 3 + abs(self.srtt - sample)) / 4
+            self.srtt = (self.srtt * 7 + sample) / 8
+        self.pto = round(self.srtt + 4 * self.rttvar + self.peer_max_ack_delay)
+
+    def _on_loss(self, epoch):
+        self.slow_start_threshold = max(self.congestion_window // 2, 2 * self.min_window)
+        self.congestion_window = self.min_window
+
+    def _check_loss(self, now):
+        for epoch in range(3):
+            entries = self.in_flight[epoch]
+            if not entries:
+                continue
+            if now - entries[0]["time"] < self._pto_duration():
+                continue
+            entry = entries[0]
+            self.in_flight[epoch] = entries[1:]
+            self._return_lost(epoch, entry)
+            self.retransmits += 1
+            self.stats["retransmits"] += 1
+            self.pto_count += 1
+            if self.retransmits > 24:
+                self._fail("no response after %d retransmits" % self.retransmits)
+                return
+
+    def _return_lost(self, epoch, entry):
+        if entry["crypto"]:
+            self.crypto_send[epoch].loss_ranges([entry["crypto"]])
+        for item in entry["streams"]:
+            item["stream"].send.loss_ranges([{"start": item["start"], "length": item["length"]}])
+            if item["fin"]:
+                item["stream"].send.loss_ranges([{"start": item["start"] + item["length"], "length": 0, "fin": True}])
+            self.mark_send_ready(item["stream"])
+
+    def _discard_epoch(self, epoch, reason):
+        if self.keys[epoch] is None:
+            return
+        self.keys[epoch] = None
+        self.in_flight[epoch] = []
+        self.log.debug("quic discarded %s keys (%s)", QUIC_EPOCH_NAMES[epoch], reason)
+
+    def _flush_handshake_ack(self):
+        # 丢弃握手密钥前冲刷未确认的 handshake-epoch ACK: 边缘的 ack-eliciting 握手包
+        # (如 Finished 的 CRYPTO 包) 若不获 ACK 会按 RFC 9002 无限重传, 而密钥丢弃后
+        # _pick_epoch 因 keys=None 永远跳过 HANDSHAKE, ACK 再也发不出去
+        epoch = QUIC_EPOCH_HANDSHAKE
+        keys = self.keys[epoch]
+        if keys is None or not self.ack_pending[epoch] or not self.recv_ranges[epoch]:
+            return
+        frame = _quic_encode_ack(self.recv_ranges[epoch][-16:])
+        self.ack_pending[epoch] = False
+        packet_number = self.pn_send[epoch]
+        self.pn_send[epoch] += 1
+        built = self._header(epoch, QUIC_PN_LEN + len(frame) + 16, packet_number)
+        aad = built["header"] + built["pn_bytes"]
+        sealed = aad + keys["send"].seal(packet_number, aad, frame)
+        protected = _quic_apply_protection(keys["send"], sealed, built["pn_offset"], built["long"])
+        if protected is None:
+            self.ack_pending[epoch] = True
+            return
+        self._transmit({"epoch": epoch, "packet": protected, "pn": packet_number,
+                        "meta": {"crypto": None, "streams": []}, "ack_eliciting": False})
+
+    def _confirm_handshake(self):
+        # RFC 9000 §4.1.2: HANDSHAKE_DONE / 1-RTT 包被 ACK 均确认握手
+        if self.confirmed or not self.handshake_complete or not self.finished_sent:
+            return
+        self._flush_handshake_ack()
+        self.confirmed = True
+        self._discard_epoch(QUIC_EPOCH_HANDSHAKE, "handshake confirmed")
+        self._discard_epoch(QUIC_EPOCH_INITIAL, "handshake confirmed")
+
+    def _header_overhead(self, epoch):
+        tag = 16
+        if epoch == QUIC_EPOCH_APPLICATION:
+            return 1 + len(self.peer_cid) + QUIC_PN_LEN + tag
+        if epoch == QUIC_EPOCH_HANDSHAKE:
+            return 1 + 4 + 1 + len(self.peer_cid) + 1 + len(self.our_cid) + 2 + QUIC_PN_LEN + tag
+        return (
+            1 + 4 + 1 + len(self.peer_cid) + 1 + len(self.our_cid)
+            + quic_varint_size(len(self.peer_token)) + len(self.peer_token)
+            + 2 + QUIC_PN_LEN + tag
+        )
+
+    def _header(self, epoch, protected_length, packet_number):
+        pn_bytes = packet_number.to_bytes(QUIC_PN_LEN, "big")
+        if epoch == QUIC_EPOCH_APPLICATION:
+            first = 0x40 | (self.app_key_phase << 2) | (QUIC_PN_LEN - 1)
+            header = bytes([first]) + self.peer_cid
+            return {"header": header, "pn_bytes": pn_bytes, "pn_offset": 1 + len(self.peer_cid), "long": False}
+        ext_type = 0 if epoch == QUIC_EPOCH_INITIAL else 2
+        out = bytearray([0xC0 | (ext_type << 4) | (QUIC_PN_LEN - 1)])
+        out += QUIC_VERSION.to_bytes(4, "big")
+        out.append(len(self.peer_cid))
+        out += self.peer_cid
+        if epoch == QUIC_EPOCH_INITIAL:
+            out.append(len(self.our_cid))
+            out += self.our_cid
+            out += quic_write_varint(len(self.peer_token))
+            if self.peer_token:
+                out += self.peer_token
+        else:
+            out.append(0)
+        out += (0x4000 | protected_length).to_bytes(2, "big")
+        header = bytes(out)
+        return {"header": header, "pn_bytes": pn_bytes, "pn_offset": len(header), "long": True}
+
+    def _pick_epoch(self):
+        for epoch in (QUIC_EPOCH_INITIAL, QUIC_EPOCH_HANDSHAKE, QUIC_EPOCH_APPLICATION):
+            if self.keys[epoch] is None:
+                continue
+            if self.ack_pending[epoch] and self.recv_ranges[epoch]:
+                return epoch
+            if any(item["epoch"] == epoch for item in self.pending_one_off):
+                return epoch
+            if self.crypto_send[epoch].pending:
+                return epoch
+            if epoch == QUIC_EPOCH_APPLICATION and (self.send_ready or self.credit_ready or self.ping_pending or self.closing):
+                return epoch
+        return -1
+
+    def _build_packet(self):
+        epoch = self._pick_epoch()
+        if epoch < 0:
+            return None
+        budget = self.max_packet - self._header_overhead(epoch)
+        if budget < 16:
+            return None
+        frames = []
+        meta = {"crypto": None, "streams": [], "ping": False, "closing": False, "one_off": False}
+        if self.ack_pending[epoch] and self.recv_ranges[epoch]:
+            frame = _quic_encode_ack(self.recv_ranges[epoch][-16:])
+            frames.append(frame)
+            budget -= len(frame)
+            self.ack_pending[epoch] = False
+        for item in [item for item in self.pending_one_off if item["epoch"] == epoch]:
+            if len(item["frame"]) > budget - 16:
+                break
+            frames.append(item["frame"])
+            budget -= len(item["frame"])
+            self.pending_one_off.remove(item)
+            meta["one_off"] = True
+        sender = self.crypto_send[epoch]
+        if sender.pending and budget > 16:
+            chunk = sender.take(budget - 12)
+            frame = bytes([QUIC_FRAME["crypto"]]) + quic_write_varint(chunk["start"]) + quic_write_varint(chunk["length"]) + chunk["bytes"]
+            frames.append(frame)
+            budget -= len(frame)
+            meta["crypto"] = chunk
+        if epoch == QUIC_EPOCH_APPLICATION:
+            self._credit_frames(frames, budget)
+            self._stream_frames(frames, meta, min(budget, max(0, self._send_window() - self._in_flight_bytes())))
+        if epoch == QUIC_EPOCH_APPLICATION and self.closing:
+            reason = (self.close_reason or "close").encode()[:64]
+            frames.append(bytes([QUIC_FRAME["application_close"]]) + quic_write_varint(0) + quic_write_varint(0) + reason)
+            meta["closing"] = True
+        elif epoch == QUIC_EPOCH_APPLICATION and self.ping_pending:
+            frames.append(bytes([QUIC_FRAME["ping"]]))
+            self.ping_pending = False
+            meta["ping"] = True
+        if not frames:
+            return None
+        payload = b"".join(frames)
+        if epoch == QUIC_EPOCH_INITIAL and not self.handshake_complete:
+            # RFC 9000 §14.1: 客户端携带 Initial 包的数据报必须填充至 1200 字节 —
+            # 边缘 (quic-go) 丢弃过小的客户端 Initial, ACK-only 小包会让 ServerHello
+            # 被 PTO 无限重传 (实机取证)
+            pad = QUIC_MIN_INITIAL - self._header_overhead(epoch) - len(payload)
+            if pad > 0:
+                payload += bytes(pad)
+        packet_number = self.pn_send[epoch]
+        self.pn_send[epoch] += 1
+        send_keys = self.app_send_keys[self.app_key_phase] if epoch == QUIC_EPOCH_APPLICATION else self.keys[epoch]["send"]
+        built = self._header(epoch, QUIC_PN_LEN + len(payload) + 16, packet_number)
+        aad = built["header"] + built["pn_bytes"]
+        sealed = aad + send_keys.seal(packet_number, aad, payload)
+        protected = _quic_apply_protection(send_keys, sealed, built["pn_offset"], built["long"])
+        if protected is None:
+            self._fail("packet too small for header protection sample")
+            return None
+        return {
+            "epoch": epoch,
+            "packet": protected,
+            "pn": packet_number,
+            "meta": meta,
+            "ack_eliciting": bool(meta["crypto"] or meta["streams"] or meta["ping"] or meta["closing"] or meta["one_off"]),
+        }
+
+    def _credit_frames(self, frames, budget):
+        if self.credit_max_data and budget > 12:
+            frames.append(bytes([QUIC_FRAME["max_data"]]) + quic_write_varint(self.local_max_data))
+            self.credit_max_data = False
+        for stream in list(self.credit_ready):
+            if budget < 20:
+                break
+            frames.append(
+                bytes([QUIC_FRAME["max_stream_data"]])
+                + quic_write_varint(stream.id) + quic_write_varint(stream.local_limit)
+            )
+            self.credit_ready.remove(stream)
+
+    def _peer_stream_limit(self, stream):
+        if stream.peer_limit:
+            return stream.peer_limit
+        return self.peer_stream_remote if stream.initiator == "local" else self.peer_stream_local
+
+    def _stream_frames(self, frames, meta, budget):
+        for stream in list(self.send_ready):
+            if budget < 24:
+                break
+            credit = min(self.peer_max_data - self.connection_sent, self._peer_stream_limit(stream) - stream.sent_end)
+            if credit <= 0:
+                break
+            chunk = stream.send.take(min(budget - 20, credit))
+            if chunk is None:
+                if stream.send.take_fin():
+                    frames.append(
+                        bytes([QUIC_FRAME["stream"] | 0x04 | 0x02 | 0x01])
+                        + quic_write_varint(stream.id) + quic_write_varint(len(stream.send.data)) + quic_write_varint(0)
+                    )
+                    meta["streams"].append({"stream": stream, "start": len(stream.send.data), "length": 0, "fin": True})
+                else:
+                    if stream in self.send_ready:
+                        self.send_ready.remove(stream)
+                continue
+            at_end = chunk["start"] + chunk["length"] >= len(stream.send.data)
+            flags = 0x04 | 0x02 | (0x01 if at_end and stream.send.fin else 0)
+            frames.append(
+                bytes([QUIC_FRAME["stream"] | flags])
+                + quic_write_varint(stream.id) + quic_write_varint(chunk["start"])
+                + quic_write_varint(chunk["length"]) + chunk["bytes"]
+            )
+            meta["streams"].append({
+                "stream": stream, "start": chunk["start"], "length": chunk["length"],
+                "fin": at_end and stream.send.fin, "retransmitted": chunk["retransmitted"],
+            })
+            novel = max(0, chunk["start"] + chunk["length"] - stream.sent_end)
+            stream.sent_end = max(stream.sent_end, chunk["start"] + chunk["length"])
+            self.connection_sent += novel
+            if stream.send.idle() and stream in self.send_ready:
+                self.send_ready.remove(stream)
+
+    def _transmit(self, built):
+        if self.sock is None or self.closed:
+            return
+        try:
+            self.sock.sendto(built["packet"], self._send_addr)
+        except OSError as exc:
+            self.log.debug("quic send failed: %s", exc)
+        self.stats["tx"] += 1
+        self.stats["tx_bytes"] += len(built["packet"])
+        if built["epoch"] == QUIC_EPOCH_INITIAL:
+            self.initial_sent += 1
+        if built["epoch"] == QUIC_EPOCH_HANDSHAKE and not self.crypto_send[QUIC_EPOCH_HANDSHAKE].pending:
+            self.finished_sent = True
+        if built["ack_eliciting"]:
+            retransmitted = (
+                (built["meta"]["crypto"] is not None and built["meta"]["crypto"].get("retransmitted") is True)
+                or any(item.get("retransmitted") is True for item in built["meta"]["streams"])
+            )
+            self.in_flight[built["epoch"]].append({
+                "pn": built["pn"], "time": time.time() * 1000, "bytes": len(built["packet"]),
+                "crypto": built["meta"]["crypto"], "streams": built["meta"]["streams"],
+                "retransmitted": retransmitted,
+            })
+            self.last_eliciting = time.time() * 1000
+
+    def _on_datagram(self, message):
+        self.stats["rx"] += 1
+        self.stats["rx_bytes"] += len(message)
+        self.last_received = time.time() * 1000
+        offset = 0
+        while offset < len(message):
+            first = message[offset]
+            if not first & 0x80:
+                self._handle_short(message[offset:])
+                return
+            view = message[offset:]
+            parsed = self._parse_long(view)
+            if parsed is None:
+                return
+            if parsed["version"] != QUIC_VERSION:
+                self.log.debug("rx version negotiation or unknown version %#x", parsed["version"])
+                return
+            if parsed["type"] == 3:
+                self._handle_retry(parsed)
+                return
+            end = min(len(view), parsed["pn_offset"] + parsed["length"])
+            self._handle_long(view[:end], parsed)
+            offset += end
+
+    def _parse_long(self, packet):
+        if len(packet) < 7:
+            return None
+        first = packet[0]
+        version = int.from_bytes(packet[1:5], "big")
+        ext_type = (first & 0x30) >> 4
+        pos = 5
+        dcid_len = packet[pos]
+        pos += 1
+        if len(packet) - pos < dcid_len + 1:
+            return None
+        dcid = packet[pos:pos + dcid_len]
+        pos += dcid_len
+        scid_len = packet[pos]
+        pos += 1
+        if len(packet) - pos < scid_len:
+            return None
+        scid = packet[pos:pos + scid_len]
+        pos += scid_len
+        token = b""
+        if ext_type == 0:
+            parsed = quic_read_varint(packet, pos)
+            if parsed is None:
+                return None
+            token_len, pos = parsed[0], pos + parsed[1]
+            if len(packet) - pos < token_len:
+                return None
+            token = packet[pos:pos + token_len]
+            pos += token_len
+        if ext_type == 3:
+            return {"first": first, "type": ext_type, "version": version, "dcid": dcid, "scid": scid,
+                    "token": packet[pos:len(packet) - 16], "pn_offset": 0, "length": 0, "retry": True}
+        length_field = quic_read_varint(packet, pos)
+        if length_field is None:
+            return None
+        length = length_field[0]
+        pos += length_field[1]
+        return {"first": first, "type": ext_type, "version": version, "dcid": dcid, "scid": scid,
+                "token": token, "pn_offset": pos, "length": length, "retry": False}
+
+    def _handle_retry(self, parsed):
+        self.peer_token = bytes(parsed["token"])
+        self.peer_cid = bytes(parsed["scid"])
+        self.pn_send[QUIC_EPOCH_INITIAL] = 0
+        self.in_flight[QUIC_EPOCH_INITIAL] = []
+        self.crypto_send[QUIC_EPOCH_INITIAL].loss()
+        self.initial_sent = 0
+
+    def _epoch_for_type(self, ext_type):
+        if ext_type in (0, 1):
+            return QUIC_EPOCH_INITIAL
+        return QUIC_EPOCH_HANDSHAKE
+
+    def _handle_long(self, packet, parsed):
+        epoch = self._epoch_for_type(parsed["type"])
+        keys = self.keys[epoch]
+        if keys is None or parsed["length"] < QUIC_PN_LEN:
+            self.stats["dropped"] += 1
+            return
+        removed = _quic_remove_protection(keys["recv"], packet, parsed["pn_offset"], True)
+        if removed is None:
+            self.stats["dropped"] += 1
+            return
+        plain_header, truncated = removed
+        pn_length = (plain_header[0] & 0x03) + 1
+        packet_number = _quic_decode_packet_number(max(self.largest_recv[epoch], 0), pn_length * 8, truncated)
+        try:
+            payload = keys["recv"].open(packet_number, plain_header, packet[parsed["pn_offset"] + pn_length:])
+        except Exception as exc:
+            self.stats["dropped"] += 1
+            self.log.debug("rx %dB %s undecryptable", len(packet), QUIC_EPOCH_NAMES[epoch])
+            return
+        if epoch == QUIC_EPOCH_INITIAL and parsed["dcid"] == self.our_cid:
+            if not self.handshake_complete and parsed["scid"] and self.peer_cid != parsed["scid"]:
+                self.peer_cid = bytes(parsed["scid"])
+                self.log.debug("quic peer cid %s", self.peer_cid.hex())
+        self._record_received(epoch, packet_number)
+        if epoch == QUIC_EPOCH_HANDSHAKE:
+            self._discard_epoch(QUIC_EPOCH_INITIAL, "handshake packet received")
+        self._handle_frames(payload, epoch)
+
+    def _handle_short(self, packet):
+        keys = self.keys[QUIC_EPOCH_APPLICATION]
+        if keys is None:
+            self.stats["dropped"] += 1
+            return
+        if not self.app_recv_gens:
+            self.app_recv_gens.append({"keys": keys["recv"], "phase": 0})
+        pn_offset = 1 + len(self.our_cid)
+        # key phase 在保护首字节内: 代次只能靠试解密判别 — argo 边缘跨 key update 沿用
+        # 原 header protection key, 该 key 全程留在候选列表
+        header_keys = [keys["recv"]]
+        for gen in self.app_recv_gens:
+            if gen["keys"] not in header_keys:
+                header_keys.append(gen["keys"])
+        newest = self.app_recv_gens[0]
+        gens = self.app_recv_gens + [{"keys": quic_next_keys(newest["keys"]), "phase": 1 - newest["phase"], "next": True}]
+        for gen in gens:
+            candidates = header_keys + [gen["keys"]] if gen.get("next") else header_keys
+            for header in candidates:
+                removed = _quic_remove_protection(header, packet, pn_offset, False)
+                if removed is None:
+                    continue
+                plain_header, truncated = removed
+                pn_length = (plain_header[0] & 0x03) + 1
+                packet_number = _quic_decode_packet_number(max(self.largest_recv[QUIC_EPOCH_APPLICATION], 0), pn_length * 8, truncated)
+                try:
+                    payload = gen["keys"].open(packet_number, plain_header, packet[pn_offset + pn_length:])
+                except Exception:
+                    continue
+                if gen.get("next"):
+                    # RFC 9001 §6.1: 用下一代密钥解开即证明对端已换钥
+                    self.app_recv_gens.insert(0, {"keys": gen["keys"], "phase": gen["phase"]})
+                    if len(self.app_recv_gens) > 2:
+                        self.app_recv_gens.pop()
+                    self.app_key_phase = gen["phase"]
+                    self.app_send_keys[gen["phase"]] = quic_next_keys(self.app_send_keys[1 - gen["phase"]], True)
+                    self.log.debug("quic key phase %d updated", gen["phase"])
+                self._record_received(QUIC_EPOCH_APPLICATION, packet_number)
+                # RFC 9000 §4.1.2: 客户端确认握手只基于 HANDSHAKE_DONE 或 1-RTT 包被 ACK;
+                # 解密 1-RTT 包本身不确认 — 过急确认会在边缘 coalesce 的 hs+1RTT 数据报里
+                # 先于待发 handshake-epoch ACK 丢弃握手密钥, 令边缘 ack-eliciting 握手包
+                # (Finished CRYPTO 包) 永远等不到 ACK 而无限重传 (实机取证)
+                self._handle_frames(payload, QUIC_EPOCH_APPLICATION)
+                return
+        self.stats["dropped"] += 1
+        self.log.debug("rx %dB one-rtt undecryptable", len(packet))
+
+    def _record_received(self, epoch, packet_number):
+        self.recv_ranges[epoch] = _ranges_union(self.recv_ranges[epoch], [{"start": packet_number, "length": 1}])
+        if packet_number > self.largest_recv[epoch]:
+            self.largest_recv[epoch] = packet_number
+        self.ack_pending[epoch] = True
+
+    def _apply_ack(self, epoch, ranges):
+        now = time.time() * 1000
+        ack_delay = 0
+        if ranges and isinstance(ranges[-1], dict) and "ack_delay" in ranges[-1]:
+            ack_delay = ranges[-1]["ack_delay"]
+            ranges = ranges[:-1]
+        sent = self.in_flight[epoch]
+        largest_acked = -1
+        for r in ranges:
+            largest_acked = max(largest_acked, r["start"] + r["length"] - 1)
+        keep = []
+        acked_bytes = 0
+        sample = None
+        for entry in sent:
+            acked = any(entry["pn"] >= r["start"] and entry["pn"] < r["start"] + r["length"] for r in ranges)
+            if not acked:
+                keep.append(entry)
+                continue
+            acked_bytes += entry["bytes"]
+            # Karn 规则: 仅最大 ACK 且未重传的包给出真实 RTT 采样
+            if entry["pn"] == largest_acked and entry["retransmitted"] is not True:
+                sample = now - entry["time"] - min(ack_delay, self.peer_max_ack_delay)
+            if entry["crypto"]:
+                self.crypto_send[epoch].ack(entry["crypto"]["start"], entry["crypto"]["length"], False)
+            for item in entry["streams"]:
+                item["stream"].send.ack(item["start"], item["length"], item["fin"])
+        # RFC 9002 §7.2: 被越过 K 包阈值未确认的包判丢失
+        survivors, lost = [], []
+        for entry in keep:
+            if largest_acked - entry["pn"] >= self.k_packet_threshold:
+                lost.append(entry)
+            else:
+                survivors.append(entry)
+        self.in_flight[epoch] = survivors
+        if acked_bytes:
+            if sample is not None and sample > 0:
+                self._record_rtt_sample(sample)
+            self.on_send_progress()
+            self._grow_window(acked_bytes)
+        for entry in lost:
+            self._return_lost(epoch, entry)
+        if lost:
+            self._on_loss(epoch)
+        if epoch == QUIC_EPOCH_APPLICATION and len(survivors) < len(sent):
+            self._confirm_handshake()
+
+    def _grow_window(self, acked_bytes):
+        if self.congestion_window < self.slow_start_threshold:
+            self.congestion_window += acked_bytes
+        else:
+            self.congestion_window += max(1, (self.max_packet * acked_bytes) // self.congestion_window)
+        self.congestion_window = min(self.congestion_window, self.max_window)
+
+    def _handle_frames(self, payload, epoch):
+        pos = 0
+        while pos < len(payload):
+            frame_type = payload[pos]
+            pos += 1
+            if frame_type in (QUIC_FRAME["padding"], QUIC_FRAME["ping"]):
+                continue
+            if frame_type in (QUIC_FRAME["ack"], QUIC_FRAME["ack_ecn"]):
+                reader = {"buffer": payload, "pos": pos, "number": lambda r: self._reader_number(r)}
+                ranges = _quic_ranges_from_ack(reader)
+                pos = reader["pos"]
+                if frame_type == QUIC_FRAME["ack_ecn"]:
+                    for _ in range(3):
+                        parsed = quic_read_varint(payload, pos)
+                        pos += parsed[1]
+                self._apply_ack(epoch, ranges)
+                continue
+            if frame_type == QUIC_FRAME["crypto"]:
+                parsed = quic_read_varint(payload, pos)
+                start, pos = parsed[0], pos + parsed[1]
+                parsed = quic_read_varint(payload, pos)
+                length, pos = parsed[0], pos + parsed[1]
+                if len(payload) - pos < length:
+                    return
+                fresh = self.tls_offsets[epoch].accept(start, payload[pos:pos + length])
+                pos += length
+                if fresh:
+                    self._consume_tls(epoch, fresh)
+                continue
+            if (frame_type & 0xF8) == QUIC_FRAME["stream"]:
+                # RFC 9000 §19.8: OFF=0x04, LEN=0x02, FIN=0x01
+                flags = frame_type & 0x07
+                parsed = quic_read_varint(payload, pos)
+                stream_id, pos = parsed[0], pos + parsed[1]
+                has_length = bool(flags & 0x02)
+                has_offset = bool(flags & 0x04)
+                fin = bool(flags & 0x01)
+                offset = 0
+                if has_offset:
+                    parsed = quic_read_varint(payload, pos)
+                    offset, pos = parsed[0], pos + parsed[1]
+                length = len(payload) - pos
+                if has_length:
+                    parsed = quic_read_varint(payload, pos)
+                    length, pos = parsed[0], pos + parsed[1]
+                if len(payload) - pos < length:
+                    return
+                self._deliver_stream(stream_id, offset, payload[pos:pos + length], fin)
+                pos += length
+                continue
+            if frame_type == QUIC_FRAME["max_data"]:
+                parsed = quic_read_varint(payload, pos)
+                self.peer_max_data = max(self.peer_max_data, parsed[0])
+                pos += parsed[1]
+                continue
+            if frame_type == QUIC_FRAME["max_stream_data"]:
+                parsed = quic_read_varint(payload, pos)
+                stream_id, pos = parsed[0], pos + parsed[1]
+                stream = self.streams.get(stream_id)
+                if stream is not None:
+                    parsed = quic_read_varint(payload, pos)
+                    stream.peer_limit = max(stream.peer_limit, parsed[0])
+                    pos += parsed[1]
+                else:
+                    parsed = quic_read_varint(payload, pos)
+                    pos += parsed[1]
+                continue
+            if frame_type in (QUIC_FRAME["max_streams_bidi"], QUIC_FRAME["max_streams_uni"]):
+                parsed = quic_read_varint(payload, pos)
+                pos += parsed[1]
+                continue
+            if frame_type == QUIC_FRAME["new_connection_id"]:
+                parsed = quic_read_varint(payload, pos)
+                pos += parsed[1]
+                parsed = quic_read_varint(payload, pos)
+                pos += parsed[1]
+                cid_len = payload[pos]
+                pos += 1
+                if len(payload) - pos < cid_len + 16:
+                    return
+                pos += cid_len + 16
+                continue
+            if frame_type == QUIC_FRAME["retire_connection_id"]:
+                parsed = quic_read_varint(payload, pos)
+                pos += parsed[1]
+                continue
+            if frame_type == QUIC_FRAME["path_challenge"]:
+                if len(payload) - pos < 8:
+                    return
+                data = payload[pos:pos + 8]
+                pos += 8
+                self._queue_one_off_frame(bytes([QUIC_FRAME["path_response"]]) + data, epoch)
+                continue
+            if frame_type == QUIC_FRAME["path_response"]:
+                continue
+            if frame_type == QUIC_FRAME["handshake_done"]:
+                self._confirm_handshake()
+                continue
+            if frame_type == QUIC_FRAME["reset_stream"]:
+                parsed = quic_read_varint(payload, pos)
+                stream_id, pos = parsed[0], pos + parsed[1]
+                for _ in range(2):
+                    parsed = quic_read_varint(payload, pos)
+                    pos += parsed[1]
+                stream = self.streams.get(stream_id)
+                if stream is not None:
+                    stream.reset = True
+                    self.on_stream_end(stream)
+                continue
+            if frame_type == QUIC_FRAME["stop_sending"]:
+                for _ in range(2):
+                    parsed = quic_read_varint(payload, pos)
+                    pos += parsed[1]
+                continue
+            if frame_type == QUIC_FRAME["new_token"]:
+                parsed = quic_read_varint(payload, pos)
+                length, pos = parsed[0], pos + parsed[1]
+                self.peer_token = bytes(payload[pos:pos + length])
+                pos += length
+                continue
+            if frame_type in (QUIC_FRAME["transport_close"], QUIC_FRAME["application_close"]):
+                parsed = quic_read_varint(payload, pos)
+                code, pos = parsed[0], pos + parsed[1]
+                if frame_type == QUIC_FRAME["transport_close"]:
+                    parsed = quic_read_varint(payload, pos)
+                    pos += parsed[1]
+                reason = payload[pos:].decode("utf-8", "replace") if pos < len(payload) else ""
+                self._fail("peer closed code=%d reason=%s" % (code, reason))
+                return
+            if frame_type in (QUIC_FRAME["datagram"], QUIC_FRAME["datagram_len"]):
+                length = len(payload) - pos
+                if frame_type == QUIC_FRAME["datagram_len"]:
+                    parsed = quic_read_varint(payload, pos)
+                    length, pos = parsed[0], pos + parsed[1]
+                if len(payload) - pos < length:
+                    return
+                pos += length
+                continue
+            self._fail("unhandled QUIC frame type %#x" % frame_type)
+            return
+
+    def _reader_number(self, reader):
+        parsed = quic_read_varint(reader["buffer"], reader["pos"])
+        if parsed is None:
+            raise ValueError("truncated QUIC varint")
+        reader["pos"] += parsed[1]
+        return parsed[0]
+
+    def _queue_one_off_frame(self, frame, epoch):
+        self.ack_pending[epoch] = True
+        self.pending_one_off.append({"epoch": epoch, "frame": frame})
+
+    def _deliver_stream(self, stream_id, offset, payload, fin):
+        stream = self.streams.get(stream_id)
+        if stream is None:
+            stream = QuicStream(self, stream_id, "remote" if stream_id & 1 else "local")
+            self.streams[stream_id] = stream
+            self.on_stream(stream)
+        fresh = stream.receiver.accept(offset, payload)
+        if fresh:
+            stream.recv += fresh
+            self.consumed_total += len(fresh)
+            if self.local_max_data - self.consumed_total < self.receive_window / 2:
+                self.local_max_data = self.consumed_total + self.receive_window
+                self.credit_max_data = True
+            if stream.local_limit - len(stream.recv) < self.receive_window / 2:
+                stream.local_limit = len(stream.recv) + self.receive_window
+                if stream not in self.credit_ready:
+                    self.credit_ready.append(stream)
+            self.on_stream_data(stream, fresh)
+            self._tick()
+        if fin and not stream.ended and stream.receiver.contiguous == len(stream.recv):
+            stream.ended = True
+            self.on_stream_end(stream)
+
+    def _consume_tls(self, epoch, payload):
+        if epoch == QUIC_EPOCH_APPLICATION:
+            return
+        if epoch == QUIC_EPOCH_INITIAL and self.tls.state == "awaiting-server-hello":
+            self.server_hello += payload
+            try:
+                message = self.tls.server_hello_complete(self.server_hello)
+                if message is None:
+                    return
+                self.server_hello = b""
+                keys = self.tls.handle_server_hello(message)
+            except Exception as exc:
+                self._fail("server hello: %s" % exc)
+                return
+            self.keys[QUIC_EPOCH_HANDSHAKE] = keys
+            self.log.debug("quic server hello received, handshake keys installed")
+            return
+        # RFC 9001: ServerHello 之后的 flight 应为 Handshake epoch; 但边缘实机行为
+        # (2026-10 取证) 是把整个 flight 继续用 Initial epoch 发送 — 两处来源统一
+        # 汇入同一条 TLS 消息流
+        self.handshake_bytes += payload
+        self._pump_handshake_messages()
+
+    def _pump_handshake_messages(self):
+        while len(self.handshake_bytes) >= 4:
+            total = 4 + int.from_bytes(self.handshake_bytes[1:4], "big")
+            if len(self.handshake_bytes) < total:
+                return
+            message = self.handshake_bytes[:total]
+            self.handshake_bytes = self.handshake_bytes[total:]
+            try:
+                result = self.tls.handle_handshake_message(message)
+            except Exception as exc:
+                self._fail("handshake message: %s" % exc)
+                return
+            if self.tls.remote_parameters is not None and self.remote_parameters is None:
+                self.remote_parameters = self.tls.remote_parameters
+                params = self.remote_parameters
+                self.peer_max_data = params.get(QUIC_PARAM["initial_max_data"], 0)
+                self.peer_stream_remote = params.get(QUIC_PARAM["initial_max_stream_data_bidi_remote"], 0)
+                self.peer_stream_local = params.get(QUIC_PARAM["initial_max_stream_data_bidi_local"], 0)
+                self.peer_max_ack_delay = min(params.get(QUIC_PARAM["max_ack_delay"], 25), 100)
+            if result is not None:
+                if self.verify_certificate:
+                    # 🔐 边缘软校验在安装应用密钥前执行: 失败直接拒连, 交还上层换下一主机
+                    verify_error = verify_edge_quic_certificate(self.tls.leaf_cert)
+                    if verify_error:
+                        self._fail("edge certificate verification failed: " + verify_error)
+                        return
+                self.keys[QUIC_EPOCH_APPLICATION] = {"send": result["send"], "recv": result["recv"]}
+                self.app_recv_gens = [{"keys": result["recv"], "phase": 0}]
+                self.app_send_keys[0] = result["send"]
+                self.crypto_send[QUIC_EPOCH_HANDSHAKE].append(result["finished"], False)
+                self.handshake_complete = True
+                if not result["verified"]:
+                    self.log.warning("server Finished verify_data mismatch")
+                self.log.debug("quic handshake complete alpn=%s", self.tls.negotiated_alpn or "?")
+                if self.handshake_event is not None:
+                    self.handshake_event.set()
+                self.on_ready()
+                return
+
+    def _fail(self, message):
+        if self.closed:
+            return
+        self.log.debug("quic closed: %s", message)
+        self._finish(OSError(message))
+
+    def _finish(self, err):
+        if self.closed:
+            return
+        self.closed = str(err) if err else "closed"
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
+        if not self.handshake_complete and self.handshake_event is not None:
+            self.handshake_event.set()
+        else:
+            self.on_close(err)
+
+
+# 数据流请求头/长度解析 (与 h2 路径的 H2 request 对应)
+def quic_header_values(headers, name):
+    return [value for key, value in headers if key.lower() == name]
+
+
+def build_quic_request(connect):
+    metadata = {}
+    headers = []
+    for key, value in connect["metadata"]:
+        if QUIC_META_HEADER in key:
+            parts = key.split(":")
+            if len(parts) != 2:
+                raise ValueError("header Key: %s malformed" % key)
+            headers.append((parts[1], value))
+        else:
+            metadata[key] = value
+    request_path = connect["dest"]
+    try:
+        parsed = urlsplit(connect["dest"])
+        request_path = parsed.path + ("?" + parsed.query if parsed.query else "")
+    except ValueError:
+        request_path = connect["dest"]
+    content_length_values = quic_header_values(headers, "content-length")
+    chunked = "chunked" in ",".join(quic_header_values(headers, "transfer-encoding")).lower()
+    content_length = int(content_length_values[0]) if content_length_values and content_length_values[0].isdigit() else None
+    return {
+        "type": connect["type"],
+        "method": metadata.get(QUIC_META_METHOD, "GET"),
+        "host": metadata.get(QUIC_META_HOST, ""),
+        "path": request_path if request_path.startswith("/") else "/" + request_path,
+        "headers": headers,
+        "content_length": content_length,
+        "bodyless": not chunked and content_length is None,
+    }
+
+
+def quic_request_complete(state):
+    request = state["request"]
+    if request["bodyless"]:
+        return True
+    if state["ended"]:
+        return True
+    return request["content_length"] is not None and len(state["body"]) >= request["content_length"]
+
+
+class QuicWebsocketRelay:
+    # QUIC websocket 中继: ConnectRequest(type=1) 的响应头经 ConnectResponse metadata 交付
+    # (状态字面转发 101, 实机确认; 响应体/WS 帧走裸字节双向转发)
+    def __init__(self, session, state, request, origin, log):
+        self.session = session
+        self.state = state
+        self.request = request
+        self.origin = origin
+        self.log = log
+        self.incoming = queue.Queue()
+        self.stopped = threading.Event()
+        self.sock = None
+
+    def feed(self, payload):
+        self.incoming.put(payload)   # None = 边缘侧 FIN
+
+    def stop(self):
+        self.stopped.set()
+        sock = self.sock
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def run(self):
+        writer = None
+        try:
+            self.sock = open_origin_socket(self.origin)
+            self.send_handshake()
+            response = http.client.HTTPResponse(self.sock, method="GET")
+            response.begin()
+            if response.status != 101:
+                self.session.write_response(self.state["stream"], "origin websocket upgrade rejected: %d" % response.status,
+                                            [(QUIC_META_STATUS, str(response.status))], True)
+                try:
+                    self.sock.close()
+                except OSError:
+                    pass
+                return
+            # websocket 类型: 上报真实 101 (边缘把 metadata 状态字面转发给 WS 客户端)
+            metadata = [(QUIC_META_STATUS, str(response.status))]
+            for name, value in response.getheaders():
+                lower = name.lower()
+                if lower in ("transfer-encoding", "content-length"):
+                    continue
+                if lower.startswith("cf-int-") or lower.startswith("cf-cloudflared-") or lower.startswith("cf-proxy-"):
+                    continue
+                metadata.append((QUIC_META_HEADER + ":" + name, value))
+            self.session.write_response(self.state["stream"], "", metadata, False)
+            writer = threading.Thread(target=self.write_to_origin, daemon=True)
+            writer.start()
+            self.pump_origin()
+        except Exception as exc:
+            self.log.warning("websocket stream %d failed: %s", self.state["stream"].id, exc)
+            self.session.respond(self.state, str(exc), 502)
+        finally:
+            self.stop()
+            if writer is not None:
+                writer.join(timeout=1)
+
+    def pump_origin(self):
+        # origin → 边缘流 (裸字节)
+        if not self.stopped.is_set():
+            try:
+                first = self.sock.recv(65536)
+            except OSError:
+                first = b""
+            if first and not self.stopped.is_set():
+                self.state["stream"].write(first, False)
+            while not self.stopped.is_set():
+                try:
+                    chunk = self.sock.recv(65536)
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    break
+                self.state["stream"].write(chunk, False)
+            if not self.stopped.is_set():
+                self.state["stream"].write(b"", True)
+
+    def write_to_origin(self):
+        # 边缘流 → origin (队列消费; None = 边缘 FIN)
+        while not self.stopped.is_set():
+            try:
+                payload = self.incoming.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if payload is None:
+                try:
+                    self.sock.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+                return
+            try:
+                self.sock.sendall(payload)
+            except OSError:
+                self.stopped.set()
+                return
+
+    def send_handshake(self):
+        parsed = urlsplit(self.origin)
+        target = self.request["path"] if self.request["path"].startswith("/") else "/" + self.request["path"]
+        lines = ["GET %s HTTP/1.1" % target]
+        has_key = has_version = has_origin = False
+        for name, value in self.request["headers"]:
+            lower = name.lower()
+            if lower in ("host", "connection", "upgrade", "content-length", "transfer-encoding"):
+                continue
+            if lower == "sec-websocket-key":
+                has_key = True
+            elif lower == "sec-websocket-version":
+                has_version = True
+            elif lower == "origin":
+                has_origin = True
+            lines.append("%s: %s" % (name, value))
+        lines.append("Host: %s" % parsed.netloc)
+        if not has_origin and self.request.get("host"):
+            lines.append("Origin: https://%s" % self.request["host"])
+        if not has_key:
+            lines.append("Sec-WebSocket-Key: %s" % base64.b64encode(secrets.token_bytes(16)).decode())
+        if not has_version:
+            lines.append("Sec-WebSocket-Version: 13")
+        lines.append("Connection: Upgrade")
+        lines.append("Upgrade: websocket")
+        self.sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1"))
+
+
+class QuicSession:
+    # QUIC 隧道会话: 首个客户端发起流为控制面 (复用 ControlStream, 注册语义与 h2 一致);
+    # 边缘发起的双向流 (id & 3 == 1) 携带 7 字节前导 + ConnectRequest, 代理至本地 origin
+    def __init__(self, connection, origin, account_tag, tunnel_secret, tunnel_id, conn_index, log):
+        self.conn = connection
+        self.origin = origin
+        self.account_tag = account_tag
+        self.tunnel_secret = tunnel_secret
+        self.tunnel_id = tunnel_id
+        self.conn_index = conn_index
+        self.log = log
+        self.control = None
+        self.requests = {}
+        self.relays = set()
+        self.stopped = False
+        self._done = threading.Event()
+        self._error = None
+        connection.on_stream = self.accept_stream
+        connection.on_stream_data = self.receive_stream
+        connection.on_stream_end = self.end_stream
+        connection.on_close = self.stop
+
+    def run(self):
+        # 边缘约定首个客户端发起流为控制面; 阻塞直至连接关闭 (关闭异常向上抛)
+        control = self.conn.open_stream()
+        self.control = ControlStream(self.conn, control.id, self.log)
+        self.control.start(self.account_tag, self.tunnel_secret, self.tunnel_id, self.conn_index)
+        self._done.wait()
+        if self._error is not None:
+            raise self._error
+
+    def run_async(self):
+        # 非阻塞启动 (测试/脚本用): 会话在独立 daemon 线程运行
+        threading.Thread(target=self.run, daemon=True, name="quic-session").start()
+
+    def stop(self, err=None):
+        if self.stopped:
+            return
+        self.stopped = True
+        self.requests.clear()
+        for relay in list(self.relays):
+            relay.stop()
+        self.relays.clear()
+        self._error = err
+        self._done.set()
+
+    def accept_stream(self, stream):
+        # 边缘发起的双向流承载请求 (id & 3 == 1); 偶数 id 是我方发起
+        if stream.id & 3 != 1:
+            return
+        self.requests[stream.id] = {
+            "stream": stream, "buffer": b"", "body": b"", "request": None,
+            "websocket": False, "relay": None, "ended": False, "served": False, "failed": False,
+        }
+
+    def receive_stream(self, stream, data):
+        if self.control is not None and stream.id == self.control.stream_id:
+            self.control.feed(data)
+            return
+        state = self.requests.get(stream.id)
+        if state is None or state["failed"]:
+            return
+        if state["request"] is None:
+            state["buffer"] += data
+            self.parse_request(state)
+        elif data:
+            if state["websocket"] and state["relay"] is not None:
+                state["relay"].feed(data)
+            else:
+                state["body"] += data
+        self.maybe_serve(state)
+
+    def end_stream(self, stream):
+        if self.control is not None and stream.id == self.control.stream_id:
+            self.control.finished = True
+            return
+        state = self.requests.get(stream.id)
+        if state is None:
+            return
+        state["ended"] = True
+        if state["websocket"] and state["relay"] is not None:
+            state["relay"].feed(None)
+            return
+        if state["request"] is not None:
+            self.maybe_serve(state)
+        else:
+            self.requests.pop(stream.id, None)
+
+    def parse_request(self, state):
+        buffer = state["buffer"]
+        if len(buffer) < len(QUIC_DATA_STREAM_PREAMBLE):
+            return
+        if buffer[:len(QUIC_DATA_STREAM_SIGNATURE)] != QUIC_DATA_STREAM_SIGNATURE:
+            self.log.warning("stream %d is not a v1 tunnel data stream", state["stream"].id)
+            state["failed"] = True
+            return
+        if buffer[6:8] != b"01":
+            self.log.warning("stream %d uses tunnel protocol %s", state["stream"].id, buffer[6:8].decode("latin-1"))
+            state["failed"] = True
+            return
+        messages, tail = capnp_messages(buffer[len(QUIC_DATA_STREAM_PREAMBLE):])
+        if not messages:
+            return
+        try:
+            connect = capnp_connect_request(messages[0])
+        except Exception as exc:
+            self.log.warning("stream %d has an unreadable ConnectRequest: %s", state["stream"].id, exc)
+            state["failed"] = True
+            return
+        state["body"] = tail
+        state["buffer"] = b""
+        try:
+            state["request"] = build_quic_request(connect)
+            if state["request"]["type"] == QUIC_CONNECTION_TYPE["websocket"]:
+                state["websocket"] = True
+        except Exception as exc:
+            self.log.warning("stream %d: %s", state["stream"].id, exc)
+            state["failed"] = True
+            self.respond(state, str(exc), 502)
+
+    def maybe_serve(self, state):
+        if state["served"] or state["request"] is None or state["failed"] or not quic_request_complete(state):
+            return
+        state["served"] = True
+        self.serve_request(state)
+
+    def serve_request(self, state):
+        stream = state["stream"]
+        request = state["request"]
+        if request["type"] == QUIC_CONNECTION_TYPE["websocket"]:
+            self.serve_websocket(state)
+            return
+        if request["type"] != QUIC_CONNECTION_TYPE["http"]:
+            threading.Thread(
+                target=self.respond, args=(state, "tunnel connection type %d is not proxied over QUIC yet" % request["type"], 502),
+                daemon=True,
+            ).start()
+            return
+        # 与 h2 路径一致: 代理在独立线程执行, 不阻塞读循环 (ACK/重传照常推进)
+        threading.Thread(target=self._proxy_http, args=(state,), daemon=True).start()
+
+    def _proxy_http(self, state):
+        stream = state["stream"]
+        request = state["request"]
+        try:
+            response = proxy_to_origin(self.origin, request["method"], request["path"], request["headers"], state["body"])
+            resp = response["body"]
+            metadata = [(QUIC_META_STATUS, str(200 if response["status"] == 101 else response["status"]))]
+            has_content_type = False
+            for name, value in response["headers"]:
+                lower = name.lower()
+                if lower == "transfer-encoding":
+                    continue
+                if lower == "content-type":
+                    has_content_type = True
+                metadata.append((QUIC_META_HEADER + ":" + name, value))
+            if not has_content_type:
+                inferred = infer_content_type(request["path"])
+                if inferred:
+                    metadata.append((QUIC_META_HEADER + ":Content-Type", inferred))
+            self.write_response(stream, "", metadata, False)
+            while True:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                stream.write(chunk, False)
+            stream.write(b"", True)
+        except Exception as exc:
+            self.log.warning("stream %d proxy failed: %s", stream.id, exc)
+            self.respond(state, str(exc), 502)
+        finally:
+            if not state["websocket"]:
+                self.requests.pop(stream.id, None)
+
+    def serve_websocket(self, state):
+        relay = QuicWebsocketRelay(self, state, state["request"], self.origin, self.log)
+        state["relay"] = relay
+        self.relays.add(relay)
+        # 解析 ConnectRequest 时已到达的残余字节先喂给中继
+        if state["body"]:
+            relay.feed(state["body"])
+            state["body"] = b""
+        threading.Thread(target=relay.run, daemon=True).start()
+
+    def respond(self, state, error_text, status):
+        self.write_response(state["stream"], error_text, [(QUIC_META_STATUS, str(status))], True)
+
+    def write_response(self, stream, error_text, metadata, end_stream):
+        if self.stopped or stream.send.fin:
+            return
+        stream.write(QUIC_DATA_STREAM_PREAMBLE + capnp_connect_response(error_text, metadata), end_stream)
+
+
+def connect_edge_quic(logger, idle_timeout_ms=None, verify_certificate=False):
+    # QUIC 边缘建连: 按主机洗牌逐个尝试; 证书校验/空闲超时与 h2 路径共用同一套开关语义
+    candidates = list(EDGE_HOSTS)
+    secrets.SystemRandom().shuffle(candidates)
+    last_error = None
+    for host in candidates:
+        connection = QuicConnection(
+            host, EDGE_PORT, logger,
+            server_name=QUIC_SERVER_NAME, alpn=QUIC_ALPN,
+            idle_timeout=idle_timeout_ms if idle_timeout_ms else 30000,
+            verify_certificate=verify_certificate,
+        )
+        try:
+            connection.connect()
+            logger.info("connected to %s:%d over QUIC", host, EDGE_PORT)
+            return connection
+        except (OSError, Exception) as exc:
+            last_error = exc
+            logger.warning("edge %s failed: %s", host, exc)
+            try:
+                connection.close("edge connect failed")
+            except Exception:
+                pass
+    raise OSError("all Cloudflare edges failed: %s" % last_error)
+
+
+# ----------------------------------------------------------------------------
 # 日志适配: cftunnel 的 %-格式化实例日志 -> agent 的 Logger 类方法
 # ----------------------------------------------------------------------------
 class _ArgoLogAdapter:
@@ -5151,7 +7594,7 @@ class CloudflareQuickTunnel:
     # 1. start(): 向 api.trycloudflare.com 注册, 拿到临时公网域名并启动守护线程
     # 2. 守护线程维护与 Cloudflare Edge 的 HTTP/2 长连接, 断线自动重连
     # 3. stop(): 断开当前连接并退出守护线程
-    def __init__(self, port, logger=None, quick_service=QUICK_SERVICE, retry_seconds=2.0, verify_certificate=None, silent=False):
+    def __init__(self, port, logger=None, quick_service=QUICK_SERVICE, retry_seconds=2.0, verify_certificate=None, silent=False, use_quic=False, requester=None):
         # 🔐 A-2: 默认校验 Cloudflare edge 证书; 自定义链路确需豁免时 KISAMA_EDGE_INSECURE=true
         if verify_certificate is None:
             verify_certificate = os.getenv("KISAMA_EDGE_INSECURE", "").strip().lower() != "true"
@@ -5162,6 +7605,10 @@ class CloudflareQuickTunnel:
         self.retry_seconds = retry_seconds
         self.verify_certificate = verify_certificate
         self.silent = silent              # KMODE=2 静默模式: 不向 stdout 打印隧道域名
+        # 🚦 本条隧道的边缘传输 ('h2'|'quic'): 注册协议与传输无关, 按隧道独立选择;
+        # QUIC 建连连续失败达阈值自动回退 h2 (实例级, 重启进程恢复)
+        self.transport = "quic" if use_quic else "h2"
+        self.quic_failures = 0
         self.hostname = None              # 临时公网域名 (含 https:// 前缀)
         self.created_at = None            # 注册成功时间戳 (int)
         # 🛡️ 守护重建换新域名时的回调 (old_domain, new_domain); KMODE 接线后自动再上报/重写域名文件
@@ -5169,13 +7616,18 @@ class CloudflareQuickTunnel:
         self._stop = threading.Event()
         self._thread = None
         self._sock = None
+        self._conn = None                 # QUIC 传输时为 QuicConnection, 供 stop() 主动关闭
+        # 注册请求注入缝 (_requester 为测试注入缝, 生产恒 None → 调用时取 request_quick_tunnel;
+        # 延迟解析使 agent.request_quick_tunnel 的测试 patch 生效)
+        self._requester = requester
         self._tunnel_state = {"printed": False}
 
     def start(self):
         # 幂等保护: 已启动则直接返回现有域名
         if self._thread is not None and self._thread.is_alive():
             return self.hostname
-        hostname, account_tag, tunnel_secret, tunnel_id = request_quick_tunnel(self.quick_service)
+        requester = self._requester or request_quick_tunnel
+        hostname, account_tag, tunnel_secret, tunnel_id = requester(self.quick_service)
         self.hostname = hostname if hostname.startswith("https://") else "https://" + hostname
         self.created_at = int(time.time())
         self._stop.clear()
@@ -5195,27 +7647,45 @@ class CloudflareQuickTunnel:
         while not self._stop.is_set():
             sock = None
             conn = None
+            quic_conn = None
             try:
-                sock = connect_edge(self.verify_certificate, self.log)
-                self._sock = sock
-                conn_index = (conn_index + 1) % 4
-                conn = H2Connection(
-                    sock,
-                    self.origin,
-                    account_tag,
-                    tunnel_secret,
-                    tunnel_id,
-                    conn_index,
-                    self.log,
-                    self.hostname,
-                    not self.silent,
-                    self._tunnel_state,
-                )
-                conn.run()
+                # 🔐 A-2: 默认校验 Cloudflare edge 证书; 自定义链路确需豁免时 KISAMA_EDGE_INSECURE=true
+                if self.transport == "quic":
+                    # 🚦 QUIC 传输: UDP/7844, SNI quic.cftunnel.com, ALPN argotunnel;
+                    # 空闲超时与 h2 共用 KISAMA_ARGO_IDLE_TIMEOUT (0=禁用时回落 QUIC 默认 30s)
+                    idle_ms = ARGO_IDLE_TIMEOUT * 1000 if ARGO_IDLE_TIMEOUT > 0 else 30000
+                    quic_conn = connect_edge_quic(self.log, idle_ms, self.verify_certificate)
+                    if self._stop.is_set():
+                        quic_conn.close("tunnel removed")
+                        return
+                    self._conn = quic_conn
+                    conn_index = (conn_index + 1) % 4
+                    session = QuicSession(
+                        quic_conn, self.origin, account_tag, tunnel_secret, tunnel_id,
+                        conn_index, self.log,
+                    )
+                    session.run()
+                else:
+                    sock = connect_edge(self.verify_certificate, self.log)
+                    self._sock = sock
+                    conn_index = (conn_index + 1) % 4
+                    conn = H2Connection(
+                        sock,
+                        self.origin,
+                        account_tag,
+                        tunnel_secret,
+                        tunnel_id,
+                        conn_index,
+                        self.log,
+                        self.hostname,
+                        not self.silent,
+                        self._tunnel_state,
+                    )
+                    conn.run()
             except KeyboardInterrupt:
                 return
             except Exception as exc:
-                # 🛡️ 全捕获: 任何异常 (含 H2 解析错误等) 都不能让守护线程静默死亡, 死了就再也无法自愈
+                # 🛡️ 全捕获: 任何异常 (含 H2/QUIC 解析错误等) 都不能让守护线程静默死亡, 死了就再也无法自愈
                 if not self._stop.is_set():
                     self.log.warning("tunnel connection closed: %s", exc)
             finally:
@@ -5224,19 +7694,38 @@ class CloudflareQuickTunnel:
                         sock.close()
                     except OSError:
                         pass
+                if quic_conn is not None:
+                    try:
+                        quic_conn.close("tunnel closed")
+                    except Exception:
+                        pass
                 self._sock = None
+                self._conn = None
             if self._stop.is_set():
                 return
-            # 🛡️ 守护计数: 本轮注册过=旧凭据仍有效; 未注册=凭据可能已被 Cloudflare 回收
-            if conn is not None and conn.registered:
+            registered = (conn is not None and conn.registered) or (quic_conn is not None and quic_conn.registered)
+            if registered:
                 failures = 0
+                self.quic_failures = 0
             else:
                 failures += 1
+                # 🚦 QUIC 连续失败达阈值: 自动回退 h2 (同一注册凭据无需重注册, UDP 被墙环境兜底;
+                # 回退只影响本条隧道, 重启进程恢复 QUIC)
+                if self.transport == "quic":
+                    self.quic_failures += 1
+                    if self.quic_failures >= ARGO_REREGISTER_AFTER:
+                        self.transport = "h2"
+                        self.log.warning(
+                            "argo tunnel %s: QUIC 连续 %d 轮建连失败, 已自动回退 h2 传输 (重启进程恢复 QUIC)",
+                            self.hostname, self.quic_failures,
+                        )
+                        self.quic_failures = 0
                 if failures >= ARGO_REREGISTER_AFTER:
                     credentials = self._reregister()
                     if credentials is not None:
                         account_tag, tunnel_secret, tunnel_id = credentials
                         failures = 0
+                        self.quic_failures = 0   # 凭据类失败不计入传输回退, 避免误降级
                     elif self._stop.wait(ARGO_REREGISTER_RETRY_SECONDS):
                         # 重新注册失败: 退避更久再试, 避免高频请求 api.trycloudflare.com
                         return
@@ -5247,7 +7736,8 @@ class CloudflareQuickTunnel:
         # 🛡️ 旧凭据连续失败达阈值: 重新注册快速隧道换取新域名, 触发 on_domain_change 回调
         # (KMODE=2 自动再上报 shz.al / KMODE=1 自动重写域名文件)。成功返回新凭据元组。
         try:
-            hostname, account_tag, tunnel_secret, tunnel_id = request_quick_tunnel(self.quick_service)
+            requester = self._requester or request_quick_tunnel
+            hostname, account_tag, tunnel_secret, tunnel_id = requester(self.quick_service)
         except Exception as exc:
             self.log.warning("tunnel re-register failed: %s", exc)
             return None
@@ -5280,6 +7770,12 @@ class CloudflareQuickTunnel:
                 sock.close()
             except OSError:
                 pass
+        quic_conn = self._conn
+        if quic_conn is not None:
+            try:
+                quic_conn.close("tunnel removed")
+            except Exception:
+                pass
         if self._thread is not None:
             self._thread.join(timeout=2)
 
@@ -5306,6 +7802,8 @@ class ArgoTunnelManager:
         self.log = logger if logger is not None else _ArgoLogAdapter()
         # 🛡️ 守护重建换新域名时的回调 (old_domain, new_domain), 创建隧道时下发给实例
         self.on_domain_change = None
+        # 注册请求注入缝 (_requester 为测试注入缝, 生产恒为 None → request_quick_tunnel)
+        self._requester = None
 
     def list_tunnels(self):
         # 返回已注册成功的临时隧道 (域名 / 端口 / 创建时间)
@@ -5315,12 +7813,13 @@ class ArgoTunnelManager:
                     "tunnel_domain": tunnel.hostname,
                     "port": tunnel.port,
                     "created_at": datetime.fromtimestamp(tunnel.created_at, timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "transport": tunnel.transport,
                 }
                 for tunnel in self._tunnels
                 if tunnel.hostname is not None
             ]
 
-    def create_tunnel(self, port, duplicate=False, silent=False):
+    def create_tunnel(self, port, duplicate=False, silent=False, quic=False):
         # 重复策略: 同端口已有隧道且未声明 duplicate 时拒绝 (409)
         with self._lock:
             if self._by_port.get(port) and not duplicate:
@@ -5329,7 +7828,7 @@ class ArgoTunnelManager:
                     "tunnel already exists on port %d, set duplicate=true to force creation" % port,
                 )
         # 注册 + 建连属于网络操作, 放在锁外执行, 避免长时间阻塞查询接口
-        tunnel = CloudflareQuickTunnel(port=port, logger=self.log, silent=silent)
+        tunnel = CloudflareQuickTunnel(port=port, logger=self.log, silent=silent, use_quic=quic, requester=self._requester)
         tunnel.on_domain_change = self.on_domain_change
         try:
             tunnel.start()
@@ -5345,6 +7844,7 @@ class ArgoTunnelManager:
             "tunnel_domain": tunnel.hostname,
             "port": port,
             "created_at": datetime.fromtimestamp(tunnel.created_at, timezone.utc).isoformat().replace("+00:00", "Z"),
+            "transport": tunnel.transport,
         }
 
     def delete_tunnel(self, port, tunnel_domain=None):
@@ -5381,6 +7881,7 @@ class ArgoTunnelManager:
                     "tunnel_domain": t.hostname,
                     "port": t.port,
                     "created_at": datetime.fromtimestamp(t.created_at, timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "transport": t.transport,
                 }
                 for t in targets
             ]
@@ -5561,9 +8062,9 @@ class KModeController:
                     print("[KMODE] tunnel domain not ready", flush=True)
 
     @classmethod
-    def _tunnel_task(cls, manager, after_domain=None, silent=False):
+    def _tunnel_task(cls, manager, after_domain=None, silent=False, quic=False):
         try:
-            manager.create_tunnel(Config.PORT, silent=silent)
+            manager.create_tunnel(Config.PORT, silent=silent, quic=quic)
         except Exception as exc:
             if not silent:
                 Logger.warning(f"[KMODE] ⚠️ 启动隧道创建失败: {exc}")
@@ -5581,11 +8082,12 @@ class KModeController:
     def activate(cls, manager):
         # KMODE=1: 隧道 + 域名文件 + stdin 监听; KMODE=2: 隧道 + shz.al 静默上报
         if Config.KMODE == "2" and cls.kname_valid():
-            Logger.info("[KMODE] 🚀 KMODE=2: 隧道域名将上报至外部平台")
+            quic = Config.KMODE_QUIC
+            Logger.info("[KMODE] 🚀 KMODE=2%s: 隧道域名将上报至外部平台%s" % ("q" if quic else "", " (QUIC 传输)" if quic else ""))
             # 🛡️ 守护重建换新域名时自动重新上报 (静默重试, 回调在独立线程执行)
             manager.on_domain_change = lambda old_domain, new_domain: cls.report_domain_change(new_domain)
             threading.Thread(target=cls._tunnel_task, args=(manager,),
-                             kwargs={"after_domain": cls.report_shzal, "silent": True},
+                             kwargs={"after_domain": cls.report_shzal, "silent": True, "quic": quic},
                              daemon=True, name="kmode-tunnel").start()
             return
         Logger.info("[KMODE] 🚀 KMODE=1: 启动时自动创建临时隧道")
@@ -5615,6 +8117,7 @@ class ArgoTunnelCreateRequest(BaseModel):
     # POST /api/argo 请求体
     port: Optional[int] = Field(default=None, ge=1, le=65535, description="隧道转发端口, 缺省使用 agent 自身监听端口", examples=[8000])
     duplicate: bool = Field(default=False, description="是否允许同一端口重复建隧道 (默认 false)", examples=[False])
+    quic: bool = Field(default=False, description="该隧道边缘传输是否走 QUIC (UDP/7844, 缺省 h2); QUIC 连续建连失败自动回退 h2", examples=[False])
 
 
 class ArgoTunnelCreateResponse(BaseModel):
@@ -5767,7 +8270,7 @@ async def create_argo_tunnel(
     manager = request.app.state.argo_tunnel_manager
     port = payload.port if payload.port is not None else Config.PORT
     try:
-        return manager.create_tunnel(port, duplicate=payload.duplicate)
+        return manager.create_tunnel(port, duplicate=payload.duplicate, quic=payload.quic)
     except ArgoTunnelError as exc:
         return JSONResponse(
             status_code=exc.status_code,
@@ -6184,11 +8687,140 @@ class TaskManager:
         if restored_cron:
             Config.crontasks = restored_cron
     
+    # ================= 🪪 任务元数据行 (0.6.2 契约, docs/API.MD 四) =================
+    # 任务身份 = 脚本首行保留注释 `kisama-task: id=<创建ms> updated=<修改ms>`
+    # (Unix `#` / Windows `rem` 注释语法, 随脚本逐字往返; POST 设置时在此规范化盖章:
+    #  同任务内容未变→幂等保留原 id/updated, 内容变化→保留 id 刷新 updated, 全新任务→赋 id=now)
+    TASK_META_LINE_RE = re.compile(r"^\s*(?:#|rem\b)\s*kisama-task:\s*(.*)$", re.IGNORECASE)
+
+    @staticmethod
+    def _parse_task_meta(script: str):
+        """从脚本前 3 行解析元数据行, 返回 (id, updated) 或 None"""
+        for line in str(script or "").split("\n")[:3]:
+            m = TaskManager.TASK_META_LINE_RE.match(line)
+            if not m:
+                continue
+            mid = re.search(r"\bid=(\d+)\b", m.group(1))
+            if not mid:
+                return None
+            upd = re.search(r"\bupdated=(\d+)\b", m.group(1))
+            return (mid.group(1), int(upd.group(1)) if upd else 0)
+        return None
+
+    @staticmethod
+    def _strip_task_meta(script: str) -> str:
+        """剥掉元数据行后的有效脚本 (无行原样返回)"""
+        lines = str(script or "").split("\n")
+        for i, line in enumerate(lines[:3]):
+            if TaskManager.TASK_META_LINE_RE.match(line):
+                return "\n".join(lines[:i] + lines[i + 1:])
+        return str(script or "")
+
+    @staticmethod
+    def _with_task_meta(script: str, task_id: str, updated: int) -> str:
+        """把规范化元数据行插到脚本头部 (首行是 shebang 则第二行); 平台注释语法跟随本端"""
+        effective = TaskManager._strip_task_meta(script)
+        comment = "rem" if os.name == "nt" else "#"
+        line = f"{comment} kisama-task: id={task_id} updated={updated}"
+        lines = effective.split("\n")
+        pos = 1 if lines and lines[0].startswith("#!") else 0
+        lines.insert(pos, line)
+        return "\n".join(lines)
+
+    @classmethod
+    def _normalize_onetime_tasks(cls, incoming: List[str], stored: List[str]) -> List[str]:
+        """身份感知整表规范化 (启动任务): 匹配优先级 id 跨位置 > 有效脚本全等 (任一侧无行时);
+        存量中未被入参匹配的条目删除 (整表替换语义不变)"""
+        now = int(time.time() * 1000)
+        stored_parsed = [
+            {"raw": s, "meta": cls._parse_task_meta(s), "eff": cls._strip_task_meta(s).strip()}
+            for s in (stored or [])
+        ]
+        consumed = set()
+        out: List[str] = []
+        for raw in (incoming or []):
+            raw = str(raw or "")
+            meta = cls._parse_task_meta(raw)
+            eff = cls._strip_task_meta(raw).strip()
+            hit = -1
+            if meta:
+                for i, sp in enumerate(stored_parsed):
+                    if i not in consumed and sp["meta"] and sp["meta"][0] == meta[0]:
+                        hit = i
+                        break
+            if hit < 0:
+                for i, sp in enumerate(stored_parsed):
+                    if i not in consumed and sp["eff"] == eff and (not meta or not sp["meta"]):
+                        hit = i
+                        break
+            if hit < 0:
+                # 全新任务: 赋 id=now (入参行被剥掉, 面板暂授的 id 以响应回显为准)
+                out.append(cls._with_task_meta(eff, str(now), now))
+                continue
+            sp = stored_parsed[hit]
+            consumed.add(hit)
+            if sp["eff"] == eff:
+                # 内容未变: 幂等保留原 id/updated; 存量无行 (0.5.7 遗留) 则采纳入参 id
+                sm = sp["meta"]
+                if sm:
+                    out.append(cls._with_task_meta(sp["raw"], sm[0], sm[1]))
+                else:
+                    out.append(cls._with_task_meta(sp["raw"], meta[0] if meta else str(now), meta[1] if meta and meta[1] else now))
+                continue
+            # 内容变化: 保留身份 (存量 id 优先, 存量无行采纳入参 id), 刷新修改时间
+            keep_id = sp["meta"][0] if sp["meta"] else (meta[0] if meta else str(now))
+            out.append(cls._with_task_meta(eff, keep_id, now))
+        return out
+
+    @classmethod
+    def _normalize_cron_tasks(cls, incoming: Dict[str, str], stored: Dict[str, str]) -> Dict[str, str]:
+        """身份感知整表规范化 (定时任务): id 跨表达式匹配 (同一条任务改了调度时间仍是同一条),
+        其次同表达式 + 有效脚本全等; 输出保持入参表达式顺序"""
+        now = int(time.time() * 1000)
+        stored_parsed = [
+            {"expr": e, "raw": s, "meta": cls._parse_task_meta(s), "eff": cls._strip_task_meta(s).strip()}
+            for e, s in (stored or {}).items()
+        ]
+        consumed = set()
+        out: Dict[str, str] = {}
+        for expr, raw in (incoming or {}).items():
+            expr = str(expr)
+            raw = str(raw or "")
+            meta = cls._parse_task_meta(raw)
+            eff = cls._strip_task_meta(raw).strip()
+            hit = -1
+            if meta:
+                for i, sp in enumerate(stored_parsed):
+                    if i not in consumed and sp["meta"] and sp["meta"][0] == meta[0]:
+                        hit = i
+                        break
+            if hit < 0:
+                for i, sp in enumerate(stored_parsed):
+                    if i not in consumed and sp["expr"] == expr and sp["eff"] == eff and (not meta or not sp["meta"]):
+                        hit = i
+                        break
+            if hit < 0:
+                out[expr] = cls._with_task_meta(eff, str(now), now)
+                continue
+            sp = stored_parsed[hit]
+            consumed.add(hit)
+            if sp["eff"] == eff and sp["expr"] == expr:
+                sm = sp["meta"]
+                if sm:
+                    out[expr] = cls._with_task_meta(sp["raw"], sm[0], sm[1])
+                else:
+                    out[expr] = cls._with_task_meta(sp["raw"], meta[0] if meta else str(now), meta[1] if meta and meta[1] else now)
+                continue
+            keep_id = sp["meta"][0] if sp["meta"] else (meta[0] if meta else str(now))
+            out[expr] = cls._with_task_meta(eff, keep_id, now)
+        return out
+
     # ================= 启动任务 (One-time) =================
-    
+
     def set_onetime_tasks(self, tasks: List[str]) -> dict:
         """设置启动任务列表"""
-        Config.onetasks = tasks if tasks else []
+        # 🪪 0.6.2: 身份感知规范化盖章 (空表=清空, 不经规范化)
+        Config.onetasks = self._normalize_onetime_tasks(tasks, Config.onetasks) if tasks else []
         result = {"status": "ok", "count": len(Config.onetasks), "tasks": Config.onetasks}
         # 💾 持久化 (0.5.7): 设置/清空后落盘
         result["persisted"] = self.store.save(Config.onetasks, Config.crontasks)
@@ -6397,8 +9029,9 @@ class TaskManager:
                 "valid_count": len(tasks) - len(invalid)
             }
         
-        Config.crontasks = tasks if tasks else {}
-        
+        # 🪪 0.6.2: 身份感知规范化盖章 (空表=清空停止, 不经规范化)
+        Config.crontasks = self._normalize_cron_tasks(tasks, Config.crontasks) if tasks else {}
+
         # 控制循环开关: 有任务则启动，无任务则停止
         if Config.crontasks and not Config.cronloop:
             self.start_cron_loop()

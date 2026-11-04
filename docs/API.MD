@@ -9,6 +9,10 @@
 ## 日志级别
 通过环境变量LOG_LEVEL控制（py/js/go/java/java11 五语言统一，0=DEBUG / 1=INFO / 2=WARN / 3=ERROR），缺省 `3` 即生产只输出错误日志；未显式设置且 `DEBUG=true` 时接管为 `0`（调试全量输出），详见「十一、日志级别」一节。
 
+## `.env` 自举文件（五语言统一；py/js/java/java11 既有，0.6.2 起 Go 补齐）
+
+agent 启动时自动读取**可执行文件同目录**（py/js 为脚本同目录，java/java11 为 jar/class 同目录，与 keys/ 同路径约定）下的 `.env`，对全部环境变量生效（`DEBUG`/`HOST`/`KPORT`/`KMODE`/`KSTORE`/`KSTORE_KEY`/`LOG_LEVEL`/`KISAMA_ARGO_*` 等）：**真实环境变量优先，`.env` 只填补空缺**（setdefault 语义）。解析规则四份实现逐条一致：UTF-8 按行；跳过空行与 `#` 开头行；支持 `export ` 前缀；按首个 `=` 切分、键值两侧 trim；成对单/双引号剥离；**不处理行内注释**（保护含 `#` 的值，如域名 x-target-host 反代语法）；文件不存在或解析异常静默跳过，绝不影响启动。典型用途：容器/托管环境不便注入环境变量时，将 `.env` 与二进制同目录放置即可完成全部配置（含任务持久化密钥 `KSTORE_KEY`，威胁模型见「十三」）。
+
 【安全说明】
 除了/api/baseinfo、/api/status 以及 /kisamaproxy 转发器（纯转发，不参与认证）外，
 其他所有接口均受 AuthEncryptMiddleware 保护。
@@ -368,6 +372,8 @@ X-Total-Chunks: 1
 
 > 💾 0.5.7 起任务定义支持本地加密持久化与重启自动恢复（`KSTORE`/`KSTORE_KEY`，启动任务离线自治，onetime 单次执行语义），详见「十三」。本节 13/14/16 的响应含 `persisted` 字段，17 的响应含 `persistence` 对象。
 
+> 🪪 **0.6.2 任务元数据行（任务身份契约，面板双向合并的语义依赖）**：每条任务的脚本体可携带一行保留注释 `kisama-task: id=<创建时刻ms> updated=<最后修改时刻ms>`，位置为首行（`#!` shebang 后一行），注释语法随 agent 平台（Unix `#` / Windows `rem`），对 shell 执行零副作用。**agent 在 14/16 设置时做「身份感知整表规范化」**：解析入参脚本的元数据行并与存量表按 `id` 匹配（onetime 跨位置、cron 跨表达式——同一条任务改了调度时间仍是同一条），无 id 时按「剥行后的有效脚本」全等匹配（任一侧无行才参与内容匹配）；匹配且有效内容未变 → 幂等保留原 `id/updated`（重复推送不推进修改时间）；匹配但内容/表达式变化 → 保留 `id`、刷新 `updated` 为本端接单时刻；未匹配 → 全新任务赋 `id=updated=now`；存量中未被入参匹配的条目删除（整表替换语义不变）。存量无行的 0.5.7 遗留任务按上述规则补盖行；入参行缺 `updated` 视为 0。响应 14/16 的 `tasks` 回显**规范化后**的表（调用方应以回显为准回写本地镜像）；GET 13/15 原样返回存储表（含行）。旧客户端/裸 curl 无行推送会被补盖行、回显多一行注释，行为透明。KSTORE 存储格式与 GET 结构均不变（行是脚本内容的一部分逐字往返）。
+
 ### 13. 获取启动任务
 路径：GET /api/task/onetime  
 用途：获取待执行的一次性任务列表  
@@ -403,6 +409,8 @@ X-Total-Chunks: 1
 ```
 { "status": "ok", "count": 2, "tasks": { "*/10 * * * *": "python /opt/scripts/health_check.py", "0 0 * * 0": "/opt/scripts/weekly_report.sh" } }
 ```
+
+> 🔧 **整表替换即整表摘挂（0.6.2 起 Go 对齐，py/js/java/java11 本就如此）**：16 是整表替换语义——本次请求未包含的存量任务即被删除，agent 必须按新表同步重建调度器（新表为空时摘除全部调度项并停止调度循环），已删除任务不得残留任何内存调度项继续触发（kisama_app TC-34 回归：Go 0.6.1 及更早版本空表只清表不摘调度项，已删任务在内存调度器中按原表达式持续执行，任务表/面板/App 均无可见残留，仅 agent 重启可清除）。`17` 的 `cron.active` 与调度器实际状态同步。
 
 ### 17. 获取任务状态
 路径：GET /api/task/status  
@@ -452,7 +460,7 @@ X-Total-Chunks: 1
 
 ### 23. 手动触发启动任务
 路径：POST /api/task/onetime/execute
-用途：强制立即重新执行所有已配置的一次性启动任务（不受 InitTask 状态限制）。
+用途：强制立即重新执行所有已配置的一次性启动任务（不受 InitTask 状态限制）。执行结果与生命周期首跑同样写入启动任务日志环（`GET /api/task/log/onetime` 可回看；0.6.2 起 Go 对齐 py/js/java——此前 Go 手动触发只响应返回、不落日志环）。
 输入：无  
 返回示例： 
 ```
@@ -461,15 +469,27 @@ X-Total-Chunks: 1
 
 ### 24. 超级终端（可选）
 路径：/api/ws/任意路径
-用途：使用websocket建立完整双向终端上下文环境，在http条件下使用noise端到端加密，在https条件下会使用https加密，此时认证功能使用代理端公钥进行身份认证。  
+用途：使用websocket建立完整双向终端上下文环境。传输加密与认证方式由**控制端**按目标 scheme 绑定（代理端不感知自身 http/https，详见下方「传输与认证绑定规范」）：无 TLS（`ws://`）传输走 Noise XX 端到端加密握手；TLS（`wss://`）传输由 TLS 提供机密性，控制端缺省携带 `token` 走明文降级认证，也可显式强制 Noise。  
 输入：
 
 ```
 request_id：用来区分每个会话。  
-token：仅在https传输下使用，其使用代理端noise公钥进行认证。
+token：可选，明文降级模式的认证令牌，值为 `Base64(HMAC-SHA256(base64decode(session_key), "kisama-ws-token-v1"))`（agent ≥ 0.4.8，服务端常数时间比较）；携带非空 `token` 即进入明文降级路径（传输必须为 TLS），未携带即进入 Noise XX 握手路径。
 meta：可选，=1 时表示客户端可解析 JSON 控制帧，代理端会在 PTY 启动后、输出任何 shell 回显之前，主动推送一帧 welcome 元数据（0.5.5+，旧版代理端忽略此参数）。
 incognito：可选，=1 时请求原生无痕会话（0.5.5+，旧版代理端忽略此参数）。
 ```
+
+> **传输与认证绑定规范（控制端契约，规范口径）**：
+> `/api/ws/*` 不经过 HTTP 认证中间件，且**代理端无法感知自身对外暴露的 scheme**（http/https 由反代、隧道与部署形态决定，不进入代理进程）——明文降级与 Noise 加密两条路径的选择完全由**控制端是否携带 `token` 参数**表达：未携带（或为空）⇒ Noise XX 握手（go `handlers/websocket.go:327` `useNoise = (token == "")`、py `agent.py:7042-7045`，五端同构）；携带非空 ⇒ 校验降级令牌后明文降级（常数时间比较，DEBUG 模式不豁免，见第十节）。传输安全责任因此落在控制端选路一侧，控制端（含第三方面板、脚本与 AI 控制端）必须按下表绑定传输与认证：
+>
+> | 实际传输 | 认证方式 | 规范要求 |
+> | --- | --- | --- |
+> | `wss://` / `https://` | 缺省：明文 wss + `token` 降级令牌 | 机密性由 TLS 承担；`token` **仅允许**在此传输下携带 |
+> | `wss://` / `https://` | 可选：强制 Noise | TLS 之上叠加端到端加密（如面板节点级「强制 Noise」开关），允许 |
+> | `ws://` / `http://` | **必须** Noise XX 端到端加密 | **禁止携带 `token`**——无 TLS 时令牌与全部击键、回显明文过网，降级令牌等同泄露 |
+>
+> **违规形态与后果**：在 `ws://` 明文传输上携带 `token`（"明文链路 + 明文认证"）时代理端不会拒绝——令牌校验本身可以通过，代理端无从区分"TLS 下的合法降级"与"明文链路上的违规降级"，后果是持有该令牌即可直连终端、会话内容全部明文暴露。该约束因此只能由控制端实现保证：按目标 scheme 推导 ws/wss 后，非 TLS 传输一律不生成、不携带 `token` 并走 Noise；无法建立 Noise 会话时应拒绝连接或显式告警，不得静默降级为明文 token。
+> **参考实现**（Kisama Panel）：`getTerminalWsUrl` 按节点有效域名 scheme 推导 `ws://`/`wss://`；终端建联时 `useNoise = 节点「强制 Noise」开关 || 非 https 域名`——Noise 路径从 baseinfo 取 `noise_key.controller.private`（msg3 控制端身份）与 `noise_key.agent.public`（msg2 对端钉扎）完成 XX 握手，明文路径以 `session_key` 计算降级令牌。面板对 DEBUG（`x-encrypted: false`）与生产明文认证（`x-encrypted: plain`，PHP）节点缺 `session_key` 的例外处置：不生成令牌也不追加参数，由代理端按"未携带 token"规则处置。
 
 welcome 元数据帧（0.5.5+，仅 meta=1 时发送；Noise 模式下经加密通道推送，二进制帧内为 JSON）：
 
@@ -639,6 +659,7 @@ GET /kisamaproxy/https://host:8443/api/exec
 | :--- | :--- | :---: | :--- |
 | port | number | 否 | 隧道转发端口（整数，1~65535）。缺省时使用 agent 自身监听端口（按 KPORT → PORT → SERVER_PORT 优先级，默认 8000） |
 | duplicate | boolean | 否 | 是否允许同一端口重复创建隧道，默认 `false`。`false` 时若该端口已存在隧道则拒绝创建（409）；`true` 时强制创建，原隧道保留 |
+| quic | boolean | 否 | 该隧道边缘传输是否走 QUIC（UDP/7844），缺省 `false`（h2 over TCP/7844）。js 端已实机验证全链路可用（HTTP + WebSocket over QUIC）；py 端协议栈已实现（握手/密钥/帧层单测全绿）但控制流数据面遗留回退兜底；java 端协议栈原语已移植、数据面后续批次接线。所有端 QUIC 连续建连失败均自动回退 h2（同一注册凭据无需重注册，重启进程恢复 QUIC） |
 行为约定：
 - **重复策略**：默认阻止同一端口重复建隧道（409）；仅当请求体携带 `duplicate: true` 时才允许重复；
 - 端口缺省时取 agent 自身监听端口（与「默认端口」一节一致）；
@@ -772,7 +793,7 @@ KMODE 是代理端的一个启动模式开关，通过环境变量取值，用�
 ### 环境变量说明
 | 环境变量 | 默认值 | 说明 |
 | :--- | :--- | :--- |
-| KMODE | `0` | 启动模式开关：`0`=普通启动；`1`=自动创建临时隧道 + 写域名文件 + stdin 指令监听；`2`=自动创建临时隧道 + 上报域名至 shz.al（全程静默） |
+| KMODE | `0` | 启动模式开关：`0`=普通启动；`1`=自动创建临时隧道 + 写域名文件 + stdin 指令监听；`2`=自动创建临时隧道 + 上报域名至 shz.al（全程静默）；`2q`/`2quic`=2 且启动隧道走 QUIC 边缘传输（UDP/7844；js 端已实机验证，py 端回退兜底，java 端后续批次激活） |
 | KPATH | `$HOME/domain.txt` | 仅 KMODE=1 有效：隧道域名文件的写入路径，支持相对 HOME 的子目录写法（如 `$HOME/.cache/domain.txt`） |
 | KNAME | 无 | 仅 KMODE=2 有效：shz.al 自定义名（≥3 字符，限字母、数字及 `+_-[]*$=@,;/`），同时是可预测访问 URL 的组成部分；未设置时 KMODE=2 退化为普通启动（等同 KMODE=0），不报错 |
 | KNAME_KEY | `$KNAME` | 仅 KMODE=2 有效：上报的管理/修改密钥（即 shz.al 的密码）；缺省复用 KNAME 本身。**注意：shz.al 平台要求密码 ≥8 字符，若最终生效的密钥（KNAME_KEY 或复用的 KNAME）短于 8 字符，上报会被平台以 `400 Password too short` 拒绝，粘贴不会创建（KMODE=2 可视为未生效）** |
@@ -832,6 +853,32 @@ curl -X PUT "https://shz.al/~env01a:s3cret-key" -F "c=new-value"
 ```
 
 安全提示：预测 URL 无认证即可读（shz.al 平台特性），其暴露的仅是隧道域名本身；隧道背后的 agent 接口仍有完整认证与加密，风险面与 KMODE=1 写本地域名文件相当。
+
+### KMODE=2q / 2quic：QUIC 边缘传输（0.6.1，三端移植）
+
+KMODE=2q（或 2quic，大小写不敏感）在 KMODE=2 的基础上将启动隧道的**云边长连接**从 h2 over TCP/7844 切换为 QUIC v1 over UDP/7844。KMODE 数字的交付语义（shz.al 静默上报 / 域名文件 / stdin）完全不变；QUIC 只影响 agent ↔ Cloudflare edge 之间的传输协议。
+
+**与 /api/argo quic 字段的关系**：KMODE 只影响启动隧道的传输；`POST /api/argo` 请求体的 `quic` 字段按隧道独立选择传输。两者互不依赖，可自由组合。
+
+**协议要点**（实机取证 2026-10-31，js 端参考实现已通过 trycloudflare 全链路验证）：
+- SNI 固定 `quic.cftunnel.com`（切勿用 region 主机名做 SNI，边缘走另一套入口）
+- ALPN `argotunnel`；0-RTT 不支持；HRR 不支持；Retry 包/key update/RFC 9002 丢包恢复均支持
+- 边缘把 TLS 1.3 flight 放在 Handshake epoch（标准行为），但 ServerHello 可能仍在 Initial epoch（需统一汇入 TLS 流处理）
+- 传输参数整数值按 varint 变长编码（RFC 9000 §16）
+- 客户端所有 Initial 包填充至 1200 字节（RFC 9000 §14.1），否则 ServerHello 被 PTO 无限重传
+- 客户端所有 Handshake 包需 ACK 后边缘才下发后续 flight（ACK-only Initial 包也须填充 1200）
+- 控制流（流 0）直接承载 capnp RPC（bootstrap/register），不写 rpcStreamProtocolSignature 前导
+- websocket 类型响应经 ConnectResponse metadata 上报真实 101（边缘字面转发）
+- 边缘证书软校验与 h2 路径同级：issuer O/OU/CN + SAN 覆盖 quic.cftunnel.com；KISAMA_EDGE_INSECURE=true 豁免
+
+**可用性（按端）**：
+| 端 | QUIC 数据面 | 说明 |
+| :--- | :--- | :--- |
+| js | ✅ 实机验证 | 注册/HTTP/WebSocket 经 QUIC 隧道全链路通过 |
+| py | ⚠️ 回退兜底 | 握手/密钥/帧层单测全绿；控制流数据面 1-RTT 遗留，建连连续失败自动回退 h2 |
+| java/java11 | ⚠️ 后续批次 | 协议栈原语已移植（QuicConnection/QuicTlsClient/capnp 修复），数据面未接线暂走 h2 |
+
+**自动回退**：QUIC 建连/注册连续失败达 `KISAMA_ARGO_REREGISTER_AFTER`（默认 5）阈值后，该隧道自动切回 h2 并输出 WARN 日志（同一注册凭据无需重新注册，重启进程恢复 QUIC）。回退只影响触发回退的隧道实例，不影响其他隧道。
 
 ### 隧道守护自愈（0.5.2，四版本统一）
 
@@ -1121,6 +1168,7 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，请求
 - 更换密钥后旧文件无法解密 → 被隔离重建，任务丢失（运维需自行重设任务或找回旧密钥）；
 - GCM 认证标签提供防篡改：密文或 tag 被改动即解密失败 → 隔离；
 - 固有边界：与本 agent 同用户的进程可读其环境变量（`/proc/<pid>/environ` 等），密钥对该威胁面不可防御；机密性边界为"防止存储文件单独外泄被还原"，不防御本机 root。
+- 服务部署脚本例外（0.6.2 起，Owner 拍板的部署便利取舍）：`kisama_service.sh` / `kisama_service.ps1` 在部署前未注入 `KSTORE_KEY` 时自动生成随机密钥写入安装目录 `agent.env`（并收紧为属主可读 / ACL 仅当前用户+SYSTEM+管理员），密钥与 `store.enc` 同机同目录落盘——此形态下"仅拿到 `store.enc` 单文件无法解密"仍成立，但"整个安装目录外泄即可解密"，机密性边界较上条收缩。要维持密钥不落盘的原威胁模型，在执行部署脚本前注入自备的 `KSTORE_KEY`（agent.env 已有该键时脚本不轮换、不覆盖）；脚本不回显密钥、不进日志。
 
 ### 验收
 
@@ -1475,9 +1523,9 @@ PHP 端（`kisamaphp` 四个副本）每次请求一个生命周期，§16.2 的
 
 ## 十七、控制端后台轮询与调度机制（Kisama Panel 对代理端点的周期调用口径）
 
-> **一句话**：面板打开即拉起三条常驻周期——节点任务维护（默认 5 分钟）、节点基础信息同步（默认 10 分钟）、配置云同步（默认 10 分钟；三者的周期与开关均可调，见 17.6）；调度统一为「欠账驱动」——tick 到点只查账（距上次发起 ≥ 门槛才执行），hidden 期间任务维护/节点探测跳过、配置云同步仍按欠账执行（1 次 GET 成本极低、后台尽力而为），回到前台对超门槛欠账各补跑一次；另有变更驱动的云同步防抖通道与切后台前冲刷；全部轮内作业单飞锁 + 并发上限，任何使用模式下请求总量 ≤ 固定间隔轮询版本。代理侧零配合、零新接口，本节回答「节点为什么隔几分钟被连一次」的运维排障口径。
+> **一句话**：面板打开即拉起三条常驻周期——节点任务维护（默认 5 分钟）、节点基础信息同步（默认 10 分钟）、配置云同步（默认 10 分钟；三者的周期与开关均可调，见 17.6）；调度统一为「欠账驱动」——tick 到点只查账（距上次发起 ≥ 门槛才执行），hidden 期间任务维护/节点探测跳过、配置云同步仍按欠账执行（1 次 GET 成本极低、后台尽力而为），回到前台对超门槛欠账各补跑一次；另有变更驱动的云同步防抖通道与切后台前冲刷；全部轮内作业单飞锁 + 并发上限，任何使用模式下请求总量 ≤ 固定间隔轮询版本。任务维护对 agent 的配合要求为零新接口：≥0.6.2 依赖「任务元数据行」盖章契约（第四节开篇，agent 在 14/16 设置时自动完成，面板不感知语言实现），<0.6.2 走纯旧契约。本节回答「节点为什么隔几分钟被连一次」的运维排障口径。
 
-（截至 2026-10-23，面板 0.6.4 代码现状定稿。调度实现位于 kisama-panel 仓 `src/lib/task-daemon.ts` / `config-sync-scheduler.ts` / `node-backoff.ts`，本节只定契约语义，不登记面板行号。）
+（截至 2026-10-28，面板 0.6.5 代码现状定稿。调度实现位于 kisama-panel 仓 `src/lib/task-daemon.ts` / `config-sync-scheduler.ts` / `node-backoff.ts`，本节只定契约语义，不登记面板行号。）
 
 ### 17.1 定位与适用面
 
@@ -1488,7 +1536,7 @@ PHP 端（`kisamaphp` 四个副本）每次请求一个生命周期，§16.2 的
 
 | 作业 | 默认周期 | 启动首跑（错峰） | 目标端点 / 数据面 | 节点范围 | 失败处置 |
 |---|---|---|---|---|---|
-| 🛡️ 节点任务维护 | 5 分钟（可调，17.6） | 启动后 10 秒 | 四、任务管理：13 GET 启动任务 + 15 GET 定时任务；仅「远端双向清单**全空**而本地非空」时按 14/16 整表回灌 | 仅 `status=online` 且非 PHP 探针节点 | 不适用退避；请求失败丢弃会话缓存重新握手后立即重试一轮 |
+| 🛡️ 节点任务维护 | 5 分钟（可调，17.6） | 启动后 10 秒 | 四、任务管理：按节点三分支——① 有待同步标记（面板离线改动）→ 14/16 整表硬推本地（全版本）；② agent ≥0.6.2（任务元数据行契约）→ 13/15 GET 后做任务 ID 感知双向合并（同任务按 `updated` 修改时间戳裁决、不同任务并集、停用仓库条目拦截），有节点侧内容差异才 14/16 下发、有镜像侧差异才回写面板镜像；③ agent <0.6.2 → 仅「远端该表为空而本地非空」时整表回灌 | 仅 `status=online` 且非 PHP 探针节点 | 不适用退避；请求失败丢弃会话缓存重新握手后立即重试一轮 |
 | 🔄 节点基础信息同步 | 10 分钟（可调，17.6） | 启动后 20 秒（逐节点新鲜度门禁兜底 17.5） | 一.1 GET `/api/baseinfo`（会话建立 + 在线探测 + shz 域名解析汇聚点） | 全部活跃节点 | 逐节点指数退避（17.5）；每轮前先做中转站点池健康洗牌 |
 | ☁️ 配置云同步 | 10 分钟（可调，17.6） | 启动后 5 秒（启动即拉，先对齐云端一次） | 不走代理端点：WebDAV `kisama.json` 分域合并（push/pull/merge 幂等路由；内容一致走 in-sync 快速通道零写入） | —（不针对节点） | busy/error 有界重试（17.3）；未登录引擎内部零开销跳过 |
 
@@ -1537,7 +1585,7 @@ PHP 端（`kisamaphp` 四个副本）每次请求一个生命周期，§16.2 的
 
 ### 17.7 零轮询边界（面板刻意不发起请求的面）
 
-- 全局任务中心打开 = **零网络请求**（localStorage 本地镜像）；🔄 手动刷新才发起一轮全节点核对（远端与镜像有差异才采纳回镜像）；任务保存后仅对被改节点做一次确认性重拉。
+- 全局任务中心打开 = **零网络请求**（localStorage 本地镜像）；🔄 手动刷新才发起一轮全节点核对：agent ≥0.6.2 节点做 ID 感知双向合并（远端独有条目采纳回镜像、本地独有条目下发节点、同任务按修改时间戳裁决），旧节点维持「远端非空有差异才采纳回镜像」；任务保存后仅对被改节点做一次确认性重拉。
 - `/api/status`（一.2）当前**未接入任何周期轮询**（面板定义了客户端但无调用点）。
 - 冻结节点（回收站）不在活跃列表，恢复前守护调度永不对其发起连接。
 - PHP 探针节点不参与任务维护（任务端点不支持）。
@@ -1546,4 +1594,66 @@ PHP 端（`kisamaphp` 四个副本）每次请求一个生命周期，§16.2 的
 
 - **不变式**：上述门禁叠加后，任何使用模式（常驻前台、切后台、暂停开关、浏览器冻结恢复）下的请求数均 ≤ 固定间隔轮询版本，且手动操作路径不受守护调度影响——0.5.3 轮询治理确立的目标至今保持。
 - **已知边界**：配置云同步的后台执行属尽力而为——整页冻结（Memory Saver/移动端切走）期间完全停摆，欠账回到前台按 2 分钟门槛补齐；10 分钟周期仅是兜底节拍，实时性承诺由变更驱动通道（17.3）承担。任务维护/节点探测在 hidden 期间不执行、回前台按完整周期门槛补跑，冻结/睡眠恢复的一个周期内缺口由该补跑覆盖。
-- **对代理端的唯一语义依赖**：任务回灌仅在远端**双向全空**且本地非空时触发（13/15 读 + 14/16 写、整表下发；语义见第十三节 KSTORE 启动恢复）。守护进程对**非空**远端任务清单零写请求——代理侧手工维护的任务不会被后台轮询抹掉；远端非空清单的差异性对账属面板手动刷新动作，不经守护调度。
+- **对代理端的语义依赖**（面板 0.6.5 起，按 agent 版本分流）：
+  - agent ≥0.6.2（任务元数据行契约，见第四节开篇）：任务维护走「fetch → ID 感知合并 → 有差异才写」——合并只做**并集采纳**（远端独有条目回镜像）、**增量下发**（本地独有条目进节点）、**同任务按修改时间戳裁决**（赢家的脚本/表达式整表写回，输家条目删除）与**停用仓库拦截**（命中面板停用仓库的远端条目随合并从节点剔除）。代理侧手工维护的任务不会被抹掉（远端独有条目只被采纳不删除）；对非空远端的写请求仅发生在有内容差异时，且幂等（内容一致重复推送不推进 `updated`、不产生新差异）。
+  - agent <0.6.2：维持旧契约——任务回灌仅在远端该表为空而本地非空时触发（13/15 读 + 14/16 写、整表下发；语义见第十三节 KSTORE 启动恢复），守护进程对非空远端任务清单零写请求；远端非空清单的差异性对账属面板手动刷新动作。
+  - 通用前置：面板有待同步标记（离线改动）时对任何版本整表硬推本地清单——离线编辑是最新的面板意图。
+
+---
+
+## 十八、内置加密 DNS（DoH）：`KISAMA_DNS` 开关（五端统一，防 DNS 污染）
+
+> **一句话**：`KISAMA_DNS=on` 时 agent 全部出站域名解析改走内置 DoH（DNS over HTTPS JSON API），防御本地 DNS 污染/劫持；`off`（默认）不安装任何钩子、零行为变化。argo 隧道模块（快速隧道注册 + edge 长连接）、baseinfo 外网 IP 探测、KMODE=2 shz.al 上报、go 端 /kisamaproxy 上游转发全部覆盖；纯标准库零新依赖，证书校验零降级，无新增端点/监听面。
+
+### 18.1 背景与覆盖矩阵
+
+agent 为纯入站服务端（面板 → agent 是入站连接），DNS 污染不影响主控通道；受影响的是出站解析面：
+
+| 出站模块 | py | js | go | java | java11 | 覆盖方式 |
+|---|---|---|---|---|---|---|
+| baseinfo 外网 IP 探测（api.ipify.org 等） | ✅ | ✅ | ✅ | ✅ | ✅ | 全局钩子 / SecureSend |
+| argo 快速隧道注册（api.trycloudflare.com） | ✅ | ✅ | —（go 无 argo 模块） | ✅ | ✅ | 同上 |
+| argo edge 长连接（regionX.v2.argotunnel.com:7844，SNI=h2.cftunnel.com） | ✅ | ✅ | — | ✅ | ✅ | DoH 解析后按 IP 建连（逐 IP 尝试），SNI 与自研证书校验不变 |
+| KMODE=2 shz.al 上报 | ✅ | ✅ | —（go 无 KMODE） | ✅ | ✅ | SecureSend |
+| /kisamaproxy 上游转发 | —（py 无 proxy） | — | ✅ | — | — | Transport.DialContext 挂载 |
+
+- **py**：包装 `socket.getaddrinfo`（import 期安装），以「对 DoH 解析出的 IP 调原版 getaddrinfo」合成规范结果——覆盖 aiohttp/urllib/http.client/socket 全部进程内出站解析，完整保留 family/flags 语义；`gethostbyname` 等裸 API 不在钩子范围（本仓未使用）。
+- **js**：包装 `dns.lookup`（require 期安装），覆盖 http/https/tls/net 全部进程内出站解析（node 内置请求不经环境代理）；`dns.Resolver`（c-ares 线）不涉本仓出站路径。
+- **go**：`go/utils/dns.go` 提供 `SecureDialContext`，`fetchIP` 客户端与 `handlers.kisamaProxyTransport` 显式挂载；**未来新增出站域名连接（如 argo-go 移植）一律经 `utils.SecureDialContext` 挂载自动纳入**。
+- **java/java11**：`java.net.http.HttpClient` 无解析钩子，由 `secureSend` 改写连接（URI host → DoH 解析 IP，强制 HTTP/1.1 + 手工 `Host` 头保持原域名；`jdk.httpclient.allowRestrictedHeaders=host` 由静态块设置，仅放开本进程 Host 头设置许可）；edge 走 `SecureDns.resolve` 后按 IP 建连；proxyToOrigin 为回环地址不解析。
+- **php**：不在本仓（独立仓库），本期不涉及。
+
+### 18.2 开关与变量
+
+| 变量 | 缺省 | 说明 |
+|---|---|---|
+| `KISAMA_DNS` | `off` | `off`=系统解析（零行为变化）；`on`=全部出站域名解析走 DoH |
+| `KISAMA_DOH_SERVERS` | （空） | 逗号/空白分隔的 DoH JSON API 基地址链（去尾斜杠）；空/全非法回缺省链 |
+
+缺省服务器链（按序尝试；前一台网络级失败退避 60s 后换台，SERVFAIL 等服务端错误仅换台不退避）：
+
+1. `https://223.5.5.5/resolve`（阿里 DoH，国内直连快）
+2. `https://1.1.1.1/dns-query`（Cloudflare DoH）
+3. `https://8.8.8.8/resolve`（Google DoH）
+
+- 请求形态：`GET {base}?name={域名}&type=1|28`，头 `accept: application/dns-json`；应答取 `Answer[]` 中 type 匹配且 data 为对应族 IP 字面量的记录（CNAME 链与非 IP 文本过滤；DoH 应答携带主机名一律拒绝，防止借道触发系统解析）。
+- 变量读取优先级与本仓既有变量一致：真实环境变量 > 脚本/jar 同目录 `.env`；运行期不热更新，改后重启生效。
+
+### 18.3 解析语义
+
+- **缓存**：按 (主机, 地址族) 记忆应答，TTL 取应答最小值截断 `[30,600]s`；NXDOMAIN/NODATA 负缓存 60s；解析失败不缓存（单服务器退避已防抖）；同键并发解析 single-flight 去重（py/java 解析期间持锁，go/js 按键单飞）。
+- **双栈排序**：对齐系统 RFC6724 惯例 v6 优先；IPv6 不可用（建 UDP6 套接字探测，懒缓存）时 v4 优先，减少无谓的 v6 连接尝试。
+- **回落（可用性优先）**：全部 DoH 服务器失败 → 回落系统解析，限频告警（5 分钟一次，LOG_LEVEL≤2 或 DEBUG 可见）；DoH 明确无记录（Status=3 / NODATA）→ **不回落**，直接按 NXDOMAIN 失败，防被污染解析「复活」。两分支语义不同：前者是解析器不可达（网络层），后者是权威应答。
+- **字面量直通**：IP 字面量（容忍 `[v6]` 方括号）与 `AI_NUMERICHOST` 一律不进 DoH——DoH 请求本身即 IP 直连，此为防递归前提。
+
+### 18.4 安全语义（对齐 docs/SECURITY-AUDIT.md 设计特性记录）
+
+- DoH 请求直连字面量 IP：py 空 ProxyHandler / go `Proxy: nil` / java `NO_PROXY`，不经环境或系统代理；TLS 证书校验全程开启（223.5.5.5 / 1.1.1.1 / 8.8.8.8 证书均含 IP SAN）。
+- 证书校验零降级：py/js 换 IP 拨号后 SNI/校验仍按原域名；go 经 Transport 语义天然保持（ServerName 取自 URL host）；java 以 X509ExtendedTrustManager 委托 JVM 默认信任链 + 按原域名手工 SAN 校验（单标签通配），**无 trust-all**。
+- 隐私口径：开启后出站目标域名（trycloudflare / argotunnel / shz.al / IP 探测服务 / 代理上游）会出现在 DoH 供应商的查询日志中——默认关闭、由 Owner 显式开启即视为接受该取舍。
+- 无新增监听面 / 端点 / 协议字段；off 模式零开销；面板与 kisama-skill 零适配。
+
+### 18.5 验收与限制
+
+- 单测（全部 mock 网络层，不依赖外网）：`tests/py/test_secure_dns.py`（22 例）、`tests/js/test_secure_dns.js`（11 组）、`go/utils/dns_test.go`（14 个测试函数，含 httptest 假 DoH 与真实拨号链路）。
+- 已知限制：DoH 供应商被网络整体阻断时行为等价 off（全部回落系统解析）；php 端、js `dns.Resolver`、py `gethostbyname` 不在覆盖面（本仓出站路径均未使用）。

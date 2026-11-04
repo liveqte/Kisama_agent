@@ -3,6 +3,10 @@ Kisama_Panel的agent
 
 这是一个Kisama_Panel代理端，内置 API 管理器，专注于集中化管理服务与接口。所有通信均采用端到端加密，即便在 HTTP 环境下也能保障数据传输安全，避免敏感信息泄露。
 
+## 内置加密 DNS（🆕 防DNS污染，`KISAMA_DNS` 开关）
+
+节点本地 DNS 被污染/劫持导致 argo 临时隧道、外网 IP 探测失败时，设 `KISAMA_DNS=on` 让 agent 全部出站域名解析改走内置 DoH（DNS over HTTPS，缺省链 阿里 223.5.5.5 → Cloudflare 1.1.1.1 → Google 8.8.8.8，可用 `KISAMA_DOH_SERVERS` 自定义）；缺省 `off` 零行为变化。覆盖 argo 隧道（注册 + edge）、baseinfo IP 探测、shz.al 上报与 Go 版 /kisamaproxy 上游；纯标准库零依赖，证书校验零降级。详见 `docs/API.MD` 第十八节。
+
 ## KMODE 启动模式（🆕 0.4.8 新增支持特性，KMODE=2 为 0.4.8 后期迭代新增）
 
 ### 什么情况下应该使用
@@ -37,7 +41,7 @@ KMODE=2 KNAME=env01a KNAME_KEY=s3cret-key python agent.py
 
 | 环境变量 | 默认值 | 说明 |
 | :--- | :--- | :--- |
-| `KMODE` | `0` | `0`=普通启动；`1`=自动创建隧道+写域名文件+stdin 指令监听；`2`=自动创建隧道+shz.al 静默上报 |
+| `KMODE` | `0` | `0`=普通启动；`1`=自动创建隧道+写域名文件+stdin 指令监听；`2`=自动创建隧道+shz.al 静默上报；`2q`/`2quic`=等同 `2` 且边缘传输走 QUIC（大小写不敏感，js/py/java） |
 | `KPATH` | `$HOME/domain.txt` | 仅 KMODE=1：域名文件写入路径，支持 `$HOME`/`~` 前缀 |
 | `KNAME` | 无 | 仅 KMODE=2：shz.al 自定义名（≥3 字符，限字母数字及 `+_-[]*$=@,;/`），部署前需预先约定好 |
 | `KNAME_KEY` | 复用 `KNAME` | 仅 KMODE=2：上报管理/修改密钥 |
@@ -55,6 +59,34 @@ KMODE=2 KNAME=env01a KNAME_KEY=s3cret-key python agent.py
 https://shz.al/~<KNAME>
 ```
 例如 `KNAME=env01a`，则 `curl https://shz.al/~env01a` 的响应体就是该环境的隧道域名；未上报时返回 404，轮询直至 200 即可。代理每次重启会自动覆盖更新同一 URL 的值（409→PUT），因此**预测 URL 永远指向最新域名**；持有 `KNAME_KEY` 的一方也可自行改写或删除该值。上报值 7 天后自动过期。
+
+## Argo 隧道 QUIC 边缘传输（🆕 0.6.2 新增，js/py/java 三端）
+
+argo 临时隧道的云边长连接此前固定走 h2 over TCP/7844，现可按需切换 QUIC（UDP/7844，与 cloudflared 同款传输）：UDP 可用但 TCP/7844 被干扰的网络下更稳。缺省仍为 h2，零行为变化。
+
+### 开启方式
+
+**方式一：KMODE 后缀（仅影响启动自动创建的隧道）**
+
+```bash
+# KMODE=2q / 2quic（大小写不敏感）：语义等同 KMODE=2，边缘传输改走 QUIC
+KMODE=2q KNAME=env01a python agent.py
+```
+
+**方式二：/api/argo 请求体字段（每条隧道独立选择）**
+
+```bash
+curl -X POST https://<agent>/api/argo -d '{"port": 8080, "quic": true}'
+# 响应与 GET /api/argo 列表均新增 "transport": "quic"（缺省 false 走 h2）
+```
+
+### 行为说明
+
+- QUIC 传输为手写 QUIC v1 + TLS 1.3（零依赖）：UDP/7844，SNI `quic.cftunnel.com`，ALPN `argotunnel`，边缘证书软校验与 h2 同级（`KISAMA_EDGE_INSECURE=true` 共用豁免语义）。
+- 自动回退：QUIC 连续 `KISAMA_ARGO_REREGISTER_AFTER`（缺省 5）轮建连失败自动回退 h2（同一注册凭据无需重注册），重启进程恢复 QUIC；UDP 被墙环境可长期稳定回退运行。
+- 版本支持：js / py / java 已实机验证（QUIC 注册 + HTTP + WebSocket 全链路）；java11 解析 `2q` 但建连仍走 h2（QUIC 适配后续批次）；Go 版 KMODE 未实现。
+- 详见 `docs/API.MD` 第九节。
+
 ---
 
 ## 任务持久化（🆕 0.5.7 新增支持特性，五语言统一）

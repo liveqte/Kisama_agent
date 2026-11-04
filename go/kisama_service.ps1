@@ -92,6 +92,12 @@ kisama_service.ps1 - Kisama Agent (Go) Windows 部署与管理脚本
 
 环境变量 (存在则写进 agent.env, 之后改动请直接编辑 agent.env):
   ECDSA_PUBKEY ECIES_PUBKEY LOG_LEVEL FILE_ROOT EXEC_TIMEOUT EXEC_SHELL
+  KSTORE_KEY    任务持久化加密密钥 (API.MD 十三; hex 64 字符或 std base64 解码后
+                恰为 32 字节)。未注入时本脚本自动生成随机密钥写入 agent.env;
+                agent.env 已有则沿用不轮换 (换钥后旧 store.enc 解密失败被隔离,
+                任务会丢失; 手工换钥后执行 restart 生效)
+  KSTORE        持久化存储文件路径, off 显式关闭; 未注入时跟随 agent 默认
+                (%USERPROFILE%\.tmp\store.enc)
   只支持单行值 (base64 压缩点或 hex); 多行 PEM 请放 <安装目录>\keys\ 目录
 
 说明:
@@ -367,6 +373,31 @@ function Write-EnvFile {
         if ((Read-EnvValue $k)) { continue }
         Set-EnvValue $k $v
     }
+    # 任务持久化 (API.MD 十三): agent.env 已有 KSTORE_KEY 时沿用不轮换 — 换钥会让
+    # 旧 store.enc 解密失败被隔离, 已恢复的任务全部丢失
+    if (-not (Read-EnvValue 'KSTORE_KEY')) {
+        $kk = [Environment]::GetEnvironmentVariable('KSTORE_KEY')
+        if ($kk) {
+            if (-not (Test-KstoreKey $kk)) {
+                Die '注入的 KSTORE_KEY 非法 (需 hex 64 字符或 std base64 解码后恰为 32 字节), 按 agent 口径任务持久化会保持关闭'
+            }
+            Set-EnvValue 'KSTORE_KEY' $kk
+            Info '已写入注入的 KSTORE_KEY, 任务持久化启用 (密钥见 agent.env, 不回显)'
+        } else {
+            $kk = New-KstoreKey
+            if ($kk) {
+                Set-EnvValue 'KSTORE_KEY' $kk
+                Info '已生成随机 KSTORE_KEY 写入 agent.env, 任务持久化启用'
+            } else {
+                Warn '无法生成 KSTORE_KEY, 任务持久化保持关闭, 不影响 agent 其他功能'
+            }
+        }
+    }
+    if (-not (Read-EnvValue 'KSTORE')) {
+        $ks = [Environment]::GetEnvironmentVariable('KSTORE')
+        if ($ks) { Set-EnvValue 'KSTORE' $ks }
+    }
+    Protect-EnvFile
 }
 
 function Read-EnvValue([string]$Key) {
@@ -376,6 +407,35 @@ function Read-EnvValue([string]$Key) {
     $val = ($hit[$hit.Count - 1] -split '=', 2)[1]
     if ($val -match '^"(.*)"$' -or $val -match "^'(.*)'$") { return $Matches[1] }
     return $val
+}
+
+# 任务持久化 (API.MD 十三): KSTORE_KEY 预校验与 go/handlers/task_store.go
+# parseTaskStoreKey 同口径 — hex (恰 64 字符) 或 std base64, 解码后必须恰为 32 字节
+function Test-KstoreKey([string]$k) {
+    if (-not $k -or $k -match '\s') { return $false }
+    if ($k -match '^[0-9a-fA-F]{64}$') { return $true }
+    try { return ([Convert]::FromBase64String($k).Length -eq 32) } catch { return $false }
+}
+
+# 生成 32 字节随机密钥的 hex 形态 (64 字符); 失败返回 $null
+function New-KstoreKey {
+    try {
+        $b = New-Object byte[] 32
+        $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+        try { $rng.GetBytes($b) } finally { $rng.Dispose() }
+        return (($b | ForEach-Object { $_.ToString('x2') }) -join '')
+    } catch { return $null }
+}
+
+# agent.env 含 KSTORE_KEY 后即持有密钥材料, 收紧 ACL 为仅当前用户/SYSTEM/管理员
+# (用 SID 形式, 免受系统显示语言影响); 失败仅告警, 不阻断安装
+function Protect-EnvFile {
+    if (-not (Read-EnvValue 'KSTORE_KEY')) { return }
+    try {
+        $u = "$env:USERDOMAIN\$env:USERNAME"
+        & icacls $script:EnvFile /inheritance:r /grant:r "${u}:F" '*S-1-5-18:F' '*S-1-5-32-544:F' | Out-Null
+        if ($LASTEXITCODE -ne 0) { Warn "收紧 agent.env ACL 失败 (icacls 退出码 $LASTEXITCODE)" }
+    } catch { Warn "收紧 agent.env ACL 失败: $($_.Exception.Message)" }
 }
 
 function Write-Runner {
@@ -830,6 +890,15 @@ function Invoke-Status {
     if (Debug-Effective) { Say '认证     : DEBUG 模式 (免认证、不需要密钥)' }
     elseif (Test-KeysReady) { Say '认证     : 控制端公钥已就绪' }
     else { Say '认证     : 缺控制端公钥 (非 DEBUG 模式下 agent 会拒绝启动)' }
+    # 与 agent 端 strings.ToLower 口径一致: off/0/none/false 不区分大小写均视为显式关闭
+    $ks = Read-EnvValue 'KSTORE'
+    if ($ks -match '^(off|0|none|false)$') {
+        Say "持久化   : 已显式关闭 (KSTORE=$ks)"
+    } elseif (Read-EnvValue 'KSTORE_KEY') {
+        Say "持久化   : 已启用 (store: $(if ($ks) { $ks } else { 'agent 默认 (%USERPROFILE%\.tmp\store.enc)' }))"
+    } else {
+        Say '持久化   : 未启用 (agent.env 无 KSTORE_KEY)'
+    }
 }
 
 switch ($Command) {

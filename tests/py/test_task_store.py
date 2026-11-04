@@ -161,7 +161,10 @@ class TaskManagerRestoreTest(unittest.TestCase):
         self.assertTrue(result["persisted"])
         fresh = agent.TaskStore()
         onetasks, _ = fresh.load()
-        self.assertEqual(onetasks, ["echo new"])
+        # 🪪 0.6.2: 存量带任务元数据行 (kisama-task: id=... updated=...), 有效脚本不变
+        self.assertEqual(len(onetasks), 1)
+        self.assertIsNotNone(agent.TaskManager._parse_task_meta(onetasks[0]))
+        self.assertEqual(agent.TaskManager._strip_task_meta(onetasks[0]), "echo new")
 
     def test_init_task_marker_consumed_by_run(self):
         # 单次执行语义: run_onetime_tasks 执行完置 InitTask=False,

@@ -89,7 +89,10 @@ func SetOneTimeTasks(c *gin.Context) {
 	}
 
 	taskManager.mu.Lock()
-	taskManager.oneTimeTasks = req
+	// 🪪 0.6.2: 身份感知规范化盖章 (响应回显规范化后的表, 面板以回显为准)
+	normalizedOne := normalizeOnetimeTasks(req, taskManager.oneTimeTasks, time.Now().UnixMilli())
+	taskManager.oneTimeTasks = models.OneTimeTaskSetRequest(normalizedOne)
+	req = models.OneTimeTaskSetRequest(normalizedOne)
 	taskManager.mu.Unlock()
 
 	// 💾 单次执行语义 (0.5.7, docs/API.MD 十三): InitTask 已消费 (boot 恢复执行过
@@ -179,7 +182,12 @@ func SetCronTasks(c *gin.Context) {
 	// Clear tasks if empty
 	if len(req) == 0 {
 		taskManager.cronTasks = make(map[string]string)
-		taskManager.cronActive = false
+
+		// 🔧 S2 修复 (0.6.2, kisama_app TC-34): 清空必须整表摘除调度项并停表。
+		// 旧实现只清任务表+落盘、不触碰 cronEntries/cronRunner, 已删任务在内存
+		// 调度器中继续按原表达式触发 (表净/调度器脏, 仅进程重启可清除, TC-34
+		// 实测删除后 37h+ 仍每分钟执行)
+		taskManager.registerCronEntries()
 
 		// 🚀 核心修复：清空时必须明确告知测试脚本 status="ok" 且 count=0
 		c.JSON(http.StatusOK, models.CronTaskResponse{
@@ -192,7 +200,10 @@ func SetCronTasks(c *gin.Context) {
 	}
 
 	// Add new cron tasks
-	taskManager.cronTasks = req
+	// 🪪 0.6.2: 身份感知规范化盖章 (响应回显规范化后的表)
+	normalizedCron := normalizeCronTasks(req, taskManager.cronTasks, time.Now().UnixMilli())
+	taskManager.cronTasks = normalizedCron
+	req = normalizedCron
 	taskManager.registerCronEntries()
 
 	response := models.CronTaskResponse{
@@ -235,6 +246,12 @@ func (tm *TaskManager) registerCronEntries() {
 	if len(tm.cronEntries) > 0 {
 		tm.cronActive = true
 		tm.cronRunner.Start()
+	} else {
+		// 🔧 S2 (0.6.2): 调度集为空时同步熄火——清 active 标志并停 runner。
+		// 清空路径与恢复路径都经由本函数, 状态接口不再出现"表净调度器脏";
+		// robfig/cron Stop 后可再次 Start (run 循环重启时重算全部 Next)
+		tm.cronActive = false
+		tm.cronRunner.Stop()
 	}
 }
 
@@ -380,6 +397,16 @@ func ExecuteOneTimeTasks(c *gin.Context) {
 	var results []ExecutedTask
 	for _, cmd := range tasks {
 		result := executeTask(cmd)
+		// 📝 S3 修复 (0.6.2, waveC): 手动触发与生命周期首跑同样落任务日志环。
+		// 旧实现只响应返回、不落 /api/task/log/onetime, 用户无法回看手动触发结果;
+		// py/js/java 三端均落环, Go 对齐 (响应结构与字段零变化)
+		taskManager.logTask(models.TaskLogEntry{
+			Timestamp: time.Now().Format(time.RFC3339),
+			Cmd:       cmd,
+			Output:    result.Output,
+			ExitCode:  result.ExitCode,
+			Type:      "onetime",
+		})
 		results = append(results, ExecutedTask{
 			Cmd:      cmd,
 			ExitCode: result.ExitCode,

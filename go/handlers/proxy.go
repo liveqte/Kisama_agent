@@ -15,6 +15,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/liveqte/kisama_agent/go/logger"
+	"github.com/liveqte/kisama_agent/go/utils"
 )
 
 // kisamaProxyCORSHeaders 与 kpng worker.js / ng.conf 中的 CORS 头配置保持一致。
@@ -209,6 +210,9 @@ func resolveProxyUpstreamTLSVerify() bool {
 var kisamaProxyTransport = &http.Transport{
 	// 上游证书校验策略见 proxyUpstreamTLSVerify 的说明: 默认按透明中转处理(不校验),
 	// 需要严格校验时用 KISAMA_PROXY_TLS_VERIFY=true 显式开启。
+	// 拨号经 utils.SecureDialContext 挂载 (KISAMA_DNS=on 时上游域名走内置 DoH, 见 utils/dns.go);
+	// TLS ServerName/校验仍按上游原始主机名处理, 不因换 IP 拨号降级。
+	DialContext:           utils.SecureDialContext(&net.Dialer{Timeout: 30 * time.Second}),
 	TLSClientConfig:       &tls.Config{InsecureSkipVerify: !proxyUpstreamTLSVerify}, //nolint:gosec
 	ResponseHeaderTimeout: 600 * time.Second,
 	TLSHandshakeTimeout:   10 * time.Second,

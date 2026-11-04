@@ -85,6 +85,12 @@ kisama_service.sh - Kisama Agent (Go) Linux 服务管理脚本
 
 环境变量 (存在则写进 agent.env, 之后改动请直接编辑 agent.env):
   ECDSA_PUBKEY ECIES_PUBKEY LOG_LEVEL FILE_ROOT EXEC_TIMEOUT EXEC_SHELL
+  KSTORE_KEY   任务持久化加密密钥 (API.MD 十三; hex 64 字符或 std base64 解码后恰
+               为 32 字节)。未注入时本脚本自动生成随机密钥写入 agent.env; agent.env
+               已有则沿用不轮换 (换钥后旧 store.enc 解密失败被隔离, 任务会丢失;
+               手工换钥后执行 restart 生效)
+  KSTORE       持久化存储文件路径, off 显式关闭; 未注入时跟随 agent 默认
+               ($HOME/.tmp/store.enc, HOME 不可用时回落到安装目录)
   只支持单行值 (base64 压缩点或 hex); 多行 PEM 请放 <安装目录>/keys/ 目录
 
 示例:
@@ -420,6 +426,32 @@ env_needs_quote() { # 值含这些字符之外就不必引号
     printf '%s' "$1" | grep -Eq "^[A-Za-z0-9_/:=+.,@-]*$"
 }
 
+# KSTORE_KEY 预校验, 与 go/handlers/task_store.go parseTaskStoreKey 同口径:
+# hex (恰 64 字符) 或 std base64, 解码后必须恰为 32 字节; 非法注入直接报错,
+# 免得装出一个持久化静默关闭 (agent fail-closed) 的实例
+kstore_key_valid() { # $1=候选值
+    _k="$1"
+    case "$_k" in ''|*[[:space:]]*|*[!0-9a-zA-Z+/=]*) return 1 ;; esac
+    if [ "${#_k}" -eq 64 ] && printf '%s' "$_k" | grep -Eq '^[0-9a-fA-F]{64}$'; then
+        return 0
+    fi
+    have base64 || { warn "本机没有 base64 工具, 无法预校验 base64 形态密钥, 交由 agent 校验"; return 0; }
+    _n=$(printf '%s' "$_k" | base64 -d 2>/dev/null | wc -c | tr -d ' ')
+    [ "$_n" = "32" ]
+}
+
+# 生成 32 字节随机密钥的 hex 形态 (64 字符); openssl 优先, 无则从 /dev/urandom 取
+gen_kstore_key() {
+    if have openssl; then
+        _k=$(openssl rand -hex 32 2>/dev/null) && [ "${#_k}" = 64 ] && { printf '%s' "$_k"; return 0; }
+    fi
+    if [ -r /dev/urandom ]; then
+        _k=$(tr -dc 'a-f0-9' </dev/urandom 2>/dev/null | head -c 64)
+        [ "${#_k}" = 64 ] && { printf '%s' "$_k"; return 0; }
+    fi
+    return 1
+}
+
 env_set() { # KEY VALUE (KEY 只来自脚本内的固定白名单)
     _k="$1" _v="$2"
     case "$_v" in
@@ -453,7 +485,32 @@ write_env_file() {
         if [ -f "$ENV_FILE" ] && grep -qs "^$_k=" "$ENV_FILE"; then continue; fi
         env_set "$_k" "$_v"
     done
-    chmod 644 "$ENV_FILE" 2>/dev/null || true
+    # 任务持久化 (API.MD 十三): agent.env 已有 KSTORE_KEY 时沿用不轮换 — 换钥会让
+    # 旧 store.enc 解密失败被隔离, 已恢复的任务全部丢失
+    if ! grep -qs '^KSTORE_KEY=' "$ENV_FILE"; then
+        _kk=$(printenv KSTORE_KEY 2>/dev/null || true)
+        if [ -n "$_kk" ]; then
+            kstore_key_valid "$_kk" || die "注入的 KSTORE_KEY 非法 (需 hex 64 字符或 std base64 解码后恰为 32 字节), 按 agent 口径任务持久化会保持关闭"
+            env_set KSTORE_KEY "$_kk"
+            info "已写入注入的 KSTORE_KEY, 任务持久化启用 (密钥见 agent.env, 不回显)"
+        elif _kk=$(gen_kstore_key); then
+            env_set KSTORE_KEY "$_kk"
+            info "已生成随机 KSTORE_KEY 写入 agent.env, 任务持久化启用"
+        else
+            warn "无法生成 KSTORE_KEY (缺 openssl 且 /dev/urandom 不可读), 任务持久化保持关闭, 不影响 agent 其他功能"
+        fi
+    fi
+    if ! grep -qs '^KSTORE=' "$ENV_FILE"; then
+        _ks=$(printenv KSTORE 2>/dev/null || true)
+        [ -n "$_ks" ] && env_set KSTORE "$_ks"
+    fi
+    # agent.env 含 KSTORE_KEY 后即持有密钥材料, 收紧为仅属主可读; 无密钥时保持
+    # 644, 兼容其他用户只读 status 的既有用法
+    if grep -qs '^KSTORE_KEY=' "$ENV_FILE"; then
+        chmod 600 "$ENV_FILE" 2>/dev/null || true
+    else
+        chmod 644 "$ENV_FILE" 2>/dev/null || true
+    fi
 }
 
 write_runner() {
@@ -930,6 +987,18 @@ cmd_status() {
     else
         say "认证     : 缺控制端公钥 (非 DEBUG 模式下 agent 会拒绝启动)"
     fi
+    _ks=""
+    [ -f "$ENV_FILE" ] && _ks=$(grep -m1 '^KSTORE=' "$ENV_FILE" | sed 's/^[^=]*=//; s/["'\'']//g')
+    # 与 agent 端 strings.ToLower 口径一致: off/0/none/false 不区分大小写均视为显式关闭
+    case "$(printf '%s' "$_ks" | tr 'A-Z' 'a-z')" in
+        off|0|none|false) say "持久化   : 已显式关闭 (KSTORE=$_ks)" ;;
+        *)
+            if grep -qs '^KSTORE_KEY=' "$ENV_FILE"; then
+                say "持久化   : 已启用 (store: ${_ks:-默认 \$HOME/.tmp/store.enc})"
+            else
+                say "持久化   : 未启用 (agent.env 无 KSTORE_KEY)"
+            fi ;;
+    esac
 }
 
 case "$ACTION" in
