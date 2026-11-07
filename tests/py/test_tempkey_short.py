@@ -102,10 +102,24 @@ class TempKeyShortTest(unittest.TestCase):
 
     # ---------- 幂等: 同一密钥对两种格式同取 ----------
     def test_idempotent_across_formats(self):
-        again = self.manager.get_or_create(48)  # 不同 ttl 不影响有效期内幂等
+        again = self.manager.get_or_create(24)  # 同 ttl 重复请求, 有效期内幂等
         self.assertEqual(again["key_id"], self.key["key_id"])
         self.assertEqual(again["ecdsa_private_hex"], self.key["ecdsa_private_hex"])
         self.assertEqual(again["ecdsa_public_b64"], self.key["ecdsa_public_b64"])
+
+    # ---------- ttl 变更即重建 (0.6.3 批次语义, 与面板"先选有效期再生成"配套) ----------
+    def test_ttl_change_regenerates(self):
+        mgr = agent.TempKeyManager()
+        first = mgr.get_or_create(24)
+        self.assertEqual(mgr.get_or_create(24)["key_id"], first["key_id"])   # 同 ttl 幂等
+        changed = mgr.get_or_create(48)                                      # ttl 变更 → 重建
+        self.assertNotEqual(changed["key_id"], first["key_id"])
+        self.assertEqual(changed["ttl_seconds"], 48 * 3600)
+        self.assertEqual(changed["expires_at"] - changed["created_at"], 48 * 3600)
+        self.assertEqual(mgr.get_or_create(48)["key_id"], changed["key_id"])  # 新 ttl 下幂等
+        back = mgr.get_or_create(24)                                          # 再变更 → 再次重建
+        self.assertNotEqual(back["key_id"], changed["key_id"])
+        self.assertEqual(back["ttl_seconds"], 24 * 3600)
 
 
 if __name__ == "__main__":

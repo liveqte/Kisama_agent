@@ -948,7 +948,7 @@ class Config:
     DOH_SERVERS = os.getenv("KISAMA_DOH_SERVERS", "").strip()
 
     # 代理版本信息
-    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.6.2-python")
+    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.6.3-python")
     
     # ================= 启动校验 =================
     
@@ -1763,7 +1763,8 @@ class TempKeyManager:
     """
     临时密钥管理器 (线程安全)
     - 同一时刻仅维护一份有效临时密钥对，避免内部多头密钥管理负担
-    - 有效期内重复查询返回同一密钥对；过期后自动生成新的密钥对
+    - 有效期内且 ttl 与当前密钥一致时重复查询返回同一密钥对；
+      ttl 变更或过期后自动生成新的密钥对，旧密钥立即作废
     - 临时持有者: 用临时 ECDSA P-256 私钥签名请求, 用临时 ECIES 私钥解密响应
     """
 
@@ -1776,11 +1777,23 @@ class TempKeyManager:
     # ================= 对外接口 =================
 
     def get_or_create(self, ttl_hours: int) -> Dict[str, Any]:
-        """获取临时密钥: 有效期内幂等返回同一密钥, 过期/不存在则重新生成"""
+        """获取临时密钥: 有效期内且 ttl 与当前密钥一致时幂等返回同一密钥,
+        ttl 变更或过期/不存在则重新生成 (旧密钥立即作废)"""
         with self._lock:
             self._expire_current_locked()
             if self._key:
-                return self._key
+                if int(self._key["ttl_seconds"]) == int(ttl_hours) * 3600:
+                    return self._key
+                # 🔐 ttl 变更: 旧密钥提前作废, 与自然过期同一安全依据触发长期凭据轮换
+                changed_id = self._key["key_id"]
+                self._key = None
+                Logger.warning(f"🔄 [TempKey] 请求 ttl 变更, 旧临时密钥提前作废: key_id={changed_id}")
+                cb = self.on_expired
+                if cb:
+                    try:
+                        cb()
+                    except Exception as e:
+                        Logger.error(f"💥 [TempKey] ttl 变更轮换失败: {e}")
             self._key = self._generate(ttl_hours)
             Logger.info(
                 f"🔑 [TempKey] 新临时密钥已生成: key_id={self._key['key_id']}, "

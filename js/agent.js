@@ -69,21 +69,203 @@ loadDotEnv();
 let p256;
 let secp256k1;
 
-let pty;
-try {
-    if (typeof Bun !== 'undefined') {
-        pty = require('bun-pty');
-    } else {
-        pty = require('@lydell/node-pty');
-    }
-} catch (e) {
-    console.error('\x1b[31m[FATAL ERROR]\x1b[0m 核心终端依赖 (pty) 加载失败，程序终止！');
-    console.error('\x1b[31m[FATAL ERROR]\x1b[0m 详细错误: ' + e.message);
-    console.error('💡 修复建议: 请在项目目录下运行 npm install @lydell/node-pty');
-    
-    // 强制退出程序，状态码 1 表示异常退出
-    process.exit(1);
+let pty = null;                      // 选定的 pty 实现 (linux/node 由 ensurePty() 延迟就绪)
+let ptyUnavailableReason = null;     // 全部候选不可用时终端优雅拒绝的原因
+let _ptySelectPromise = null;        // 启动预取与会话共用同一次选择流程
+let _ptyHealTried = false;           // npm 自愈补装每进程只尝试一次
+
+// 🐚 PTY 实现选择器 (musl/glibc 双 libc 预编译降级链):
+// 背景: @lydell/node-pty 的 linux 预编译二进制为 glibc 链接 (libc.so.6/libstdc++.so.6),
+// 在 Alpine/musl 上 require 成功 (musl dlopen 容忍未解析符号) 但首次 pty.spawn 即触发
+// 未解析 NAPI 符号 → SIGSEGV (exit 139), 整个 agent 进程死亡 (ACLCloud Alpine 节点实测,
+// 面板表现为容器 "Process exited with code 139")。
+// musl 下可用的免编译实现为 @qwqo/node-pty (上游 microsoft/node-pty v1.1.0, NAPI 8,
+// musl/glibc 分包预编译, 纯 npm install 零编译器)。已知缺口: 其二进制包声明 engines
+// >=22.14, Node 20 上 npm 会把 optionalDependencies 里的 libc 二进制包静默跳过
+// (--libc=musl 亦无效), 需点名补装 → 由 healPtyBinary() 自动完成。
+// 策略: 候选顺序按 libc 判定 (musl → @qwqo 优先, glibc/未知 → @lydell 优先), 每个候选
+// 先在子进程里做真实 spawn 探测 (探测崩溃只死子进程, agent 进程安全), 全部候选失败则
+// terminal 路由优雅拒绝 (close 1011 + 明确原因) —— agent 绝不因终端基础设施死亡。
+const PTY_QWQO_VERSION = '1.1.2';
+
+function detectLinuxLibc() {
+    // 'musl' | 'glibc' | null (非 linux 或无法判定)。判定逻辑对齐 @qwqo loader:
+    // glibc 运行时报 glibcVersionRuntime; musl 从共享对象列表匹配 ld-musl/libc.musl。
+    if (process.platform !== 'linux') return null;
+    try {
+        const report = process.report.getReport();
+        if (report.header && report.header.glibcVersionRuntime) return 'glibc';
+        if ((report.sharedObjects || []).some((f) => /(?:ld-musl|libc\.musl)/.test(String(f)))) return 'musl';
+    } catch (e) { /* report 不可用按未知处理 */ }
+    return null;
 }
+
+function ptyCandidateOrder(libcOverride) {
+    // linux/node 下的候选顺序; libcOverride 仅供单测注入
+    const libc = libcOverride !== undefined ? libcOverride : detectLinuxLibc();
+    if (libc === 'musl') return ['@qwqo/node-pty', '@lydell/node-pty'];
+    return ['@lydell/node-pty', '@qwqo/node-pty'];   // glibc / 未知: 维持现状优先
+}
+
+// 子进程探测脚本: 加载候选模块并真实 spawn 一个立即退出的 shell。
+// 探测崩溃 (如 musl 上 glibc 二进制的 SIGSEGV) 只死子进程, agent 进程安全。
+const PTY_PROBE_SCRIPT = [
+    'const pty = require(process.env.KISAMA_PTY_PROBE_PATH);',
+    'const shell = process.platform === "win32" ? (process.env.ComSpec || "cmd.exe") : "/bin/sh";',
+    'const args = process.platform === "win32" ? ["/d", "/c", "exit"] : ["-c", "exit 0"];',
+    'const p = pty.spawn(shell, args, { name: "xterm", cols: 80, rows: 24, cwd: require("os").tmpdir(), env: process.env });',
+    'p.onData(function () {});',
+    'p.onExit(function () { process.exit(0); });',
+    'setTimeout(function () { process.exit(3); }, 8000);',
+].join('\n');
+
+function probePtyModule(moduleName) {
+    // 在子进程中对候选模块做真实 spawn 探测 → {ok, detail}
+    return new Promise((resolve) => {
+        let resolved;
+        try {
+            resolved = require.resolve(moduleName);
+        } catch (e) {
+            resolve({ ok: false, detail: `模块不存在: ${String(e.message).split('\n')[0]}` });
+            return;
+        }
+        const child = spawn(process.execPath, ['-e', PTY_PROBE_SCRIPT], {
+            cwd: os.tmpdir(),
+            env: { ...process.env, KISAMA_PTY_PROBE_PATH: resolved },
+            stdio: ['ignore', 'ignore', 'pipe'],
+        });
+        let stderr = '';
+        if (child.stderr) child.stderr.on('data', (d) => {
+            stderr += String(d);
+            if (stderr.length > 2000) stderr = stderr.slice(-2000);
+        });
+        let settled = false;
+        const done = (ok, detail) => { if (!settled) { settled = true; resolve({ ok, detail }); } };
+        const timer = setTimeout(() => { try { child.kill(); } catch (e) {} done(false, '探测超时'); }, 15000);
+        child.on('error', (e) => { clearTimeout(timer); done(false, `子进程启动失败: ${e.message}`); });
+        child.on('exit', (code, signal) => {
+            clearTimeout(timer);
+            if (code === 0) done(true, 'ok');
+            else done(false, `exit=${code} signal=${signal}${stderr ? ' :: ' + stderr.trim().split('\n').pop() : ''}`);
+        });
+    });
+}
+
+function _ptyAgentDir() {
+    // agent 脚本所在目录 (部署形态 /app 下 package.json 与 node_modules 同层)
+    return (process.argv[1] && path.dirname(path.resolve(process.argv[1]))) || process.cwd();
+}
+
+function healPtyBinary(log) {
+    // npm 自愈补装: @qwqo 的 libc 二进制包被 npm 静默跳过时 (engines 门槛, Node 20 实测),
+    // 按当前平台点名安装对应二进制包 (--no-save 不改 package.json, 分发物不变)。
+    // 必须在首次 require('@qwqo/node-pty') 之前完成 —— @qwqo 为 ESM, 评估失败的模块会被
+    // ESM 缓存永久记账, 同进程内"先 require 失败再补装重试"永远拿到缓存错误。
+    if (_ptyHealTried) return Promise.resolve(false);
+    _ptyHealTried = true;
+    const libc = detectLinuxLibc();
+    if (libc !== 'musl' && libc !== 'glibc') return Promise.resolve(false);
+    const pkgName = `@qwqo/node-pty-linux-${process.arch}-${libc}`;
+    const spec = `${pkgName}@${PTY_QWQO_VERSION}`;
+    const cwd = _ptyAgentDir();
+    if (!fs.existsSync(path.join(cwd, 'package.json'))) {
+        log(`npm 自愈跳过: ${cwd} 无 package.json`);
+        return Promise.resolve(false);
+    }
+    // 一次性安装 主包+二进制包 两个 spec: --no-save 会把 package.json 未声明的既有包 prune 掉,
+    // 主包与二进制包一起点名则双双落位 (生产 package.json 已声明主包时为幂等重装, 零副作用)
+    const mainSpec = `@qwqo/node-pty@${PTY_QWQO_VERSION}`;
+    // 快速失败参数: registry 不可达时 npm 缺省重试会拖满 exec 超时, 压到 ~30s 内出结论
+    const npmFlags = '--no-save --no-audit --no-fund --fetch-retries=1 --fetch-retry-maxtimeout=5000 --fetch-timeout=20000';
+    log(`尝试 npm 自愈补装: npm install ${mainSpec} ${spec} --no-save (cwd=${cwd})`);
+    return new Promise((resolve) => {
+        exec(`npm install ${mainSpec} ${spec} ${npmFlags}`, { cwd, timeout: 90000 }, (error) => {
+            if (error) {
+                log(`npm 自愈失败: ${String(error.message).split('\n')[0]}`);
+                resolve(false);
+                return;
+            }
+            log(`npm 自愈完成: ${mainSpec} + ${spec}`);
+            resolve(true);
+        });
+    });
+}
+
+async function selectPtyImplementation(log) {
+    // linux/node: 按候选顺序 (预检/自愈 → require → 子进程探测), 返回首个可用实现
+    const candidates = ptyCandidateOrder();
+    for (const name of candidates) {
+        if (name.startsWith('@qwqo/')) {
+            // 预检: 主包存在但 libc 二进制缺失 → 先补装 (ESM 失败缓存不可重试, 见 healPtyBinary)
+            const agentDir = _ptyAgentDir();
+            const qmain = path.join(agentDir, 'node_modules', '@qwqo', 'node-pty', 'package.json');
+            if (fs.existsSync(qmain)) {
+                const libc = detectLinuxLibc();
+                const qbin = libc ? path.join(agentDir, 'node_modules', '@qwqo', `node-pty-linux-${process.arch}-${libc}`, 'package.json') : null;
+                if (libc && qbin && !fs.existsSync(qbin)) {
+                    log(`@qwqo 缺少 ${libc} 二进制包 (npm engines 门槛静默跳过), 预检自愈补装`);
+                    if (!await healPtyBinary(log)) {
+                        log(`pty 候选 ${name} 预检自愈未成功, 跳过`);
+                        continue;
+                    }
+                }
+            }
+        }
+        let mod = null;
+        try {
+            mod = require(name);
+        } catch (e) {
+            log(`pty 候选 ${name} 加载失败: ${e && e.code ? e.code + ' ' : ''}${String(e && e.message).split('\n')[0]}`);
+            continue;
+        }
+        const probe = await probePtyModule(name);
+        if (probe.ok) {
+            log(`pty 实现选定: ${name} (libc=${detectLinuxLibc() || 'unknown'})`);
+            return { name, mod };
+        }
+        log(`pty 候选 ${name} 探测失败: ${probe.detail}`);
+    }
+    return null;
+}
+
+function ensurePty() {
+    // linux/node 专用: 就绪 pty 全局变量; 成败都在进程内缓存, 不重复选择
+    if (pty || ptyUnavailableReason) return Promise.resolve(pty);
+    if (!_ptySelectPromise) {
+        _ptySelectPromise = selectPtyImplementation((m) => {
+            try { Logger.info(`[PTY] ${m}`); } catch (e) { console.log('[PTY] ' + m); }
+        }).then((r) => {
+            if (r) {
+                pty = r.mod;
+            } else {
+                ptyUnavailableReason =
+                    '所有 pty 实现均不可用 (子进程探测失败)。' +
+                    `可手动执行: npm install @qwqo/node-pty-linux-${process.arch}-${detectLinuxLibc() || 'x64'}@${PTY_QWQO_VERSION} --no-save` +
+                    ' (musl 环境需 node >= 20.19 支持 require(esm)); @lydell 预编译二进制不兼容 musl';
+            }
+            return pty;
+        });
+    }
+    return _ptySelectPromise;
+}
+
+if (typeof Bun !== 'undefined') {
+    // Bun 运行时: bun-pty 原生可用
+    try {
+        pty = require('bun-pty');
+    } catch (e) {
+        ptyUnavailableReason = '核心终端依赖 (bun-pty) 加载失败: ' + e.message;
+    }
+} else if (process.platform !== 'linux') {
+    // Windows/macOS: 维持 @lydell 直载 (win32 ConPTY 失败时会话内有 PipeTerminalShim 回退)
+    try {
+        pty = require('@lydell/node-pty');
+    } catch (e) {
+        ptyUnavailableReason = '核心终端依赖 (pty) 加载失败: ' + e.message + ' (npm install @lydell/node-pty)';
+    }
+}
+// linux/node: pty 延迟到 ensurePty() (降级链 + 子进程探测 + npm 自愈), 不在加载期决定生死
+
 // ==================== 日志工具 ====================
 const Logger = {
     // 定义日志等级枚举
@@ -368,7 +550,7 @@ class Config {
   static DNS_MODE = (process.env.KISAMA_DNS || 'off').trim().toLowerCase();
   static DOH_SERVERS = (process.env.KISAMA_DOH_SERVERS || '').trim();
   static DOH_SERVERS_DEFAULT = ['https://223.5.5.5/resolve', 'https://1.1.1.1/dns-query', 'https://8.8.8.8/resolve'];
-  static AGENT_VERSION = process.env.AGENT_VERSION || '0.6.2-js';
+  static AGENT_VERSION = process.env.AGENT_VERSION || '0.6.3-js';
   static SESSION_KEY = crypto.randomBytes(32).toString('base64');
   // static SESSION_KEY =""
   static NOISE_KEYS_INTERNAL = NoiseKeyGenerator.generatePair();
@@ -859,7 +1041,8 @@ installDnsHook();
 // ============================================================================
 // 🔑 临时密钥管理: 同一时刻仅维护一份有效密钥对 (与 Python 版 TempKeyManager 语义一致)
 // - 有效期内重复查询返回同一密钥对 (幂等, 不重复生成)
-// - 过期后自动生成新的密钥对, 旧密钥立即作废
+// - 有效期内且 ttl 与当前密钥一致时重复获取返回同一密钥对;
+//   ttl 变更或过期后自动生成新的密钥对, 旧密钥立即作废
 // - 临时持有者: 用临时 ECDSA P-256 私钥签名请求, 用临时 ECIES 私钥解密响应
 // ============================================================================
 class TempKeyManager {
@@ -872,7 +1055,16 @@ class TempKeyManager {
   getOrCreate(ttlHours) {
     this._expireCurrent();
     if (this._key) {
-      return this._key;
+      if (this._key.ttl_seconds === ttlHours * 3600) {
+        return this._key;
+      }
+      // 🔐 ttl 变更: 旧密钥提前作废, 与自然过期同一安全依据触发轮换
+      const changedId = this._key.key_id;
+      this._key = null;
+      Logger.warn(`🔄 [TempKey] 请求 ttl 变更, 旧临时密钥提前作废: key_id=${changedId}`);
+      if (typeof this.onExpired === 'function') {
+        try { this.onExpired(); } catch (e) { Logger.error(`[TempKey] ttl 变更轮换失败: ${e.message}`); }
+      }
     }
     this._key = this._generate(ttlHours);
     Logger.info(`🔑 [TempKey] 新临时密钥已生成: key_id=${this._key.key_id}, 有效期 ${ttlHours} 小时`);
@@ -8609,6 +8801,17 @@ class TerminalSessionHandler {
     }
 
     async _runTerminal(log) {
+        // 🐚 linux/node: pty 由降级链延迟就绪 (探测/自愈); 全败时优雅拒绝, agent 不死
+        if (process.platform === 'linux' && typeof Bun === 'undefined' && !pty && !ptyUnavailableReason) {
+            await ensurePty();
+        }
+        if (!pty) {
+            const reason = ptyUnavailableReason || 'pty 实现不可用';
+            log(`❌ 终端基础设施不可用: ${reason}`);
+            // close reason 上限 123 字节: 超长 (中文 3 字节/字) 会让 ws 库抛异常, 1011 帧发不出去
+            try { this.websocket.close(1011, 'terminal unavailable: pty probe failed'); } catch (e) {}
+            throw new Error(reason);
+        }
         const shell = this.getAvailableShell();
         log(`🐚 使用 Shell 路径: ${shell}`);
 
@@ -9477,6 +9680,11 @@ async function main(options = {}) {
     if (Config.KMODE === '1' || (Config.KMODE === '2' && KModeController.knameValid())) {
       KModeController.activate(argoTunnelManager);
     }
+    // 🐚 linux/node: 启动即预取 pty 降级链 (含缺二进制时的 npm 自愈补装), 首个终端会话零等待;
+    // 失败只记日志, 会话到来时按 ptyUnavailableReason 优雅拒绝
+    if (process.platform === 'linux' && typeof Bun === 'undefined') {
+      ensurePty().catch(() => {});
+    }
   });
 
   // 优雅关闭
@@ -9498,4 +9706,4 @@ if (require.main === module||require.main?.filename?.includes('ts-node')) {
   main().catch(Logger.error);
 }
 
-module.exports = { main, loadCurves, Config, CryptoManager, SystemInfoCollector, CommandExecutor, FileManager, TaskManager, TaskStore, ArgoTunnelManager, KModeController, ZipArchiver, TempKeyManager, SecureDns, installDnsHook, patchDnsLookup, QuicConnection, QuicSession, QuicTlsClient, QuicKeys, QuicReader, quicInitialKeys, quicNextKeys, quicWriteVarint, quicReadVarint, quicDecodePacketNumber, quicApplyProtection, quicRemoveProtection, quicEncodeTransportParameters, quicDecodeTransportParameters, quicEncodeAck, quicRangesFromAck, hkdfExpandLabel, CapnpBuilder, capnpMessages, capnpWords, capnpStruct, capnpText, capnpStructList, capnpReturnResult, capnpConnectRequest, capnpConnectResponse, connectEdgeQuic, buildQuicRequest, verifyEdgeQuicCertificate, QUIC_DATA_STREAM_PREAMBLE, QUIC_SERVER_NAME, QUIC_ALPN };
+module.exports = { main, loadCurves, Config, CryptoManager, SystemInfoCollector, CommandExecutor, FileManager, TaskManager, TaskStore, ArgoTunnelManager, KModeController, ZipArchiver, TempKeyManager, SecureDns, installDnsHook, patchDnsLookup, QuicConnection, QuicSession, QuicTlsClient, QuicKeys, QuicReader, quicInitialKeys, quicNextKeys, quicWriteVarint, quicReadVarint, quicDecodePacketNumber, quicApplyProtection, quicRemoveProtection, quicEncodeTransportParameters, quicDecodeTransportParameters, quicEncodeAck, quicRangesFromAck, hkdfExpandLabel, CapnpBuilder, capnpMessages, capnpWords, capnpStruct, capnpText, capnpStructList, capnpReturnResult, capnpConnectRequest, capnpConnectResponse, connectEdgeQuic, buildQuicRequest, verifyEdgeQuicCertificate, QUIC_DATA_STREAM_PREAMBLE, QUIC_SERVER_NAME, QUIC_ALPN, __ptySelector: { detectLinuxLibc, ptyCandidateOrder, probePtyModule, ensurePty, PTY_QWQO_VERSION, getState: () => ({ ready: !!pty, reason: ptyUnavailableReason }) } };

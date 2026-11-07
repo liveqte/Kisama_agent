@@ -199,7 +199,7 @@ public class kisama {
     // 其余 (无 opt-in 头/超阈值) 保持原始字节流——旧客户端零适配, 大文件不付 Base64+33% 与
     // 整读内存的代价。0 = 关闭加密 (恒明文)。
     private static final long DOWNLOAD_ENCRYPT_MAX = Long.parseLong(DOTENV.getOrDefault("DOWNLOAD_ENCRYPT_MAX", "4194304"));
-    private static final String AGENT_VERSION = "0.6.2-java11";
+    private static final String AGENT_VERSION = "0.6.3-java11";
 
     // baseinfo 三组快照 (docs/API.MD 十六): P 级进程内只建一次; T-local 30s; T-net 3600s.
     // 快照只含系统字段, 凭证在路由层按请求装配, 轮换不再清空
@@ -3601,9 +3601,11 @@ public class kisama {
     }
 
     // ==================== 🔑 临时密钥管理器 (与 Python/JS 版语义一致) ====================
+    // 有效期内且 ttl 与当前密钥一致时幂等返回同一密钥对; ttl 变更或过期后自动生成新的密钥对, 旧密钥立即作废
     private final class TempKeyManager {
         private final Object lock = new Object();
         private long expiresAt = 0;
+        private long ttlSeconds = 0;
         private long createdAt = 0;
         private String keyId = "";
         private String ecdsaPrivatePem = "";
@@ -3628,7 +3630,19 @@ public class kisama {
             synchronized (lock) {
                 expireIfNeededLocked();
                 if (expiresAt > 0) {
-                    return snapshot();
+                    if (ttlSeconds == (long) ttlHours * 3600) {
+                        return snapshot();
+                    }
+                    // 🔐 ttl 变更: 旧密钥提前作废, 与自然过期同一安全依据触发轮换回调
+                    log("[TEMPKEY] 🔄 请求 ttl 变更, 旧临时密钥提前作废: key_id=" + keyId);
+                    expiresAt = 0;
+                    ecdsaVk = null;
+                    eciesPub = null;
+                    try {
+                        onExpired.run();
+                    } catch (Exception e) {
+                        logError("[TEMPKEY] ❌ ttl 变更轮换失败: " + e.getMessage());
+                    }
                 }
                 generate(ttlHours);
                 log("[TEMPKEY] 🔑 新临时密钥已生成: key_id=" + keyId + ", 有效期 " + ttlHours + " 小时");
@@ -3718,6 +3732,7 @@ public class kisama {
 
             long now = System.currentTimeMillis() / 1000;
             this.createdAt = now;
+            this.ttlSeconds = (long) ttlHours * 3600;
             this.expiresAt = now + (long) ttlHours * 3600;
         }
     }

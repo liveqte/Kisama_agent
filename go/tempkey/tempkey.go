@@ -40,7 +40,8 @@ type Entry struct {
 	EciesPub *ecies.PublicKey
 }
 
-// Manager 临时密钥管理器: 同一时刻仅维护一份有效密钥对, 有效期内幂等, 过期自动轮换
+// Manager 临时密钥管理器: 同一时刻仅维护一份有效密钥对, 有效期内且 ttl 一致时幂等,
+// ttl 变更或过期自动轮换
 type Manager struct {
 	mu  sync.Mutex
 	key *Entry
@@ -65,13 +66,23 @@ func (m *Manager) expireLockedIfNeeded() {
 	}
 }
 
-// GetOrCreate 有效期内幂等返回同一密钥对; 过期或不存在则重新生成
+// GetOrCreate 有效期内且 ttl 与当前密钥一致时幂等返回同一密钥对;
+// ttl 变更或过期/不存在则重新生成 (旧密钥立即作废)
 func (m *Manager) GetOrCreate(ttlHours int) (*Entry, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.expireLockedIfNeeded()
 	if m.key != nil {
-		return m.key, nil
+		if m.key.TTLSeconds == int64(ttlHours)*3600 {
+			return m.key, nil
+		}
+		// 🔐 ttl 变更: 旧密钥提前作废, 与自然过期同一安全依据触发轮换回调
+		changedID := m.key.KeyID
+		m.key = nil
+		logger.Infof("🔄 [TempKey] 请求 ttl 变更, 旧临时密钥提前作废: key_id=%s", changedID)
+		if m.OnExpired != nil {
+			m.OnExpired()
+		}
 	}
 	entry, err := generate(ttlHours)
 	if err != nil {

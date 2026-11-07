@@ -54,11 +54,21 @@ async function main() {
   assert.ok(eciesCompressed.subarray(1).equals(eciesPub65.subarray(1, 33)), 'ECIES 压缩点 X 应一致');
   assert.strictEqual(eciesCompressed[0], eciesPub65[64] & 1 ? 3 : 2, 'ECIES 压缩点前缀奇偶应一致');
 
-  // ---------- 幂等: 同一密钥对不同 ttl 同取 ----------
-  const again = mgr.getOrCreate(48);
+  // ---------- 幂等: 同 ttl 重复获取同取 ----------
+  const again = mgr.getOrCreate(24);
   assert.strictEqual(again.key_id, key.key_id);
   assert.strictEqual(again.ecdsa_private_hex, key.ecdsa_private_hex);
   assert.strictEqual(again.ecdsa_public_b64, key.ecdsa_public_b64);
+
+  // ---------- ttl 变更即重建 (0.6.3 批次语义, 与面板"先选有效期再生成"配套) ----------
+  const changed = mgr.getOrCreate(48);
+  assert.notStrictEqual(changed.key_id, key.key_id, 'ttl 变更应重建密钥对');
+  assert.strictEqual(changed.ttl_seconds, 48 * 3600);
+  assert.strictEqual(changed.expires_at - changed.created_at, 48 * 3600);
+  assert.strictEqual(mgr.getOrCreate(48).key_id, changed.key_id, '新 ttl 下幂等');
+  const back = mgr.getOrCreate(24);
+  assert.notStrictEqual(back.key_id, changed.key_id, '再次变更应再次重建');
+  assert.strictEqual(back.ttl_seconds, 24 * 3600);
 
   // ---------- 内存验签/加密字段不被短格式污染 ----------
   assert.ok(Buffer.isBuffer(key.ecies_pub) && key.ecies_pub.length === 65, '内部 ecies_pub 应保持 65 字节未压缩');

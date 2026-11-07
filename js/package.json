@@ -1,6 +1,6 @@
 {
   "name": "kisama-js",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "description": "Kisama Agent - Node.js implementation",
   "main": "index.js",
   "scripts": {
@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@lydell/node-pty": "^1.1.0",
+    "@qwqo/node-pty": "1.1.2",
     "@noble/curves": "^2.2.0",
     "base64-js": "^1.5.1",
     "bun-pty": "^0.4.8",

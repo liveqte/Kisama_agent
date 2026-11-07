@@ -164,6 +164,27 @@ func TestTempKeyInvalidFormat(t *testing.T) {
 	}
 }
 
+// ttl 变更即重建 (0.6.3 批次语义): 同 ttl 幂等, ttl 不同重建并按新 ttl 计时
+func TestTempKeyTTLChangeRegenerates(t *testing.T) {
+	r := setupTempKeyTest(t)
+	_, first := doTempKeyJSON(t, r, "/api/tempkey?ttl=24")
+	_, same := doTempKeyJSON(t, r, "/api/tempkey?ttl=24")
+	if same["key_id"] != first["key_id"] {
+		t.Fatalf("same ttl should be idempotent: %v vs %v", first["key_id"], same["key_id"])
+	}
+	_, changed := doTempKeyJSON(t, r, "/api/tempkey?ttl=48")
+	if changed["key_id"] == first["key_id"] {
+		t.Fatalf("ttl change should regenerate: key_id %v unchanged", changed["key_id"])
+	}
+	if got, _ := changed["ttl_seconds"].(float64); got != 48*3600 {
+		t.Errorf("changed ttl_seconds = %v, want %d", changed["ttl_seconds"], 48*3600)
+	}
+	_, again := doTempKeyJSON(t, r, "/api/tempkey?ttl=48")
+	if again["key_id"] != changed["key_id"] {
+		t.Fatalf("new ttl should be idempotent: %v vs %v", changed["key_id"], again["key_id"])
+	}
+}
+
 func isPEM(s string) bool {
 	block, _ := pem.Decode([]byte(s))
 	return block != nil
