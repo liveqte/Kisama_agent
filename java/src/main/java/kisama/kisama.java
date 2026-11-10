@@ -199,7 +199,7 @@ public class kisama {
     // 其余 (无 opt-in 头/超阈值) 保持原始字节流——旧客户端零适配, 大文件不付 Base64+33% 与
     // 整读内存的代价。0 = 关闭加密 (恒明文)。
     private static final long DOWNLOAD_ENCRYPT_MAX = Long.parseLong(DOTENV.getOrDefault("DOWNLOAD_ENCRYPT_MAX", "4194304"));
-    private static final String AGENT_VERSION = "0.6.3-java";
+    private static final String AGENT_VERSION = "0.6.4-java";
     // 内置加密 DNS (DoH, docs/API.MD 第十八节): off=系统解析 (默认, 零行为变化);
     // on=全部出站域名解析走 DoH JSON API 防污染。KISAMA_DOH_SERVERS 逗号分隔自定义链,
     // 缺省 阿里 223.5.5.5 → Cloudflare 1.1.1.1 → Google 8.8.8.8
@@ -1315,13 +1315,19 @@ public class kisama {
                     || "true".equalsIgnoreCase(String.valueOf(quicRaw));
             try {
                 ArgoTunnelManager.TunnelEntry tunnel = this.argoTunnelManager.create(portNum, duplicate, quic);
-                return this.gson.toJson(Map.of(
-                        "status", "ok",
-                        "created", true,
-                        "tunnel_domain", tunnel.tunnelDomain,
-                        "port", tunnel.port,
-                        "created_at", tunnel.createdAt,
-                        "transport", tunnel.transport));
+                // 🛡️ 状态透明: Map.of 禁止 null 值, 改用 LinkedHashMap 承载 (last_* 为 null 时 Gson 省略)
+                Map<String, Object> payload = new LinkedHashMap<>();
+                payload.put("status", "ok");
+                payload.put("created", true);
+                payload.put("tunnel_domain", tunnel.tunnelDomain);
+                payload.put("port", tunnel.port);
+                payload.put("created_at", tunnel.createdAt);
+                payload.put("transport", tunnel.transport);
+                payload.put("tunnel_status", tunnel.status);
+                payload.put("last_error", tunnel.lastError);
+                payload.put("last_error_at", tunnel.lastErrorAt);
+                payload.put("consecutive_failures", tunnel.consecutiveFailures);
+                return this.gson.toJson(payload);
             } catch (ArgoTunnelManager.TunnelException e) {
                 halt(e.status, this.gson.toJson(Map.of(
                         "status", "error", "created", false, "port", e.port, "message", e.getMessage())));
@@ -3324,14 +3330,29 @@ public class kisama {
 
     private List<String> detectMarks() {
         List<String> marks = new ArrayList<>();
-        if (!System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("linux")) return marks;
-        Map<String, java.util.function.BooleanSupplier> probes = new LinkedHashMap<>();
-        probes.put("root", this::markRoot);
-        probes.put("kvm", this::markKvm);
-        probes.put("pterodactyl", this::markPterodactyl);
-        probes.put("systemd", this::markSystemd);
-        probes.put("fuse", this::markFuse);
-        for (Map.Entry<String, java.util.function.BooleanSupplier> probe : probes.entrySet()) {
+        // 主机探测标记仅 Linux 语义; 配置类标记与平台无关 (docs/API.MD 15.1)
+        if (System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("linux")) {
+            Map<String, java.util.function.BooleanSupplier> probes = new LinkedHashMap<>();
+            probes.put("root", this::markRoot);
+            probes.put("kvm", this::markKvm);
+            probes.put("pterodactyl", this::markPterodactyl);
+            probes.put("systemd", this::markSystemd);
+            probes.put("fuse", this::markFuse);
+            for (Map.Entry<String, java.util.function.BooleanSupplier> probe : probes.entrySet()) {
+                try {
+                    if (probe.getValue().getAsBoolean()) marks.add(probe.getKey());
+                } catch (Throwable t) {
+                    logDebug("[TRACE-MARKS] marks 探测失败 [" + probe.getKey() + "]: " + t.getMessage());
+                }
+            }
+        }
+        // 配置类标记 (kstore/kmode1/kmode2, docs/API.MD 15.8-15.10): agent 自身配置事实,
+        // 非 Linux 同样输出; KMODE 已由 parseKmode 归一化 (2q/2quic → 2)
+        Map<String, java.util.function.BooleanSupplier> configProbes = new LinkedHashMap<>();
+        configProbes.put("kstore", this::markKstore);
+        configProbes.put("kmode1", this::markKmode1);
+        configProbes.put("kmode2", this::markKmode2);
+        for (Map.Entry<String, java.util.function.BooleanSupplier> probe : configProbes.entrySet()) {
             try {
                 if (probe.getValue().getAsBoolean()) marks.add(probe.getKey());
             } catch (Throwable t) {
@@ -3341,6 +3362,21 @@ public class kisama {
         // 仅输出标记名, 禁止打印 environ/mountinfo/passwd 原文
         logDebug("[TRACE-MARKS] marks 命中: " + (marks.isEmpty() ? "(none)" : String.join(",", marks)));
         return marks;
+    }
+
+    private boolean markKstore() {
+        // 任务持久化已启用 (initTaskStore 解析 KSTORE/KSTORE_KEY 的结果, start() 先于路由初始化)
+        return this.taskStoreEnabled;
+    }
+
+    private boolean markKmode1() {
+        // KMODE 配置为 1 (隧道 + 域名文件 + stdin)
+        return this.KMODE == 1;
+    }
+
+    private boolean markKmode2() {
+        // KMODE 配置为 2 (含 2q/2quic, parseKmode 归一化后为 2; 按配置值判定, 不校验 knameValid 生效条件)
+        return this.KMODE == 2;
     }
 
     private boolean markRoot() {
@@ -5138,7 +5174,22 @@ public class kisama {
     // 注册永远失败 (域名永久失效, 即"ECONNRESET 后连不上"的根因)。连续失败 N 次后重新注册
     // 换取新域名并回调通知 (KMODE=2 自动再上报 / KMODE=1 自动重写域名文件)。
     private static final int ARGO_REREGISTER_AFTER = argoEnvInt("KISAMA_ARGO_REREGISTER_AFTER", 5, 2);
-    private static final long ARGO_REREGISTER_RETRY_SECONDS = 30;   // 重新注册失败后的退避
+    private static final long ARGO_REREGISTER_RETRY_SECONDS = 30;   // 重新注册失败后的退避 (兼容保留, 退避序列中会被指数公式覆盖)
+    // 指数退避 + 封顶低频巡检: 短失败 2s 起、指数增长封顶 300s, 失败越久等越久, 成功清零
+    private static final int ARGO_RETRY_BASE_SECONDS = argoEnvInt("KISAMA_ARGO_RETRY_BASE_SECONDS", 2, 1);
+    private static final int ARGO_RETRY_MAX_SECONDS = argoEnvInt("KISAMA_ARGO_RETRY_MAX_SECONDS", 300, 60);
+    private static long argoBackoffSeconds(int failures) {
+        if (failures <= 0) return ARGO_RETRY_BASE_SECONDS;
+        long exp = Math.min(failures - 1L, 10L);
+        return Math.min(ARGO_RETRY_BASE_SECONDS * (1L << exp), ARGO_RETRY_MAX_SECONDS);
+    }
+    private static String argoTruncateError(String msg) {
+        if (msg == null) return null;
+        return msg.length() > 300 ? msg.substring(0, 300) : msg;
+    }
+    private static String argoNowIso() {
+        return java.time.Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS).toString();
+    }
     // 读空闲超时 (秒): edge 有周期 PING, 长时间无任何入站数据 = 半开假死, 主动断开走重连; 0=禁用
     private static final int ARGO_IDLE_TIMEOUT = argoIdleTimeout();
 
@@ -9614,6 +9665,12 @@ public class kisama {
                     m.put("tunnel_domain", entry.tunnelDomain);
                     m.put("port", entry.port);
                     m.put("created_at", entry.createdAt);
+                    // 🛡️ 状态透明: 三态 + 失败原因 + 连续失败计数, 供 Panel 灰显区分 (last_* 为 null 时 Gson 省略)
+                    m.put("status", entry.status);
+                    m.put("last_error", entry.lastError);
+                    m.put("last_error_at", entry.lastErrorAt);
+                    m.put("consecutive_failures", entry.consecutiveFailures);
+                    m.put("last_registered_at", entry.lastRegisteredAt);
                     out.add(m);
                 }
             }
@@ -9667,6 +9724,12 @@ public class kisama {
                 m.put("tunnel_domain", entry.tunnelDomain);
                 m.put("port", entry.port);
                 m.put("created_at", entry.createdAt);
+                // 🛡️ 状态透明: 与 GET /api/argo 同构 (last_* 为 null 时 Gson 省略)
+                m.put("status", entry.status);
+                m.put("last_error", entry.lastError);
+                m.put("last_error_at", entry.lastErrorAt);
+                m.put("consecutive_failures", entry.consecutiveFailures);
+                m.put("last_registered_at", entry.lastRegisteredAt);
                 deleted.add(m);
             }
             List<TunnelEntry> remaining = new ArrayList<>();
@@ -9712,7 +9775,8 @@ public class kisama {
 
         private void runLoop(TunnelEntry entry, String accountTag, byte[] tunnelSecret, byte[] tunnelId) {
             String origin = "http://127.0.0.1:" + entry.port;
-            int failures = 0;   // 🛡️ 连续失败计数 (连接失败/注册失败): 本轮注册过=旧凭据仍有效, 清零
+            // 🛡️ 连续失败计数提升为条目字段 entry.consecutiveFailures: 供 GET /api/argo 暴露给 Panel
+            entry.consecutiveFailures = 0;
             int connIndex = 0;  // 注册索引轮换, 降低 edge 侧旧连接残留导致的注册拒绝
             while (!entry.stopped) {
                 javax.net.ssl.SSLSocket sock = null;
@@ -9754,6 +9818,13 @@ public class kisama {
                 } catch (Exception e) {
                     if (!entry.stopped) {
                         logWarn("[TRACE-ARGO] ⚠️ 临时隧道连接中断: " + entry.tunnelDomain + " -> " + e.getMessage());
+                        // 🛡️ 状态透明: 失败原因即时暴露 (failed 态不被降级覆盖)
+                        if (!"failed".equals(entry.status)) {
+                            entry.status = "reconnecting";
+                        }
+                        entry.lastError = argoTruncateError(e.getMessage() != null
+                                ? e.getMessage() : e.getClass().getSimpleName());
+                        entry.lastErrorAt = argoNowIso();
                     }
                 } finally {
                     if (sock != null) {
@@ -9777,10 +9848,17 @@ public class kisama {
                 // 🛡️ 守护计数: 本轮注册过=旧凭据仍有效; 未注册=凭据可能已被 Cloudflare 回收
                 boolean registered = (conn != null && conn.registered) || (quicConn != null && quicConn.registered);
                 if (registered) {
-                    failures = 0;
+                    entry.consecutiveFailures = 0;
                     entry.quicFailures = 0;
+                    entry.status = "alive";
+                    entry.lastError = null;
+                    entry.lastErrorAt = null;
+                    entry.lastRegisteredAt = argoNowIso();
                 } else {
-                    failures += 1;
+                    entry.consecutiveFailures += 1;
+                    if (!"failed".equals(entry.status)) {
+                        entry.status = "reconnecting";
+                    }
                     // 🚦 QUIC 连续失败达阈值: 自动回退 h2 (同一注册凭据无需重注册, UDP 被墙环境兜底;
                     // 回退只影响本条隧道, 重启进程恢复 QUIC)
                     if ("quic".equals(entry.transport)) {
@@ -9792,18 +9870,30 @@ public class kisama {
                             entry.quicFailures = 0;
                         }
                     }
-                    if (failures >= ARGO_REREGISTER_AFTER) {
+                    if (entry.consecutiveFailures >= ARGO_REREGISTER_AFTER) {
                         // 🛡️ 旧凭据已被 Cloudflare 回收: 重新注册换取新域名, 回调通知后继续新域名下的重连
                         QuickTunnelInfo re = reregister(entry);
                         if (re != null) {
                             accountTag = re.accountTag;
                             tunnelSecret = re.secret;
                             tunnelId = re.tunnelId;
-                            failures = 0;
+                            entry.consecutiveFailures = 0;
+                            entry.quicFailures = 0;   // 凭据类失败不计入传输回退, 避免误降级
+                            entry.status = "alive";
+                            entry.lastError = null;
+                            entry.lastErrorAt = null;
+                            entry.lastRegisteredAt = argoNowIso();
                         } else {
-                            // 重新注册失败: 退避更久再试, 避免高频请求 api.trycloudflare.com
+                            // 重新注册亦失败: 标 failed, 退避封顶低频巡检再试, 不永久停掉
+                            if (!"failed".equals(entry.status)) {
+                                entry.status = "failed";
+                                if (entry.lastError == null) {
+                                    entry.lastError = "tunnel re-register failed";
+                                    entry.lastErrorAt = argoNowIso();
+                                }
+                            }
                             try {
-                                Thread.sleep(ARGO_REREGISTER_RETRY_SECONDS * 1000L);
+                                Thread.sleep(argoBackoffSeconds(entry.consecutiveFailures) * 1000L);
                             } catch (InterruptedException e) {
                                 break;
                             }
@@ -9811,8 +9901,11 @@ public class kisama {
                     }
                 }
                 if (!entry.stopped) {
+                    // 🛡️ 指数退避封顶: 连续失败越久等越久 (2s→300s), 无失败保持固定 2s 快速重连
+                    long backoffMs = entry.consecutiveFailures > 0
+                            ? argoBackoffSeconds(entry.consecutiveFailures) * 1000L : 2000L;
                     try {
-                        Thread.sleep(2000);
+                        Thread.sleep(backoffMs);
                     } catch (InterruptedException e) {
                         break;
                     }
@@ -9851,8 +9944,14 @@ public class kisama {
 
         static final class TunnelEntry {
             // 🚦 本条隧道的边缘传输 ('h2'|'quic'); java 端本批次暂走 h2, 后续批次激活
-            String transport = "h2";
-            int quicFailures = 0;
+            volatile String transport = "h2";
+            volatile int quicFailures = 0;
+            // 🛡️ 状态透明: status 三态 + 失败原因, 供 GET /api/argo 暴露给 Panel 灰显区分
+            volatile String status = "alive";   // alive | reconnecting | failed
+            volatile String lastError = null;
+            volatile String lastErrorAt = null;
+            volatile int consecutiveFailures = 0;
+            volatile String lastRegisteredAt = null;
             // 🛡️ 非 final: 守护重新注册后域名会变化, list/remove 接口始终呈现最新域名
             volatile String tunnelDomain;
             final int port;

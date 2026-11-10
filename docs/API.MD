@@ -59,7 +59,7 @@ agent 启动时自动读取**可执行文件同目录**（py/js 为脚本同目�
 
 > **ipv4/ipv6 上报口径（五语言统一语义）**：`ipv4`/`ipv6` 均以专用外部服务探测优先且对返回文本做族校验——`ipv6` 只接受**公网全局单播**（2000::/3；ULA(fc00::/7)、链路本地(fe80::/10)、多播、回环、未指定、IPv4-mapped、站点本地一律拒绝），本地网卡地址仅在外部探测全失败时兜底（v6 兜底同样必须全局单播）。**无公网 IPv6 时 `ipv6` 报 `null`，不会用容器内网地址（如 docker 网络的 fdXX::）回填**。
 
-> **marks 主机标记（可选字段，additive）**：字符串数组，标识当前进程视角下**已确认成立**的主机能力，当前取值为 `root`、`kvm`、`pterodactyl`、`systemd`、`fuse`（可同时出现多个，顺序固定）。**字段可能缺失**（旧版代理未实现 / 非 Linux 平台），缺失与空数组语义不同：缺失 = 未探测或不适用，`[]` = 已探测且无命中；`null` 非法，客户端按缺失处理。客户端必须忽略未知取值。判据、实现方式、性能与误报边界见「十五、`/api/baseinfo` 可选字段 `marks`（主机标记）探测规范」。
+> **marks 主机标记（可选字段，additive）**：字符串数组，标识当前进程视角下**已确认成立**的事实，分两类：主机探测标记 `root`、`kvm`、`pterodactyl`、`systemd`、`fuse`（Linux 语义），与配置类标记 `kstore`（任务持久化已启用）、`kmode1`/`kmode2`（KMODE 配置为 1/2，go 未实现 KMODE 故不输出）。可同时出现多个，顺序固定（主机探测标记在前、配置类标记追加在末尾）。**字段可能缺失**（旧版代理未实现），缺失与空数组语义不同：缺失 = 未探测或不适用，`[]` = 已探测且无命中；`null` 非法，客户端按缺失处理。客户端必须忽略未知取值。判据、实现方式、性能与误报边界见「十五、`/api/baseinfo` 可选字段 `marks`（主机标记）探测规范」。
 
 > **字段缓存分级（P 级 / T 级）**：baseinfo 系统信息按字段分两级缓存——**P 级（进程级静态）**如 `marks`、`virtualization`、`os`、`kernel_version`、`arch` 等，在进程生命周期内只探测一次并一直复用快照（TTL 过期与密钥轮换都不重探）；**T 级（TTL 快照）**按各自 TTL 重探：`disk_total`/`mem_total`/`swap_total` 为 30 秒，`ipv4`/`ipv6` 为 3600 秒。`session_key`/`noise_key` 属每请求凭证材料，**绝不进入任何快照**。完整字段表、失效规则与验收断言见「十六、`/api/baseinfo` 字段分级缓存与快照语义」。
 
@@ -615,17 +615,17 @@ GET /kisamaproxy/https://host:8443/api/exec
 ```
 
 
-## 七、Argo 临时隧道模块（可选接口 · 仅 Python 版已实现）
+## 七、Argo 临时隧道模块（可选接口 · py / js / java / java11 已实现，Go 版无此模块）
 
 > **可选接口**：创建 Cloudflare 临时公网隧道（Quick Tunnel / trycloudflare），将本代理监听端口或内网任意 TCP 端口暴露为一个随机的 `https://<随机域名>.trycloudflare.com` 临时公网域名，无需自有域名与 DNS/证书配置，隧道随进程退出而失效。
-> ✅ **实现状态**：Python 版（py/agent.py）已实现，隧道基于 Python 标准库手写的 HTTP/2 + Cap'n Proto 协议（与 cloudflared 相同的 Quick Tunnel 协议，无需安装任何外部二进制）；GO / JS / Java 版尚未提供该路由。
+> ✅ **实现状态**：py（py/agent.py，Python 标准库手写 HTTP/2 + Cap'n Proto 协议，与 cloudflared 相同的 Quick Tunnel 协议，无需安装任何外部二进制）与 js / java / java11（同构移植）已实现；GO 版不提供该路由。QUIC 边缘传输可用性按端不对称（见「九」的 QUIC 小节）。
 
 ### 27. 查询临时隧道列表
 路径：GET /api/argo  
 用途：返回当前已创建的全部临时隧道（隧道域名、转发端口、创建时间）  
 输入：无  
 行为约定：
-- 返回所有**存活中**的临时隧道（含通过 `duplicate: true` 创建的重复隧道）；
+- 返回所有已创建的临时隧道（含通过 `duplicate: true` 创建的重复隧道）；🛡️ **0.6.4 起失效条目不丢弃**：连续失败达阈值的隧道以 `status: "failed"` 保留在列表中并附 `last_error` 失败原因，由控制端（面板）灰显区分，Agent 守护循环仍按指数退避低频巡检、恢复后自动转回 `alive`；
 - 🛡️ **0.5.2 起隧道具备守护自愈能力**：与 edge 断开后自动重连（短暂抖动域名不变）；若旧隧道凭据被 Cloudflare 回收（连续重连失败达阈值），代理端自动重新注册并**更换新域名**，本接口返回的 `tunnel_domain` 始终为**最新域名**（详见「九、KMODE 启动模式」的「隧道守护自愈」小节）；
 - 无隧道时返回空列表（`count: 0`）。  
 返回示例：
@@ -634,8 +634,8 @@ GET /kisamaproxy/https://host:8443/api/exec
   "status": "ok",
   "count": 2,
   "tunnels": [
-    { "tunnel_domain": "https://lucky-wildflower-1a2b3c4d.trycloudflare.com", "port": 8000, "created_at": "2026-08-18T10:00:00Z" },
-    { "tunnel_domain": "https://quiet-cloud-9f8e7d6c.trycloudflare.com", "port": 8080, "created_at": "2026-08-18T11:30:00Z" }
+    { "tunnel_domain": "https://lucky-wildflower-1a2b3c4d.trycloudflare.com", "port": 8000, "created_at": "2026-08-18T10:00:00Z", "status": "alive", "last_error": null, "last_error_at": null, "consecutive_failures": 0, "last_registered_at": "2026-08-18T10:00:05Z" },
+    { "tunnel_domain": "https://quiet-cloud-9f8e7d6c.trycloudflare.com", "port": 8080, "created_at": "2026-08-18T11:30:00Z", "status": "failed", "last_error": "tunnel re-register failed", "last_error_at": "2026-08-18T12:05:00Z", "consecutive_failures": 5, "last_registered_at": "2026-08-18T11:30:04Z" }
   ]
 }
 ```
@@ -643,10 +643,16 @@ GET /kisamaproxy/https://host:8443/api/exec
 | 字段 | 类型 | 说明 |
 | :--- | :--- | :--- |
 | status | string | 固定为 `"ok"` |
-| count | number | 隧道数量 |
-| tunnels[].tunnel_domain | string | 临时隧道公网域名（含 `https://` 前缀） |
+| count | number | 返回条目总数（**含失效条目**，Agent 端不丢弃） |
+| tunnels[].tunnel_domain | string | 临时隧道公网域名（含 `https://` 前缀，守护重注册后为最新域名） |
 | tunnels[].port | number | 隧道转发的本地端口 |
 | tunnels[].created_at | string | 创建时间（ISO8601 UTC，如 `2026-08-18T10:00:00Z`） |
+| tunnels[].transport | string | 边缘传输 `h2` / `quic`（0.6.2 additive）。**按端不对称**：GET 响应仅 js 返回（py 被 FastAPI 响应模型过滤、java/java11 GET 不含该键）；缺失 = 未知，不猜 |
+| tunnels[].status | string | 隧道状态三态（0.6.4 additive，四端统一）：`alive`=存活 / `reconnecting`=中断自动重连中 / `failed`=重注册亦失败（守护循环仍低频巡检，非终态） |
+| tunnels[].last_error | string \| null | 最近一次失败原因（截断 ≤300 字符，仅连接类异常文本，不含密钥）；无失败为 `null`。java/java11 的 null 值省略字段（Gson 默认不序列化 null） |
+| tunnels[].last_error_at | string \| null | 最近一次失败时间（ISO8601 UTC）；无失败为 `null`（java/java11 省略） |
+| tunnels[].consecutive_failures | number | 当前连续失败轮数（本轮注册成功即清零） |
+| tunnels[].last_registered_at | string \| null | 最近一次成功注册时间（ISO8601 UTC）；从未成功注册为 `null`（java/java11 省略） |
 
 ### 28. 创建临时隧道
 路径：POST /api/argo  
@@ -674,7 +680,11 @@ GET /kisamaproxy/https://host:8443/api/exec
   "created": true,
   "tunnel_domain": "https://sunny-breeze-5a6b7c8d.trycloudflare.com",
   "port": 8080,
-  "created_at": "2026-08-18T12:00:00Z"
+  "created_at": "2026-08-18T12:00:00Z",
+  "tunnel_status": "alive",
+  "last_error": null,
+  "last_error_at": null,
+  "consecutive_failures": 0
 }
 ```
 返回示例（同端口重复被拒，HTTP 409）：
@@ -703,6 +713,11 @@ GET /kisamaproxy/https://host:8443/api/exec
 | tunnel_domain | string | 创建成功时返回临时隧道域名；失败时无此字段 |
 | port | number | 本次请求的转发端口 |
 | created_at | string | 创建时间（ISO8601 UTC）；失败时无此字段 |
+| transport | string | 边缘传输 `h2` / `quic`（0.6.2 additive）。**按端不对称**：仅 js / java 返回（py 被 FastAPI 响应模型过滤、java11 无此字段）；缺失 = 未知，不猜 |
+| tunnel_status | string | 隧道状态（0.6.4 additive，四端统一）：新创建恒为 `alive`。字段名为 `tunnel_status` 以避免与信封 `status` 撞名 |
+| last_error | string \| null | 最近一次失败原因（新建成功恒为 `null`；java/java11 省略） |
+| last_error_at | string \| null | 最近一次失败时间（新建成功恒为 `null`；java/java11 省略） |
+| consecutive_failures | number | 连续失败轮数（新建成功恒为 `0`） |
 | message | string | 失败原因（仅 `status=error` 时出现） |
 
 ### 29. 删除临时隧道
@@ -759,7 +774,7 @@ GET /kisamaproxy/https://host:8443/api/exec
 | status | string | 请求处理结果：`"ok"` / `"error"` |
 | deleted | number | 实际删除的隧道数量（成功时 ≥1） |
 | port | number | 本次请求的端口 |
-| tunnels | array | 已删除隧道的明细（结构同 GET /api/argo 的 tunnels），失败时无此字段 |
+| tunnels | array | 已删除隧道的明细（结构同 GET /api/argo 的 tunnels，0.6.4 起同样携带 `status`/`last_error` 等状态字段），失败时无此字段 |
 | message | string | 失败原因（仅 `status=error` 时出现） |
 
 
@@ -798,6 +813,8 @@ KMODE 是代理端的一个启动模式开关，通过环境变量取值，用�
 | KPATH | `$HOME/domain.txt` | 仅 KMODE=1 有效：隧道域名文件的写入路径，支持相对 HOME 的子目录写法（如 `$HOME/.cache/domain.txt`） |
 | KNAME | 无 | 仅 KMODE=2 有效：shz.al 自定义名（≥3 字符，限字母、数字及 `+_-[]*$=@,;/`），同时是可预测访问 URL 的组成部分；未设置时 KMODE=2 退化为普通启动（等同 KMODE=0），不报错 |
 | KNAME_KEY | `$KNAME` | 仅 KMODE=2 有效：上报的管理/修改密钥（即 shz.al 的密码）；缺省复用 KNAME 本身。**注意：shz.al 平台要求密码 ≥8 字符，若最终生效的密钥（KNAME_KEY 或复用的 KNAME）短于 8 字符，上报会被平台以 `400 Password too short` 拒绝，粘贴不会创建（KMODE=2 可视为未生效）** |
+
+> 🏷️ **0.6.4 起 KMODE 配置值经 baseinfo `marks` 暴露**：`KMODE=1` → `kmode1`、`KMODE=2`（含 `2q`/`2quic`）→ `kmode2`（按配置值判定，`KNAME` 缺失退化场景仍报，见「十五」15.9/15.10）。go 端未实现 KMODE，不输出这两个标记。
 
 ### KMODE=0（默认）
 与正常启动完全一致，不会在启动时创建临时隧道，也不会开启标准流输入监听。
@@ -885,20 +902,25 @@ KMODE=2q（或 2quic，大小写不敏感）在 KMODE=2 的基础上将启动隧
 
 trycloudflare Quick Tunnel 是临时资源：与 Cloudflare edge 的连接全部断开一段时间后，Cloudflare 侧的隧道记录与域名路由会被回收。0.5.2 之前守护线程只用**首次注册的旧凭据**每 2 秒重连，回收后注册永远失败，表现为日志反复出现 `connection closed: read ECONNRESET` 且隧道永久失联。0.5.2 起引入三层自愈（py / js / java / java11 同步）：
 
-1. **断线自动重连（原有）**：固定 2 秒间隔重连 edge；只要旧凭据仍有效（注册成功），**域名保持不变**——短暂网络抖动不会导致换域名、不影响 KMODE 已上报的值。
-2. **凭据失效自动重新注册（新增）**：连续重连失败达到阈值（默认 5 次，约 10~15 秒）后，自动向 `api.trycloudflare.com` 重新注册并**更换新随机域名**（trycloudflare 平台限制，无法保留旧域名），日志输出 `domain changed: <旧域名> -> <新域名>`；重新注册自身失败则 30 秒退避重试。注册索引（connIndex）随重连轮换（0~3），降低 edge 侧旧连接残留导致的注册拒绝。
+1. **断线自动重连（原有）**：与 edge 断开后自动重连；只要旧凭据仍有效（注册成功），**域名保持不变**——短暂网络抖动不会导致换域名、不影响 KMODE 已上报的值。0.6.4 起连续失败时的重连等待改为**指数退避封顶**（见下方环境变量），无失败时保持固定 2 秒快速重连。
+2. **凭据失效自动重新注册（新增）**：连续重连失败达到阈值（默认 5 次）后，自动向 `api.trycloudflare.com` 重新注册并**更换新随机域名**（trycloudflare 平台限制，无法保留旧域名），日志输出 `domain changed: <旧域名> -> <新域名>`；重新注册自身失败按**同一指数退避公式**等待后重试（封顶后等价于长期低频巡检，0.5.2~0.6.3 为固定 30 秒），避免持续失败时高频请求注册 API 触发 429/1015 限流。注册索引（connIndex）随重连轮换（0~3），降低 edge 侧旧连接残留导致的注册拒绝。
 3. **域名变更自动通知（新增）**：重新注册成功后触发 `onDomainChange(旧域名, 新域名)` 回调：
    - **KMODE=2**：自动把新域名重新上报 shz.al（409 冲突走 PUT 覆盖，指数退避重试 3 次），控制端照常轮询同一预测 URL 即可拿到新域名，无需任何干预；
    - **KMODE=1**：自动重写 KPATH 域名文件（原文件即使已被 baseinfo 钩子删除也会重写），stdin `/domain` 指令输出最新域名；
    - **无 KMODE（面板 /api/argo 创建的隧道）**：无额外动作，面板刷新 `GET /api/argo` 即得新域名。
 4. **半开假死防护（新增）**：edge 连接开启读空闲超时（默认 300 秒无任何入站数据即主动断开重连；edge 本有周期 PING，正常连接不会触发），根治 NAT/防火墙静默断流导致的"连接看似活着但永远收不到数据"的假死。
 5. **守护线程永不静默死亡（py 版修复）**：重连循环改为全量捕获异常（此前仅捕获 `OSError/EOFError/ValueError`，其他异常会让守护线程无声退出、隧道永久失联）。
+6. **状态透明（0.6.4 新增，四版本统一）**：每条隧道维护 `status`（`alive` 存活 / `reconnecting` 中断重连中 / `failed` 连续失败达阈值且重注册亦失败）与 `last_error`（最近失败原因，截断 ≤300 字符）、`last_error_at`、`consecutive_failures`、`last_registered_at` 五个状态字段，随 GET /api/argo 暴露给控制端——失效条目**保留在列表中不丢弃**，由面板灰显区分。标记 `failed` 后守护循环仍按封顶退避低频巡检，成功即自动转回 `alive`，**不存在"到达上限永久停掉"的终态**——DELETE /api/argo 与进程退出仍是唯一移除路径。
+
+指数退避公式（0.6.4 起，四版本统一）：`delay = min(BASE × 2^(连续失败-1), MAX)`，指数钳制在 10 防溢出。`BASE=2`、`MAX=300`（缺省）时序列为 2s → 4s → 8s → 16s → 32s（达阈值 5 触发重注册）→ 64s → 128s → 256s → 300s 封顶低频巡检；任何一轮注册成功即清零回 2 秒。
 
 守护行为环境变量（四版本统一，支持同目录 `.env`）：
 
 | 环境变量 | 默认值 | 说明 |
 | :--- | :--- | :--- |
 | KISAMA_ARGO_REREGISTER_AFTER | `5` | 连续重连失败多少次后判定旧凭据已被回收并重新注册换新域名（最小 2；调小恢复更快但更易在短暂抖动时换域名） |
+| KISAMA_ARGO_RETRY_BASE_SECONDS | `2` | 指数退避基数秒（最小 1；0.6.4 新增）：连续失败时重连/重注册的等待 = BASE × 2^(连续失败-1) |
+| KISAMA_ARGO_RETRY_MAX_SECONDS | `300` | 指数退避封顶秒（最小 60；0.6.4 新增）：失败持续越久巡检频率越低，封顶后按 MAX 间隔低频巡检 |
 | KISAMA_ARGO_IDLE_TIMEOUT | `300` | edge 连接读空闲超时秒数，无任何入站数据即主动断开重连（最小 10；`0`=禁用半开检测） |
 | KISAMA_EDGE_HOSTS | region1/2.v2.argotunnel.com | edge 入口覆盖（逗号分隔）；守护自愈验收（verify_all.py 场景 6）借此模拟"edge 不可达" |
 
@@ -1116,6 +1138,8 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，请求
 
 `$HOME` 解析链：`USERPROFILE` → `HOME` → `user.home`（py/js/java/java11，与 KMODE 域名文件一致）→ go `os.UserHomeDir()` → 全部不可用时降级当前工作目录。
 
+> 🏷️ **0.6.4 起持久化启用状态经 baseinfo `marks` 暴露**：启用（本节启停口径）时 `marks` 含 `kstore`，见「十五」15.8；标记不含存储路径与密钥。PHP 副本无持久化实现，不输出该标记。
+
 ### 存储文件格式
 
 文件内容为**单行密文**，容器与 0.5.6 响应加密完全一致：`Base64(JSON{nonce, tag, ciphertext})`，AES-256-GCM，nonce 每次随机 12 字节。内层明文 JSON：
@@ -1169,7 +1193,7 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，请求
 - 更换密钥后旧文件无法解密 → 被隔离重建，任务丢失（运维需自行重设任务或找回旧密钥）；
 - GCM 认证标签提供防篡改：密文或 tag 被改动即解密失败 → 隔离；
 - 固有边界：与本 agent 同用户的进程可读其环境变量（`/proc/<pid>/environ` 等），密钥对该威胁面不可防御；机密性边界为"防止存储文件单独外泄被还原"，不防御本机 root。
-- 服务部署脚本例外（0.6.2 起，Owner 拍板的部署便利取舍）：`kisama_service.sh` / `kisama_service.ps1` 在部署前未注入 `KSTORE_KEY` 时自动生成随机密钥写入安装目录 `agent.env`（并收紧为属主可读 / ACL 仅当前用户+SYSTEM+管理员），密钥与 `store.enc` 同机同目录落盘——此形态下"仅拿到 `store.enc` 单文件无法解密"仍成立，但"整个安装目录外泄即可解密"，机密性边界较上条收缩。要维持密钥不落盘的原威胁模型，在执行部署脚本前注入自备的 `KSTORE_KEY`（agent.env 已有该键时脚本不轮换、不覆盖）；脚本不回显密钥、不进日志。
+- 服务部署脚本例外（0.6.2 起，Owner 拍板的部署便利取舍）：`kisama_service.sh` / `kisama_service.ps1` 在部署前未注入 `KSTORE_KEY` 时自动生成随机密钥写入安装目录 `agent.env`（并收紧为属主可读 / ACL 仅当前用户+SYSTEM+管理员），密钥与 `store.enc` 同机同目录落盘——此形态下"仅拿到 `store.enc` 单文件无法解密"仍成立，但"整个安装目录外泄即可解密"，机密性边界较上条收缩。要维持密钥不落盘的原威胁模型，在执行部署脚本前注入自备的 `KSTORE_KEY`（sh 版 0.6.4 起：未注入时沿用 agent.env 已有密钥，显式注入与已存不同的密钥会**覆盖轮换**并告警——换钥后旧存储文件被隔离、任务需重设；未注入的自动路径仍绝不轮换）；脚本不回显密钥、不进日志。
 
 ### 验收
 
@@ -1214,18 +1238,20 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，请求
 
 ### 15.1 字段契约
 
-- 类型 `string[]`，元素为小写 ASCII 短名，当前定义五个值：`root`、`kvm`、`pterodactyl`、`systemd`、`fuse`，语义见 15.3–15.7。
-- 顺序固定为 `root` → `kvm` → `pterodactyl` → `systemd` → `fuse`（新增标记一律追加在末尾），同一标记只出现一次；客户端必须按集合处理，不得依赖顺序。
+- 类型 `string[]`，元素为小写 ASCII 短名，当前定义八个值，分两类：
+  - **主机探测标记**（Linux 语义，探测判定，见 15.3–15.7）：`root`、`kvm`、`pterodactyl`、`systemd`、`fuse`；
+  - **配置类标记**（agent 自身启动配置事实，见 15.8–15.10）：`kstore`、`kmode1`、`kmode2`。
+- 顺序固定为 `root` → `kvm` → `pterodactyl` → `systemd` → `fuse` → `kstore` → `kmode1` → `kmode2`（主机探测标记在前、配置类标记在其后追加，新增标记一律追加在末尾），同一标记只出现一次；客户端必须按集合处理，不得依赖顺序。
 - 语义：每一项都表示"在 **agent 进程视角**下已确认成立"的客观事实，不表示程度，也不代表宿主机或其它命名空间的状态（见 15.3）。
 - 缺失 / 空数组 / null 三态语义：
-  - **字段缺失**：代理未实现该字段（旧版）、平台不适用（非 Linux）、部署方禁用，或低权限模拟器副本不实现探测（PHP 两个 emulator 副本按此例外省略字段，不得用 `[]` 冒充"已探测且无命中"）→ 控制端按"未知"处理，不得假设无能力；
-  - **`[]`**：已完成探测，未命中任何标记；
+  - **字段缺失**：代理未实现该字段（旧版）、部署方禁用，或低权限模拟器副本不实现探测（PHP 两个 emulator 副本按此例外省略字段，不得用 `[]` 冒充"已探测且无命中"）→ 控制端按"未知"处理，不得假设无能力；
+  - **`[]`**：已完成探测/组装，未命中任何标记；
   - **`null`**：非法值，实现不得输出；客户端遇到时按"字段缺失"处理。
 - 前向兼容：客户端遇到未知取值必须忽略（不得报错，也不得因此丢弃整个响应）。
 - 客户端读取（零依赖）：baseinfo 响应本身就是 JSON，`marks` 是标准 JSON 字符串数组，浏览器/Node 内置 `JSON.parse` 后即为原生 Array，不需要任何三方库：`const marks = Array.isArray(info.marks) ? info.marks : []; marks.includes('kvm')`（IE11 等旧环境用 `marks.indexOf('kvm') !== -1`）。**禁止**对原始响应文本做正则或字符串切分来提取该字段。
-- 平台：五项均为 Linux 语义；Windows / macOS / *BSD 返回 `[]` 或省略字段，不得伪造。
-- 可用性：additive 可选字段，五端（`0.6.0-*`）与 PHP 两个完整副本（`0.6.0-php`、`0.6.0-php-cpanel-ai`）已实现；两个 emulator 副本按上述例外省略字段。控制端以"字段是否存在"判定，不要求版本号门槛。
-- 生命周期：进程级静态属性（P 级）——进程启动后首次 baseinfo 计算一次并写入快照，生命周期内不再重探；**不随 T 级 TTL 过期、也不随临时密钥轮换而重跑**（见「十六」）。
+- 平台：五个主机探测标记均为 Linux 语义，Windows / macOS / \*BSD 上不输出、不得伪造；三个配置类标记与平台无关，**全平台输出**。因此非 Linux 平台的 `marks` 不再必然为 `[]`（例如启用了持久化的 Windows 节点返回 `["kstore"]`）。
+- 可用性：additive 可选字段。主机探测标记五端（`0.6.0-*`）与 PHP 两个完整副本（`0.6.0-php`、`0.6.0-php-cpanel-ai`）已实现；配置类标记自 `0.6.4` 起由 py / js / java / java11 实现（go 未实现 KMODE，只可能命中 `kstore`），PHP 四个副本无 KSTORE/KMODE 实现、不输出配置类标记；两个 emulator 副本按上述例外省略字段。控制端以"字段是否存在"判定，不要求版本号门槛。
+- 生命周期：进程级静态属性（P 级）——进程启动后首次 baseinfo 计算一次并写入快照，生命周期内不再重探；**不随 T 级 TTL 过期、也不随临时密钥轮换而重跑**（见「十六」）。配置类标记由启动期环境变量决定、进程内恒定，进 P 级快照无时效问题。
 
 ### 15.2 探测总则（准确优先、零子进程、零网络）
 
@@ -1293,7 +1319,7 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，请求
 
 - wings 的 `system.data` 可自定义，此时特征 1 不命中，靠特征 2/3；
 - 翼龙镜像既有非 root（实测 uid/gid 998）也有 root，`pterodactyl` 与 `root` 可同时出现，互不排斥；
-- 衍生面板若沿用 `P_SERVER_*` 约定，会被本标记覆盖；需要区分时新增标记（见 15.11），不得改本标记语义。
+- 衍生面板若沿用 `P_SERVER_*` 约定，会被本标记覆盖；需要区分时新增标记（见 15.14），不得改本标记语义。
 
 实测（翼龙容器，java 0.5.9，2026-10-22）：`/proc/self/mountinfo` 命中 `/var/lib/pterodactyl/volumes/19e68255-bb71-4a86-b4c8-6e328f59cdec`；`/proc/1/environ` 与 agent 进程环境均含 `P_SERVER_UUID=19e68255-...`、`P_SERVER_LOCATION=de`；`/etc/hostname` 与 `P_SERVER_UUID` 相同；euid 998 在 `/etc/passwd` 无条目；无 `/dev/kvm`、无 `systemctl`、无 `/dev/fuse`。
 
@@ -1350,7 +1376,59 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，请求
 
 实测：root+KVM+systemd 主机 `/dev/fuse` 为 `crw-rw-rw- root:root 10, 229`，`open(O_RDWR)` 成功，`CapEff=000001ffffffffff`（第 21 位为 1；该机未安装 `fusermount3`，root 直接挂载）→ `fuse`；翼龙容器无 `/dev/fuse`、`CapEff=0000000000000000`、`CapBnd=00000000000000e1`（无 `CAP_SYS_ADMIN`）→ 无 `fuse`。
 
-### 15.8 跨语言实现映射
+### 15.8 `kstore` —— 任务持久化已启用（配置类，全平台）
+
+判据（同时满足，与「十三」启停口径逐字一致）：
+
+1. 环境变量 `KSTORE` 不属于显式关闭取值 `off` / `0` / `none` / `false`（大小写不敏感）；
+2. 环境变量 `KSTORE_KEY` 已设置且能解出恰 **32 字节**密钥（hex 64 字符或 std base64）。
+
+实现：**复用持久化初始化的同一套判定，不是独立重实现**。py 在 `TaskStore` 上提供与 `_resolve_config` 同口径的静态判定（共用 off 取值常量与 `_parse_key`，零日志零副作用），marks 探测调用之；js 直读 `TaskStore.state.enabled`（`init()` 解析结果）；go 在 handlers 层 P 级快照装配时经 `appendConfigMarks` 追加（读包级 `taskManager.store.enabled`，函数变量形式供离线测试注入）；java/java11 直读 `initTaskStore()` 置位的 `taskStoreEnabled` 字段。各端持久化初始化均先于路由可用（py/js 在 main 生命周期、go 在 newRouter、java/java11 在 start()），首个 baseinfo 请求前状态已定。
+
+排除条件：
+
+- `KSTORE=off` / `0` / `none` / `false`（任一大小写）→ 不报，即使 `KSTORE_KEY` 合法；
+- `KSTORE_KEY` 未设置或非法（解码后非 32 字节）→ 不报（fail-closed，持久化实际处于关闭态）；
+- 标记只表达"持久化已启用"这一布尔事实，**不含存储路径与密钥**。
+
+性能：O(1)——进程内已解析状态直读，或两次 `getenv` + 一次纯内存密钥解析；无 I/O、无网络、无子进程。
+
+实测（2026-11-07，Windows 10 实机 py agent）：`KSTORE=<路径> KSTORE_KEY=<64 位 hex>` 启动，未认证 `GET /api/baseinfo` → `marks == ["kstore"]`（非 Linux 无主机探测标记，仅配置类标记）；清空两变量对照 → `marks == []`。启停矩阵（off 取值大小写、合法 hex/base64、密钥缺失/非法/31 字节 hex）由离线单测覆盖（`tests/py/test_marks.py`、`tests/js/test_marks.js`、`go/handlers/baseinfo_cache_test.go`）。
+
+### 15.9 `kmode1` —— KMODE 配置为 1（配置类，全平台）
+
+判据：`KMODE` 环境变量经各端既有归一化解析后等于 1（py/js `Config.KMODE == '1'`，java/java11 `parseKmode()` 返回 1）。`KMODE=1` 无生效前置条件（不依赖 `KNAME`/`KNAME_KEY`，见「九」），配置即生效。
+
+实现：marks 探测直读各端已归一化的 KMODE 配置值（py/js 类属性、java/java11 final 实例字段），不重读环境变量、不触发任何隧道相关逻辑。
+
+排除条件：
+
+- `KMODE=0`、未设置或非法值（py/js 保留原字符串、等值比较落空；java 归一为 0）→ 不报；
+- **go 端未实现 KMODE**（见「九」），go 永不输出 `kmode1`；
+- `2q` / `2quic` 归一化为 2 → 报 `kmode2`，不报 `kmode1`。
+
+性能：O(1) 常量比较。
+
+实测（2026-11-07，Windows 10 实机 py agent）：`KSTORE_KEY=<64 位 hex> KMODE=1` 启动，未认证 `GET /api/baseinfo` → `marks == ["kstore", "kmode1"]`（取样后随即终止进程，运行约 6 秒，至多一次隧道注册尝试、无失败重试循环）。取值矩阵（0/1/2/3/非法值）由离线单测覆盖。
+
+### 15.10 `kmode2` —— KMODE 配置为 2，含 2q/2quic（配置类，全平台）
+
+判据：`KMODE` 环境变量经各端既有归一化解析后等于 2（`2` / `2q` / `2quic`，大小写不敏感；py/js 归一化为 `'2'`，java/java11 `parseKmode()` 返回 2）。
+
+**按配置值判定，不校验生效条件**：`KMODE=2` 但 `KNAME` 未设置或不合法时，「九」规定退化为普通启动（不建隧道、不上报），此时本标记**仍报**。语义定义是"**配置了** KMODE=2 启动模式"这一配置事实——判据（配置值）本身确定成立，与 15.2 第 4 条"只报确定命中"不冲突。控制端不得把 `kmode2` 当作"可预测 URL 已就绪"的承诺；需要判断隧道可用性时应结合 `KNAME` 有效性自行判定。
+
+实现：同 15.9，直读归一化后的 KMODE 配置值。
+
+排除条件：
+
+- `KMODE=0` / `1`、未设置或非法值 → 不报；
+- **go 端未实现 KMODE**，go 永不输出 `kmode2`。
+
+性能：O(1) 常量比较。
+
+实测（2026-11-07，Windows 10 实机 py agent）：`KSTORE_KEY=<64 位 hex> KMODE=2`（未设 `KNAME`，隧道与上报按「九」退化，零外部请求）→ `marks == ["kstore", "kmode2"]`。`2q`/`2quic` → 2 的归一化是各端 Config 既有行为，由既有实现保证，标记层不重复归一。
+
+### 15.11 跨语言实现映射
 
 | 语义 | py | js | go | java / java11 | php |
 |---|---|---|---|---|---|
@@ -1365,25 +1443,27 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，请求
 
 > `dev_t` 解码：Linux 为 `major = ((rdev >> 8) & 0xfff) | ((rdev >> 32) & ~0xfff)`、`minor = (rdev & 0xff) | ((rdev >> 12) & 0xfff00)`；只在小设备号场景可退化为 `rdev == (major << 8) | minor`（`/dev/kvm` → 2792，`/dev/fuse` → 2789）。各语言运行时若只暴露原始 `rdev`，按上式解码后与 10:232 / 10:229 比较；确实拿不到可靠编码时，**至少校验字符设备类型**，不得把普通文件当作设备。
 
-### 15.9 性能预算与实测
+> 配置类标记（15.8–15.10）不涉及上表的任何 `/proc`/设备探测原语：py/java/java11 直读进程内已归一化的配置值与持久化状态，js 读静态 `TaskStore` 状态，go 在 handlers 层 P 级快照装配（`appendConfigMarks`）；PHP 四个副本无 KSTORE/KMODE 实现，不输出配置类标记。
 
-- 设计目标：五标记冷态全量探测 ≤ 5 ms；热态（缓存命中）≤ 0.5 ms；相对 baseinfo 现有外网 IP 探测（多个 HTTPS 请求，几十至几百 ms）可忽略。
+### 15.12 性能预算与实测
+
+- 设计目标：五标记冷态全量探测 ≤ 5 ms；热态（缓存命中）≤ 0.5 ms；相对 baseinfo 现有外网 IP 探测（多个 HTTPS 请求，几十至几百 ms）可忽略。配置类标记为 O(1) 常量读，不进入该预算。
 - 成本分项：`root` 1 次系统调用（java/php 需 1 次 `/proc/self/status` 读，可与 `fuse` 共用）；`kvm` 1 `stat` + 1 `open/close`；`fuse` 1 `stat` + 1 `open/close` + ≤4 次助手 `stat`；`pterodactyl` 1 次 `mountinfo` 读（实测 3–4 KB）+ 1–2 次 `environ` 读；`systemd` 4–5 次 `stat`（`/run/systemd/system`、两个控制通道、≤3 个 `systemctl` 候选路径）。全部为本地、可短路、无子进程。
 - 实测（2026-10-22）：
   - root+KVM+systemd+fuse 主机（go 0.5.8）：`/proc/self/mountinfo` 3169 B、`/proc/1/environ` 93 B；Python 参考实现（root/kvm/pterodactyl/systemd 四项）200 次均值 **0.085 ms/次**（文件系统缓存热态）。
   - 翼龙容器（java 0.5.9，uid 998）：`/proc/self/mountinfo` 3649 B、`/proc/1/environ` 567 B；容器内无 python3，未跑同款基准，读取量同量级。
 - 反例成本（禁止路径）：`systemctl is-system-running` 在无 daemon 的环境可阻塞数十秒；每次 `fork/exec` 额外 0.5–3 ms，PHP 共享主机常直接禁用。
 
-### 15.10 兼容性、暴露面与已知边界
+### 15.13 兼容性、暴露面与已知边界
 
-- **additive**：不改变 baseinfo 既有字段、端点、认证链、签名与响应加密；旧控制端忽略新字段，新控制端必须容忍字段缺失。
-- **暴露面**：`marks` 与 baseinfo 其余字段同策略下发。当前 baseinfo 位于匿名白名单，实测两台真机未认证 `GET /api/baseinfo` 均返回 200 与全量字段（无 `session_key`），因此 `marks` 同样对未认证方可读。它只含能力布尔值，不含凭证、密钥、路径或地址，敏感度低于已暴露的 `os`/`kernel_version`/`ipv4`。若后续执行 SECURITY-AUDIT 的 M2 / B-3（匿名端点瘦身），`marks` 与 `os`/`kernel_version` 同档处理，不做字段级特殊裁剪，也不新增端点。
-- **已知漏报（预期，不算缺陷）**：非 Linux；`/proc` 被 hidepid 或强隔离屏蔽；翼龙容器无读 `/proc/1/environ` 权限且未命中 `mountinfo`、兜底四条件不全；wings 自定义 `system.data` 且 hostname 非 UUID。
+- **additive**：不改变 baseinfo 既有字段、端点、认证链、签名与响应加密；旧控制端忽略新字段，新控制端必须容忍字段缺失。配置类标记（15.8–15.10）同样 additive：未启用持久化 / `KMODE=0` 的节点输出与 0.6.2 完全一致（非 Linux 为 `[]`），已启用节点仅在末尾多出对应布尔值。
+- **暴露面**：`marks` 与 baseinfo 其余字段同策略下发。当前 baseinfo 位于匿名白名单，实测两台真机未认证 `GET /api/baseinfo` 均返回 200 与全量字段（无 `session_key`），因此 `marks` 同样对未认证方可读。它只含能力布尔值，不含凭证、密钥、路径或地址，敏感度低于已暴露的 `os`/`kernel_version`/`ipv4`。配置类标记在此基础上多暴露三个**部署形态布尔**（持久化是否启用、启动模式 1/2）——不含路径、密钥与隧道域名，敏感度与既有能力布尔同档；已作为设计特性在 SECURITY-AUDIT 台账留档。若后续执行 SECURITY-AUDIT 的 M2 / B-3（匿名端点瘦身），`marks` 与 `os`/`kernel_version` 同档处理，不做字段级特殊裁剪，也不新增端点。
+- **已知漏报（预期，不算缺陷）**：五个主机探测标记在非 Linux 不输出（配置类标记不受此限，见 15.1 平台条款）；`/proc` 被 hidepid 或强隔离屏蔽；翼龙容器无读 `/proc/1/environ` 权限且未命中 `mountinfo`、兜底四条件不全；wings 自定义 `system.data` 且 hostname 非 UUID；go 端永不输出 `kmode1`/`kmode2`（未实现 KMODE）。
 - **已知误报边界（如实记录）**：`CapEff` 置位但 seccomp/LSM 另行拦截 `mount(2)` 时，`fuse` 仍会命中——本规范不做真实挂载（需实现 FUSE 守护进程，成本与副作用不可接受），接受该极窄误报；同理 `kvm` 在未启用严格模式时只保证"设备可打开"。
 - **误报防线**：弱特征必须四项同时满足；`kvm`/`fuse` 以"能打开设备"而非"路径存在"为准；`systemd` 三重条件；`root` 取 effective 而非 real。
 - **禁止用 `virtualization` 反推**：py 对 `/proc/cpuinfo` 中的 `KVM`/`QEMU` 字样返回 `QEMU`，go 的 `kvm` 表示"本机是虚拟机"，与"能运行 KVM"相反或无关。
 
-### 15.11 扩展规则
+### 15.14 扩展规则
 
 1. 取值限定 `[a-z0-9-]+`，语义单一、可在本地验证，不表达程度或质量（不要 `kvm-fast`、`root-limited` 这类取值）。
 2. **additive**：新标记追加到输出末尾，不重命名、不合并、不改变既有标记语义；客户端忽略未知值。
@@ -1391,9 +1471,9 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，请求
 4. 平台专属能力（Windows 服务、macOS launchd）与其它挂载体系（CIFS/NFS）单独命名，不复用现有值。
 5. 标记表达"能力存在"的布尔事实；需要表达程度时用新增数值字段，不得塞进 `marks`。
 
-### 15.12 验收建议
+### 15.15 验收建议
 
-- 离线单测：把 `/proc`、`/dev`、`/etc` 根路径做成可注入常量（如 `PROC_ROOT`、`DEV_ROOT`），覆盖"命中 / 不命中 / 读取失败 / 权限拒绝 / 字段异常"五类用例；断言 `marks` 不含未知值、无重复、顺序固定。
+- 离线单测：把 `/proc`、`/dev`、`/etc` 根路径做成可注入常量（如 `PROC_ROOT`、`DEV_ROOT`），覆盖"命中 / 不命中 / 读取失败 / 权限拒绝 / 字段异常"五类用例；断言 `marks` 不含未知值、无重复、顺序固定。配置类标记按 15.8–15.10 的启停矩阵注入环境变量/配置值（`KSTORE`/`KSTORE_KEY`/KMODE 配置值），并断言其固定追加在主机探测标记末尾。
 - 真机矩阵（交叉核对命令见下）：
 
 | 场景 | 期望 `marks` |
@@ -1403,11 +1483,13 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，请求
 | Docker root 容器（默认 capability，无 `CAP_SYS_ADMIN`） | 不含 `fuse`（即使映射了 `/dev/fuse`）；无 `/dev/kvm` 时也不含 `kvm` |
 | 非 root、不在 `kvm` 组 | 不含 `kvm` |
 | 有 `systemctl` 但 `/run/systemd/system` 缺失 | 不含 `systemd` |
-| Windows 代理 | `[]` 或字段缺失 |
+| Windows / macOS 代理，未启用持久化、`KMODE=0` | `[]` |
+| Windows 代理，`KSTORE_KEY` 合法 + `KMODE=2` | `["kstore","kmode2"]`（go 端为 `["kstore"]`） |
+| Linux 主机启用持久化且 `KMODE=1` | 主机探测标记在前、`kstore`,`kmode1` 追加在末尾 |
 
 - 交叉核对（只读命令）：`id -u; id -g; grep -E '^(CapEff|Uid|Gid)' /proc/self/status; stat -c '%F %t:%T %a' /dev/kvm /dev/fuse 2>&1; test -d /run/systemd/system && echo systemd-ok; tr '\0' '\n' < /proc/1/environ | grep -E '^P_SERVER_(UUID|LOCATION)='`。
 - 性能门限：冷态 ≤ 5 ms、热态 ≤ 0.5 ms；以 `strace -f -e trace=process` 断言探测路径零 `fork`/`clone`。
-- 一致性：五端（py/js/go/java/java11）对同一台真机必须给出相同集合（顺序按 15.1）；PHP 端不在本仓，以分发 dist 实测为准（两个 emulator 副本不探测、按 15.1 省略字段）。
+- 一致性：五端（py/js/go/java/java11）对同一台真机必须给出相同的**主机探测标记**集合（顺序按 15.1）；配置类标记按端能力输出——py/js/java/java11 可输出 `kstore`/`kmode1`/`kmode2`，go 只可能输出 `kstore`（未实现 KMODE，见「九」）；PHP 端不在本仓，以分发 dist 实测为准（两个 emulator 副本不探测、按 15.1 省略字段；四副本均无 KSTORE/KMODE，不输出配置类标记）。
 
 ## 十六、`/api/baseinfo` 字段分级缓存与快照语义
 

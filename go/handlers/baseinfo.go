@@ -52,6 +52,25 @@ var (
 	baseInfoNowFn     = time.Now
 )
 
+// taskStoreEnabledFn returns whether encrypted task persistence is enabled
+// (docs/API.MD 十三). It is a variable so offline tests can replace it.
+// InitTaskManager runs during router construction (kisama/service.go newRouter),
+// before any HTTP request, so the value is settled ahead of the first baseinfo.
+var taskStoreEnabledFn = func() bool {
+	return taskManager != nil && taskManager.store != nil && taskManager.store.enabled
+}
+
+// appendConfigMarks appends the config-derived marks after the host-probed ones
+// (kstore/kmode1/kmode2, docs/API.MD 15.8-15.10). These reflect the agent's own
+// startup configuration, not host capabilities, and apply on every platform.
+// Go does not implement KMODE (docs/API.MD 九), so only kstore can ever hit.
+func appendConfigMarks(marks []string, storeEnabled bool) []string {
+	if storeEnabled {
+		marks = append(marks, "kstore")
+	}
+	return marks
+}
+
 var (
 	baseInfoPMu    sync.Mutex
 	baseInfoP      baseInfoPFields
@@ -98,6 +117,8 @@ func getBaseInfoP() baseInfoPFields {
 	if baseInfoP.Marks == nil {
 		baseInfoP.Marks = []string{}
 	}
+	// 配置类标记 (docs/API.MD 15.8-15.10): 追加在主机探测标记末尾, 进程内恒定, 进 P 快照无时效问题.
+	baseInfoP.Marks = appendConfigMarks(baseInfoP.Marks, taskStoreEnabledFn())
 	// P 级失败也只写兜底值并置 ready, 进程内不再重试.
 	baseInfoPReady = true
 	return baseInfoP

@@ -31,7 +31,10 @@ func resetBaseInfoCache() {
 func installFakeProbes(t *testing.T, now *time.Time, counts map[string]int) {
 	t.Helper()
 	oldStatic, oldLocal, oldNet, oldNow := getSystemStaticFn, getSystemLocalFn, getSystemNetFn, baseInfoNowFn
+	oldStore := taskStoreEnabledFn
 	baseInfoNowFn = func() time.Time { return *now }
+	// taskManager 为包级全局 (task_store_test.go 会初始化), 默认关掉配置标记保证各用例密闭.
+	taskStoreEnabledFn = func() bool { return false }
 	getSystemStaticFn = func() *utils.SystemStaticInfo {
 		counts["p"]++
 		return &utils.SystemStaticInfo{
@@ -50,6 +53,7 @@ func installFakeProbes(t *testing.T, now *time.Time, counts map[string]int) {
 	}
 	t.Cleanup(func() {
 		getSystemStaticFn, getSystemLocalFn, getSystemNetFn, baseInfoNowFn = oldStatic, oldLocal, oldNet, oldNow
+		taskStoreEnabledFn = oldStore
 		resetBaseInfoCache()
 	})
 }
@@ -95,12 +99,13 @@ func TestBaseInfoCachePtlCounts(t *testing.T) {
 func TestBaseInfoMarksNeverNil(t *testing.T) {
 	resetBaseInfoCache()
 	now := time.Unix(1000, 0)
-	oldStatic := getSystemStaticFn
+	oldStatic, oldStore := getSystemStaticFn, taskStoreEnabledFn
 	getSystemStaticFn = func() *utils.SystemStaticInfo {
 		return &utils.SystemStaticInfo{Marks: nil}
 	}
+	taskStoreEnabledFn = func() bool { return false }
 	t.Cleanup(func() {
-		getSystemStaticFn = oldStatic
+		getSystemStaticFn, taskStoreEnabledFn = oldStatic, oldStore
 		resetBaseInfoCache()
 	})
 
@@ -190,4 +195,65 @@ func TestBaseInfoResponseJSONHasMarksArray(t *testing.T) {
 		t.Fatalf("unexpected payload: %s", payload)
 	}
 	_ = local
+}
+
+// ---------- 配置类 marks: kstore (docs/API.MD 15.8; go 未实现 KMODE, 无 kmode 标记) ----------
+
+func TestAppendConfigMarks(t *testing.T) {
+	got := appendConfigMarks([]string{}, false)
+	if len(got) != 0 {
+		t.Fatalf("store disabled must add no mark, got %v", got)
+	}
+	got = appendConfigMarks([]string{"root"}, true)
+	if len(got) != 2 || got[0] != "root" || got[1] != "kstore" {
+		t.Fatalf("config marks must append after host marks, got %v", got)
+	}
+	got = appendConfigMarks(nil, true)
+	if len(got) != 1 || got[0] != "kstore" {
+		t.Fatalf("appendConfigMarks(nil, true) = %v, want [kstore]", got)
+	}
+}
+
+func TestBaseInfoPAppendsKstoreMark(t *testing.T) {
+	resetBaseInfoCache()
+	oldStatic, oldStore := getSystemStaticFn, taskStoreEnabledFn
+	getSystemStaticFn = func() *utils.SystemStaticInfo {
+		return &utils.SystemStaticInfo{Marks: []string{"root"}}
+	}
+	taskStoreEnabledFn = func() bool { return true }
+	t.Cleanup(func() {
+		getSystemStaticFn, taskStoreEnabledFn = oldStatic, oldStore
+		resetBaseInfoCache()
+	})
+
+	p := getBaseInfoP()
+	if len(p.Marks) != 2 || p.Marks[0] != "root" || p.Marks[1] != "kstore" {
+		t.Fatalf("marks = %v, want [root kstore]", p.Marks)
+	}
+	// P 快照进程内一次: 二次读取复用缓存, 不得重复追加
+	if p2 := getBaseInfoP(); len(p2.Marks) != 2 || p2.Marks[1] != "kstore" {
+		t.Fatalf("cached marks changed on second read: %v", p2.Marks)
+	}
+}
+
+func TestBaseInfoPNoKstoreWhenStoreDisabled(t *testing.T) {
+	resetBaseInfoCache()
+	oldStatic, oldStore := getSystemStaticFn, taskStoreEnabledFn
+	getSystemStaticFn = func() *utils.SystemStaticInfo {
+		return &utils.SystemStaticInfo{Marks: nil}
+	}
+	taskStoreEnabledFn = func() bool { return false }
+	t.Cleanup(func() {
+		getSystemStaticFn, taskStoreEnabledFn = oldStatic, oldStore
+		resetBaseInfoCache()
+	})
+
+	p := getBaseInfoP()
+	payload, err := json.Marshal(p.Marks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(payload) != "[]" {
+		t.Fatalf("marks with store disabled = %s, want []", payload)
+	}
 }

@@ -56,7 +56,7 @@ type BaseInfoResponse struct {
 	SwapTotal      int64           `json:"swap_total"`
 	Version        string          `json:"version"`
 	Virtualization string          `json:"virtualization"`
-	Marks          []string        `json:"marks"`
+	Marks          []string        `json:"marks"` // 主机探测 + 配置类标记, 顺序固定 (docs/API.MD 十五)
 	SessionKey     *string         `json:"session_key"`
 	NoiseKey       *NoiseKeyConfig `json:"noise_key"`
 }

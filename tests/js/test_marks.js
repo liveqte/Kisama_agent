@@ -6,7 +6,7 @@ const os = require('os');
 const path = require('path');
 const assert = require('assert');
 
-const { SystemInfoCollector } = require(path.join(__dirname, '..', '..', 'js', 'agent.js'));
+const { Config, TaskStore, SystemInfoCollector } = require(path.join(__dirname, '..', '..', 'js', 'agent.js'));
 
 function mkFixture() {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'kisama-marks-'));
@@ -160,9 +160,47 @@ function testFuseSetuidHelper(fx) {
   }
 }
 
+function withConfigState({ kmode, storeEnabled }, fn) {
+  const savedKmode = Config.KMODE;
+  const savedState = { enabled: TaskStore.state.enabled };
+  if (kmode !== undefined) Config.KMODE = kmode;
+  if (storeEnabled !== undefined) TaskStore.state.enabled = storeEnabled;
+  try {
+    return fn();
+  } finally {
+    Config.KMODE = savedKmode;
+    TaskStore.state.enabled = savedState.enabled;
+  }
+}
+
+function testConfigMarks() {
+  const c = new SystemInfoCollector();
+  // kstore: 与 TaskStore.state.enabled 同口径 (init() 解析 KSTORE/KSTORE_KEY 的结果)
+  assert.strictEqual(withConfigState({ storeEnabled: true }, () => c._markKstore()), true,
+    'enabled store hits kstore');
+  assert.strictEqual(withConfigState({ storeEnabled: false }, () => c._markKstore()), false,
+    'disabled store misses kstore');
+  // kmode: 按归一化后的 Config.KMODE 配置值判定 (2q/2quic → '2' 发生在 Config 定义处);
+  // 不校验 KNAME 生效条件 (docs/API.MD 15.9/15.10)
+  const cases = { '0': [false, false], '1': [true, false], '2': [false, true], '3': [false, false], 'abc': [false, false] };
+  for (const [kmode, [kmode1, kmode2]] of Object.entries(cases)) {
+    assert.strictEqual(withConfigState({ kmode }, () => c._markKmode1()), kmode1, `KMODE=${kmode} kmode1`);
+    assert.strictEqual(withConfigState({ kmode }, () => c._markKmode2()), kmode2, `KMODE=${kmode} kmode2`);
+  }
+  // 非 Linux (真实 process.platform): 配置类标记仍输出, 主机探测跳过
+  assert.deepStrictEqual(
+    withConfigState({ kmode: '1', storeEnabled: true }, () => c.detectMarks()),
+    ['kstore', 'kmode1'], 'non-Linux still reports config marks');
+  assert.deepStrictEqual(
+    withConfigState({ kmode: '0', storeEnabled: false }, () => c.detectMarks()),
+    [], 'non-Linux without config marks stays []');
+}
+
 function testOrderAndNonLinux() {
   const c = new SystemInfoCollector();
-  assert.deepStrictEqual(c.detectMarks(), [], 'non-Linux returns []');
+  assert.deepStrictEqual(
+    withConfigState({ kmode: '0', storeEnabled: false }, () => c.detectMarks()), [],
+    'non-Linux with no config marks returns []');
 
   const saved = {
     root: SystemInfoCollector.prototype._markRoot,
@@ -170,6 +208,9 @@ function testOrderAndNonLinux() {
     pterodactyl: SystemInfoCollector.prototype._markPterodactyl,
     systemd: SystemInfoCollector.prototype._markSystemd,
     fuse: SystemInfoCollector.prototype._markFuse,
+    kstore: SystemInfoCollector.prototype._markKstore,
+    kmode1: SystemInfoCollector.prototype._markKmode1,
+    kmode2: SystemInfoCollector.prototype._markKmode2,
   };
   const desc = Object.getOwnPropertyDescriptor(process, 'platform');
   SystemInfoCollector.prototype._markRoot = () => true;
@@ -177,11 +218,16 @@ function testOrderAndNonLinux() {
   SystemInfoCollector.prototype._markPterodactyl = () => true;
   SystemInfoCollector.prototype._markSystemd = () => true;
   SystemInfoCollector.prototype._markFuse = () => false;
+  SystemInfoCollector.prototype._markKstore = () => true;
+  SystemInfoCollector.prototype._markKmode1 = () => false;
+  SystemInfoCollector.prototype._markKmode2 = () => true;
   try {
     Object.defineProperty(process, 'platform', { value: 'linux' });
-    assert.deepStrictEqual(c.detectMarks(), ['root', 'pterodactyl', 'systemd']);
+    // 配置类标记固定追加在主机探测标记末尾 (docs/API.MD 15.1)
+    assert.deepStrictEqual(c.detectMarks(), ['root', 'pterodactyl', 'systemd', 'kstore', 'kmode2']);
     SystemInfoCollector.prototype._markRoot = () => { throw new Error('boom'); };
-    assert.deepStrictEqual(c.detectMarks(), ['pterodactyl', 'systemd'],
+    SystemInfoCollector.prototype._markKstore = () => { throw new Error('boom'); };
+    assert.deepStrictEqual(c.detectMarks(), ['pterodactyl', 'systemd', 'kmode2'],
       'one probe failure must not drop the others');
   } finally {
     Object.defineProperty(process, 'platform', desc);
@@ -190,6 +236,9 @@ function testOrderAndNonLinux() {
     SystemInfoCollector.prototype._markPterodactyl = saved.pterodactyl;
     SystemInfoCollector.prototype._markSystemd = saved.systemd;
     SystemInfoCollector.prototype._markFuse = saved.fuse;
+    SystemInfoCollector.prototype._markKstore = saved.kstore;
+    SystemInfoCollector.prototype._markKmode1 = saved.kmode1;
+    SystemInfoCollector.prototype._markKmode2 = saved.kmode2;
   }
 }
 
@@ -210,6 +259,7 @@ async function main() {
   try { testCapEff(fx); } finally { fx.restore(); }
   fx = mkFixture();
   try { testFuseSetuidHelper(fx); } finally { fx.restore(); }
+  testConfigMarks();
   testOrderAndNonLinux();
   console.log('✅ test_marks: all assertions passed');
 }

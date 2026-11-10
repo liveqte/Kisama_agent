@@ -213,7 +213,10 @@ class MarksProbeTest(unittest.TestCase):
              mock.patch.object(self.collector, "_mark_kvm", return_value=False), \
              mock.patch.object(self.collector, "_mark_pterodactyl", return_value=True), \
              mock.patch.object(self.collector, "_mark_systemd", return_value=True), \
-             mock.patch.object(self.collector, "_mark_fuse", return_value=False):
+             mock.patch.object(self.collector, "_mark_fuse", return_value=False), \
+             mock.patch.object(self.collector, "_mark_kstore", return_value=False), \
+             mock.patch.object(self.collector, "_mark_kmode1", return_value=False), \
+             mock.patch.object(self.collector, "_mark_kmode2", return_value=False):
             self.assertEqual(self.collector._detect_marks(),
                              ["root", "pterodactyl", "systemd"])
 
@@ -224,11 +227,109 @@ class MarksProbeTest(unittest.TestCase):
              mock.patch.object(self.collector, "_mark_kvm", return_value=True), \
              mock.patch.object(self.collector, "_mark_pterodactyl", return_value=False), \
              mock.patch.object(self.collector, "_mark_systemd", return_value=False), \
-             mock.patch.object(self.collector, "_mark_fuse", return_value=False):
+             mock.patch.object(self.collector, "_mark_fuse", return_value=False), \
+             mock.patch.object(self.collector, "_mark_kstore", return_value=False), \
+             mock.patch.object(self.collector, "_mark_kmode1", return_value=False), \
+             mock.patch.object(self.collector, "_mark_kmode2", return_value=False):
             self.assertEqual(self.collector._detect_marks(), ["kvm"])
 
-    def test_detect_marks_non_linux_is_empty(self):
-        with mock.patch.object(agent.platform, "system", return_value="Windows"):
+    # ---------- config marks: kstore / kmode1 / kmode2 (docs/API.MD 15.8-15.10) ----------
+    KSTORE_KEY_HEX = "ab" * 32
+
+    @staticmethod
+    def _kstore_env(path=None, key=None):
+        """kstore 判定读实时环境变量; 显式置空等价未设置 (getenv 默认值为空串)"""
+        return mock.patch.dict(os.environ, {
+            "KSTORE": path if path is not None else "",
+            "KSTORE_KEY": key if key is not None else "",
+        })
+
+    def test_task_store_is_env_enabled_with_valid_hex_key(self):
+        with self._kstore_env(key=self.KSTORE_KEY_HEX):
+            self.assertTrue(agent.TaskStore.is_env_enabled())
+
+    def test_task_store_is_env_enabled_with_valid_base64_key(self):
+        import base64 as b64
+        with self._kstore_env(key=b64.b64encode(b"\x07" * 32).decode()):
+            self.assertTrue(agent.TaskStore.is_env_enabled())
+        # 合法 base64 但解码后 33 字节 → 长度门拒绝
+        with self._kstore_env(key=b64.b64encode(b"\x07" * 33).decode()):
+            self.assertFalse(agent.TaskStore.is_env_enabled())
+
+    def test_task_store_is_env_enabled_requires_key(self):
+        with self._kstore_env():
+            self.assertFalse(agent.TaskStore.is_env_enabled())
+
+    def test_task_store_is_env_enabled_rejects_invalid_key(self):
+        with self._kstore_env(key="not-a-key"):
+            self.assertFalse(agent.TaskStore.is_env_enabled())
+        with self._kstore_env(key="ab" * 31):  # 31 字节 hex, 解码后非 32 字节
+            self.assertFalse(agent.TaskStore.is_env_enabled())
+
+    def test_task_store_is_env_enabled_off_values_close(self):
+        for value in ("off", "0", "none", "false", "OFF", "False", "None"):
+            with self._kstore_env(path=value, key=self.KSTORE_KEY_HEX):
+                self.assertFalse(agent.TaskStore.is_env_enabled(),
+                                 f"KSTORE={value} 应显式关闭持久化")
+
+    def test_kstore_mark_mirrors_env(self):
+        with self._kstore_env(key=self.KSTORE_KEY_HEX):
+            self.assertTrue(self.collector._mark_kstore())
+        with self._kstore_env():
+            self.assertFalse(self.collector._mark_kstore())
+
+    def test_kmode_marks_by_config_value(self):
+        # 2q/2quic → "2" 的归一化发生在 Config 定义处 (py :936), marks 只消费归一化结果
+        cases = {
+            "0": (False, False),
+            "1": (True, False),
+            "2": (False, True),
+            "3": (False, False),
+            "abc": (False, False),
+        }
+        for kmode, (kmode1, kmode2) in cases.items():
+            with mock.patch.object(agent.Config, "KMODE", kmode):
+                self.assertEqual(self.collector._mark_kmode1(), kmode1, f"KMODE={kmode}")
+                self.assertEqual(self.collector._mark_kmode2(), kmode2, f"KMODE={kmode}")
+
+    def test_detect_marks_appends_config_marks_after_host_marks(self):
+        with mock.patch.object(agent.platform, "system", return_value="Linux"), \
+             mock.patch.object(self.collector, "_mark_root", return_value=True), \
+             mock.patch.object(self.collector, "_mark_kvm", return_value=False), \
+             mock.patch.object(self.collector, "_mark_pterodactyl", return_value=False), \
+             mock.patch.object(self.collector, "_mark_systemd", return_value=False), \
+             mock.patch.object(self.collector, "_mark_fuse", return_value=False), \
+             mock.patch.object(self.collector, "_mark_kstore", return_value=True), \
+             mock.patch.object(self.collector, "_mark_kmode1", return_value=False), \
+             mock.patch.object(self.collector, "_mark_kmode2", return_value=True):
+            self.assertEqual(self.collector._detect_marks(),
+                             ["root", "kstore", "kmode2"])
+
+    def test_detect_marks_isolates_config_probe_exceptions(self):
+        with mock.patch.object(agent.platform, "system", return_value="Linux"), \
+             mock.patch.object(self.collector, "_mark_root", return_value=False), \
+             mock.patch.object(self.collector, "_mark_kvm", return_value=False), \
+             mock.patch.object(self.collector, "_mark_pterodactyl", return_value=False), \
+             mock.patch.object(self.collector, "_mark_systemd", return_value=False), \
+             mock.patch.object(self.collector, "_mark_fuse", return_value=False), \
+             mock.patch.object(self.collector, "_mark_kstore",
+                               side_effect=RuntimeError("boom")), \
+             mock.patch.object(self.collector, "_mark_kmode1", return_value=True), \
+             mock.patch.object(self.collector, "_mark_kmode2", return_value=False):
+            self.assertEqual(self.collector._detect_marks(), ["kmode1"])
+
+    def test_detect_marks_non_linux_outputs_only_config_marks(self):
+        # 配置类标记与平台无关: 非 Linux 跳过主机探测, 仍输出配置类标记 (docs/API.MD 15.1)
+        with mock.patch.object(agent.platform, "system", return_value="Windows"), \
+             mock.patch.object(self.collector, "_mark_kstore", return_value=True), \
+             mock.patch.object(agent.Config, "KMODE", "1"):
+            self.assertEqual(self.collector._detect_marks(), ["kstore", "kmode1"])
+
+    def test_detect_marks_non_linux_without_config_is_empty(self):
+        with mock.patch.object(agent.platform, "system", return_value="Windows"), \
+             mock.patch.object(self.collector, "_mark_kstore", return_value=False), \
+             mock.patch.object(self.collector, "_mark_kmode1", return_value=False), \
+             mock.patch.object(self.collector, "_mark_kmode2", return_value=False):
             self.assertEqual(self.collector._detect_marks(), [])
 
 

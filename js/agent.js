@@ -550,7 +550,7 @@ class Config {
   static DNS_MODE = (process.env.KISAMA_DNS || 'off').trim().toLowerCase();
   static DOH_SERVERS = (process.env.KISAMA_DOH_SERVERS || '').trim();
   static DOH_SERVERS_DEFAULT = ['https://223.5.5.5/resolve', 'https://1.1.1.1/dns-query', 'https://8.8.8.8/resolve'];
-  static AGENT_VERSION = process.env.AGENT_VERSION || '0.6.3-js';
+  static AGENT_VERSION = process.env.AGENT_VERSION || '0.6.4-js';
   static SESSION_KEY = crypto.randomBytes(32).toString('base64');
   // static SESSION_KEY =""
   static NOISE_KEYS_INTERNAL = NoiseKeyGenerator.generatePair();
@@ -1663,16 +1663,32 @@ function authEncryptMiddleware(cryptoManager, tempKeyManager = null) {
   static MARKS_ROOT = '/';
 
   detectMarks() {
-    if (process.platform !== 'linux') return [];
     const marks = [];
-    const probes = [
-      ['root', () => this._markRoot()],
-      ['kvm', () => this._markKvm()],
-      ['pterodactyl', () => this._markPterodactyl()],
-      ['systemd', () => this._markSystemd()],
-      ['fuse', () => this._markFuse()]
+    // 主机探测标记仅 Linux 语义; 配置类标记与平台无关 (docs/API.MD 15.1)
+    if (process.platform === 'linux') {
+      const probes = [
+        ['root', () => this._markRoot()],
+        ['kvm', () => this._markKvm()],
+        ['pterodactyl', () => this._markPterodactyl()],
+        ['systemd', () => this._markSystemd()],
+        ['fuse', () => this._markFuse()]
+      ];
+      for (const [name, probe] of probes) {
+        try {
+          if (probe()) marks.push(name);
+        } catch (e) {
+          Logger.debug(`marks 探测失败 [${name}]: ${e.message}`, 1);
+        }
+      }
+    }
+    // 配置类标记 (kstore/kmode1/kmode2, docs/API.MD 15.8-15.10): agent 自身配置事实,
+    // 非 Linux 同样输出; KMODE 已在 Config 归一化 (2q/2quic → '2')
+    const configProbes = [
+      ['kstore', () => this._markKstore()],
+      ['kmode1', () => this._markKmode1()],
+      ['kmode2', () => this._markKmode2()]
     ];
-    for (const [name, probe] of probes) {
+    for (const [name, probe] of configProbes) {
       try {
         if (probe()) marks.push(name);
       } catch (e) {
@@ -1682,6 +1698,21 @@ function authEncryptMiddleware(cryptoManager, tempKeyManager = null) {
     // 仅输出标记名, 禁止打印 environ/mountinfo/passwd 原文
     Logger.debug(`marks 命中: ${marks.join(',') || '(none)'}`, 1);
     return marks;
+  }
+
+  _markKstore() {
+    // 任务持久化已启用 (TaskStore.init 解析 KSTORE/KSTORE_KEY 的结果, 与 _resolve_config 同口径)
+    return TaskStore.state.enabled === true;
+  }
+
+  _markKmode1() {
+    // KMODE 配置为 1 (隧道 + 域名文件 + stdin)
+    return Config.KMODE === '1';
+  }
+
+  _markKmode2() {
+    // KMODE 配置为 2 (含 2q/2quic, Config 归一化后为 '2'; 按配置值判定, 不校验 KNAME 生效条件)
+    return Config.KMODE === '2';
   }
 
   _markRoot() {
@@ -7986,7 +8017,22 @@ function argoEnvInt(name, fallback, minimum) {
   return raw;
 }
 const argoReregisterAfter = argoEnvInt('KISAMA_ARGO_REREGISTER_AFTER', 5, 2);   // 连续失败阈值
-const argoReregisterRetrySeconds = 30;                                          // 重新注册失败后的退避
+const argoReregisterRetrySeconds = 30;                                          // 重新注册失败后的退避 (兼容保留, 退避序列中会被指数公式覆盖)
+// 🛡️ 指数退避 + 封顶低频巡检: 短失败 2s 起、指数增长封顶 300s, 失败越久等越久, 成功清零
+const argoRetryBaseSeconds = argoEnvInt('KISAMA_ARGO_RETRY_BASE_SECONDS', 2, 1);
+const argoRetryMaxSeconds = argoEnvInt('KISAMA_ARGO_RETRY_MAX_SECONDS', 300, 60);
+function argoBackoffSeconds(failures) {
+  if (failures <= 0) return argoRetryBaseSeconds;
+  const exp = Math.min(failures - 1, 10);
+  return Math.min(argoRetryBaseSeconds * (2 ** exp), argoRetryMaxSeconds);
+}
+function argoTruncateError(msg, limit = 300) {
+  if (msg == null) return null;
+  return String(msg).slice(0, limit);
+}
+function argoNowIso() {
+  return new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
 // 读空闲超时 (秒): edge 有周期 PING, 长时间无任何入站数据 = 半开假死, 主动断开走重连; 0=禁用
 const argoIdleTimeoutMs = (() => {
   const raw = parseInt(process.env.KISAMA_ARGO_IDLE_TIMEOUT || '', 10);
@@ -8013,6 +8059,9 @@ class ArgoTunnelManager {
     this.tunnels = new Map(); // port -> Array<tunnelEntry>
     // 🛡️ 守护重建换新域名时的回调 (oldDomain, newDomain); KMODE 接线后自动再上报/重写域名文件
     this.onDomainChange = null;
+    // 🧪 测试注入缝 (生产恒为模块级同名符号): js 测试无法 monkey-patch 模块内部, 经实例属性注入 mock
+    this._connectEdge = connectEdge;
+    this._H2Connection = H2Connection;
   }
 
   async create(port, duplicate, quic = false) {
@@ -8026,7 +8075,8 @@ class ArgoTunnelManager {
 
     let hostname, accountTag, tunnelSecret, tunnelId;
     try {
-      [hostname, accountTag, tunnelSecret, tunnelId] = await requestQuickTunnel('https://api.trycloudflare.com');
+      // 🧪 复用 _requester 注入缝 (生产恒为 requestQuickTunnel), 供离线单测 mock 注册请求
+      [hostname, accountTag, tunnelSecret, tunnelId] = await (this._requester || requestQuickTunnel)('https://api.trycloudflare.com');
     } catch (e) {
       const err = new Error('failed to create tunnel: ' + e.message);
       err.status = 500;
@@ -8043,13 +8093,26 @@ class ArgoTunnelManager {
       // QUIC 建连连续失败达阈值自动回退 h2 (entry 级, 重启进程恢复)
       transport: quic ? 'quic' : 'h2',
       quicFailures: 0,
+      consecutiveFailures: 0,
+      status: 'alive',           // alive | reconnecting | failed
+      lastError: null,
+      lastErrorAt: null,
+      lastRegisteredAt: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
       stopped: false,
       sock: null,
       conn: null,   // QUIC 传输时为 QuicConnection, 供 remove() 主动关闭
       runPromise: null
     };
     entry.runPromise = this._runLoop(entry, accountTag, tunnelSecret, tunnelId)
-      .catch((err) => this.log.warning('argo tunnel loop for ' + tunnelDomain + ' ended: ' + err.message));
+      .catch((err) => {
+        this.log.warning('argo tunnel loop for ' + tunnelDomain + ' ended: ' + err.message);
+        // 顶层兜底: 未捕获异常落为 failed, 条目保留供 Panel 区分展示
+        if (!entry.stopped) {
+          entry.status = 'failed';
+          entry.lastError = argoTruncateError(err && err.message ? err.message : err);
+          entry.lastErrorAt = argoNowIso();
+        }
+      });
     existing.push(entry);
     this.tunnels.set(port, existing);
     this.log.info('argo tunnel created: ' + tunnelDomain + ' -> 127.0.0.1:' + port + ' (' + entry.transport + ')');
@@ -8065,7 +8128,12 @@ class ArgoTunnelManager {
           tunnel_domain: entry.tunnelDomain,
           port: entry.port,
           created_at: entry.createdAt,
-          transport: entry.transport
+          transport: entry.transport,
+          status: entry.status || 'alive',
+          last_error: entry.lastError ?? null,
+          last_error_at: entry.lastErrorAt ?? null,
+          consecutive_failures: entry.consecutiveFailures || 0,
+          last_registered_at: entry.lastRegisteredAt ?? null
         });
       }
     }
@@ -8105,7 +8173,12 @@ class ArgoTunnelManager {
         tunnel_domain: entry.tunnelDomain,
         port: entry.port,
         created_at: entry.createdAt,
-        transport: entry.transport
+        transport: entry.transport,
+        status: entry.status || 'alive',
+        last_error: entry.lastError ?? null,
+        last_error_at: entry.lastErrorAt ?? null,
+        consecutive_failures: entry.consecutiveFailures || 0,
+        last_registered_at: entry.lastRegisteredAt ?? null
       });
     }
 
@@ -8130,7 +8203,7 @@ class ArgoTunnelManager {
         await new Promise((resolve) => setTimeout(resolve, Math.min(500, ms - waited)));
       }
     };
-    let failures = 0;   // 🛡️ 连续失败计数 (连接失败/注册失败): 本轮注册过=旧凭据仍有效, 清零
+    entry.consecutiveFailures = 0;   // 🛡️ 提升为条目字段: 供 list() 暴露给 Panel
     let connIndex = 0;  // 注册索引轮换, 降低 edge 侧旧连接残留导致的注册拒绝
     while (!entry.stopped) {
       let sock = null;
@@ -8153,14 +8226,14 @@ class ArgoTunnelManager {
             quicConn, origin, accountTag, tunnelSecret, tunnelId, connIndex, this.log
           ).run();
         } else {
-          sock = await connectEdge(edgeVerifyCert, this.log);
+          sock = await this._connectEdge(edgeVerifyCert, this.log);
           if (entry.stopped) {
             try { sock.destroy(); } catch (ignored) {}
             break;
           }
           entry.sock = sock;
           connIndex = (connIndex + 1) % 4;
-          conn = new H2Connection(
+          conn = new this._H2Connection(
             sock, origin, accountTag, tunnelSecret, tunnelId, connIndex,
             this.log, entry.tunnelDomain, false, { printed: true }
           );
@@ -8169,6 +8242,9 @@ class ArgoTunnelManager {
       } catch (err) {
         if (!entry.stopped) {
           this.log.warning('argo tunnel ' + entry.tunnelDomain + ' connection closed: ' + err.message);
+          if (entry.status !== 'failed') entry.status = 'reconnecting';
+          entry.lastError = argoTruncateError(err && err.message ? err.message : err);
+          entry.lastErrorAt = argoNowIso();
         }
       } finally {
         if (sock !== null) {
@@ -8185,10 +8261,15 @@ class ArgoTunnelManager {
       }
       const registered = (conn !== null && conn.registered) || (quicConn !== null && quicConn.registered);
       if (registered) {
-        failures = 0;
+        entry.consecutiveFailures = 0;
         entry.quicFailures = 0;
+        entry.status = 'alive';
+        entry.lastError = null;
+        entry.lastErrorAt = null;
+        entry.lastRegisteredAt = argoNowIso();
       } else {
-        failures += 1;
+        entry.consecutiveFailures += 1;
+        if (entry.status !== 'failed') entry.status = 'reconnecting';
         // 🚦 QUIC 连续失败达阈值: 自动回退 h2 (同一注册凭据无需重注册, UDP 被墙环境兜底;
         // 回退只影响本条隧道, 重启进程恢复 QUIC)
         if (entry.transport === 'quic') {
@@ -8199,19 +8280,31 @@ class ArgoTunnelManager {
             entry.quicFailures = 0;
           }
         }
-        if (failures >= argoReregisterAfter) {
+        if (entry.consecutiveFailures >= argoReregisterAfter) {
           // 🛡️ 旧凭据已被 Cloudflare 回收: 重新注册换取新域名, 回调通知后继续新域名下的重连
           if (await this._reregister(entry, (tag, secret, id) => { accountTag = tag; tunnelSecret = secret; tunnelId = id; })) {
-            failures = 0;
+            entry.consecutiveFailures = 0;
             entry.quicFailures = 0;   // 凭据类失败不计入传输回退, 避免误降级
+            entry.status = 'alive';
+            entry.lastError = null;
+            entry.lastErrorAt = null;
+            entry.lastRegisteredAt = argoNowIso();
           } else {
-            // 重新注册失败: 退避更久再试, 避免高频请求 api.trycloudflare.com
-            await sleep(argoReregisterRetrySeconds * 1000);
+            // 重新注册亦失败: 标 failed, 但退避封顶低频巡检, 不永久停掉
+            if (entry.status !== 'failed') {
+              entry.status = 'failed';
+              if (entry.lastError == null) {
+                entry.lastError = 'tunnel re-register failed';
+                entry.lastErrorAt = argoNowIso();
+              }
+            }
+            // 退避: 指数封顶, 替代固定 30s, 避免高频请求 api.trycloudflare.com
+            await sleep(argoBackoffSeconds(entry.consecutiveFailures) * 1000);
           }
         }
       }
       if (!entry.stopped) {
-        await sleep(argoRetrySeconds * 1000);
+        await sleep((entry.consecutiveFailures > 0 ? argoBackoffSeconds(entry.consecutiveFailures) : argoRetrySeconds) * 1000);
       }
     }
   }
@@ -9583,7 +9676,11 @@ async function main(options = {}) {
         tunnel_domain: tunnel.tunnelDomain,
         port: tunnel.port,
         created_at: tunnel.createdAt,
-        transport: tunnel.transport
+        transport: tunnel.transport,
+        tunnel_status: tunnel.status || 'alive',
+        last_error: tunnel.lastError ?? null,
+        last_error_at: tunnel.lastErrorAt ?? null,
+        consecutive_failures: tunnel.consecutiveFailures || 0
       });
     } catch (e) {
       res.status(e.status || 500).json({
@@ -9706,4 +9803,4 @@ if (require.main === module||require.main?.filename?.includes('ts-node')) {
   main().catch(Logger.error);
 }
 
-module.exports = { main, loadCurves, Config, CryptoManager, SystemInfoCollector, CommandExecutor, FileManager, TaskManager, TaskStore, ArgoTunnelManager, KModeController, ZipArchiver, TempKeyManager, SecureDns, installDnsHook, patchDnsLookup, QuicConnection, QuicSession, QuicTlsClient, QuicKeys, QuicReader, quicInitialKeys, quicNextKeys, quicWriteVarint, quicReadVarint, quicDecodePacketNumber, quicApplyProtection, quicRemoveProtection, quicEncodeTransportParameters, quicDecodeTransportParameters, quicEncodeAck, quicRangesFromAck, hkdfExpandLabel, CapnpBuilder, capnpMessages, capnpWords, capnpStruct, capnpText, capnpStructList, capnpReturnResult, capnpConnectRequest, capnpConnectResponse, connectEdgeQuic, buildQuicRequest, verifyEdgeQuicCertificate, QUIC_DATA_STREAM_PREAMBLE, QUIC_SERVER_NAME, QUIC_ALPN, __ptySelector: { detectLinuxLibc, ptyCandidateOrder, probePtyModule, ensurePty, PTY_QWQO_VERSION, getState: () => ({ ready: !!pty, reason: ptyUnavailableReason }) } };
+module.exports = { main, loadCurves, Config, CryptoManager, SystemInfoCollector, CommandExecutor, FileManager, TaskManager, TaskStore, ArgoTunnelManager, argoBackoffSeconds, argoTruncateError, argoRetryBaseSeconds, argoRetryMaxSeconds, argoReregisterAfter, KModeController, ZipArchiver, TempKeyManager, SecureDns, installDnsHook, patchDnsLookup, QuicConnection, QuicSession, QuicTlsClient, QuicKeys, QuicReader, quicInitialKeys, quicNextKeys, quicWriteVarint, quicReadVarint, quicDecodePacketNumber, quicApplyProtection, quicRemoveProtection, quicEncodeTransportParameters, quicDecodeTransportParameters, quicEncodeAck, quicRangesFromAck, hkdfExpandLabel, CapnpBuilder, capnpMessages, capnpWords, capnpStruct, capnpText, capnpStructList, capnpReturnResult, capnpConnectRequest, capnpConnectResponse, connectEdgeQuic, buildQuicRequest, verifyEdgeQuicCertificate, QUIC_DATA_STREAM_PREAMBLE, QUIC_SERVER_NAME, QUIC_ALPN, __ptySelector: { detectLinuxLibc, ptyCandidateOrder, probePtyModule, ensurePty, PTY_QWQO_VERSION, getState: () => ({ ready: !!pty, reason: ptyUnavailableReason }) } };

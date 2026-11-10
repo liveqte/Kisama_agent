@@ -253,7 +253,7 @@ class BaseInfoResponse(BaseModel):
     swap_total: int = Field(..., description="交换分区总量(字节)", examples=[0])
     version: str = Field(..., description="代理版本", examples=["0.0.1"])
     virtualization: str = Field(..., description="虚拟化环境", examples=["None"])
-    marks: List[str] = Field(default_factory=list, description="主机标记 (root/kvm/pterodactyl/systemd/fuse, 顺序固定)", examples=[["root", "kvm", "systemd", "fuse"]])
+    marks: List[str] = Field(default_factory=list, description="主机标记 (root/kvm/pterodactyl/systemd/fuse + 配置类 kstore/kmode1/kmode2, 顺序固定)", examples=[["root", "kvm", "systemd", "fuse"]])
     session_key: Optional[bytes] = Field(None, description="本次会话的动态 AES-256 密钥 (明文，由中间件负责加密)", examples=["k7Bv9...32位密钥字符串或Base64"] )
     noise_key: Optional[Dict[str, Any]] = Field(
         None, 
@@ -948,7 +948,7 @@ class Config:
     DOH_SERVERS = os.getenv("KISAMA_DOH_SERVERS", "").strip()
 
     # 代理版本信息
-    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.6.3-python")
+    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.6.4-python")
     
     # ================= 启动校验 =================
     
@@ -2280,16 +2280,27 @@ class SystemInfoCollector:
 
     # ---------------- 主机标记 marks 探测 (只读/无子进程/无网络, 见 API.MD 十五) ----------------
     def _detect_marks(self) -> List[str]:
-        """按固定顺序探测五类主机标记; 单个标记异常只丢弃该项"""
-        if platform.system() != "Linux":
-            return []
+        """主机探测标记 (仅 Linux) 与配置类标记 (全平台) 按固定顺序探测; 单个标记异常只丢弃该项"""
         marks: List[str] = []
+        if platform.system() == "Linux":
+            for name, probe in (
+                ("root", self._mark_root),
+                ("kvm", self._mark_kvm),
+                ("pterodactyl", self._mark_pterodactyl),
+                ("systemd", self._mark_systemd),
+                ("fuse", self._mark_fuse),
+            ):
+                try:
+                    if probe():
+                        marks.append(name)
+                except Exception as e:
+                    Logger.debug(f"marks 探测失败 [{name}]: {e}", 11)
+        # 配置类标记 (kstore/kmode1/kmode2, docs/API.MD 15.8-15.10): agent 自身配置事实,
+        # 与平台无关 (非 Linux 同样输出); KMODE 已在 Config 归一化 (2q/2quic → "2")
         for name, probe in (
-            ("root", self._mark_root),
-            ("kvm", self._mark_kvm),
-            ("pterodactyl", self._mark_pterodactyl),
-            ("systemd", self._mark_systemd),
-            ("fuse", self._mark_fuse),
+            ("kstore", self._mark_kstore),
+            ("kmode1", self._mark_kmode1),
+            ("kmode2", self._mark_kmode2),
         ):
             try:
                 if probe():
@@ -2299,6 +2310,18 @@ class SystemInfoCollector:
         # 仅输出标记名, 禁止打印 environ/mountinfo/passwd 原文
         Logger.debug(f"marks 命中: {','.join(marks) if marks else '(none)'}", 11)
         return marks
+
+    def _mark_kstore(self) -> bool:
+        """任务持久化已启用 (KSTORE/KSTORE_KEY 环境变量判定, 与 TaskStore._resolve_config 同口径)"""
+        return TaskStore.is_env_enabled()
+
+    def _mark_kmode1(self) -> bool:
+        """KMODE 配置为 1 (隧道 + 域名文件 + stdin)"""
+        return Config.KMODE == "1"
+
+    def _mark_kmode2(self) -> bool:
+        """KMODE 配置为 2 (含 2q/2quic, Config 归一化后为 "2"; 按配置值判定, 不校验 KNAME 生效条件)"""
+        return Config.KMODE == "2"
 
     def _mark_root(self) -> bool:
         """effective uid 与 gid 均为 0; 无 POSIX API 的平台不报"""
@@ -4412,7 +4435,25 @@ def _argo_env_int(name, fallback, minimum):
 # 注册永远失败 (域名永久失效, 即"ECONNRESET 后连不上"的根因)。连续失败 N 次后重新注册
 # 换取新域名并回调通知 (KMODE=2 自动再上报 / KMODE=1 自动重写域名文件)。
 ARGO_REREGISTER_AFTER = _argo_env_int("KISAMA_ARGO_REREGISTER_AFTER", 5, 2)  # 连续失败阈值
-ARGO_REREGISTER_RETRY_SECONDS = 30.0                                         # 重新注册失败后的退避
+ARGO_REREGISTER_RETRY_SECONDS = 30.0                                         # 重新注册失败后的退避 (兼容保留, 退避序列中会被指数公式覆盖)
+# 🛡️ 指数退避 + 封顶低频巡检: 短失败 2s 起、指数增长封顶 300s, 失败越久等越久, 成功清零
+ARGO_RETRY_BASE_SECONDS = float(_argo_env_int("KISAMA_ARGO_RETRY_BASE_SECONDS", 2, 1))
+ARGO_RETRY_MAX_SECONDS = float(_argo_env_int("KISAMA_ARGO_RETRY_MAX_SECONDS", 300, 60))
+
+
+def _argo_backoff_seconds(failures):
+    # 指数退避: min(BASE * 2^(failures-1), MAX), failures 钳制防溢出
+    if failures <= 0:
+        return ARGO_RETRY_BASE_SECONDS
+    exp = min(failures - 1, 10)
+    return min(ARGO_RETRY_BASE_SECONDS * (2 ** exp), ARGO_RETRY_MAX_SECONDS)
+
+
+def _argo_truncate_error(message, limit=300):
+    # last_error 截断防响应体膨胀
+    if message is None:
+        return None
+    return str(message)[:limit]
 
 
 def _argo_idle_timeout():
@@ -7624,6 +7665,12 @@ class CloudflareQuickTunnel:
         self.quic_failures = 0
         self.hostname = None              # 临时公网域名 (含 https:// 前缀)
         self.created_at = None            # 注册成功时间戳 (int)
+        # 🛡️ 状态透明: status 三态 + 失败原因, 供 GET /api/argo 暴露给 Panel 灰显区分
+        self.status = "alive"             # alive | reconnecting | failed, start 成功前为 alive
+        self.last_error = None            # 最近一次异常消息 (截断 300 字)
+        self.last_error_at = None         # ISO8601 UTC 时间戳
+        self.consecutive_failures = 0     # 连续失败轮数 (= _run_loop 的 failures)
+        self.last_registered_at = None    # 最近一次成功注册时间 (int epoch, 无则 None)
         # 🛡️ 守护重建换新域名时的回调 (old_domain, new_domain); KMODE 接线后自动再上报/重写域名文件
         self.on_domain_change = None
         self._stop = threading.Event()
@@ -7655,95 +7702,127 @@ class CloudflareQuickTunnel:
         return self.hostname
 
     def _run_loop(self, account_tag, tunnel_secret, tunnel_id):
-        failures = 0      # 🛡️ 连续失败计数 (连接失败/注册失败): 本轮注册过=旧凭据仍有效, 清零
+        self.consecutive_failures = 0         # 🛡️ 提升为条目字段: 供 GET /api/argo 暴露给 Panel
         conn_index = 0    # 注册索引轮换, 降低 edge 侧旧连接残留导致的注册拒绝
-        while not self._stop.is_set():
-            sock = None
-            conn = None
-            quic_conn = None
-            try:
-                # 🔐 A-2: 默认校验 Cloudflare edge 证书; 自定义链路确需豁免时 KISAMA_EDGE_INSECURE=true
-                if self.transport == "quic":
-                    # 🚦 QUIC 传输: UDP/7844, SNI quic.cftunnel.com, ALPN argotunnel;
-                    # 空闲超时与 h2 共用 KISAMA_ARGO_IDLE_TIMEOUT (0=禁用时回落 QUIC 默认 30s)
-                    idle_ms = ARGO_IDLE_TIMEOUT * 1000 if ARGO_IDLE_TIMEOUT > 0 else 30000
-                    quic_conn = connect_edge_quic(self.log, idle_ms, self.verify_certificate)
-                    if self._stop.is_set():
-                        quic_conn.close("tunnel removed")
-                        return
-                    self._conn = quic_conn
-                    conn_index = (conn_index + 1) % 4
-                    session = QuicSession(
-                        quic_conn, self.origin, account_tag, tunnel_secret, tunnel_id,
-                        conn_index, self.log,
-                    )
-                    session.run()
-                else:
-                    sock = connect_edge(self.verify_certificate, self.log)
-                    self._sock = sock
-                    conn_index = (conn_index + 1) % 4
-                    conn = H2Connection(
-                        sock,
-                        self.origin,
-                        account_tag,
-                        tunnel_secret,
-                        tunnel_id,
-                        conn_index,
-                        self.log,
-                        self.hostname,
-                        not self.silent,
-                        self._tunnel_state,
-                    )
-                    conn.run()
-            except KeyboardInterrupt:
-                return
-            except Exception as exc:
-                # 🛡️ 全捕获: 任何异常 (含 H2/QUIC 解析错误等) 都不能让守护线程静默死亡, 死了就再也无法自愈
-                if not self._stop.is_set():
-                    self.log.warning("tunnel connection closed: %s", exc)
-            finally:
-                if sock is not None:
-                    try:
-                        sock.close()
-                    except OSError:
-                        pass
-                if quic_conn is not None:
-                    try:
-                        quic_conn.close("tunnel closed")
-                    except Exception:
-                        pass
-                self._sock = None
-                self._conn = None
-            if self._stop.is_set():
-                return
-            registered = (conn is not None and conn.registered) or (quic_conn is not None and quic_conn.registered)
-            if registered:
-                failures = 0
-                self.quic_failures = 0
-            else:
-                failures += 1
-                # 🚦 QUIC 连续失败达阈值: 自动回退 h2 (同一注册凭据无需重注册, UDP 被墙环境兜底;
-                # 回退只影响本条隧道, 重启进程恢复 QUIC)
-                if self.transport == "quic":
-                    self.quic_failures += 1
-                    if self.quic_failures >= ARGO_REREGISTER_AFTER:
-                        self.transport = "h2"
-                        self.log.warning(
-                            "argo tunnel %s: QUIC 连续 %d 轮建连失败, 已自动回退 h2 传输 (重启进程恢复 QUIC)",
-                            self.hostname, self.quic_failures,
+        terminal_error = None
+        try:
+            while not self._stop.is_set():
+                sock = None
+                conn = None
+                quic_conn = None
+                try:
+                    # 🔐 A-2: 默认校验 Cloudflare edge 证书; 自定义链路确需豁免时 KISAMA_EDGE_INSECURE=true
+                    if self.transport == "quic":
+                        # 🚦 QUIC 传输: UDP/7844, SNI quic.cftunnel.com, ALPN argotunnel;
+                        # 空闲超时与 h2 共用 KISAMA_ARGO_IDLE_TIMEOUT (0=禁用时回落 QUIC 默认 30s)
+                        idle_ms = ARGO_IDLE_TIMEOUT * 1000 if ARGO_IDLE_TIMEOUT > 0 else 30000
+                        quic_conn = connect_edge_quic(self.log, idle_ms, self.verify_certificate)
+                        if self._stop.is_set():
+                            quic_conn.close("tunnel removed")
+                            return
+                        self._conn = quic_conn
+                        conn_index = (conn_index + 1) % 4
+                        session = QuicSession(
+                            quic_conn, self.origin, account_tag, tunnel_secret, tunnel_id,
+                            conn_index, self.log,
                         )
-                        self.quic_failures = 0
-                if failures >= ARGO_REREGISTER_AFTER:
-                    credentials = self._reregister()
-                    if credentials is not None:
-                        account_tag, tunnel_secret, tunnel_id = credentials
-                        failures = 0
-                        self.quic_failures = 0   # 凭据类失败不计入传输回退, 避免误降级
-                    elif self._stop.wait(ARGO_REREGISTER_RETRY_SECONDS):
-                        # 重新注册失败: 退避更久再试, 避免高频请求 api.trycloudflare.com
-                        return
+                        session.run()
+                    else:
+                        sock = connect_edge(self.verify_certificate, self.log)
+                        self._sock = sock
+                        conn_index = (conn_index + 1) % 4
+                        conn = H2Connection(
+                            sock,
+                            self.origin,
+                            account_tag,
+                            tunnel_secret,
+                            tunnel_id,
+                            conn_index,
+                            self.log,
+                            self.hostname,
+                            not self.silent,
+                            self._tunnel_state,
+                        )
+                        conn.run()
+                except KeyboardInterrupt:
+                    return
+                except Exception as exc:
+                    # 🛡️ 全捕获: 任何异常 (含 H2/QUIC 解析错误等) 都不能让守护线程静默死亡, 死了就再也无法自愈
+                    if not self._stop.is_set():
+                        self.log.warning("tunnel connection closed: %s", exc)
+                        self.status = "reconnecting"
+                        self.last_error = _argo_truncate_error(exc)
+                        self.last_error_at = datetime.fromtimestamp(time.time(), timezone.utc).isoformat().replace("+00:00", "Z")
+                        terminal_error = exc
+                finally:
+                    if sock is not None:
+                        try:
+                            sock.close()
+                        except OSError:
+                            pass
+                    if quic_conn is not None:
+                        try:
+                            quic_conn.close("tunnel closed")
+                        except Exception:
+                            pass
+                    self._sock = None
+                    self._conn = None
+                if self._stop.is_set():
+                    return
+                registered = (conn is not None and conn.registered) or (quic_conn is not None and quic_conn.registered)
+                if registered:
+                    self.consecutive_failures = 0
+                    self.quic_failures = 0
+                    self.status = "alive"
+                    self.last_error = None
+                    self.last_error_at = None
+                    self.last_registered_at = int(time.time())
+                    terminal_error = None
+                else:
+                    self.consecutive_failures += 1
+                    if self.status != "failed":
+                        self.status = "reconnecting"
+                    # 🚦 QUIC 连续失败达阈值: 自动回退 h2 (同一注册凭据无需重注册, UDP 被墙环境兜底;
+                    # 回退只影响本条隧道, 重启进程恢复 QUIC)
+                    if self.transport == "quic":
+                        self.quic_failures += 1
+                        if self.quic_failures >= ARGO_REREGISTER_AFTER:
+                            self.transport = "h2"
+                            self.log.warning(
+                                "argo tunnel %s: QUIC 连续 %d 轮建连失败, 已自动回退 h2 传输 (重启进程恢复 QUIC)",
+                                self.hostname, self.quic_failures,
+                            )
+                            self.quic_failures = 0
+                    if self.consecutive_failures >= ARGO_REREGISTER_AFTER:
+                        credentials = self._reregister()
+                        if credentials is not None:
+                            account_tag, tunnel_secret, tunnel_id = credentials
+                            self.consecutive_failures = 0
+                            self.quic_failures = 0   # 凭据类失败不计入传输回退, 避免误降级
+                            self.status = "alive"
+                            self.last_error = None
+                            self.last_error_at = None
+                            self.last_registered_at = int(time.time())
+                        else:
+                            # 重新注册亦失败: 标 failed, 但仍退避封顶低频巡检, 不永久停掉
+                            if self.status != "failed":
+                                self.status = "failed"
+                                if self.last_error is None:
+                                    self.last_error = "tunnel re-register failed"
+                                    self.last_error_at = datetime.fromtimestamp(time.time(), timezone.utc).isoformat().replace("+00:00", "Z")
+                            if self._stop.wait(_argo_backoff_seconds(self.consecutive_failures)):
+                                return
+                if not self._stop.is_set():
+                    self._stop.wait(_argo_backoff_seconds(self.consecutive_failures) if self.consecutive_failures > 0 else self.retry_seconds)
+        except Exception as exc:
+            # 顶层兜底: 任何未捕获异常落为 failed, 条目保留供 Panel 区分展示, 不允许静默消失
+            if terminal_error is None:
+                terminal_error = exc
             if not self._stop.is_set():
-                self._stop.wait(self.retry_seconds)
+                self.status = "failed"
+                self.last_error = _argo_truncate_error(terminal_error)
+                self.last_error_at = datetime.fromtimestamp(time.time(), timezone.utc).isoformat().replace("+00:00", "Z")
+            raise
 
     def _reregister(self):
         # 🛡️ 旧凭据连续失败达阈值: 重新注册快速隧道换取新域名, 触发 on_domain_change 回调
@@ -7819,7 +7898,7 @@ class ArgoTunnelManager:
         self._requester = None
 
     def list_tunnels(self):
-        # 返回已注册成功的临时隧道 (域名 / 端口 / 创建时间)
+        # 返回临时隧道 (域名 / 端口 / 创建时间 / 状态) — 含失效条目, 状态透明交 Panel 灰显区分
         with self._lock:
             return [
                 {
@@ -7827,6 +7906,11 @@ class ArgoTunnelManager:
                     "port": tunnel.port,
                     "created_at": datetime.fromtimestamp(tunnel.created_at, timezone.utc).isoformat().replace("+00:00", "Z"),
                     "transport": tunnel.transport,
+                    "status": tunnel.status,
+                    "last_error": tunnel.last_error,
+                    "last_error_at": tunnel.last_error_at,
+                    "consecutive_failures": tunnel.consecutive_failures,
+                    "last_registered_at": (datetime.fromtimestamp(tunnel.last_registered_at, timezone.utc).isoformat().replace("+00:00", "Z") if tunnel.last_registered_at is not None else None),
                 }
                 for tunnel in self._tunnels
                 if tunnel.hostname is not None
@@ -7858,6 +7942,10 @@ class ArgoTunnelManager:
             "port": port,
             "created_at": datetime.fromtimestamp(tunnel.created_at, timezone.utc).isoformat().replace("+00:00", "Z"),
             "transport": tunnel.transport,
+            "tunnel_status": tunnel.status,
+            "last_error": tunnel.last_error,
+            "last_error_at": tunnel.last_error_at,
+            "consecutive_failures": tunnel.consecutive_failures,
         }
 
     def delete_tunnel(self, port, tunnel_domain=None):
@@ -8118,6 +8206,11 @@ class ArgoTunnelInfo(BaseModel):
     tunnel_domain: str = Field(..., description="临时隧道公网域名", examples=["https://lucky-wildflower-1a2b3c4d.trycloudflare.com"])
     port: int = Field(..., description="隧道转发的本地端口", examples=[8000])
     created_at: str = Field(..., description="创建时间 (ISO8601 UTC)", examples=["2026-08-18T10:00:00Z"])
+    status: Optional[str] = Field(default=None, description="隧道状态: alive|reconnecting|failed", examples=["alive"])
+    last_error: Optional[str] = Field(default=None, description="最近失败原因 (截断 300 字)", examples=["edge failed: ECONNREFUSED"])
+    last_error_at: Optional[str] = Field(default=None, description="最近失败时间 (ISO8601 UTC)", examples=["2026-11-09T14:20:00Z"])
+    consecutive_failures: Optional[int] = Field(default=None, description="连续失败轮数", examples=[0])
+    last_registered_at: Optional[str] = Field(default=None, description="最近成功注册时间 (ISO8601 UTC)", examples=["2026-11-09T14:10:36Z"])
 
 
 class ArgoTunnelListResponse(SResponse):
@@ -8140,6 +8233,11 @@ class ArgoTunnelCreateResponse(BaseModel):
     tunnel_domain: Optional[str] = Field(default=None, description="临时隧道公网域名", examples=["https://lucky-wildflower-1a2b3c4d.trycloudflare.com"])
     port: int = Field(..., description="本次请求的转发端口", examples=[8000])
     created_at: Optional[str] = Field(default=None, description="创建时间 (ISO8601 UTC)", examples=["2026-08-18T10:00:00Z"])
+    transport: Optional[str] = Field(default=None, description="边缘传输: h2|quic")
+    tunnel_status: Optional[str] = Field(default=None, description="隧道状态: alive|reconnecting|failed", examples=["alive"])
+    last_error: Optional[str] = Field(default=None, description="最近失败原因")
+    last_error_at: Optional[str] = Field(default=None, description="最近失败时间")
+    consecutive_failures: Optional[int] = Field(default=None, description="连续失败轮数", examples=[0])
     message: Optional[str] = Field(default=None, description="失败原因", examples=["tunnel already exists on port 8000, set duplicate=true to force creation"])
 
 
@@ -8530,6 +8628,7 @@ async def get_tempkey(
 class TaskStore:
     MAGIC = "kisama-store"
     VERSION = 1
+    OFF_VALUES = ("off", "0", "none", "false")   # KSTORE 显式关闭取值 (大小写不敏感)
 
     def __init__(self):
         self.enabled = False
@@ -8549,7 +8648,7 @@ class TaskStore:
 
     def _resolve_config(self):
         raw_path = os.getenv("KSTORE", "").strip()
-        if raw_path.lower() in ("off", "0", "none", "false"):
+        if raw_path.lower() in self.OFF_VALUES:
             Logger.info("[TaskStore] 💾 KSTORE=off, 任务持久化已显式关闭")
             return
         raw_key = os.getenv("KSTORE_KEY", "").strip()
@@ -8581,6 +8680,14 @@ class TaskStore:
             return key if len(key) == 32 else None
         except Exception:
             return None
+
+    @classmethod
+    def is_env_enabled(cls) -> bool:
+        """仅凭环境变量按 _resolve_config 同口径判定持久化是否启用 (marks 探测用, 零日志零副作用)"""
+        raw_path = os.getenv("KSTORE", "").strip()
+        if raw_path.lower() in cls.OFF_VALUES:
+            return False
+        return cls._parse_key(os.getenv("KSTORE_KEY", "").strip()) is not None
 
     def load(self):
         """加载持久化任务, 返回 (onetasks, crontasks); 文件缺失/损坏一律安全降级为空表"""

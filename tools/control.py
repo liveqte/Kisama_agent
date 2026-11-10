@@ -643,7 +643,8 @@ def test_baseinfo():
         marks_state = "marks: 缺省(跳过)"
         if "marks" in result:
             marks = result["marks"]
-            marks_order = ["root", "kvm", "pterodactyl", "systemd", "fuse"]
+            marks_order = ["root", "kvm", "pterodactyl", "systemd", "fuse",
+                           "kstore", "kmode1", "kmode2"]
             marks_problem = None
             if not isinstance(marks, list):
                 marks_problem = f"marks 非数组: {type(marks).__name__}"

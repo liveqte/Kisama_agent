@@ -36,6 +36,7 @@ PURGE=0
 DEBUG_FLAG=0
 LOG_FILE=""
 BINARY_UPDATED=0
+CONFIG_CHANGED=0
 INIT="none"
 LATEST_DONE=0
 LATEST_RESULT=""
@@ -71,7 +72,8 @@ kisama_service.sh - Kisama Agent (Go) Linux 服务管理脚本
 选项:
   --name NAME    服务名, 缺省 kisama-agent (多实例并存时用不同名字)
   --dir PATH     安装目录, 缺省为当前工作目录
-  --port PORT    监听端口, 缺省 8000 (写入 agent.env 的 KPORT; 已装过则以 agent.env 为准)
+  --port PORT    监听端口, 缺省 8000 (写入 agent.env 的 KPORT; 优先级 --port > 环境变量
+                 KPORT > agent.env 已装值 > 8000)
   --host HOST    绑定地址, 缺省跟随 agent 默认 (0.0.0.0)
   --version TAG  固定安装某个发布标签, 例如 0.5.8 (缺省自动取最新)
   --bin PATH     使用本地已有二进制, 不联网下载
@@ -83,14 +85,16 @@ kisama_service.sh - Kisama Agent (Go) Linux 服务管理脚本
   --purge        配合 remove, 一并删除安装目录
   --log PATH     一次性启动模式的日志文件, 缺省 <安装目录>/agent.log
 
-环境变量 (存在则写进 agent.env, 之后改动请直接编辑 agent.env):
+环境变量 (执行脚本时给出即覆盖写入 agent.env — 有变化生效新值, 无变化保持原值;
+未注入的键沿用 agent.env 原值, 也可直接编辑 agent.env 后执行 restart):
+  KPORT        监听端口 (优先级见 --port; 环境变量注入同样覆盖 agent.env 旧值)
   ECDSA_PUBKEY ECIES_PUBKEY LOG_LEVEL FILE_ROOT EXEC_TIMEOUT EXEC_SHELL
   KSTORE_KEY   任务持久化加密密钥 (API.MD 十三; hex 64 字符或 std base64 解码后恰
-               为 32 字节)。未注入时本脚本自动生成随机密钥写入 agent.env; agent.env
-               已有则沿用不轮换 (换钥后旧 store.enc 解密失败被隔离, 任务会丢失;
-               手工换钥后执行 restart 生效)
-  KSTORE       持久化存储文件路径, off 显式关闭; 未注入时跟随 agent 默认
-               ($HOME/.tmp/store.enc, HOME 不可用时回落到安装目录)
+               为 32 字节)。未注入时沿用 agent.env 已有密钥 (无则自动生成随机密钥);
+               注入与已存不同的密钥会覆盖轮换并告警 (旧 store.enc 解密失败被隔离,
+               任务会丢失; 手工换钥后执行 restart 生效)
+  KSTORE       持久化存储文件路径, off 显式关闭; 注入即覆盖, 未注入时保持 agent.env
+               原值或跟随 agent 默认 ($HOME/.tmp/store.enc, HOME 不可用时回落到安装目录)
   只支持单行值 (base64 压缩点或 hex); 多行 PEM 请放 <安装目录>/keys/ 目录
 
 示例:
@@ -452,12 +456,32 @@ gen_kstore_key() {
     return 1
 }
 
-env_set() { # KEY VALUE (KEY 只来自脚本内的固定白名单)
+# 取 agent.env 中某键的值, 去一层成对单/双引号; 键或文件不存在返回非 0
+env_get() { # KEY
+    [ -f "$ENV_FILE" ] || return 1
+    _line=$(grep -m1 "^$1=" "$ENV_FILE") || return 1
+    _v=${_line#"$1="}
+    if [ "${#_v}" -ge 2 ]; then
+        _c1=${_v%"${_v#?}"}
+        _c2=${_v#"${_v%?}"}
+        if [ "$_c1" = "$_c2" ] && { [ "$_c1" = '"' ] || [ "$_c1" = "'" ]; }; then
+            _v=${_v#?}
+            _v=${_v%?}
+        fi
+    fi
+    printf '%s' "$_v"
+}
+
+env_set() { # KEY VALUE (KEY 只来自脚本内的固定白名单) — 同值跳过不重写, 值变化才覆盖
     _k="$1" _v="$2"
     case "$_v" in
         *"
 "*) die "$_k 的值含换行 (多行 PEM?), 请改用 $INSTALL_DIR/keys/ 目录放密钥文件" ;;
     esac
+    if [ "$(env_get "$_k")" = "$_v" ]; then
+        return 0
+    fi
+    CONFIG_CHANGED=1
     if [ ! -f "$ENV_FILE" ]; then
         {
             printf '# Kisama Agent 环境变量, 由 %s 生成, 可手工编辑\n' "$SCRIPT_NAME"
@@ -482,28 +506,32 @@ write_env_file() {
     for _k in ECDSA_PUBKEY ECIES_PUBKEY LOG_LEVEL FILE_ROOT EXEC_TIMEOUT EXEC_SHELL; do
         _v=$(printenv "$_k" 2>/dev/null || true)
         [ -n "$_v" ] || continue
-        if [ -f "$ENV_FILE" ] && grep -qs "^$_k=" "$ENV_FILE"; then continue; fi
+        # 注入即生效: 本次执行给过的环境变量覆盖 agent.env 旧值 (同值由 env_set 跳过)
         env_set "$_k" "$_v"
     done
-    # 任务持久化 (API.MD 十三): agent.env 已有 KSTORE_KEY 时沿用不轮换 — 换钥会让
-    # 旧 store.enc 解密失败被隔离, 已恢复的任务全部丢失
-    if ! grep -qs '^KSTORE_KEY=' "$ENV_FILE"; then
-        _kk=$(printenv KSTORE_KEY 2>/dev/null || true)
-        if [ -n "$_kk" ]; then
-            kstore_key_valid "$_kk" || die "注入的 KSTORE_KEY 非法 (需 hex 64 字符或 std base64 解码后恰为 32 字节), 按 agent 口径任务持久化会保持关闭"
+    # 任务持久化 (API.MD 十三): 未注入时沿用 agent.env 已有密钥 (无则生成一次) — 自动
+    # 路径绝不轮换; 注入与已存不同的密钥则覆盖并告警 (换钥后旧 store.enc 解密失败被
+    # 隔离, 已恢复的任务全部丢失)
+    _kk=$(printenv KSTORE_KEY 2>/dev/null || true)
+    if [ -n "$_kk" ]; then
+        kstore_key_valid "$_kk" || die "注入的 KSTORE_KEY 非法 (需 hex 64 字符或 std base64 解码后恰为 32 字节), 按 agent 口径任务持久化会保持关闭"
+        if [ "$(env_get KSTORE_KEY)" != "$_kk" ]; then
+            grep -qs '^KSTORE_KEY=' "$ENV_FILE" && \
+                warn "注入的 KSTORE_KEY 与已存密钥不同, 覆盖后旧 store.enc 将解密失败被隔离 (任务丢失); 非有意轮换请核对注入来源"
             env_set KSTORE_KEY "$_kk"
             info "已写入注入的 KSTORE_KEY, 任务持久化启用 (密钥见 agent.env, 不回显)"
-        elif _kk=$(gen_kstore_key); then
+        fi
+    elif ! grep -qs '^KSTORE_KEY=' "$ENV_FILE"; then
+        if _kk=$(gen_kstore_key); then
             env_set KSTORE_KEY "$_kk"
             info "已生成随机 KSTORE_KEY 写入 agent.env, 任务持久化启用"
         else
             warn "无法生成 KSTORE_KEY (缺 openssl 且 /dev/urandom 不可读), 任务持久化保持关闭, 不影响 agent 其他功能"
         fi
     fi
-    if ! grep -qs '^KSTORE=' "$ENV_FILE"; then
-        _ks=$(printenv KSTORE 2>/dev/null || true)
-        [ -n "$_ks" ] && env_set KSTORE "$_ks"
-    fi
+    # KSTORE: 注入即覆盖 (含 off), 同值自动跳过; 未注入保持 agent.env 原值或缺省
+    _ks=$(printenv KSTORE 2>/dev/null || true)
+    [ -n "$_ks" ] && env_set KSTORE "$_ks"
     # agent.env 含 KSTORE_KEY 后即持有密钥材料, 收紧为仅属主可读; 无密钥时保持
     # 644, 兼容其他用户只读 status 的既有用法
     if grep -qs '^KSTORE_KEY=' "$ENV_FILE"; then
@@ -740,9 +768,21 @@ preflight() {
     [ -d "$INSTALL_DIR" ] || mkdir -p "$INSTALL_DIR" 2>/dev/null || true
     [ -d "$INSTALL_DIR" ] || die "安装目录不存在且无法创建: $INSTALL_DIR (或用 --dir 指定)"
     [ -w "$INSTALL_DIR" ] || die "安装目录不可写: $INSTALL_DIR"
-    # 没显式给 --port 时, 以 agent.env 里已安装的 KPORT 为准
+    # 端口优先级: --port > 环境变量 KPORT > agent.env 已装值 > 缺省 8000;
+    # 注入的 KPORT 与已装值不同时, write_env_file 会覆盖并触发运行中服务重启
+    if [ "$PORT_SET" != 1 ]; then
+        _kp=$(printenv KPORT 2>/dev/null || true)
+        case "$_kp" in
+            ''|*[!0-9]*) ;;
+            *)  if [ "$_kp" -ge 1 ] && [ "$_kp" -le 65535 ]; then
+                    PORT="$_kp"; PORT_SET=1
+                else
+                    warn "环境变量 KPORT=$_kp 超出 1-65535, 已忽略"
+                fi ;;
+        esac
+    fi
     if [ "$PORT_SET" != 1 ] && [ -f "$ENV_FILE" ]; then
-        _kp=$(grep -m1 '^KPORT=' "$ENV_FILE" | sed 's/^[^=]*=//; s/["'\'']//g')
+        _kp=$(env_get KPORT) || _kp=""
         case "$_kp" in ''|*[!0-9]*) ;; *) PORT="$_kp" ;; esac
     fi
     case "$INSTALL_DIR" in
@@ -789,8 +829,12 @@ cmd_start() {
     fi
 
     if [ "$_was_active" = 1 ]; then
-        if [ "$BINARY_UPDATED" = 1 ]; then
-            step "二进制已更新, 重启服务使其生效"
+        if [ "$BINARY_UPDATED" = 1 ] || [ "$CONFIG_CHANGED" = 1 ]; then
+            if [ "$BINARY_UPDATED" = 1 ]; then
+                step "二进制已更新, 重启服务使其生效"
+            else
+                step "配置已更新, 重启服务使其生效"
+            fi
             svc_stop
             sleep 1
             port_guard
@@ -987,8 +1031,7 @@ cmd_status() {
     else
         say "认证     : 缺控制端公钥 (非 DEBUG 模式下 agent 会拒绝启动)"
     fi
-    _ks=""
-    [ -f "$ENV_FILE" ] && _ks=$(grep -m1 '^KSTORE=' "$ENV_FILE" | sed 's/^[^=]*=//; s/["'\'']//g')
+    _ks=$(env_get KSTORE) || _ks=""
     # 与 agent 端 strings.ToLower 口径一致: off/0/none/false 不区分大小写均视为显式关闭
     case "$(printf '%s' "$_ks" | tr 'A-Z' 'a-z')" in
         off|0|none|false) say "持久化   : 已显式关闭 (KSTORE=$_ks)" ;;
