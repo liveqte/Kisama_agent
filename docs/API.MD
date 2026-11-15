@@ -1138,6 +1138,8 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，请求
 
 `$HOME` 解析链：`USERPROFILE` → `HOME` → `user.home`（py/js/java/java11，与 KMODE 域名文件一致）→ go `os.UserHomeDir()` → 全部不可用时降级当前工作目录。
 
+> 🏷️ **0.6.5 起 java/java11 支持宿主烘焙构造实参**：9 参全量烘焙构造在 KMODE 家族基础上追加 `bakedKstore`/`bakedKstoreKey`，宿主（如 Bukkit 插件）可把本节两项配置直接烘焙进产物、不依赖 `.env`/环境变量；优先级仍为 真实环境变量 > `.env` > 烘焙值 > 内置缺省（`resolveSetting`）。`KSTORE_KEY` 烘焙属密钥进产物，与 KMODE 烘焙的 `KNAME_KEY` 同一模式，产物 jar 需按密钥材料对待。
+
 > 🏷️ **0.6.4 起持久化启用状态经 baseinfo `marks` 暴露**：启用（本节启停口径）时 `marks` 含 `kstore`，见「十五」15.8；标记不含存储路径与密钥。PHP 副本无持久化实现，不输出该标记。
 
 ### 存储文件格式

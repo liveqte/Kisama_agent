@@ -550,7 +550,7 @@ class Config {
   static DNS_MODE = (process.env.KISAMA_DNS || 'off').trim().toLowerCase();
   static DOH_SERVERS = (process.env.KISAMA_DOH_SERVERS || '').trim();
   static DOH_SERVERS_DEFAULT = ['https://223.5.5.5/resolve', 'https://1.1.1.1/dns-query', 'https://8.8.8.8/resolve'];
-  static AGENT_VERSION = process.env.AGENT_VERSION || '0.6.4-js';
+  static AGENT_VERSION = process.env.AGENT_VERSION || '0.6.5-js';
   static SESSION_KEY = crypto.randomBytes(32).toString('base64');
   // static SESSION_KEY =""
   static NOISE_KEYS_INTERNAL = NoiseKeyGenerator.generatePair();

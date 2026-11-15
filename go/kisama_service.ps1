@@ -49,8 +49,19 @@ $Marker = 'Managed-by: kisama_service.ps1'
 $EnvKeys = @('ECDSA_PUBKEY', 'ECIES_PUBKEY', 'LOG_LEVEL', 'FILE_ROOT', 'EXEC_TIMEOUT', 'EXEC_SHELL')
 $LatestCache = @{}
 $script:BinaryUpdated = $false
+$script:ConfigChanged = $false   # 本次 start 改写了 agent.env 任何键 → 运行中服务需重启
+$script:PortSet = $false         # 本次显式给了 -Port 或环境变量 KPORT (区别于沿用 agent.env)
 $script:Mode = 'console'      # task | console
 $script:DefaultPort = 8000
+# GitHub 加速链 (与面板 AgentDownload.vue 的 GH_ACCELERATORS 同源): raw 与 api 的直连
+# 失败时依次尝试 ghproxy 前缀式镜像, raw 额外支持 jsDelivr 改写式 (jsDelivr 是文件 CDN,
+# 不适用 api); 第三方节点可用性会变动, 失败自动落到下一个。
+# 注意 releases/latest 只返回最新"正式"发布版本——本仓 0.6.x 全部为预发布时它返回旧正
+# 式版属 GitHub 正确行为, 非镜像缓存问题 (版本发现主路径 ApiReleases 列表含预发布, 取
+# 版本号最大者)。设 KISAMA_GH_MIRROR=<前缀> 可跳过直连强制走加速 (对齐面板"通过加速
+# 节点拉取源文件")。
+$GH_PREFIX_MIRRORS = @('https://ghfast.top', 'https://gh-proxy.com', 'https://ghproxy.net', 'https://gh.llkk.cc')
+$GH_JSDELIVR = 'https://cdn.jsdelivr.net/gh'
 
 function Say($m) { Write-Host $m }
 function Step($m) { Write-Host "==> $m" }
@@ -78,7 +89,8 @@ kisama_service.ps1 - Kisama Agent (Go) Windows 部署与管理脚本
 选项:
   -Name NAME      服务/计划任务名, 缺省 kisama-agent (多实例并存时用不同名字)
   -Dir PATH       安装目录, 缺省为当前工作目录
-  -Port PORT      监听端口, 缺省 8000 (写入 agent.env 的 KPORT; 已装过则以 agent.env 为准)
+  -Port PORT      监听端口, 缺省 8000 (写入 agent.env 的 KPORT; 优先级 -Port > 环境变量
+                  KPORT > agent.env 已装值 > 8000)
   -BindHost IP    绑定地址, 缺省跟随 agent 默认 (0.0.0.0)
   -Version TAG    固定安装某个发布标签, 例如 0.5.8 (缺省自动取最新)
   -Bin PATH       使用本地已有 exe, 不联网下载
@@ -90,14 +102,20 @@ kisama_service.ps1 - Kisama Agent (Go) Windows 部署与管理脚本
   -Force          接管/删除不是本脚本创建的计划任务
   -Purge          配合 remove, 一并删除安装目录
 
-环境变量 (存在则写进 agent.env, 之后改动请直接编辑 agent.env):
+环境变量 (执行脚本时给出即覆盖写入 agent.env — 有变化生效新值, 无变化保持原值;
+未注入的键沿用 agent.env 原值, 也可直接编辑 agent.env 后执行 restart):
+  KPORT        监听端口 (优先级见 -Port; 环境变量注入同样覆盖 agent.env 旧值)
   ECDSA_PUBKEY ECIES_PUBKEY LOG_LEVEL FILE_ROOT EXEC_TIMEOUT EXEC_SHELL
   KSTORE_KEY    任务持久化加密密钥 (API.MD 十三; hex 64 字符或 std base64 解码后
-                恰为 32 字节)。未注入时本脚本自动生成随机密钥写入 agent.env;
-                agent.env 已有则沿用不轮换 (换钥后旧 store.enc 解密失败被隔离,
-                任务会丢失; 手工换钥后执行 restart 生效)
-  KSTORE        持久化存储文件路径, off 显式关闭; 未注入时跟随 agent 默认
-                (%USERPROFILE%\.tmp\store.enc)
+                恰为 32 字节)。未注入时沿用 agent.env 已有密钥 (无则自动生成随机
+                密钥); 注入与已存不同的密钥会覆盖轮换并告警 (旧 store.enc 解密失败
+                被隔离, 任务会丢失; 手工换钥后执行 restart 生效)
+  KSTORE        持久化存储文件路径, off 显式关闭; 注入即覆盖, 未注入时保持 agent.env
+                原值或跟随 agent 默认 (%USERPROFILE%\.tmp\store.enc)
+  KISAMA_GH_MIRROR  脚本自身读取 (不进 agent.env): 自定义 GitHub 加速前缀 (如
+                https://ghfast.top), 给出时跳过直连强制经加速链下载; 未给出时直连
+                失败自动逐个尝试 ghproxy 前缀式镜像 (raw 与 api 均加速; jsDelivr
+                改写式仅适用 raw 下载)
   只支持单行值 (base64 压缩点或 hex); 多行 PEM 请放 <安装目录>\keys\ 目录
 
 说明:
@@ -200,12 +218,36 @@ function Get-RemoteContent([string]$Url) {
     }
 }
 
+# GitHub URL → 候选地址列表: raw 与 api 均加速, 直连在前、失败逐个回退前缀镜像;
+# jsDelivr 改写仅适用 raw (文件 CDN, 不支持 api); KISAMA_GH_MIRROR 显式给出时跳过
+# 直连、自定义前缀优先
+function Get-GhCandidates([string]$url) {
+    if ($url -notmatch '^https://raw\.githubusercontent\.com/|^https://api\.github\.com/') { return @($url) }
+    $out = @()
+    $custom = ([string]$env:KISAMA_GH_MIRROR).Trim()
+    if ($custom) { $out += $custom.TrimEnd('/') + '/' + $url } else { $out += $url }
+    foreach ($m in $GH_PREFIX_MIRRORS) { $out += $m + '/' + $url }
+    # jsDelivr 改写式: {base}/{owner}/{repo}@{ref}/{path} (与面板 RAW_URL_RE 同款)
+    if ($url -match '^https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.+)$') {
+        $out += "$GH_JSDELIVR/$($Matches[1])/$($Matches[2])@$($Matches[3])/$($Matches[4])"
+    }
+    return $out
+}
+
+# 依候选链抓取文本 (raw 版本兜底等), 任一成功即返回
+function Get-RemoteContentAny([string]$url) {
+    foreach ($u in (Get-GhCandidates $url)) {
+        try { return (Get-RemoteContent $u) } catch { }
+    }
+    throw "全部来源失败 (直连与加速节点均不可达): $url"
+}
+
 function Get-LatestVersion {
     if ($LatestCache.ContainsKey('v')) { return $LatestCache['v'] }
     $found = ''
     try {
-        # /releases/latest 只给正式版; 预发布可能更新, 所以取全部标签里最大的
-        $json = Get-RemoteContent $ApiReleases | ConvertFrom-Json
+        # /releases 列表含预发布, 取全部标签里最大的 (releases/latest 只给最新"正式"版)
+        $json = Get-RemoteContentAny $ApiReleases | ConvertFrom-Json
         foreach ($rel in $json) {
             $t = ($rel.tag_name -replace '[^0-9.]', '')
             if ($t -match '^\d+(\.\d+){1,3}$') {
@@ -214,16 +256,22 @@ function Get-LatestVersion {
         }
     } catch { }
     if (-not $found) {
+        # 兜底 1: main 分支编译期版本常量, 经加速链。AGENT_VERSION 随发布提交 bump
+        # (tag 即该提交), 常量恒等于最新发布 tag 版本号 (含预发布口径), 比
+        # releases/latest (仅正式版) 更准, 故排在它前面
         try {
-            $rel = Get-RemoteContent $ApiLatest | ConvertFrom-Json
-            $t = ($rel.tag_name -replace '[^0-9.]', '')
-            if ($t -match '^\d+(\.\d+){1,3}$') { $found = $t }
+            $src = Get-RemoteContentAny $VersionSourceUrl
+            if ($src -match 'AGENT_VERSION\s*=\s*"(\d+(?:\.\d+){1,3})"') { $found = $Matches[1] }
         } catch { }
     }
     if (-not $found) {
+        # 兜底 2 (最后): releases/latest 只返回最新"正式"发布版本——本仓 0.6.x 全部为
+        # 预发布时它给出旧正式版 (如 0.5.4), 属 GitHub 正确行为; 仅作保底, 拿到旧版本
+        # 号至多保守降级, 不会误判"已是最新"
         try {
-            $src = Get-RemoteContent $VersionSourceUrl
-            if ($src -match 'AGENT_VERSION\s*=\s*"(\d+(?:\.\d+){1,3})"') { $found = $Matches[1] }
+            $rel = Get-RemoteContentAny $ApiLatest | ConvertFrom-Json
+            $t = ($rel.tag_name -replace '[^0-9.]', '')
+            if ($t -match '^\d+(\.\d+){1,3}$') { $found = $t }
         } catch { }
     }
     if (-not $found) { return $null }
@@ -252,14 +300,27 @@ function Save-Agent([string]$Tag) {
     $url = "$RawBase/$Tag/go/$art"
     $part = Join-Path $script:Dir '.agent.download'
     Step "下载 $url"
-    try {
-        Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 120 -OutFile $part
-    } catch {
-        $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
-        if (-not $curl) { Remove-Item $part -Force -ErrorAction SilentlyContinue; Die "下载失败: $url ($_); 若该标签没有 windows 产物, 请编译后用 -Bin 指定" }
-        & curl.exe -fsSL --connect-timeout 10 --max-time 300 -o $part $url
-        if ($LASTEXITCODE -ne 0) { Remove-Item $part -Force -ErrorAction SilentlyContinue; Die "下载失败 (curl 退出码 $LASTEXITCODE): $url; 若该标签没有 windows 产物, 请编译后用 -Bin 指定" }
+    # 直连失败自动切加速链 (ghproxy 前缀式 + jsDelivr 改写式); 候选由 Get-GhCandidates 给出
+    $ok = $false
+    foreach ($u in (Get-GhCandidates $url)) {
+        try {
+            Invoke-WebRequest -Uri $u -UseBasicParsing -TimeoutSec 120 -OutFile $part
+            $ok = $true
+        } catch {
+            $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
+            if ($curl) {
+                # 不重定向 stderr: PS 5.1 全局 EAP=Stop 下 2>$null 会把 stderr 升级成异常
+                & curl.exe -fsSL --connect-timeout 10 --max-time 300 -o $part $u
+                if ($LASTEXITCODE -eq 0) { $ok = $true }
+            }
+        }
+        if ($ok) {
+            if ($u -ne $url) { Info "经加速节点下载成功: $u" }
+            break
+        }
+        Remove-Item $part -Force -ErrorAction SilentlyContinue
     }
+    if (-not $ok) { Die "下载失败 (直连与加速节点均不可达): $url; 若该标签没有 windows 产物, 请编译后用 -Bin 指定" }
     if (-not (Test-Path -LiteralPath $part -PathType Leaf)) { Die "下载失败: 没有落地文件" }
     $size = (Get-Item -LiteralPath $part).Length
     if ($size -le 1000000) { Remove-Item $part -Force; Die "下载内容过小 ($size 字节), 已放弃" }
@@ -338,6 +399,9 @@ function Ensure-Binary {
 
 function Set-EnvValue([string]$Key, [string]$Value) {
     if ($Value -match "`r|`n") { Die "$Key 的值含换行 (多行 PEM?), 请改用 $($script:Dir)\keys\ 目录放密钥文件" }
+    # 同值跳过: 不重写不动行序, 第二次 start 无变化时不触发配置重启
+    if ((Read-EnvValue $Key) -eq $Value) { return }
+    $script:ConfigChanged = $true
     $lines = @()
     if (Test-Path -LiteralPath $script:EnvFile -PathType Leaf) {
         $lines = @(Get-Content -LiteralPath $script:EnvFile -Encoding UTF8 | Where-Object { $_ -notmatch "^$Key=" })
@@ -357,46 +421,51 @@ function Write-EnvFile {
             '# 行格式 KEY=VALUE; 计划任务的 run.ps1 与一次性启动都会读取它'),
             (New-Object Text.UTF8Encoding $true))
     }
-    if ($Port -gt 0) { Set-EnvValue 'KPORT' "$Port" }
+    if ($script:PortSet) { Set-EnvValue 'KPORT' "$($script:EffectivePort)" }
     if ($BindHost) { Set-EnvValue 'HOST' $BindHost }
     if ($DebugMode) { Set-EnvValue 'DEBUG' 'true' }
-    # 文件接口根目录: SYSTEM 身份跑时缺省会落到 systemprofile, 所以显式指到安装目录
-    $fr = Read-EnvValue 'FILE_ROOT'
-    if (-not $fr) {
-        $want = if ($FileRoot) { $FileRoot } else { Join-Path $script:Dir 'files' }
-        Set-EnvValue 'FILE_ROOT' $want
-        New-Item -ItemType Directory -Force -Path $want | Out-Null
-    }
+    # 注入即生效: 本次执行给过的环境变量覆盖 agent.env 旧值 (同值由 Set-EnvValue 跳过)
     foreach ($k in $EnvKeys) {
         $v = [Environment]::GetEnvironmentVariable($k)
         if (-not $v) { continue }
-        if ((Read-EnvValue $k)) { continue }
         Set-EnvValue $k $v
     }
-    # 任务持久化 (API.MD 十三): agent.env 已有 KSTORE_KEY 时沿用不轮换 — 换钥会让
-    # 旧 store.enc 解密失败被隔离, 已恢复的任务全部丢失
-    if (-not (Read-EnvValue 'KSTORE_KEY')) {
-        $kk = [Environment]::GetEnvironmentVariable('KSTORE_KEY')
-        if ($kk) {
-            if (-not (Test-KstoreKey $kk)) {
-                Die '注入的 KSTORE_KEY 非法 (需 hex 64 字符或 std base64 解码后恰为 32 字节), 按 agent 口径任务持久化会保持关闭'
+    # 文件接口根目录: SYSTEM 身份跑时缺省会落到 systemprofile, 所以显式指到安装目录。
+    # 优先级 -FileRoot > 环境变量 FILE_ROOT (上方白名单循环已覆盖) > agent.env 已存值
+    # > 缺省 <安装目录>\files
+    if ($FileRoot) { Set-EnvValue 'FILE_ROOT' $FileRoot }
+    elseif (-not (Read-EnvValue 'FILE_ROOT')) {
+        $want = Join-Path $script:Dir 'files'
+        Set-EnvValue 'FILE_ROOT' $want
+        New-Item -ItemType Directory -Force -Path $want | Out-Null
+    }
+    # 任务持久化 (API.MD 十三): 未注入时沿用 agent.env 已有密钥 (无则生成一次) — 自动
+    # 路径绝不轮换; 注入与已存不同的密钥则覆盖并告警 (换钥后旧 store.enc 解密失败被
+    # 隔离, 已恢复的任务全部丢失)
+    $kk = [Environment]::GetEnvironmentVariable('KSTORE_KEY')
+    if ($kk) {
+        if (-not (Test-KstoreKey $kk)) {
+            Die '注入的 KSTORE_KEY 非法 (需 hex 64 字符或 std base64 解码后恰为 32 字节), 按 agent 口径任务持久化会保持关闭'
+        }
+        if ((Read-EnvValue 'KSTORE_KEY') -ne $kk) {
+            if (Read-EnvValue 'KSTORE_KEY') {
+                Warn '注入的 KSTORE_KEY 与已存密钥不同, 覆盖后旧 store.enc 将解密失败被隔离 (任务丢失); 非有意轮换请核对注入来源'
             }
             Set-EnvValue 'KSTORE_KEY' $kk
             Info '已写入注入的 KSTORE_KEY, 任务持久化启用 (密钥见 agent.env, 不回显)'
+        }
+    } elseif (-not (Read-EnvValue 'KSTORE_KEY')) {
+        $gen = New-KstoreKey
+        if ($gen) {
+            Set-EnvValue 'KSTORE_KEY' $gen
+            Info '已生成随机 KSTORE_KEY 写入 agent.env, 任务持久化启用'
         } else {
-            $kk = New-KstoreKey
-            if ($kk) {
-                Set-EnvValue 'KSTORE_KEY' $kk
-                Info '已生成随机 KSTORE_KEY 写入 agent.env, 任务持久化启用'
-            } else {
-                Warn '无法生成 KSTORE_KEY, 任务持久化保持关闭, 不影响 agent 其他功能'
-            }
+            Warn '无法生成 KSTORE_KEY, 任务持久化保持关闭, 不影响 agent 其他功能'
         }
     }
-    if (-not (Read-EnvValue 'KSTORE')) {
-        $ks = [Environment]::GetEnvironmentVariable('KSTORE')
-        if ($ks) { Set-EnvValue 'KSTORE' $ks }
-    }
+    # KSTORE: 注入即覆盖 (含 off), 同值自动跳过; 未注入保持 agent.env 原值或缺省
+    $ks = [Environment]::GetEnvironmentVariable('KSTORE')
+    if ($ks) { Set-EnvValue 'KSTORE' $ks }
     Protect-EnvFile
 }
 
@@ -665,12 +734,25 @@ function Preflight {
         Die "安装目录不存在且无法创建: $($script:Dir) (或用 -Dir 指定)"
     }
 
-    # -Port 未显式给时, 以 agent.env 里已安装的 KPORT 为准
+    # 端口优先级: -Port > 环境变量 KPORT > agent.env 已装值 > 缺省 8000;
+    # 注入的 KPORT 与已装值不同时, Write-EnvFile 会覆盖并触发运行中服务重启
     $script:EffectivePort = $script:DefaultPort
-    if ($Port -gt 0) { $script:EffectivePort = $Port }
-    else {
-        $kp = Read-EnvValue 'KPORT'
-        if ($kp -match '^\d+$') { $script:EffectivePort = [int]$kp }
+    $script:PortSet = $false
+    if ($Port -gt 0) {
+        $script:EffectivePort = $Port
+        $script:PortSet = $true
+    } else {
+        $ke = ([string][Environment]::GetEnvironmentVariable('KPORT')).Trim()
+        if ($ke -match '^\d+$') {
+            if ([int]$ke -ge 1 -and [int]$ke -le 65535) {
+                $script:EffectivePort = [int]$ke
+                $script:PortSet = $true
+            } else { Warn "环境变量 KPORT=$ke 超出 1-65535, 已忽略" }
+        }
+        if (-not $script:PortSet) {
+            $kp = Read-EnvValue 'KPORT'
+            if ($kp -match '^\d+$' -and [int]$kp -ge 1 -and [int]$kp -le 65535) { $script:EffectivePort = [int]$kp }
+        }
     }
 
     $admin = Test-IsAdmin
@@ -732,8 +814,9 @@ function Invoke-Start {
     }
 
     if ($wasActive) {
-        if ($script:BinaryUpdated) {
-            Step 'exe 已更新, 重启服务使其生效'
+        if ($script:BinaryUpdated -or $script:ConfigChanged) {
+            if ($script:BinaryUpdated) { Step 'exe 已更新, 重启服务使其生效' }
+            else { Step '配置已更新, 重启服务使其生效' }
             Stop-Agent; Start-Sleep -Seconds 1; Start-Agent
         } else {
             Info '服务已在运行, 跳过启动'

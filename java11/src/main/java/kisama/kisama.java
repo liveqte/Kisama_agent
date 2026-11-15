@@ -143,6 +143,9 @@ public class kisama {
     private volatile boolean taskStoreLocked = false; // true=加载到高版本数据, 禁止覆盖写
     private volatile String taskStoreLastSavedAt = null;
     private final Object taskStoreLock = new Object();
+    // 宿主烘焙 KSTORE/KSTORE_KEY (9 参构造注入; null=未提供, initTaskStore 经 resolveSetting 走统一优先级)
+    private final String BAKED_KSTORE;
+    private final String BAKED_KSTORE_KEY;
 
     private volatile boolean isRunning = false;
 
@@ -199,7 +202,7 @@ public class kisama {
     // 其余 (无 opt-in 头/超阈值) 保持原始字节流——旧客户端零适配, 大文件不付 Base64+33% 与
     // 整读内存的代价。0 = 关闭加密 (恒明文)。
     private static final long DOWNLOAD_ENCRYPT_MAX = Long.parseLong(DOTENV.getOrDefault("DOWNLOAD_ENCRYPT_MAX", "4194304"));
-    private static final String AGENT_VERSION = "0.6.4-java11";
+    private static final String AGENT_VERSION = "0.6.5-java11";
 
     // baseinfo 三组快照 (docs/API.MD 十六): P 级进程内只建一次; T-local 30s; T-net 3600s.
     // 快照只含系统字段, 凭证在路由层按请求装配, 轮换不再清空
@@ -241,6 +244,9 @@ public class kisama {
         this.KEYS_DIR = DOTENV.getOrDefault("KEYS_DIR", "./keys");
         this.ECDSA_PUBLIC_KEY_B64 = getKeyWithFallback("ECDSA_PUBKEY", "agent_ecdsa_pub.pem", "YOUR_HARDCODED_ECDSA_PUBLIC_KEY_HERE");
         this.ECIES_PUBLIC_KEY_B64 = getKeyWithFallback("ECIES_PUBKEY", "agent_ecies_pub.b64", "YOUR_HARDCODED_ECIES_PUBLIC_KEY_HERE");
+        // 宿主烘焙 KSTORE 通道仅由 9 参构造注入; 无参/独立运行保持纯 DOTENV 解析
+        this.BAKED_KSTORE = null;
+        this.BAKED_KSTORE_KEY = null;
     }
 
     // 2. 有参构造函数（重载）：允许外部模块直接覆盖核心 3 要素，其余继续走默认初始化
@@ -253,10 +259,19 @@ public class kisama {
     // 烘焙参数传 null 或空串即视为"未提供", 不改变原有行为。
     public kisama(int port, String ecdsaPublicKeyB64, String eciesPublicKeyB64,
                   String bakedKmode, String bakedKpath, String bakedKname, String bakedKnameKey) {
+        this(port, ecdsaPublicKeyB64, eciesPublicKeyB64, bakedKmode, bakedKpath, bakedKname, bakedKnameKey, null, null);
+    }
+
+    // 4. 全量烘焙构造：在 7 参基础上追加 KSTORE/KSTORE_KEY——宿主可把任务持久化配置直接烘焙进产物，
+    //    不依赖外部 .env/环境变量 (KSTORE_KEY 烘焙属密钥进产物, 与 KNAME_KEY 同一模式, 需按密钥材料对待 jar)。
+    //    优先级同 resolveSetting: 真实环境变量 > jar 同目录 .env > 烘焙值 > 内置缺省; 传 null/空串视为未提供。
+    public kisama(int port, String ecdsaPublicKeyB64, String eciesPublicKeyB64,
+                  String bakedKmode, String bakedKpath, String bakedKname, String bakedKnameKey,
+                  String bakedKstore, String bakedKstoreKey) {
         // 门控先行 (同无参构造): 后续阶段若引入 log() 调用也受 LOG_LEVEL 约束, 依赖字段缺省值 0 属误用
         this.logLevel = resolveLogLevel();
-        // 覆盖你指定的三个必要参数
-        this.PORT = port;
+        // 覆盖指定的三个必要参数; PORT 同样走 resolveSetting (宿主烘焙值可被真实 env / .env 的 KPORT 覆盖, 与 KMODE 家族一致)
+        this.PORT = Integer.parseInt(resolveSetting("KPORT", String.valueOf(port), "8000"));
         this.ECDSA_PUBLIC_KEY_B64 = ecdsaPublicKeyB64;
         this.ECIES_PUBLIC_KEY_B64 = eciesPublicKeyB64;
 
@@ -273,6 +288,8 @@ public class kisama {
         this.KPATH = resolveSetting("KPATH", bakedKpath, "");
         this.FILE_ROOT = resolveSafeFileRoot();
         this.KEYS_DIR = DOTENV.getOrDefault("KEYS_DIR", "./keys");
+        this.BAKED_KSTORE = bakedKstore;
+        this.BAKED_KSTORE_KEY = bakedKstoreKey;
     }
 
     // 生效值 = DOTENV(环境变量 ∪ .env) 命中则用它, 否则用烘焙值, 再否则用内置缺省
@@ -1656,15 +1673,17 @@ public class kisama {
 
     // ==================== 任务持久化存储实现 (0.5.7, docs/API.MD 十三) ====================
 
-    // 解析 KSTORE/KSTORE_KEY; KSTORE_KEY 是唯一密钥来源 (不落盘), 未设置/非法则关闭 (fail-closed)
+    // 解析 KSTORE/KSTORE_KEY (真实 env > .env > 宿主烘焙 9 参 > 缺省); KSTORE_KEY 是唯一密钥来源 (不落盘), 未设置/非法则关闭 (fail-closed)
     private void initTaskStore() {
-        String rawPath = DOTENV.get("KSTORE") == null ? "" : DOTENV.get("KSTORE").trim();
+        String bakedPath = resolveSetting("KSTORE", this.BAKED_KSTORE, null);
+        String rawPath = bakedPath == null ? "" : bakedPath.trim();
         if (rawPath.equalsIgnoreCase("off") || rawPath.equals("0")
                 || rawPath.equalsIgnoreCase("none") || rawPath.equalsIgnoreCase("false")) {
             log("[TaskStore] 💾 KSTORE=off, 任务持久化已显式关闭");
             return;
         }
-        String rawKey = DOTENV.get("KSTORE_KEY") == null ? "" : DOTENV.get("KSTORE_KEY").trim();
+        String rawKey = resolveSetting("KSTORE_KEY", this.BAKED_KSTORE_KEY, null);
+        rawKey = rawKey == null ? "" : rawKey.trim();
         if (rawPath.isEmpty()) {
             rawPath = Paths.get(taskStoreHomeDir(), ".tmp", "store.enc").toString();
         }

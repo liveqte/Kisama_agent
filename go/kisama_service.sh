@@ -17,6 +17,16 @@ API_RELEASES="https://api.github.com/repos/${REPO}/releases?per_page=100"
 API_LATEST="https://api.github.com/repos/${REPO}/releases/latest"
 VERSION_SOURCE_URL="${RAW_BASE}/main/go/config/config.go"
 MARKER="# Managed-by: kisama_service.sh"
+# GitHub 加速链 (与面板 AgentDownload.vue 的 GH_ACCELERATORS 同源): raw 与 api 的直连
+# 失败时依次尝试 ghproxy 前缀式镜像, raw 额外支持 jsDelivr 改写式 (jsDelivr 是文件 CDN,
+# 不适用 api); 第三方节点可用性会变动, 失败自动落到下一个。
+# 注意 releases/latest 只返回最新"正式"发布版本——本仓 0.6.x 全部为预发布时它返回旧正
+# 式版属 GitHub 正确行为, 非镜像缓存问题 (版本发现主路径 API_RELEASES 列表含预发布,
+# 取版本号最大者)。设 KISAMA_GH_MIRROR=<前缀> 可跳过直连强制走加速 (对齐面板"通过加
+# 速节点拉取源文件")。
+GH_PREFIX_MIRRORS="https://ghfast.top https://gh-proxy.com https://ghproxy.net https://gh.llkk.cc"
+GH_JSDELIVR="https://cdn.jsdelivr.net/gh"
+GH_MIRROR_CUSTOM=$(printenv KISAMA_GH_MIRROR 2>/dev/null | sed 's/[[:space:]/]*$//')
 
 # $0 在 bash <(curl ...) 或 curl | sh 下不是普通文件 (是 /dev/fd/N 管道),
 # 这种时候固定用脚本自己的名字, 免得提示信息里出现 "63 help" 这种怪串
@@ -95,6 +105,10 @@ kisama_service.sh - Kisama Agent (Go) Linux 服务管理脚本
                任务会丢失; 手工换钥后执行 restart 生效)
   KSTORE       持久化存储文件路径, off 显式关闭; 注入即覆盖, 未注入时保持 agent.env
                原值或跟随 agent 默认 ($HOME/.tmp/store.enc, HOME 不可用时回落到安装目录)
+  KISAMA_GH_MIRROR  脚本自身读取 (不进 agent.env): 自定义 GitHub 加速前缀 (如
+               https://ghfast.top), 给出时跳过直连强制经加速链下载; 未给出时直连
+               失败自动逐个尝试 ghproxy 前缀式镜像 (raw 与 api 均加速; jsDelivr
+               改写式仅适用 raw 下载)
   只支持单行值 (base64 压缩点或 hex); 多行 PEM 请放 <安装目录>/keys/ 目录
 
 示例:
@@ -227,6 +241,56 @@ http_download() { # URL 目标文件
     fi
 }
 
+# raw.githubusercontent.com URL → jsDelivr 改写形态 ({base}/{owner}/{repo}@{ref}/{path})
+jsdelivr_rewrite() { # $1=raw URL
+    _rel=${1#https://raw.githubusercontent.com/}
+    _ow=${_rel%%/*}; _rest=${_rel#*/}
+    _repo=${_rest%%/*}; _rest=${_rest#*/}
+    _ref=${_rest%%/*}; _path=${_rest#*/}
+    printf '%s/%s@%s/%s' "$_ow" "$_repo" "$_ref" "$_path"
+}
+
+# GitHub URL → 候选地址列表 (每行一个): raw 与 api 均加速, 直连在前、失败逐个回退
+# 前缀镜像; jsDelivr 改写仅适用 raw (文件 CDN, 不支持 api); KISAMA_GH_MIRROR 显式
+# 给出时跳过直连、自定义前缀优先
+gh_candidates() { # $1=URL
+    case "$1" in
+        https://raw.githubusercontent.com/*|https://api.github.com/*) ;;
+        *) printf '%s\n' "$1"; return 0 ;;
+    esac
+    if [ -n "$GH_MIRROR_CUSTOM" ]; then
+        printf '%s\n' "$GH_MIRROR_CUSTOM/$1"
+    else
+        printf '%s\n' "$1"
+    fi
+    for _m in $GH_PREFIX_MIRRORS; do
+        printf '%s\n' "$_m/$1"
+    done
+    case "$1" in
+        https://raw.githubusercontent.com/*) printf '%s\n' "$GH_JSDELIVR/$(jsdelivr_rewrite "$1")" ;;
+    esac
+}
+
+# 依候选链抓取文本 (raw 版本兜底等), 任一成功即返回
+http_get_any() { # URL
+    for _u in $(gh_candidates "$1"); do
+        http_get "$_u" && return 0
+    done
+    return 1
+}
+
+# 依候选链下载文件 (agent 二进制等), 任一成功即返回; 经非直连来源成功时提示
+http_download_any() { # URL 目标文件
+    _dst="$2"
+    for _u in $(gh_candidates "$1"); do
+        if http_download "$_u" "$_dst"; then
+            [ "$_u" != "$1" ] && info "经加速节点下载成功: $_u"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # $1 版本号严格大于 $2 时返回 0
 ver_gt() {
     awk -v a="$1" -v b="$2" '
@@ -253,18 +317,23 @@ tags_from_json() {
 latest_version() {
     [ "$OFFLINE" = 1 ] && return 1
     _tags=""
-    if _json=$(http_get "$API_RELEASES"); then
+    if _json=$(http_get_any "$API_RELEASES"); then
         _tags=$(printf '%s' "$_json" | tags_from_json)
     fi
     if [ -z "$_tags" ]; then
-        if _json=$(http_get "$API_LATEST"); then
-            _tags=$(printf '%s' "$_json" | tags_from_json)
-        fi
+        # 兜底 1: 读 main 分支里的编译期版本常量 (形如 "0.5.8-go"), 经加速链。AGENT_VERSION
+        # 随发布提交 bump (tag 即该提交), 常量恒等于最新发布 tag 版本号 (含预发布口径),
+        # 比 releases/latest (仅正式版) 更准, 故排在它前面
+        _tags=$(http_get_any "$VERSION_SOURCE_URL" | grep -o '"[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*-go"' \
+                | head -1 | sed 's/"//g; s/-go$//')
     fi
     if [ -z "$_tags" ]; then
-        # 兜底: 读 main 分支里的编译期版本常量 (形如 "0.5.8-go")
-        _tags=$(http_get "$VERSION_SOURCE_URL" | grep -o '"[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*-go"' \
-                | head -1 | sed 's/"//g; s/-go$//')
+        # 兜底 2 (最后): releases/latest 只返回最新"正式"发布版本——本仓 0.6.x 全部为
+        # 预发布时它给出旧正式版 (如 0.5.4), 属 GitHub 正确行为; 仅在前两段都失败时
+        # 用作保底, 拿到旧版本号至多保守降级, 不会误判"已是最新"
+        if _json=$(http_get_any "$API_LATEST"); then
+            _tags=$(printf '%s' "$_json" | tags_from_json)
+        fi
     fi
     [ -z "$_tags" ] && return 1
 
@@ -336,7 +405,7 @@ download_agent() { # 版本
     _url="${RAW_BASE}/$1/go/$_bin_rel"
     _part="$INSTALL_DIR/.agent.download"
     step "下载 $_url"
-    http_download "$_url" "$_part" || { rm -f "$_part"; die "下载失败 (检查网络, 或标签 $1 是否存在)"; }
+    http_download_any "$_url" "$_part" || { rm -f "$_part"; die "下载失败 (直连与加速节点均不可达, 检查网络, 或标签 $1 是否存在)"; }
 
     _size=$(wc -c < "$_part" 2>/dev/null | tr -d ' ')
     [ "${_size:-0}" -gt 1000000 ] || { rm -f "$_part"; die "下载内容过小 (${_size:-0} 字节), 已放弃"; }

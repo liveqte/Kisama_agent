@@ -948,7 +948,7 @@ class Config:
     DOH_SERVERS = os.getenv("KISAMA_DOH_SERVERS", "").strip()
 
     # 代理版本信息
-    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.6.4-python")
+    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.6.5-python")
     
     # ================= 启动校验 =================
     
