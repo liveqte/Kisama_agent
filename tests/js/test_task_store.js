@@ -38,6 +38,7 @@ function resetState() {
   TaskStore.state.path = null;
   TaskStore.state.key = null;
   TaskStore.state.lastSavedAt = null;
+  TaskStore.state.hubregs = [];
   Config.onetasks = [];
   Config.crontasks = {};
   Config.InitTask = true;
@@ -99,6 +100,66 @@ async function testSaveLoadRoundtrip() {
   assert.deepStrictEqual(empty.crontasks, {});
 
   console.log('✅ save→load 往返 (含多行命令) 与密文检查');
+}
+
+async function testHubregsSubtype() {
+  // hub 注册任务子类型 (data.hubregs, 0.6.6 续批): round-trip / 旧格式兼容 / save 保留 / 非法过滤
+  resetState();
+  const dir = tempDir('ks_hr_');
+  makeStore(dir);
+  assert.strictEqual(TaskStore.saveHubregs([
+    { hub: 'https://hub.example.com', kname: 'demo1', ports: [7788] }
+  ]), true, 'saveHubregs 应成功');
+  const direct = JSON.parse(TaskStore.decrypt(TaskStore.state.key, fs.readFileSync(path.join(dir, 'store.enc'), 'utf8')));
+  assert.ok(Array.isArray(direct.data.hubregs) && direct.data.hubregs.length === 1, '容器应含 hubregs 键');
+
+  resetState();
+  makeStore(dir);
+  const restored = TaskStore.load();
+  assert.deepStrictEqual(TaskStore.getHubregs(),
+    [{ hub: 'https://hub.example.com', kname: 'demo1', ports: [7788] }], 'load 应恢复 hubregs');
+  assert.strictEqual(restored.onetasks.length, 0);
+
+  // 既有任务 API 落盘不得丢 hubregs
+  assert.strictEqual(TaskStore.save(['echo hi'], { '*/5 * * * *': 'echo cron' }), true);
+  resetState();
+  makeStore(dir);
+  TaskStore.load();
+  assert.strictEqual(TaskStore.getHubregs().length, 1, 'save(onetasks, crontasks) 必须保留 hubregs');
+
+  // 老版本写入的容器 (data 无 hubregs 键) 加载 → 空
+  resetState();
+  const dirLegacy = tempDir('ks_legacy_');
+  makeStore(dirLegacy);
+  const legacyDoc = { magic: TaskStore.MAGIC, version: TaskStore.VERSION, saved_at: '2026-01-01T00:00:00Z',
+                      data: { onetasks: ['echo old'], crontasks: {} } };
+  fs.writeFileSync(path.join(dirLegacy, 'store.enc'), TaskStore.encrypt(TaskStore.state.key, JSON.stringify(legacyDoc)), 'utf8');
+  TaskStore.load();
+  assert.deepStrictEqual(TaskStore.getHubregs(), [], '旧格式应得空 hubregs');
+  assert.deepStrictEqual(TaskStore.load().onetasks, ['echo old']);
+
+  // 非法条目过滤 (端口越界)
+  resetState();
+  const dirBad = tempDir('ks_bad_');
+  makeStore(dirBad);
+  assert.strictEqual(TaskStore.saveHubregs([
+    { hub: 'https://hub.test', kname: 'ok1', ports: [7788, 99999, 0] },
+    'not-a-dict',
+    { kname: 'no-hub', ports: [] }
+  ]), true);
+  resetState();
+  makeStore(dirBad);
+  TaskStore.load();
+  assert.strictEqual(TaskStore.getHubregs().length, 1, '非法条目应过滤');
+  assert.deepStrictEqual(TaskStore.getHubregs()[0].ports, [7788]);
+
+  // 未启用 KSTORE: saveHubregs false 且内存字段不更新
+  resetState();
+  TaskStore.state.enabled = false;
+  assert.strictEqual(TaskStore.saveHubregs([{ hub: 'https://h', kname: 'x', ports: [] }]), false);
+  assert.deepStrictEqual(TaskStore.getHubregs(), []);
+
+  console.log('✅ hub 注册任务子类型 (hubregs) 往返/兼容/过滤');
 }
 
 async function testQuarantine() {
@@ -187,6 +248,7 @@ async function testTaskManagerGate() {
   try {
     await testKeyParsing();
     await testSaveLoadRoundtrip();
+    await testHubregsSubtype();
     await testQuarantine();
     await testHigherVersionLocked();
     await testTaskManagerGate();

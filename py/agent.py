@@ -941,6 +941,25 @@ class Config:
     # 域名文件路径, 缺省 $HOME/domain.txt, 支持 $HOME / ~ 前缀
     KPATH = os.getenv("KPATH", "")
 
+    # KMODE=3 kisama-hub 中继 (docs/API.MD 十九): KHUB=hub 基址 (ws/wss 由 scheme 推导),
+    # KNAME 复用为 hub 注册名 (独立于 shz.al 的校验, hub_kname_error 判定);
+    # KHUB_PORTS=端口反代白名单 (逗号分隔, 缺省空=禁用; 非法条目忽略, activate 时提示);
+    # 重试/心跳/限额与 argo 同风格 env 可调
+    KHUB = os.getenv("KHUB", "").strip().rstrip("/")
+    # KHUB_PUBLIC_URL=hub 对面板/客户端暴露的公网基址覆盖值 (可选, 0.6.6 续批二): 注册时经 public_url 字段
+    # 上报给 hub, hub 拼订阅/页面/ack url 时优先用它; 未配置时缺省自动上报 KHUB 派生基址, 本变量
+    # 用于内网 KHUB 等派生值 ≠ 公网地址的部署; 非法值告警并回退 KHUB 派生
+    KHUB_PUBLIC_URL = os.getenv("KHUB_PUBLIC_URL", "").strip().rstrip("/")
+    KHUB_PORTS = tuple(sorted({
+        int(p.strip()) for p in os.getenv("KHUB_PORTS", "").split(",")
+        if p.strip().isdigit() and 1 <= int(p.strip()) <= 65535
+    }))
+    KISAMA_HUB_RETRY_BASE_SECONDS = float(os.getenv("KISAMA_HUB_RETRY_BASE_SECONDS", "2") or 2)
+    KISAMA_HUB_RETRY_MAX_SECONDS = float(os.getenv("KISAMA_HUB_RETRY_MAX_SECONDS", "60") or 60)
+    KISAMA_HUB_PING_INTERVAL = float(os.getenv("KISAMA_HUB_PING_INTERVAL", "20") or 20)
+    KISAMA_HUB_RELAY_TIMEOUT = float(os.getenv("KISAMA_HUB_RELAY_TIMEOUT", "60") or 60)
+    KISAMA_HUB_MAX_BODY = int(os.getenv("KISAMA_HUB_MAX_BODY", str(64 * 1024 * 1024)) or 64 * 1024 * 1024)
+
     # 内置加密 DNS (DoH, docs/API.MD 第十八节): off=系统解析 (默认, 零行为变化);
     # on=全部出站域名解析走 DoH JSON API 防污染。KISAMA_DOH_SERVERS 逗号分隔自定义
     # DoH 服务器链, 缺省 阿里 223.5.5.5 → Cloudflare 1.1.1.1 → Google 8.8.8.8
@@ -948,7 +967,7 @@ class Config:
     DOH_SERVERS = os.getenv("KISAMA_DOH_SERVERS", "").strip()
 
     # 代理版本信息
-    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.6.5-python")
+    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.6.6-python")
     
     # ================= 启动校验 =================
     
@@ -2295,12 +2314,13 @@ class SystemInfoCollector:
                         marks.append(name)
                 except Exception as e:
                     Logger.debug(f"marks 探测失败 [{name}]: {e}", 11)
-        # 配置类标记 (kstore/kmode1/kmode2, docs/API.MD 15.8-15.10): agent 自身配置事实,
+        # 配置类标记 (kstore/kmode1/kmode2/kmode3, docs/API.MD 15.8-15.11): agent 自身配置事实,
         # 与平台无关 (非 Linux 同样输出); KMODE 已在 Config 归一化 (2q/2quic → "2")
         for name, probe in (
             ("kstore", self._mark_kstore),
             ("kmode1", self._mark_kmode1),
             ("kmode2", self._mark_kmode2),
+            ("kmode3", self._mark_kmode3),
         ):
             try:
                 if probe():
@@ -2322,6 +2342,10 @@ class SystemInfoCollector:
     def _mark_kmode2(self) -> bool:
         """KMODE 配置为 2 (含 2q/2quic, Config 归一化后为 "2"; 按配置值判定, 不校验 KNAME 生效条件)"""
         return Config.KMODE == "2"
+
+    def _mark_kmode3(self) -> bool:
+        """KMODE 配置为 3 (kisama-hub 出站隧道中继, docs/API.MD 十九)"""
+        return Config.KMODE == "3"
 
     def _mark_root(self) -> bool:
         """effective uid 与 gid 均为 0; 无 POSIX API 的平台不报"""
@@ -8001,6 +8025,579 @@ class ArgoTunnelManager:
 
 
 # ----------------------------------------------------------------------------
+# KMODE=3 kisama-hub 出站隧道 (docs/API.MD 十九)
+# - agent 主动向 hub 建立出站 WebSocket 长连接 (ws/wss 由 KHUB scheme 推导), 首帧注册;
+# - hub 把 /{KNAME}/api/* 与 /{KNAME}/{PORT}/* 的外部请求封装成 req 帧经隧道下发:
+#   api 模式回环到 agent 自身服务 (验签/加密/白名单全链路不变, 中间件零改动),
+#   port 模式回环到 KHUB_PORTS 白名单端口 (缺省空=禁用; 拒绝时不发起连接, 无侧信道);
+# - ws_open 帧 → 回环拨号本地终端 WS (Noise/降级令牌字节级透传), 帧级双向转发;
+# - 断线指数退避重连, 状态三态 alive|reconnecting|failed 对齐 argo 0.6.4 惯例。
+# 签名口径: 签名 PATH = 剥离 KNAME 前缀后的本地路径 (hub 侧剥前缀), 与面板 getSignPath /
+# tools/control.py 相对路径签名天然一致, 本端无需任何中间件改动。
+# ----------------------------------------------------------------------------
+_HUB_RESERVED_KNAMES = frozenset({"api", "agents", "health", "tunnel", "static", "sub", "favicon.ico"})
+_HUB_KNAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")
+_HUB_HOP_HEADERS = frozenset({
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailer", "trailers", "transfer-encoding", "upgrade", "host",
+})
+
+
+def hub_kname_error(name):
+    """hub 注册名校验 (与 hub 端 ValidateKName 同源契约); 返回错误文本, 合法返回 None"""
+    normalized = (name or "").strip().lower()
+    if not normalized:
+        return "KNAME 未设置"
+    if not _HUB_KNAME_RE.match(normalized):
+        return "KNAME %r 非法: 限 2-63 字符小写字母/数字/连字符, 首位字母或数字" % name
+    if normalized in _HUB_RESERVED_KNAMES:
+        return "KNAME %r 是保留名, 不可注册" % name
+    return None
+
+
+_HUB_PUBLIC_URL_RE = re.compile(r"^https?://\S+$")
+
+
+def hub_public_url_error(url):
+    """agent 上报公网基址校验 (与 hub 端 ValidatePublicURL 同源契约); 返回错误文本, 合法返回 None
+    空值 = 未配置 (合法缺省, 条目回落 hub 侧推导)。scheme 白名单 http/https, 上限 512 字符,
+    尾部斜杠在 Config 解析时已剥离——非法值 agent 端不上报 (hub 端同规则硬拒绝作纵深)。"""
+    normalized = (url or "").strip().rstrip("/")
+    if not normalized:
+        return None
+    if len(normalized) > 512:
+        return "public_url 过长 (%d > 512 字符)" % len(normalized)
+    if not _HUB_PUBLIC_URL_RE.match(normalized):
+        return "public_url %r 非法: 必须以 http:// 或 https:// 开头且无空白字符" % normalized
+    return None
+
+
+def derive_hub_ws_url(hub_url):
+    """KHUB 基址 → 隧道 WS 地址 (https→wss, http→ws, 裸 host 按 ws)"""
+    url = (hub_url or "").strip().rstrip("/")
+    if url.startswith("https://"):
+        return "wss://" + url[len("https://"):] + "/tunnel"
+    if url.startswith("http://"):
+        return "ws://" + url[len("http://"):] + "/tunnel"
+    return "ws://" + url + "/tunnel"
+
+
+def filter_loopback_headers(headers):
+    """回环请求头纵深过滤 (hub 已滤一遍): 剥 hop-by-hop 与内部命名空间, 防伪造穿透"""
+    out = {}
+    for k, v in (headers or {}).items():
+        lk = str(k).lower()
+        if lk in _HUB_HOP_HEADERS or lk.startswith("x-kisama-hub-") or lk.startswith("x-forwarded-"):
+            continue
+        out[lk] = v
+    return out
+
+
+class HubRegisterError(Exception):
+    """hub 注册被拒 (invalid_name / name_taken / full / invalid_version)"""
+
+    def __init__(self, code, message):
+        super().__init__("[%s] %s" % (code, message))
+        self.code = code
+        self.message = message
+
+
+class HubTunnelManager:
+    """KMODE=3 出站隧道管理器 (结构镜像 ArgoTunnelManager / 0.6.4 状态惯例)
+
+    测试注入缝 (生产恒 None, 参照 CloudflareQuickTunnel._requester 模式):
+    - _ws_factory(session, url) → async context manager (生产 → session.ws_connect)
+    - _request(session, method, url, headers, body) → (status, headers, body)
+    """
+
+    def __init__(self, hub_url, kname, port, ports=None, source="startup"):
+        self.hub_url = (hub_url or "").strip().rstrip("/")
+        self.kname = (kname or "").strip().lower()
+        self.port = int(port)
+        self.ports = list(ports or [])
+        self.source = source             # startup (KMODE=3 静态) | dynamic (POST /api/hub 动态)
+        self.log = Logger  # KModeController 同款全局日志器 (INFO/WARNING 非 DEBUG 静默)
+        # KHUB_PUBLIC_URL 公网基址覆盖值 (可选): 注册时上报 public_url, hub 拼订阅/页面/ack url 优先用
+        # (0.6.6 续批二起缺省自动上报 KHUB 派生基址; 此变量用于内网 KHUB 等派生值 ≠ 公网地址的部署)
+        _pub_err = hub_public_url_error(Config.KHUB_PUBLIC_URL)
+        if _pub_err:
+            self.log.warning("[KMODE3] ⚠️ KHUB_PUBLIC_URL %s, 回退 KHUB 派生基址上报" % _pub_err)
+            self.public_url = None
+        else:
+            self.public_url = (Config.KHUB_PUBLIC_URL or "").strip().rstrip("/") or None
+        # 中继地址: 上报基址 = 覆盖值 || KHUB 派生 (与注册帧 public_url 字段一致)
+        self.relay_url = "%s/%s" % (self.public_url or self.hub_url, self.kname)
+        # 🛡️ 状态透明: 三态 + 失败原因, 供 GET /api/hub 暴露给 Panel
+        self.status = "reconnecting"      # alive | reconnecting | failed
+        self.last_error = None            # 最近一次异常消息 (截断 300 字)
+        self.last_error_at = None         # ISO8601 UTC
+        self.consecutive_failures = 0     # 连续失败轮数 (指数退避依据)
+        self.last_connected_at = None     # 最近一次注册成功时间
+        self.relay_count = 0              # 累计中继请求数
+        self._register_error = None       # 最近一次永久性注册错误 (HubRegisterError; 网络类置 None, 供 wait_connected 判别)
+        self._count_lock = threading.Lock()
+        # 行为参数 (env 可调, docs 十九)
+        self._ping_interval = max(5.0, float(Config.KISAMA_HUB_PING_INTERVAL))
+        self._retry_base = max(0.5, float(Config.KISAMA_HUB_RETRY_BASE_SECONDS))
+        self._retry_max = max(self._retry_base, float(Config.KISAMA_HUB_RETRY_MAX_SECONDS))
+        self._relay_timeout = max(5.0, float(Config.KISAMA_HUB_RELAY_TIMEOUT))
+        self._max_body = max(1, int(Config.KISAMA_HUB_MAX_BODY))
+        # 注入缝
+        self._ws_factory = None
+        self._request = None
+        # 运行态
+        self._stop = threading.Event()
+        self._thread = None
+        self._loop = None
+        self._main_task = None
+        self._ws_lock = asyncio.Lock()    # hub ws 出站帧写锁 (aiohttp 并发 send 不保证串行)
+
+    # ---- 状态快照 (GET /api/hub) ----
+    def snapshot(self):
+        with self._count_lock:
+            relay_count = self.relay_count
+        return {
+            "tunnel_status": self.status,   # alive | reconnecting | failed
+            "source": self.source,          # startup | dynamic
+            "hub": self.hub_url,
+            "kname": self.kname,
+            "url": self.relay_url,
+            "public_url": self.public_url or self.hub_url,  # 注册帧实际上报基址 (KHUB_PUBLIC_URL 覆盖值 || KHUB 派生)
+            "ports": sorted(self.ports),
+            "consecutive_failures": self.consecutive_failures,
+            "last_error": self.last_error,
+            "last_error_at": self.last_error_at,
+            "last_connected_at": self.last_connected_at,
+            "relay_count": relay_count,
+        }
+
+    def wait_connected(self, timeout=15.0):
+        """同步等待注册结果 (POST /api/hub 用): 返回 (ok, error)
+        ok=True → alive; error 为 HubRegisterError (永久性, name_taken 等) 或
+        ConnectionError ("unreachable", 网络类——注册项保留继续退避) 或 TimeoutError"""
+        deadline = time.time() + max(1.0, float(timeout))
+        while time.time() < deadline:
+            if self._stop.is_set():
+                return False, ConnectionError("tunnel stopped")
+            if self._register_error is not None:
+                return False, self._register_error
+            if self.status == "alive":
+                return True, None
+            time.sleep(0.2)
+        return False, TimeoutError("register not confirmed in %.0fs" % float(timeout))
+
+    def _record_failure(self, message):
+        self.consecutive_failures += 1
+        self.status = "reconnecting"
+        self.last_error = str(message)[:300]
+        self.last_error_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def _backoff(self):
+        # 指数退避: base * 2^(failures-1), 上限 retry_max (对齐 argo 0.6.4 惯例)
+        return min(self._retry_base * (2 ** max(0, self.consecutive_failures - 1)), self._retry_max)
+
+    # ---- 生命周期 ----
+    def start(self):
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="hub-tunnel-%s" % self.kname)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        loop, task = self._loop, self._main_task
+        if loop is not None and task is not None and loop.is_running():
+            try:
+                loop.call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                pass
+        if self._thread is not None:
+            self._thread.join(timeout=3.0)
+
+    def _run(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._loop = loop
+
+        async def _entry():
+            self._main_task = asyncio.current_task()
+            await self._run_loop()
+
+        try:
+            loop.run_until_complete(_entry())
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            self._record_failure(exc)
+            self.status = "failed"
+        finally:
+            try:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            except Exception:
+                pass
+            loop.close()
+            self._loop = None
+            self._main_task = None
+
+    async def _run_loop(self):
+        connector = aiohttp.TCPConnector(limit=16)
+        async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=None)) as session:
+            while not self._stop.is_set():
+                try:
+                    await self._connect_once(session)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self._record_failure(exc)
+                    # 🛡️ 永久性注册错误 (name_taken/full/invalid_*) 记录到 _register_error,
+                    # 供 wait_connected 判别; 网络类错误置 None (保留注册项继续退避)
+                    if isinstance(exc, HubRegisterError):
+                        self._register_error = exc
+                    else:
+                        self._register_error = None
+                if self._stop.is_set():
+                    break
+                wait = self._backoff()
+                self.log.warning(f"[KMODE3] ⚠️ 隧道断开 ({self.last_error}), {wait:.1f}s 后第 {self.consecutive_failures} 次重连")
+                await self._interruptible_sleep(wait)
+
+    async def _interruptible_sleep(self, seconds):
+        # 分片睡眠, stop() 置位后最多 0.25s 内退出 (避免长退避拖住进程收尾)
+        deadline = time.time() + seconds
+        while not self._stop.is_set() and time.time() < deadline:
+            await asyncio.sleep(min(0.25, max(0.0, deadline - time.time())))
+
+    async def _connect_once(self, session):
+        # timeout=None 关闭 aiohttp 默认 10s receive 超时 (心跳间隔 20s 会被它切断),
+        # 断线判定交由应用层 20s 心跳 + hub 侧 60s 读 deadline
+        ws_factory = self._ws_factory or (lambda s, url: s.ws_connect(url, autoping=True, timeout=None))
+        async with ws_factory(session, derive_hub_ws_url(self.hub_url)) as ws:
+            reg = {
+                "t": "register", "v": 1, "kname": self.kname,
+                "version": Config.AGENT_VERSION, "ports": sorted(self.ports),
+            }
+            reg["public_url"] = self.public_url or self.hub_url  # 公网基址: 覆盖值优先, 缺省 KHUB 派生 (0.6.6 续批二起恒携带)
+            await self._send(ws, reg)
+            ack_msg = await ws.receive(timeout=15)
+            if ack_msg.type != aiohttp.WSMsgType.TEXT:
+                raise ConnectionError("hub 注册应答异常: %s" % ack_msg.type)
+            ack = json.loads(ack_msg.data)
+            if not ack.get("ok"):
+                raise HubRegisterError(ack.get("code", "unknown"), ack.get("message", ""))
+            # 注册成功 → 状态复位 (对齐 argo _run_loop 的 failures 归零)
+            self.status = "alive"
+            self.consecutive_failures = 0
+            self.last_error = None
+            self.last_connected_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            self.log.info(f"[KMODE3] ✅ 已连接 hub {self.hub_url} (注册名 {self.kname}, 中继地址 {self.relay_url})")
+            await self._pump(session, ws)
+
+    async def _send(self, ws, payload):
+        async with self._ws_lock:
+            await ws.send_json(payload)
+
+    async def _pump(self, session, ws):
+        req_tasks = {}
+        streams = {}
+        ping_task = asyncio.create_task(self._ping_loop(ws))
+        try:
+            while not self._stop.is_set():
+                msg = await ws.receive()
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    try:
+                        f = json.loads(msg.data)
+                    except ValueError:
+                        continue  # 坏帧忽略
+                    t = f.get("t")
+                    if t == "pong":
+                        continue
+                    if t == "req":
+                        rid = int(f.get("id") or 0)
+                        task = asyncio.create_task(self._handle_req(session, ws, f))
+                        req_tasks[rid] = task
+                        task.add_done_callback(lambda _t, _rid=rid: req_tasks.pop(_rid, None))
+                    elif t == "ws_open":
+                        sid = int(f.get("id") or 0)
+                        st = HubWSStream(self, session, ws, sid, f)
+                        streams[sid] = st
+                        st.start()
+                    elif t == "ws_data":
+                        st = streams.get(int(f.get("id") or 0))
+                        if st is not None:
+                            st.from_hub(f)
+                    elif t == "ws_close":
+                        st = streams.pop(int(f.get("id") or 0), None)
+                        if st is not None:
+                            st.close_from_hub(f)
+                elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING,
+                                  aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                    raise ConnectionError("hub 连接关闭/错误: %s" % msg.type.name)
+                # PING/PONG: aiohttp autoping 自动应答
+        finally:
+            ping_task.cancel()
+            for task in req_tasks.values():
+                task.cancel()
+            for st in streams.values():
+                st.stop()
+
+    async def _ping_loop(self, ws):
+        try:
+            while True:
+                await asyncio.sleep(self._ping_interval)
+                if self._stop.is_set():
+                    return
+                await self._send(ws, {"t": "ping"})
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return  # 发送失败 → 读循环将因连接断开退出
+
+    # ---- HTTP 中继 req 分发 ----
+    async def _handle_req(self, session, ws, f):
+        rid = int(f.get("id") or 0)
+        mode = f.get("mode") or "api"
+        method = str(f.get("method") or "GET").upper()
+        path = f.get("path") or "/"
+        query = f.get("query") or ""
+        body = base64.b64decode(f.get("body_b64") or "") if f.get("body_b64") else b""
+        with self._count_lock:
+            self.relay_count += 1
+        try:
+            if mode == "port":
+                port = int(f.get("port") or 0)
+                if port not in self.ports:
+                    # 白名单拒绝: 不发起连接, 无端口扫描侧信道
+                    await self._send_err(ws, rid, "port_not_allowed", "KHUB_PORTS 未放行端口 %d" % port)
+                    return
+                url = "http://127.0.0.1:%d%s" % (port, path)
+            else:
+                url = "http://127.0.0.1:%d%s" % (self.port, path)
+            if query:
+                url += "?" + query
+            headers = filter_loopback_headers(f.get("headers"))
+            if self._request is not None:
+                status, resp_headers, resp_body = await self._request(session, method, url, headers, body)
+            else:
+                async with session.request(method, url, data=body if body else None,
+                                           headers=headers,
+                                           timeout=aiohttp.ClientTimeout(total=self._relay_timeout)) as resp:
+                    status = resp.status
+                    resp_headers = dict(resp.headers)
+                    resp_body = await resp.read()
+            if len(resp_body) > self._max_body:
+                await self._send_err(ws, rid, "body_too_large",
+                                     "响应体超过 KISAMA_HUB_MAX_BODY (%d 字节)" % self._max_body)
+                return
+            await self._send(ws, {
+                "t": "res", "id": rid, "status": int(status),
+                "headers": resp_headers,
+                "body_b64": base64.b64encode(resp_body).decode("ascii"),
+            })
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            try:
+                await self._send_err(ws, rid, "loopback_unreachable", str(exc)[:300])
+            except Exception:
+                pass
+
+    async def _send_err(self, ws, rid, code, message):
+        await self._send(ws, {"t": "err", "id": rid, "code": code, "message": message})
+
+
+class HubWSStream:
+    """单条 WS 流: 回环拨号本地服务, hub↔local 帧级双向转发 (binary/text 保真)
+
+    两种模式 (ws_open 帧的 port 字段区分, 0.6.6 续批):
+    - api 模式 (无 port / port=0): 回环 agent 自身 /api/ws/* (终端, Noise/令牌透传)
+    - 端口反代模式 (port>0): 回环 127.0.0.1:{port} — KHUB_PORTS 白名单校验 (拒绝时
+      ws_ack ok:false, hub 以 close 3001 关客户端; 与 HTTP 端口反代同语义, 不发起回环连接)
+
+    生命周期: start() → _run() 拨号 → ws_ack → 双泵 (hub→local / local→hub) →
+    任一侧关闭 → 向 hub 发 ws_close。from_hub/close_from_hub/stop 由 _pump 调用。
+    """
+
+    def __init__(self, mgr, session, hub_ws, sid, f):
+        self.mgr = mgr
+        self.session = session
+        self.hub_ws = hub_ws
+        self.sid = sid
+        self.path = f.get("path") or "/api/ws/terminal"
+        self.query = f.get("query") or ""
+        self.port = int(f.get("port") or 0)  # >0 = 端口反代模式 (目标端口)
+        self.headers = filter_loopback_headers(f.get("headers"))
+        self.local_ws = None
+        self._task = None
+        self._from_hub = asyncio.Queue()
+        self._stopped = False
+
+    def start(self):
+        self._task = asyncio.create_task(self._run())
+
+    def stop(self):
+        # 隧道收尾 (pump finally): 断本地连接, 双泵退出
+        self._stopped = True
+        self._from_hub.put_nowait(None)
+        if self.local_ws is not None:
+            asyncio.ensure_future(self.local_ws.close(code=1001))
+
+    def from_hub(self, f):
+        self._from_hub.put_nowait(f)
+
+    def close_from_hub(self, f):
+        # hub 侧关闭 → 断本地; 不回发 ws_close (hub 已删流, 回发亦被忽略)
+        self.stop()
+
+    async def _run(self):
+        if self.port:
+            # 端口反代模式: KHUB_PORTS 白名单校验 (拒绝时不发起连接, 无扫描侧信道)
+            if self.port not in self.mgr.ports:
+                try:
+                    await self.mgr._send(self.hub_ws, {"t": "ws_ack", "id": self.sid, "ok": False,
+                                                       "message": "KHUB_PORTS 未放行端口 %d" % self.port})
+                except Exception:
+                    pass
+                return
+            url = "ws://127.0.0.1:%d%s" % (self.port, self.path)
+        else:
+            url = "ws://127.0.0.1:%d%s" % (self.mgr.port, self.path)
+        if self.query:
+            url += "?" + self.query
+        try:
+            if self.mgr._ws_factory is not None:
+                cm = self.mgr._ws_factory(self.session, url)
+            else:
+                cm = self.session.ws_connect(url, autoping=True, timeout=None)  # 本地拨号同关 receive 超时
+            async with cm as local_ws:
+                self.local_ws = local_ws
+                await self.mgr._send(self.hub_ws, {"t": "ws_ack", "id": self.sid, "ok": True})
+                hub_task = asyncio.create_task(self._pump_hub_to_local())
+                local_task = asyncio.create_task(self._pump_local_to_hub())
+                await asyncio.wait({hub_task, local_task}, return_when=asyncio.FIRST_COMPLETED)
+                for p in (hub_task, local_task):
+                    p.cancel()
+                code = 1000
+                try:
+                    code = int(getattr(self.local_ws, "close_code", None) or 1000)
+                except Exception:
+                    pass
+                if not self._stopped:
+                    try:
+                        await self.mgr._send(self.hub_ws, {"t": "ws_close", "id": self.sid, "ws_code": code, "reason": "closed"})
+                    except Exception:
+                        pass
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # 拨号失败 → ack 失败, hub 以 3001 关闭客户端
+            try:
+                await self.mgr._send(self.hub_ws, {"t": "ws_ack", "id": self.sid, "ok": False, "message": str(exc)[:200]})
+            except Exception:
+                pass
+
+    async def _pump_hub_to_local(self):
+        while True:
+            f = await self._from_hub.get()
+            if f is None:
+                return
+            data = base64.b64decode(f.get("data_b64") or "") if f.get("data_b64") else b""
+            if f.get("bt") == "bin":
+                await self.local_ws.send_bytes(data)
+            else:
+                await self.local_ws.send_str(data.decode("utf-8", "replace"))
+
+    async def _pump_local_to_hub(self):
+        async for msg in self.local_ws:
+            if msg.type == aiohttp.WSMsgType.BINARY:
+                await self.mgr._send(self.hub_ws, {
+                    "t": "ws_data", "id": self.sid, "bt": "bin",
+                    "data_b64": base64.b64encode(msg.data).decode("ascii"),
+                })
+            elif msg.type == aiohttp.WSMsgType.TEXT:
+                await self.mgr._send(self.hub_ws, {
+                    "t": "ws_data", "id": self.sid, "bt": "txt",
+                    "data_b64": base64.b64encode(msg.data.encode("utf-8")).decode("ascii"),
+                })
+            elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING,
+                              aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                return
+
+
+# ----------------------------------------------------------------------------
+# HubTunnelRegistrar — hub 注册表 (0.6.6 续批, docs/API.MD 19.10)
+# 管理多条 HubTunnelManager (kname 唯一键): KMODE=3 静态项 (source=startup) 与
+# POST /api/hub 动态项 (source=dynamic, 持久化到 kstore data.hubregs) 共存;
+# register 同步等待注册结果 (wait_connected), 永久性错误 (name_taken 等) 不保留
+# 注册项, 网络类错误保留并继续退避 (状态后查 GET /api/hub)。
+# ----------------------------------------------------------------------------
+class HubTunnelRegistrar:
+    def __init__(self):
+        self._items = {}                  # kname -> HubTunnelManager
+        self._lock = threading.Lock()
+
+    def register(self, hub_url, kname, ports=None, source="dynamic", wait_timeout=15.0):
+        """注册一条隧道并同步等待结果; 返回 (snapshot, error_code_or_None)
+        error_code: None=成功; "unreachable"=网络类 (注册项保留继续退避); 其余为
+        HubRegisterError.code (invalid_name/name_taken/full, 注册项不保留)
+        本地 KNAME 冲突 (同 registrar 内) 同 name_taken 语义"""
+        name_err = hub_kname_error(kname)
+        if name_err:
+            snap = {"kname": (kname or "").strip().lower(), "hub": (hub_url or "").strip().rstrip("/"),
+                    "source": source, "tunnel_status": "failed", "ports": sorted(ports or [])}
+            return snap, "invalid_name", name_err
+        norm_kname = kname.strip().lower()
+        with self._lock:
+            if norm_kname in self._items:
+                existing = self._items[norm_kname]
+                return existing.snapshot(), "name_taken", "KNAME 已在本 agent 注册表中 (kname 唯一)"
+        manager = HubTunnelManager(hub_url, kname, Config.PORT, ports=ports, source=source)
+        manager.start()
+        ok, err = manager.wait_connected(wait_timeout)
+        if ok:
+            with self._lock:
+                self._items[norm_kname] = manager
+            return manager.snapshot(), None, None
+        # 失败分类: 永久性错误 (HubRegisterError) → 移除不保留; 网络类 → 保留继续退避
+        if isinstance(err, HubRegisterError):
+            manager.stop()
+            snap = manager.snapshot()
+            snap["tunnel_status"] = "failed"
+            return snap, err.code, err.message
+        snap = manager.snapshot()
+        snap["tunnel_status"] = "reconnecting"
+        with self._lock:
+            self._items[norm_kname] = manager
+        return snap, "unreachable", str(err or "hub 连接未确认")
+
+    def unregister(self, kname):
+        """注销并停止隧道; 返回 snapshot (未注册 → None)"""
+        norm_kname = (kname or "").strip().lower()
+        with self._lock:
+            manager = self._items.pop(norm_kname, None)
+        if manager is None:
+            return None
+        snap = manager.snapshot()
+        manager.stop()
+        return snap
+
+    def get(self, kname):
+        return self._items.get((kname or "").strip().lower())
+
+    def list(self):
+        with self._lock:
+            items = list(self._items.values())
+        return [m.snapshot() for m in items]
+
+    def stop_all(self):
+        with self._lock:
+            managers = list(self._items.values())
+            self._items.clear()
+        for manager in managers:
+            manager.stop()
+
+
+# ----------------------------------------------------------------------------
 # KMODE 启动模式 (docs/API.MD 第九节)
 # KMODE=1 时: 启动即建临时隧道并把域名写入 KPATH 文件 (缺省 $HOME/domain.txt);
 # 第一次 /api/baseinfo 成功响应后删除该文件; stdin 收到 /domain 指令时输出域名。
@@ -8256,6 +8853,18 @@ class ArgoTunnelDeleteResponse(BaseModel):
     message: Optional[str] = Field(default=None, description="失败原因", examples=["no tunnel found on port 8000"])
 
 
+class HubRegisterRequest(BaseModel):
+    # POST /api/hub 请求体 (0.6.6 续批, docs/API.MD 19.10 动态注册)
+    hub: str = Field(..., description="kisama-hub 基址 (http/https 前缀)", examples=["https://hub.example.com"])
+    kname: str = Field(..., description="注册名 (单个 hub 内唯一, 规则见 19.4)", examples=["myhost"])
+    ports: Optional[List[int]] = Field(default=None, description="端口反代白名单 (缺省空=禁用)", examples=[[7788]])
+
+
+class HubDeleteRequest(BaseModel):
+    # DELETE /api/hub 请求体
+    kname: str = Field(..., description="要注销的注册名", examples=["myhost"])
+
+
 # ============================================================================
 # 🔄 应用生命周期管理 (lifespan)
 # ============================================================================
@@ -8308,7 +8917,50 @@ async def lifespan(app: FastAPI):
     # KMODE=2 但 KNAME 缺失/非法时退化为普通启动 (等同 KMODE=0)
     if Config.KMODE == "1" or (Config.KMODE == "2" and KModeController.kname_valid()):
         KModeController.activate(app.state.argo_tunnel_manager)
-    
+
+    # KMODE=3: kisama-hub 出站隧道 (docs/API.MD 十九); KHUB/KNAME 缺失或非法时
+    # 告警并保持普通启动 (本地服务照常, 静态注册不建立)。
+    # 0.6.6 续批: 引入 HubTunnelRegistrar 注册表 — KMODE=3 静态项 (source=startup) 与
+    # 动态注册项 (source=dynamic, 持久化于 kstore data.hubregs) 共存, GET/POST/DELETE /api/hub 管理
+    app.state.hub_registrar = HubTunnelRegistrar()
+    if Config.KMODE == "3":
+        name_err = hub_kname_error(Config.KNAME)
+        if not Config.KHUB:
+            Logger.warning("[KMODE3] ⚠️ KHUB 未设置, KMODE=3 未生效 (本地服务照常)")
+        elif name_err:
+            Logger.warning("[KMODE3] ⚠️ %s, KMODE=3 未生效 (本地服务照常)" % name_err)
+        else:
+            ports = list(Config.KHUB_PORTS) if Config.KHUB_PORTS else []
+            if not ports:
+                Logger.info("[KMODE3] 💡 KHUB_PORTS 未配置, 端口反代已禁用 (仅中继 /api 与终端)")
+            snap, err_code, err_msg = app.state.hub_registrar.register(
+                Config.KHUB, Config.KNAME, ports=ports, source="startup", wait_timeout=0)
+            if err_code:
+                Logger.warning("[KMODE3] ⚠️ 静态注册失败 (%s: %s), KMODE=3 未生效" % (err_code, err_msg))
+            else:
+                # 兼容字段: GET /api/hub 的 tunnel 指向静态实例 (0.6.6 消费方语义)
+                app.state.hub_tunnel_manager = app.state.hub_registrar.get(Config.KNAME)
+
+    # 启动任务子类型恢复: kstore data.hubregs 的动态注册项自动重建 (KSTORE 启用时;
+    # 静态项 kname 冲突时跳过恢复项并告警; 启动时不等待连接, 失败项按退避自治重连)
+    _hubreg_items = []
+    _tm_hubreg = getattr(app.state, "task_manager", None)
+    if _tm_hubreg is not None and getattr(_tm_hubreg, "store", None) is not None:
+        try:
+            _hubreg_items = _tm_hubreg.store.get_hubregs()
+        except Exception as _exc:
+            Logger.debug(f"[KMODE3] hub 注册任务恢复读取失败: {_exc}", 11)
+    for _reg in _hubreg_items:
+        try:
+            _snap, _code, _msg = app.state.hub_registrar.register(
+                _reg["hub"], _reg["kname"], ports=_reg.get("ports") or [], source="dynamic", wait_timeout=0)
+            if _code:
+                Logger.warning(f"[KMODE3] ⚠️ 恢复注册项 {_reg['kname']} 失败 ({_code}: {_msg}), 该项不注册 (kstore 条目保留)")
+            else:
+                Logger.info(f"[KMODE3] ✅ 已恢复动态注册项: {_reg['kname']} → {_reg['hub']}")
+        except Exception as _exc:
+            Logger.warning(f"[KMODE3] ⚠️ 恢复注册项 {_reg.get('kname')} 异常: {_exc}")
+
     if Config.DEBUG:
         Logger.debug(f"✅ 管理器已挂载到 app.state")
         Logger.debug(f"   • file_manager: {app.state.file_manager}")
@@ -8332,6 +8984,13 @@ async def lifespan(app: FastAPI):
     if hasattr(app.state, 'argo_tunnel_manager'):
         try:
             app.state.argo_tunnel_manager.stop_all()
+        except Exception:
+            pass  # 忽略清理错误
+
+    # 🌐 关闭时: 停止全部 kisama-hub 注册隧道 (静态项 + 动态项)
+    if hasattr(app.state, 'hub_registrar'):
+        try:
+            app.state.hub_registrar.stop_all()
         except Exception:
             pass  # 忽略清理错误
 
@@ -8404,6 +9063,76 @@ async def delete_argo_tunnel(
             status_code=exc.status_code,
             content={"status": "error", "deleted": 0, "port": payload.port, "message": exc.message},
         )
+
+
+def _persist_hubregs(state) -> bool:
+    """把注册表当前状态落盘到 kstore data.hubregs (KSTORE 未启用时返回 False, 注册仅内存)"""
+    tm = getattr(state, "task_manager", None)
+    store = getattr(tm, "store", None) if tm is not None else None
+    if store is None:
+        return False
+    registrar = getattr(state, "hub_registrar", None)
+    items = registrar.list() if registrar is not None else []
+    return store.save_hubregs([
+        {"hub": i["hub"], "kname": i["kname"], "ports": i.get("ports") or []} for i in items
+    ])
+
+
+@app.get("/api/hub")
+async def get_hub_status(request: Request):
+    # KMODE=3 / 动态注册的 kisama-hub 隧道状态 (docs/API.MD 十九 19.8/19.10)。
+    # additive 兼容: tunnel = KMODE=3 静态实例快照 (无则 null); registrations = 注册表全量列表。
+    # 该端点走验签 (非白名单)。
+    registrar = getattr(request.app.state, "hub_registrar", None)
+    static_mgr = getattr(request.app.state, "hub_tunnel_manager", None)
+    registrations = registrar.list() if registrar is not None else []
+    if registrar is None and static_mgr is None:
+        return {"status": "ok", "enabled": False, "message": "无 hub 注册 (KMODE=3 或 POST /api/hub 动态注册)"}
+    return {
+        "status": "ok",
+        "enabled": bool(registrations),
+        "tunnel": static_mgr.snapshot() if static_mgr is not None else None,
+        "registrations": registrations,
+    }
+
+
+@app.post("/api/hub")
+async def register_hub(request: Request, payload: HubRegisterRequest = Body(...)):
+    # 动态注册到 kisama-hub (docs/API.MD 19.10): 同步等待注册结果 (15s), 永久性错误
+    # (invalid_name/name_taken/full) 不保留注册项, 网络类失败保留并继续退避 (500, 后查 GET)。
+    # 注册成功立即落盘 kstore data.hubregs (KSTORE 启用时), 重启自动恢复; 未启用 persisted=false。
+    registrar = getattr(request.app.state, "hub_registrar", None)
+    if registrar is None:
+        return JSONResponse(status_code=500, content={"status": "error", "persisted": False, "message": "hub registrar 未初始化"})
+    hub_url = (payload.hub or "").strip().rstrip("/")
+    if not hub_url.lower().startswith(("http://", "https://")):
+        return JSONResponse(status_code=422, content={"status": "error", "code": "invalid_hub", "message": "hub 必须以 http:// 或 https:// 开头"})
+    snap, code, msg = registrar.register(hub_url, payload.kname, ports=payload.ports or [],
+                                         source="dynamic", wait_timeout=15.0)
+    if code is None:
+        persisted = _persist_hubregs(request.app.state)
+        return {"status": "ok", "persisted": persisted, "registration": snap}
+    if code == "unreachable":
+        # 网络类失败: 注册项保留继续退避 (意图落盘), 状态后查 GET /api/hub
+        persisted = _persist_hubregs(request.app.state)
+        return JSONResponse(status_code=500, content={"status": "error", "persisted": persisted,
+                                                      "code": code, "message": msg, "registration": snap})
+    http_code = 409 if code in ("name_taken", "full") else 422
+    return JSONResponse(status_code=http_code, content={"status": "error", "persisted": False,
+                                                        "code": code, "message": msg, "registration": snap})
+
+
+@app.delete("/api/hub")
+async def unregister_hub(request: Request, payload: HubDeleteRequest = Body(...)):
+    # 注销一条注册 (stop 隧道 + 移出注册表 + 落盘同步删除); 未注册 → 404
+    registrar = getattr(request.app.state, "hub_registrar", None)
+    if registrar is None:
+        return JSONResponse(status_code=404, content={"status": "error", "message": "无 hub 注册"})
+    snap = registrar.unregister(payload.kname)
+    if snap is None:
+        return JSONResponse(status_code=404, content={"status": "error", "message": f"KNAME {payload.kname} 未注册"})
+    persisted = _persist_hubregs(request.app.state)
+    return {"status": "ok", "persisted": persisted, "removed": snap}
 
 
 async def get_smart_payload(request: Request) -> ExecRequestJSON:
@@ -8636,6 +9365,7 @@ class TaskStore:
         self.path = None
         self.key = None
         self.last_saved_at = None
+        self.hubregs = []            # hub 注册任务子类型 (data.hubregs, 0.6.6 起; load 时填充)
         self._lock = threading.Lock()
         self._resolve_config()
 
@@ -8689,18 +9419,18 @@ class TaskStore:
             return False
         return cls._parse_key(os.getenv("KSTORE_KEY", "").strip()) is not None
 
-    def load(self):
-        """加载持久化任务, 返回 (onetasks, crontasks); 文件缺失/损坏一律安全降级为空表"""
+    def _load_doc(self):
+        """解密并校验存储文件, 返回 doc dict (损坏/缺失/未启用返回 None; 高版本置 locked)"""
         if not self.enabled:
-            return [], {}
+            return None
         with self._lock:
             try:
                 if not os.path.isfile(self.path):
-                    return [], {}
+                    return None
                 with open(self.path, "r", encoding="utf-8") as f:
                     payload = f.read().strip()
                 if not payload:
-                    return [], {}
+                    return None
                 plaintext = CryptoManager.decrypt_data(payload, self.key)
                 if plaintext is None:
                     raise ValueError("解密失败 (密钥错误或数据被篡改)")
@@ -8713,18 +9443,55 @@ class TaskStore:
                     self.locked = True
                     Logger.error(f"[TaskStore] ❌ 存储版本 {version} 高于支持版本 {self.VERSION}, "
                                  f"保留原文件不覆盖, 本次以空任务启动且持久化只读")
-                    return [], {}
+                    return None
                 if version != self.VERSION:
                     raise ValueError(f"不支持的版本 {version}")
-                data = doc.get("data") or {}
-                onetasks = [str(x) for x in (data.get("onetasks") or [])]
-                crontasks = {str(k): str(v) for k, v in (data.get("crontasks") or {}).items()}
-                self.last_saved_at = doc.get("saved_at")
-                Logger.info(f"[TaskStore] 💾 已恢复持久化任务: onetime={len(onetasks)}, cron={len(crontasks)}")
-                return onetasks, crontasks
+                return doc
             except Exception as exc:
                 self._quarantine(f"加载失败: {exc}")
-                return [], {}
+                return None
+
+    def load(self):
+        """加载持久化任务, 返回 (onetasks, crontasks); 文件缺失/损坏一律安全降级为空表
+        同时把 hub 注册任务子类型 (data.hubregs, 0.6.6 起) 填充到 self.hubregs"""
+        self.hubregs = []
+        doc = self._load_doc()
+        if doc is None:
+            return [], {}
+        data = doc.get("data") or {}
+        onetasks = [str(x) for x in (data.get("onetasks") or [])]
+        crontasks = {str(k): str(v) for k, v in (data.get("crontasks") or {}).items()}
+        # hub 注册任务 (0.6.6): 结构化条目 {hub, kname, ports}, 非法条目静默过滤 (additive 键, 老版本回写会丢弃, 见 API.MD 十三)
+        regs = []
+        for item in (data.get("hubregs") or []):
+            if isinstance(item, dict) and isinstance(item.get("hub"), str) and isinstance(item.get("kname"), str):
+                ports = item.get("ports")
+                regs.append({
+                    "hub": item["hub"],
+                    "kname": item["kname"],
+                    "ports": [int(p) for p in ports if isinstance(p, (int, float)) and 1 <= int(p) <= 65535] if isinstance(ports, list) else [],
+                })
+        self.hubregs = regs
+        self.last_saved_at = doc.get("saved_at")
+        Logger.info(f"[TaskStore] 💾 已恢复持久化任务: onetime={len(onetasks)}, cron={len(crontasks)}, hubreg={len(regs)}")
+        return onetasks, crontasks
+
+    def get_hubregs(self):
+        """启动恢复用: 读取内存中的 hub 注册任务条目 (load 时填充; 未启用 KSTORE 恒为空)"""
+        return list(self.hubregs or [])
+
+    def save_hubregs(self, items) -> bool:
+        """落盘 hub 注册任务 (additive 键); 合并当前内存任务表整体原子写, 返回是否成功
+        未启用/只读时直接返回 False 且不更新内存字段 (get_hubregs 仅反映启动恢复语义)"""
+        if not self.enabled or self.locked:
+            return False
+        self.hubregs = [
+            {"hub": str(i["hub"]), "kname": str(i["kname"]),
+             "ports": [int(p) for p in (i.get("ports") or [])
+                       if isinstance(p, int) and 1 <= p <= 65535]}
+            for i in (items or []) if isinstance(i, dict) and i.get("hub") and i.get("kname")
+        ]
+        return self.save(Config.onetasks, Config.crontasks)
 
     def _quarantine(self, reason: str):
         """损坏文件隔离改名, 避免反复加载失败; 失败也不抛出"""
@@ -8739,7 +9506,8 @@ class TaskStore:
             Logger.error(f"[TaskStore] ❌ {reason}, 且隔离失败: {exc}")
 
     def save(self, onetasks, crontasks) -> bool:
-        """原子落盘; 返回是否成功 (未启用/只读/失败均返回 False, 不抛出)"""
+        """原子落盘; 返回是否成功 (未启用/只读/失败均返回 False, 不抛出)
+        hub 注册任务 (self.hubregs, 0.6.6 起) 一并写入容器 — 与 onetasks/crontasks 同生命周期"""
         if not self.enabled or self.locked:
             return False
         tmp = None
@@ -8749,7 +9517,8 @@ class TaskStore:
                     "magic": self.MAGIC,
                     "version": self.VERSION,
                     "saved_at": datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
-                    "data": {"onetasks": list(onetasks or []), "crontasks": dict(crontasks or {})},
+                    "data": {"onetasks": list(onetasks or []), "crontasks": dict(crontasks or {}),
+                             "hubregs": list(self.hubregs or [])},
                 }
                 plaintext = json.dumps(doc, ensure_ascii=False).encode("utf-8")
                 payload = CryptoManager.encrypt_data(plaintext, self.key)

@@ -87,6 +87,10 @@ let _ptyHealTried = false;           // npm 自愈补装每进程只尝试一次
 // 先在子进程里做真实 spawn 探测 (探测崩溃只死子进程, agent 进程安全), 全部候选失败则
 // terminal 路由优雅拒绝 (close 1011 + 明确原因) —— agent 绝不因终端基础设施死亡。
 const PTY_QWQO_VERSION = '1.1.2';
+// terminal 不可用时的 WS close reason (1011): 加 [pty_unavailable] 错误码便于日志检索与
+// 用户报障归类 (真实 reason 全文走 ERROR 日志); close reason 上限 123 字节, 超长会让 ws 库
+// 抛异常导致 1011 帧发不出去, 故只放短码不放全文
+const PTY_CLOSE_REASON = 'terminal unavailable: pty probe failed [pty_unavailable]';
 
 function detectLinuxLibc() {
     // 'musl' | 'glibc' | null (非 linux 或无法判定)。判定逻辑对齐 @qwqo loader:
@@ -172,14 +176,24 @@ function healPtyBinary(log) {
         log(`npm 自愈跳过: ${cwd} 无 package.json`);
         return Promise.resolve(false);
     }
+    // pnpm 部署 (pnpm-lock.yaml): 平台包通常已由 pnpm 装入虚拟 store (预检以主包为锚点已可见),
+    // 在 pnpm 目录跑 npm install 会长时间阻塞 (npm 孙进程持有管道, exec 不触发 close, 实测 90s 超时)
+    // 且可能与 pnpm 布局互相破坏 → 直接跳过, 平台包缺失时交给 require + 子进程探测给结论
+    if (fs.existsSync(path.join(cwd, 'pnpm-lock.yaml'))) {
+        log(`npm 自愈跳过: 检测到 pnpm-lock.yaml (pnpm 部署, npm install 会阻塞), 平台包缺失时可手动: pnpm add ${spec}`);
+        return Promise.resolve(false);
+    }
     // 一次性安装 主包+二进制包 两个 spec: --no-save 会把 package.json 未声明的既有包 prune 掉,
     // 主包与二进制包一起点名则双双落位 (生产 package.json 已声明主包时为幂等重装, 零副作用)
     const mainSpec = `@qwqo/node-pty@${PTY_QWQO_VERSION}`;
-    // 快速失败参数: registry 不可达时 npm 缺省重试会拖满 exec 超时, 压到 ~30s 内出结论
-    const npmFlags = '--no-save --no-audit --no-fund --fetch-retries=1 --fetch-retry-maxtimeout=5000 --fetch-timeout=20000';
+    // 快速失败参数: registry 不可达时 npm 缺省重试会拖满 exec 超时, 压到 ~30s 内出结论。
+    // mintimeout 必须与 maxtimeout 成对给出 (npm >=10.9 缺省 mintimeout=10000 > maxtimeout=5000
+    // 会直接报 "minTimeout is greater than maxTimeout" 退出); --no-package-lock 不在部署目录写锁文件
+    const npmFlags = '--no-save --no-audit --no-fund --no-package-lock ' +
+        '--fetch-retries=1 --fetch-retry-mintimeout=2000 --fetch-retry-maxtimeout=5000 --fetch-timeout=20000';
     log(`尝试 npm 自愈补装: npm install ${mainSpec} ${spec} --no-save (cwd=${cwd})`);
     return new Promise((resolve) => {
-        exec(`npm install ${mainSpec} ${spec} ${npmFlags}`, { cwd, timeout: 90000 }, (error) => {
+        exec(`npm install ${mainSpec} ${spec} ${npmFlags}`, { cwd, timeout: 45000, windowsHide: true }, (error) => {
             if (error) {
                 log(`npm 自愈失败: ${String(error.message).split('\n')[0]}`);
                 resolve(false);
@@ -191,34 +205,56 @@ function healPtyBinary(log) {
     });
 }
 
-async function selectPtyImplementation(log) {
-    // linux/node: 按候选顺序 (预检/自愈 → require → 子进程探测), 返回首个可用实现
-    const candidates = ptyCandidateOrder();
+function qwqoPlatformBinaryPath(mainPkgPath, libc, arch) {
+    // @qwqo 平台二进制包路径: 以主包 package.json 的解析结果为锚点 (require.resolve,
+    // 只解析不评估模块, 不触发 ESM 缓存)。npm 扁平布局与 pnpm 虚拟 store 布局下平台包
+    // 都与主包 node-pty 同级 —— pnpm 只把直接依赖软链到顶层 node_modules, 平台包只存在
+    // 于 .pnpm store 内与主包同层; 因此不能从 agent 根目录拼绝对路径 (pnpm 下必然误判
+    // 缺失, 触发无谓自愈)。
+    return path.join(path.dirname(mainPkgPath), '..', `node-pty-linux-${arch}-${libc}`, 'package.json');
+}
+
+async function selectPtyImplementation(log, deps) {
+    // linux/node: 按候选顺序 (预检/自愈 → require → 子进程探测), 返回首个可用实现。
+    // deps 仅供单测注入: { candidates, detectLinuxLibc, resolveQwqoMain, healPtyBinary,
+    // probePtyModule, loadModule }
+    const d = deps || {};
+    const candidates = d.candidates || ptyCandidateOrder();
+    const healPty = d.healPtyBinary || healPtyBinary;
+    const probeModule = d.probePtyModule || probePtyModule;
+    const loadModule = d.loadModule || ((n) => require(n));
+    const libcOf = d.detectLinuxLibc || detectLinuxLibc;
+    const resolveQwqoMain = d.resolveQwqoMain || (() => require.resolve('@qwqo/node-pty/package.json'));
     for (const name of candidates) {
         if (name.startsWith('@qwqo/')) {
-            // 预检: 主包存在但 libc 二进制缺失 → 先补装 (ESM 失败缓存不可重试, 见 healPtyBinary)
-            const agentDir = _ptyAgentDir();
-            const qmain = path.join(agentDir, 'node_modules', '@qwqo', 'node-pty', 'package.json');
-            if (fs.existsSync(qmain)) {
-                const libc = detectLinuxLibc();
-                const qbin = libc ? path.join(agentDir, 'node_modules', '@qwqo', `node-pty-linux-${process.arch}-${libc}`, 'package.json') : null;
-                if (libc && qbin && !fs.existsSync(qbin)) {
+            // 预检: libc 二进制包在主包解析位置不可见 → best-effort 补装 (ESM 失败缓存不可
+            // 重试, 见 healPtyBinary)。自愈失败不跳过候选 —— require + 子进程探测才是唯一
+            // 权威判据 (@qwqo loader 对真缺失会给出 ERR_PTY_MISSING_PACKAGE 等明确错误码)
+            const libc = libcOf();
+            if (libc) {
+                let qbin = null;
+                try {
+                    qbin = qwqoPlatformBinaryPath(resolveQwqoMain(), libc, process.arch);
+                } catch (e) {
+                    qbin = null;   // 主包不可解析: 交给后面的 require 报错
+                }
+                if (qbin && !fs.existsSync(qbin)) {
                     log(`@qwqo 缺少 ${libc} 二进制包 (npm engines 门槛静默跳过), 预检自愈补装`);
-                    if (!await healPtyBinary(log)) {
-                        log(`pty 候选 ${name} 预检自愈未成功, 跳过`);
-                        continue;
-                    }
+                    const healed = await healPty(log);
+                    log(healed
+                        ? `pty 候选 ${name} 预检自愈完成, 继续加载与探测`
+                        : `pty 候选 ${name} 预检自愈未完成, 继续尝试加载与探测`);
                 }
             }
         }
         let mod = null;
         try {
-            mod = require(name);
+            mod = loadModule(name);
         } catch (e) {
             log(`pty 候选 ${name} 加载失败: ${e && e.code ? e.code + ' ' : ''}${String(e && e.message).split('\n')[0]}`);
             continue;
         }
-        const probe = await probePtyModule(name);
+        const probe = await probeModule(name);
         if (probe.ok) {
             log(`pty 实现选定: ${name} (libc=${detectLinuxLibc() || 'unknown'})`);
             return { name, mod };
@@ -241,6 +277,7 @@ function ensurePty() {
                 ptyUnavailableReason =
                     '所有 pty 实现均不可用 (子进程探测失败)。' +
                     `可手动执行: npm install @qwqo/node-pty-linux-${process.arch}-${detectLinuxLibc() || 'x64'}@${PTY_QWQO_VERSION} --no-save` +
+                    '；手动补装后需重启 agent 进程 (ESM 评估失败在进程内永久缓存, 同进程重试无效)' +
                     ' (musl 环境需 node >= 20.19 支持 require(esm)); @lydell 预编译二进制不兼容 musl';
             }
             return pty;
@@ -487,6 +524,93 @@ class NoiseKeyGenerator {
   }
 }
 // ============================================================================
+// 🔌 KMODE=3 kisama-hub 中继 — 模块级工具 (docs/API.MD 十九, 0.6.6)
+// 与 py 端同源契约: 注册名校验 / ws 地址推导 / 回环头过滤 / 指数退避
+// ============================================================================
+const HUB_RESERVED_KNAMES = new Set(['api', 'agents', 'health', 'tunnel', 'static', 'sub', 'favicon.ico']);
+const HUB_KNAME_RE = /^[a-z0-9][a-z0-9-]{1,62}$/;
+const HUB_HOP_HEADERS = new Set(['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
+  'te', 'trailer', 'trailers', 'transfer-encoding', 'upgrade', 'host']);
+
+function parseHubPorts(raw) {
+  // KHUB_PORTS 逗号分隔 → 去重排序端口数组; 非法 (非数字/越界) 条目静默忽略
+  const out = new Set();
+  for (const part of String(raw || '').split(',')) {
+    const s = part.trim();
+    if (!/^\d+$/.test(s)) continue;
+    const p = parseInt(s, 10);
+    if (p >= 1 && p <= 65535) out.add(p);
+  }
+  return [...out].sort((a, b) => a - b);
+}
+
+function hubKnameError(name) {
+  // hub 注册名校验 (与 hub 端 ValidateKName 同源契约); 返回错误文本, 合法返回 null
+  const normalized = (name || '').trim().toLowerCase();
+  if (!normalized) return 'KNAME 未设置';
+  if (!HUB_KNAME_RE.test(normalized)) {
+    return `KNAME '${name}' 非法: 限 2-63 字符小写字母/数字/连字符, 首位字母或数字`;
+  }
+  if (HUB_RESERVED_KNAMES.has(normalized)) return `KNAME '${name}' 是保留名, 不可注册`;
+  return null;
+}
+
+const HUB_PUBLIC_URL_RE = /^https?:\/\/\S+$/;
+
+function hubPublicUrlError(url) {
+  // agent 上报公网基址校验 (与 hub 端 ValidatePublicURL 同源契约); 返回错误文本, 合法返回 null
+  // 空值 = 未配置 (合法缺省, 条目回落 hub 侧推导)。scheme 白名单 http/https (该值会成为
+  // hub /agents 页 href, 拒绝 javascript: 等危险 scheme), 上限 512 字符, 尾部斜杠已剥离
+  const normalized = (url || '').trim().replace(/\/+$/, '');
+  if (!normalized) return null;
+  if (normalized.length > 512) return `public_url 过长 (${normalized.length} > 512 字符)`;
+  if (!HUB_PUBLIC_URL_RE.test(normalized)) {
+    return `public_url '${normalized}' 非法: 必须以 http:// 或 https:// 开头且无空白字符`;
+  }
+  return null;
+}
+
+function deriveHubWsUrl(hubUrl) {
+  // KHUB 基址 → 隧道 WS 地址 (https→wss, http→ws, 裸 host 按 ws)
+  const url = (hubUrl || '').trim().replace(/\/+$/, '');
+  if (url.startsWith('https://')) return 'wss://' + url.slice(8) + '/tunnel';
+  if (url.startsWith('http://')) return 'ws://' + url.slice(7) + '/tunnel';
+  return 'ws://' + url + '/tunnel';
+}
+
+function filterLoopbackHeaders(headers) {
+  // 回环请求头纵深过滤 (hub 已滤一遍): 剥 hop-by-hop 与内部命名空间, 防伪造穿透
+  const out = {};
+  for (const [k, v] of Object.entries(headers || {})) {
+    const lk = String(k).toLowerCase();
+    if (HUB_HOP_HEADERS.has(lk) || lk.startsWith('x-kisama-hub-') || lk.startsWith('x-forwarded-')) continue;
+    out[lk] = v;
+  }
+  return out;
+}
+
+function hubBackoffSeconds(failures, base, max) {
+  // 指数退避: base × 2^(failures-1), 封顶 max (对齐 argoBackoffSeconds 与 py 端惯例)
+  const b = Math.max(0.5, base || 2);
+  const m = Math.max(b, max || 60);
+  const f = Math.max(0, failures - 1);
+  return Math.min(b * Math.pow(2, f), m);
+}
+
+function hubNowIso() {
+  return new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
+
+class HubRegisterError extends Error {
+  // hub 注册被拒 (invalid_name / name_taken / full / invalid_version)
+  constructor(code, message) {
+    super(`[${code}] ${message}`);
+    this.name = 'HubRegisterError';
+    this.code = code;
+  }
+}
+
+// ============================================================================
 // ⚙️ 全局配置类
 // ============================================================================
 class Config {
@@ -544,13 +668,28 @@ class Config {
   static KNAME_KEY = (process.env.KNAME_KEY || '').trim();
   // 域名文件路径, 缺省 $HOME/domain.txt, 支持 $HOME / ~ 前缀
   static KPATH = process.env.KPATH || '';
+  // KMODE=3 kisama-hub 中继 (docs/API.MD 十九): KHUB=hub 基址 (ws/wss 由 scheme 推导),
+  // KNAME 复用为 hub 注册名 (独立于 shz.al 的校验, hubKnameError 判定);
+  // KHUB_PORTS=端口反代白名单 (逗号分隔, 缺省空=禁用; 非法条目忽略);
+  // 重试/心跳/限额与 py 端同键名 env 可调
+  static KHUB = (process.env.KHUB || '').trim().replace(/\/+$/, '');
+  // KHUB_PUBLIC_URL=hub 对面板/客户端暴露的公网基址覆盖值 (可选, 0.6.6 续批二): 注册时经
+  // public_url 字段上报, hub 拼订阅/页面/ack url 时优先用它; 未配置时缺省自动上报 KHUB 派生
+  // 基址, 本变量用于内网 KHUB 等派生值 ≠ 公网地址的部署; 非法值告警并回退 KHUB 派生 (hubPublicUrlError 判定)
+  static KHUB_PUBLIC_URL = (process.env.KHUB_PUBLIC_URL || '').trim().replace(/\/+$/, '');
+  static KHUB_PORTS = parseHubPorts(process.env.KHUB_PORTS || '');
+  static KISAMA_HUB_RETRY_BASE_SECONDS = parseFloat(process.env.KISAMA_HUB_RETRY_BASE_SECONDS || '2') || 2;
+  static KISAMA_HUB_RETRY_MAX_SECONDS = parseFloat(process.env.KISAMA_HUB_RETRY_MAX_SECONDS || '60') || 60;
+  static KISAMA_HUB_PING_INTERVAL = parseFloat(process.env.KISAMA_HUB_PING_INTERVAL || '20') || 20;
+  static KISAMA_HUB_RELAY_TIMEOUT = parseFloat(process.env.KISAMA_HUB_RELAY_TIMEOUT || '60') || 60;
+  static KISAMA_HUB_MAX_BODY = parseInt(process.env.KISAMA_HUB_MAX_BODY || String(64 * 1024 * 1024), 10) || 64 * 1024 * 1024;
   // 内置加密 DNS (DoH, docs/API.MD 第十八节): 'off'=系统解析 (默认, 零行为变化);
   // 'on'=全部出站域名解析走 DoH JSON API 防污染。KISAMA_DOH_SERVERS 逗号分隔自定义
   // DoH 服务器链, 缺省 阿里 223.5.5.5 → Cloudflare 1.1.1.1 → Google 8.8.8.8
   static DNS_MODE = (process.env.KISAMA_DNS || 'off').trim().toLowerCase();
   static DOH_SERVERS = (process.env.KISAMA_DOH_SERVERS || '').trim();
   static DOH_SERVERS_DEFAULT = ['https://223.5.5.5/resolve', 'https://1.1.1.1/dns-query', 'https://8.8.8.8/resolve'];
-  static AGENT_VERSION = process.env.AGENT_VERSION || '0.6.5-js';
+  static AGENT_VERSION = process.env.AGENT_VERSION || '0.6.6-js';
   static SESSION_KEY = crypto.randomBytes(32).toString('base64');
   // static SESSION_KEY =""
   static NOISE_KEYS_INTERNAL = NoiseKeyGenerator.generatePair();
@@ -751,19 +890,19 @@ class Config {
     }
 
     // 3. 动态覆盖 KMODE 启动模式 (docs/API.MD 第九节): '0'=普通启动, '1'=隧道+域名文件+stdin,
-    //    '2'=隧道+shz.al 静默上报, '2q'/'2quic'=2+QUIC 传输。显式传 '0'/0 可强制关闭环境变量
-    //    设置的隧道模式; 非法取值 (含不存在的 '1q'/'0q' 后缀组合) 回退 '0' 并告警。
-    //    消费点均为运行时动态读取, 在 main() 合并阶段覆盖即生效。
+    //    '2'=隧道+shz.al 静默上报, '2q'/'2quic'=2+QUIC 传输, '3'=kisama-hub 出站隧道 (十九节)。
+    //    显式传 '0'/0 可强制关闭环境变量设置的隧道模式; 非法取值 (含不存在的 '1q'/'0q' 后缀组合)
+    //    回退 '0' 并告警。消费点均为运行时动态读取, 在 main() 合并阶段覆盖即生效。
     if (options.KMODE !== undefined && options.KMODE !== null) {
       const raw = String(options.KMODE).trim();
-      if (/^(?:0|1|2|2q|2quic)$/i.test(raw)) {
+      if (/^(?:0|1|2|2q|2quic|3)$/i.test(raw)) {
         const lower = raw.toLowerCase();
         this.KMODE = lower.startsWith('2') ? '2' : lower;
         this.KMODE_QUIC = /^2q(?:uic)?$/.test(lower);
       } else {
         this.KMODE = '0';
         this.KMODE_QUIC = false;
-        Logger.warn(`[KMODE] ⚠️ 非法 KMODE 入参 (${String(options.KMODE)}), 已回退 0 (普通启动); 合法取值: 0/1/2/2q`);
+        Logger.warn(`[KMODE] ⚠️ 非法 KMODE 入参 (${String(options.KMODE)}), 已回退 0 (普通启动); 合法取值: 0/1/2/2q/3`);
       }
     }
 
@@ -778,6 +917,18 @@ class Config {
     }
     if (options.KPATH && String(options.KPATH).trim()) {
       this.KPATH = String(options.KPATH).trim();
+    }
+
+    // 5. KMODE=3 配套参数: KHUB (hub 基址, ws/wss 由 scheme 推导);
+    //    KHUB_PORTS (端口反代白名单, 逗号分隔, 非法条目忽略)
+    if (options.KHUB !== undefined && options.KHUB !== null) {
+      this.KHUB = String(options.KHUB).trim().replace(/\/+$/, '');
+    }
+    if (options.KHUB_PUBLIC_URL !== undefined && options.KHUB_PUBLIC_URL !== null) {
+      this.KHUB_PUBLIC_URL = String(options.KHUB_PUBLIC_URL).trim().replace(/\/+$/, '');
+    }
+    if (options.KHUB_PORTS !== undefined && options.KHUB_PORTS !== null) {
+      this.KHUB_PORTS = parseHubPorts(String(options.KHUB_PORTS));
     }
   }
 }
@@ -1686,7 +1837,8 @@ function authEncryptMiddleware(cryptoManager, tempKeyManager = null) {
     const configProbes = [
       ['kstore', () => this._markKstore()],
       ['kmode1', () => this._markKmode1()],
-      ['kmode2', () => this._markKmode2()]
+      ['kmode2', () => this._markKmode2()],
+      ['kmode3', () => this._markKmode3()]
     ];
     for (const [name, probe] of configProbes) {
       try {
@@ -1713,6 +1865,11 @@ function authEncryptMiddleware(cryptoManager, tempKeyManager = null) {
   _markKmode2() {
     // KMODE 配置为 2 (含 2q/2quic, Config 归一化后为 '2'; 按配置值判定, 不校验 KNAME 生效条件)
     return Config.KMODE === '2';
+  }
+
+  _markKmode3() {
+    // KMODE 配置为 3 (kisama-hub 出站隧道中继, docs/API.MD 十九)
+    return Config.KMODE === '3';
   }
 
   _markRoot() {
@@ -3168,7 +3325,8 @@ class TaskStore {
     locked: false,      // true=加载到高版本数据, 禁止覆盖写
     path: null,
     key: null,
-    lastSavedAt: null
+    lastSavedAt: null,
+    hubregs: []         // hub 注册任务子类型 (data.hubregs, 0.6.6 续批; load 时填充)
   };
 
   static homeDir() {
@@ -3246,6 +3404,7 @@ class TaskStore {
 
   static load() {
     const state = TaskStore.state;
+    state.hubregs = [];
     if (!state.enabled) return { onetasks: [], crontasks: {} };
     try {
       if (!fs.existsSync(state.path)) return { onetasks: [], crontasks: {} };
@@ -3271,12 +3430,39 @@ class TaskStore {
       const onetasks = Array.isArray(data.onetasks) ? data.onetasks.map(String) : [];
       const crontasks = {};
       for (const [k, v] of Object.entries(data.crontasks || {})) crontasks[String(k)] = String(v);
-      Logger.info(`[TaskStore] 💾 已恢复持久化任务: onetime=${onetasks.length}, cron=${Object.keys(crontasks).length}`);
+      // hub 注册任务子类型 (data.hubregs, 0.6.6 续批): 结构化条目 {hub, kname, ports}, 非法条目静默过滤
+      state.hubregs = (Array.isArray(data.hubregs) ? data.hubregs : [])
+        .filter((r) => r && typeof r.hub === 'string' && typeof r.kname === 'string')
+        .map((r) => ({
+          hub: r.hub,
+          kname: r.kname,
+          ports: Array.isArray(r.ports) ? r.ports.filter((p) => Number.isInteger(p) && p >= 1 && p <= 65535) : []
+        }));
+      Logger.info(`[TaskStore] 💾 已恢复持久化任务: onetime=${onetasks.length}, cron=${Object.keys(crontasks).length}, hubreg=${state.hubregs.length}`);
       return { onetasks, crontasks };
     } catch (e) {
       TaskStore.quarantine(`加载失败: ${e.message}`);
       return { onetasks: [], crontasks: {} };
     }
+  }
+
+  static getHubregs() {
+    // 启动恢复用: 读取内存中的 hub 注册任务条目 (load 时填充; 未启用 KSTORE 恒为空)
+    return [...(TaskStore.state.hubregs || [])];
+  }
+
+  static saveHubregs(items) {
+    // 落盘 hub 注册任务 (additive 键); 未启用/只读时返回 false 且不更新内存字段
+    const state = TaskStore.state;
+    if (!state.enabled || state.locked) return false;
+    state.hubregs = (items || [])
+      .filter((r) => r && r.hub && r.kname)
+      .map((r) => ({
+        hub: String(r.hub),
+        kname: String(r.kname),
+        ports: (r.ports || []).filter((p) => Number.isInteger(p) && p >= 1 && p <= 65535)
+      }));
+    return TaskStore.save(Config.onetasks, Config.crontasks);
   }
 
   static quarantine(reason) {
@@ -3303,7 +3489,7 @@ class TaskStore {
         magic: TaskStore.MAGIC,
         version: TaskStore.VERSION,
         saved_at: new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
-        data: { onetasks: onetasks || [], crontasks: crontasks || {} }
+        data: { onetasks: onetasks || [], crontasks: crontasks || {}, hubregs: state.hubregs || [] }
       };
       const payload = TaskStore.encrypt(state.key, JSON.stringify(doc));
       fs.mkdirSync(path.dirname(state.path), { recursive: true });
@@ -3473,6 +3659,13 @@ class TaskManager {
   }
 
   static async setOnetimeTasks(tasks) {
+    // 🛡️ 类型守卫 (0.6.6): body 解析失败的字符串 (express.text 只解析 JSON 前缀) 传入时
+    // `(list||[]).map` 在 string 上不是函数 → TypeError 500; 显式 400 回退 (py 端 422 同语义)
+    if (!Array.isArray(tasks)) {
+      const err = new Error('请求体必须是 JSON 字符串数组 (如 ["cmd1","cmd2"])');
+      err.status = 400;
+      throw err;
+    }
     // 🪪 0.6.2: 身份感知规范化盖章 (空表=清空, 不经规范化)
     Config.onetasks = tasks && tasks.length > 0 ? TaskManager.normalizeOnetimeTasks(tasks, Config.onetasks) : [];
 
@@ -8330,6 +8523,467 @@ class ArgoTunnelManager {
 }
 
 // ============================================================================
+// 🔌 KMODE=3 kisama-hub 出站隧道 (docs/API.MD 十九, 0.6.6)
+// - agent 主动向 hub 建立出站 WebSocket 长连接 (ws/wss 由 KHUB scheme 推导), 首帧注册;
+// - hub 把 /{KNAME}/api/* 与 /{KNAME}/{PORT}/* 的外部请求封装成 req 帧经隧道下发:
+//   api 模式回环到 agent 自身服务 (验签/加密/白名单全链路不变, 中间件零改动),
+//   port 模式回环到 KHUB_PORTS 白名单端口 (缺省空=禁用; 拒绝时不发起连接, 无侧信道);
+// - ws_open 帧 → 回环拨号本地终端 WS (Noise/降级令牌字节级透传), 帧级双向转发;
+// - 断线指数退避重连, 状态三态 alive|reconnecting|failed 对齐 argo 0.6.4 惯例。
+// 签名口径: 签名 PATH = 剥离 KNAME 前缀后的本地路径 (hub 侧剥前缀), 与面板 getSignPath /
+// tools/control.py 相对路径签名天然一致, 本端无需任何中间件改动。
+// ============================================================================
+const WebSocket = require('ws'); // 直接依赖 (package.json 显式声明; express-ws 亦传递依赖之)
+
+class HubTunnelManager {
+  // 测试注入缝 (生产恒为 null, 参照 ArgoTunnelManager._requester 模式):
+  // - _wsFactory(url) → WebSocket 实例 (生产 → new WebSocket(url))
+  // - _request(method, url, headers, body) → Promise<{status, headers, body}>
+  constructor(hubUrl, kname, port, ports, logger, source = 'startup') {
+    this.hubUrl = (hubUrl || '').trim().replace(/\/+$/, '');
+    this.kname = (kname || '').trim().toLowerCase();
+    this.port = parseInt(port, 10);
+    this.ports = Array.isArray(ports) ? [...ports] : parseHubPorts(ports);
+    this.source = source;              // startup (KMODE=3 静态) | dynamic (POST /api/hub 动态)
+    this.log = logger || Logger;
+    // KHUB_PUBLIC_URL 公网基址覆盖值 (可选): 注册时上报 public_url, hub 拼订阅/页面/ack url 优先用
+    // (0.6.6 续批二起缺省自动上报 KHUB 派生基址; 此变量用于内网 KHUB 等派生值 ≠ 公网地址的部署)
+    const pubErr = hubPublicUrlError(Config.KHUB_PUBLIC_URL);
+    if (pubErr) {
+      this.log.warn(`[KMODE3] ⚠️ KHUB_PUBLIC_URL ${pubErr}, 回退 KHUB 派生基址上报`);
+      this.publicUrl = null;
+    } else {
+      this.publicUrl = (Config.KHUB_PUBLIC_URL || '').trim().replace(/\/+$/, '') || null;
+    }
+    // 中继地址: 上报基址 = 覆盖值 || KHUB 派生 (与注册帧 public_url 字段一致)
+    this.relayUrl = `${this.publicUrl || this.hubUrl}/${this.kname}`;
+    // 🛡️ 状态透明: 三态 + 失败原因, 供 GET /api/hub 暴露给 Panel
+    this.status = 'reconnecting';      // alive | reconnecting | failed
+    this.lastError = null;
+    this.lastErrorAt = null;
+    this.consecutiveFailures = 0;
+    this.lastConnectedAt = null;
+    this.relayCount = 0;
+    this._registerError = null;        // 最近一次永久性注册错误 (HubRegisterError; 网络类置 null, 供 waitConnected 判别)
+    // 行为参数 (env 可调, docs 十九)
+    this._pingInterval = Math.max(5, Config.KISAMA_HUB_PING_INTERVAL) * 1000;
+    this._retryBase = Math.max(0.5, Config.KISAMA_HUB_RETRY_BASE_SECONDS);
+    this._retryMax = Math.max(this._retryBase, Config.KISAMA_HUB_RETRY_MAX_SECONDS);
+    this._relayTimeout = Math.max(5, Config.KISAMA_HUB_RELAY_TIMEOUT) * 1000;
+    this._maxBody = Math.max(1, Config.KISAMA_HUB_MAX_BODY);
+    // 注入缝
+    this._wsFactory = null;
+    this._request = null;
+    // 运行态
+    this._stopFlag = false;
+    this._hubWs = null;
+    this._loopPromise = null;
+  }
+
+  snapshot() {
+    return {
+      tunnel_status: this.status,   // alive | reconnecting | failed
+      source: this.source,          // startup | dynamic
+      hub: this.hubUrl,
+      kname: this.kname,
+      url: this.relayUrl,
+      public_url: this.publicUrl || this.hubUrl,   // 注册帧实际上报基址 (KHUB_PUBLIC_URL 覆盖值 || KHUB 派生)
+      ports: [...this.ports].sort((a, b) => a - b),
+      consecutive_failures: this.consecutiveFailures,
+      last_error: this.lastError,
+      last_error_at: this.lastErrorAt,
+      last_connected_at: this.lastConnectedAt,
+      relay_count: this.relayCount
+    };
+  }
+
+  waitConnected(timeout = 15000) {
+    // 同步等待注册结果 (POST /api/hub 用): 返回 Promise<{ok, err}>
+    // ok=true → alive; err 为 HubRegisterError (永久性) 或 Error('unreachable'，网络类——注册项保留继续退避) 或超时
+    const deadline = Date.now() + Math.max(1000, timeout);
+    return new Promise((resolve) => {
+      const timer = setInterval(() => {
+        if (this._stopFlag) {
+          clearInterval(timer);
+          return resolve({ ok: false, err: new Error('tunnel stopped') });
+        }
+        if (this._registerError) {
+          clearInterval(timer);
+          return resolve({ ok: false, err: this._registerError });
+        }
+        if (this.status === 'alive') {
+          clearInterval(timer);
+          return resolve({ ok: true, err: null });
+        }
+        if (Date.now() >= deadline) {
+          clearInterval(timer);
+          return resolve({ ok: false, err: new Error('unreachable') });
+        }
+      }, 200);
+    });
+  }
+
+  _recordFailure(err) {
+    this.consecutiveFailures += 1;
+    this.status = 'reconnecting';
+    this.lastError = String((err && err.message) || err).slice(0, 300);
+    this.lastErrorAt = hubNowIso();
+  }
+
+  _backoff() {
+    return hubBackoffSeconds(this.consecutiveFailures, this._retryBase, this._retryMax);
+  }
+
+  start() {
+    if (this._loopPromise) return;
+    this._stopFlag = false;
+    this._loopPromise = this._loop().catch(() => {});
+  }
+
+  stop() {
+    this._stopFlag = true;
+    if (this._hubWs) {
+      try { this._hubWs.close(1000, 'agent stopping'); } catch (ignored) { /* 已关闭 */ }
+      this._hubWs = null;
+    }
+  }
+
+  _send(payload) {
+    const ws = this._hubWs;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try { ws.send(JSON.stringify(payload)); } catch (ignored) { /* 连接将断开重连 */ }
+    }
+  }
+
+  async _loop() {
+    while (!this._stopFlag) {
+      try {
+        await this._connectOnce();
+      } catch (err) {
+        this._recordFailure(err);
+        // 🛡️ 永久性注册错误 (name_taken/full/invalid_*) 记录到 _registerError, 供 waitConnected 判别;
+        // 网络类错误置 null (保留注册项继续退避)
+        this._registerError = err instanceof HubRegisterError ? err : null;
+      }
+      if (this._stopFlag) break;
+      const wait = this._backoff();
+      this.log.warning(`[KMODE3] ⚠️ 隧道断开 (${this.lastError}), ${Math.round(wait)}s 后第 ${this.consecutiveFailures} 次重连`);
+      await this._sleepInterruptible(wait * 1000);
+    }
+  }
+
+  _sleepInterruptible(ms) {
+    // 分片睡眠, stop() 置位后最多 250ms 内退出 (避免长退避拖住进程收尾)
+    return new Promise((resolve) => {
+      const t0 = Date.now();
+      const timer = setInterval(() => {
+        if (this._stopFlag || Date.now() - t0 >= ms) {
+          clearInterval(timer);
+          resolve();
+        }
+      }, 250);
+    });
+  }
+
+  // 连接 + 注册 + 帧泵。Promise 在整条连接存活期内挂起 (注册成功不 resolve!)，
+  // close 事件才 resolve (正常断线 → _loop 重连)；注册失败/建连错误 reject。
+  // ⚠️ 若在 ack 后立即 resolve，_loop 会立即重连并用新连接覆盖 _hubWs —— 旧连接的
+  // 心跳 _send 全部落空，hub 60s 读超时踢人，重连则 name_taken 打转 (0.6.6 实测教训)。
+  _connectOnce() {
+    return new Promise((resolve, reject) => {
+      const url = deriveHubWsUrl(this.hubUrl);
+      let ws;
+      try {
+        ws = this._wsFactory ? this._wsFactory(url) : new WebSocket(url);
+      } catch (err) {
+        return reject(err);
+      }
+      this._hubWs = ws;
+      const streams = new Map();
+      let settled = false;   // Promise 已定局 (防重入)
+      let acked = false;     // 注册成功 (决定 close 时 resolve 还是 reject)
+      let pingTimer = null;
+
+      const cleanup = () => {
+        if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
+        for (const st of streams.values()) st.stop();
+        streams.clear();
+      };
+      const settleDisconnect = () => {
+        if (!settled) { settled = true; cleanup(); resolve(); }
+      };
+      const settleError = (err) => {
+        if (!settled) { settled = true; cleanup(); reject(err); }
+      };
+
+      ws.on('open', () => {
+        const reg = {
+          t: 'register', v: 1, kname: this.kname,
+          version: Config.AGENT_VERSION, ports: [...this.ports].sort((a, b) => a - b)
+        };
+        reg.public_url = this.publicUrl || this.hubUrl;  // 公网基址: 覆盖值优先, 缺省 KHUB 派生 (0.6.6 续批二起恒携带)
+        this._send(reg);
+      });
+
+      ws.on('message', (data, isBinary) => {
+        if (isBinary) return;
+        let f;
+        try { f = JSON.parse(data.toString('utf8')); } catch (ignored) { return; }
+        if (!acked) {
+          if (f.t !== 'ack') return;
+          if (!f.ok) {
+            settleError(new HubRegisterError(f.code || 'unknown', f.message || ''));
+            return;
+          }
+          acked = true;
+          this.status = 'alive';
+          this.consecutiveFailures = 0;
+          this.lastError = null;
+          this.lastConnectedAt = hubNowIso();
+          this.log.info(`[KMODE3] ✅ 已连接 hub ${this.hubUrl} (注册名 ${this.kname}, 中继地址 ${this.relayUrl})`);
+          pingTimer = setInterval(() => {
+            if (this._stopFlag || ws.readyState !== WebSocket.OPEN) return;
+            this._send({ t: 'ping' });
+          }, this._pingInterval);
+          // 不 resolve: Promise 继续挂起, close 事件触发 settleDisconnect
+          return;
+        }
+        // 已注册: 帧分发
+        switch (f.t) {
+          case 'pong':
+            break;
+          case 'req':
+            this._handleReq(f).catch(() => {});
+            break;
+          case 'ws_open': {
+            const st = new HubWSStream(this, ws, f.id, f);
+            streams.set(f.id, st);
+            st.start();
+            break;
+          }
+          case 'ws_data': {
+            const st = streams.get(f.id);
+            if (st) st.fromHub(f);
+            break;
+          }
+          case 'ws_close': {
+            const st = streams.get(f.id);
+            if (st) { streams.delete(f.id); st.closeFromHub(f); }
+            break;
+          }
+          default:
+            break; // 未知帧类型忽略 (向前兼容)
+        }
+      });
+
+      ws.on('close', () => {
+        this._hubWs = null;
+        if (acked) settleDisconnect();
+        else settleError(new Error('connection closed during register'));
+      });
+
+      ws.on('error', (err) => {
+        // settled 后 error 必伴随 close, 由 close 分支清理
+        if (!acked) settleError(err);
+      });
+    });
+  }
+
+  // ---- HTTP 中继 req 分发 ----
+  async _handleReq(f) {
+    const rid = f.id;
+    const mode = f.mode || 'api';
+    const method = String(f.method || 'GET').toUpperCase();
+    const path = f.path || '/';
+    const query = f.query || '';
+    const body = f.body_b64 ? Buffer.from(f.body_b64, 'base64') : Buffer.alloc(0);
+    this.relayCount += 1;
+    try {
+      let url;
+      if (mode === 'port') {
+        const port = parseInt(f.port, 10) || 0;
+        if (!this.ports.includes(port)) {
+          // 白名单拒绝: 不发起连接, 无端口扫描侧信道
+          return this._sendErr(rid, 'port_not_allowed', `KHUB_PORTS 未放行端口 ${port}`);
+        }
+        url = `http://127.0.0.1:${port}${path}${query ? '?' + query : ''}`;
+      } else {
+        url = `http://127.0.0.1:${this.port}${path}${query ? '?' + query : ''}`;
+      }
+      const headers = filterLoopbackHeaders(f.headers);
+      let status, respHeaders, respBody;
+      if (this._request) {
+        ({ status, headers: respHeaders, body: respBody } = await this._request(method, url, headers, body));
+      } else {
+        ({ status, headers: respHeaders, body: respBody } = await this._httpRequest(method, url, headers, body, this._relayTimeout));
+      }
+      if (respBody.length > this._maxBody) {
+        return this._sendErr(rid, 'body_too_large', `响应体超过 KISAMA_HUB_MAX_BODY (${this._maxBody} 字节)`);
+      }
+      this._send({
+        t: 'res', id: rid, status: status,
+        headers: respHeaders, body_b64: respBody.toString('base64')
+      });
+    } catch (err) {
+      const code = err && err.code === 'body_too_large' ? 'body_too_large' : 'loopback_unreachable';
+      this._sendErr(rid, code, String((err && err.message) || err).slice(0, 300));
+    }
+  }
+
+  _httpRequest(method, url, headers, body, timeoutMs) {
+    return new Promise((resolve, reject) => {
+      let u;
+      try { u = new URL(url); } catch (err) { return reject(err); }
+      const mod = u.protocol === 'https:' ? https : http;
+      const req = mod.request(u, { method, headers }, (res) => {
+        const chunks = [];
+        let size = 0;
+        let tooLarge = false;
+        res.on('data', (c) => {
+          size += c.length;
+          if (size > this._maxBody + 1) { tooLarge = true; res.destroy(); return; }
+          chunks.push(c);
+        });
+        res.on('end', () => {
+          if (tooLarge) {
+            const err = new Error('response body exceeds KISAMA_HUB_MAX_BODY');
+            err.code = 'body_too_large';
+            return reject(err);
+          }
+          resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) });
+        });
+        res.on('error', reject);
+      });
+      req.setTimeout(timeoutMs, () => req.destroy(new Error('loopback request timeout')));
+      req.on('error', reject);
+      if (body && body.length) req.write(body);
+      req.end();
+    });
+  }
+
+  _sendErr(rid, code, message) {
+    this._send({ t: 'err', id: rid, code, message });
+  }
+}
+
+class HubWSStream {
+  // 单条 WS 流: 回环拨号本地服务, hub↔local 帧级双向转发 (binary/text 保真)
+  // 两种模式 (ws_open 帧的 port 字段区分, 0.6.6 续批):
+  // - api 模式 (无 port / port=0): 回环 agent 自身 /api/ws/* (终端, Noise/令牌透传)
+  // - 端口反代模式 (port>0): 回环 127.0.0.1:{port} — KHUB_PORTS 白名单校验 (拒绝时
+  //   ws_ack ok:false, hub 以 close 3001 关客户端; 与 HTTP 端口反代同语义)
+  // 生命周期: start() → open→ws_ack(ok) / error→ws_ack(ok:false) → 双向泵 → close→ws_close
+  constructor(mgr, hubWs, sid, f) {
+    this.mgr = mgr;
+    this.hubWs = hubWs;
+    this.sid = sid;
+    this.path = f.path || '/api/ws/terminal';
+    this.query = f.query || '';
+    this.port = parseInt(f.port, 10) || 0; // >0 = 端口反代模式 (目标端口)
+    // 拨号头: 剥 sec-websocket-* 握手头 (客户端经 hub 的原始握手头透传而来,
+    // 其中 permessage-deflate 协商会让 ws 库 client/server 压缩状态错乱 → 会话静默挂死)
+    const dialHeaders = {};
+    for (const [k, v] of Object.entries(filterLoopbackHeaders(f.headers))) {
+      if (!k.toLowerCase().startsWith('sec-websocket-')) dialHeaders[k] = v;
+    }
+    this.headers = dialHeaders;
+    this.localWs = null;
+    this.stopped = false;
+    this._pendingFromHub = []; // hub 下行缓冲: 本地 WS 握手未完成 (CONNECTING) 期间到达的帧,
+                               // open 后按序 flush —— 镜像 py 端 HubWSStream._from_hub 队列
+  }
+
+  start() {
+    // 端口反代模式: KHUB_PORTS 白名单校验 (拒绝时不发起连接, 无扫描侧信道)
+    if (this.port && !this.mgr.ports.includes(this.port)) {
+      this.stopped = true;
+      this.mgr._send({ t: 'ws_ack', id: this.sid, ok: false, message: `KHUB_PORTS 未放行端口 ${this.port}` });
+      return;
+    }
+    const targetPort = this.port || this.mgr.port;
+    const url = `ws://127.0.0.1:${targetPort}${this.path}${this.query ? '?' + this.query : ''}`;
+    let lws;
+    try {
+      lws = this.mgr._wsFactory ? this.mgr._wsFactory(url) : new WebSocket(url, { headers: this.headers });
+    } catch (err) {
+      this.stopped = true;
+      this.mgr._send({ t: 'ws_ack', id: this.sid, ok: false, message: String(err.message || err).slice(0, 200) });
+      return;
+    }
+    this.localWs = lws;
+    let opened = false;
+    lws.on('open', () => {
+      opened = true;
+      this.mgr._send({ t: 'ws_ack', id: this.sid, ok: true });
+      this._flushPendingFromHub(); // open 前缓冲的 hub 下行帧按序冲刷
+    });
+    lws.on('message', (data, isBinary) => {
+      this.mgr._send({
+        t: 'ws_data', id: this.sid, bt: isBinary ? 'bin' : 'txt',
+        data_b64: Buffer.from(data).toString('base64')
+      });
+    });
+    lws.on('error', (err) => {
+      if (!opened && !this.stopped) {
+        // 拨号失败 → ack 失败, hub 据此以 3001 关闭客户端
+        this.stopped = true;
+        this.mgr._send({ t: 'ws_ack', id: this.sid, ok: false, message: String(err.message || err).slice(0, 200) });
+      }
+    });
+    lws.on('close', (code, reason) => {
+      if (this.stopped) return;
+      this.stopped = true;
+      this.mgr._send({
+        t: 'ws_close', id: this.sid, ws_code: code || 1000,
+        reason: reason ? reason.toString() : 'closed'
+      });
+    });
+  }
+
+  fromHub(f) {
+    if (this.stopped) return;
+    if (!this.localWs || this.localWs.readyState !== WebSocket.OPEN) {
+      // CONNECTING 期间 hub 的下行帧 (客户端 msg1 常先于本地握手完成到达) 必须缓冲,
+      // 直接丢弃会让 Noise 握手首帧消失 → 会话静默挂死 (0.6.6 实测教训)
+      if (this.localWs && this.localWs.readyState === WebSocket.CONNECTING) {
+        this._pendingFromHub.push(f);
+      }
+      return;
+    }
+    this._flushPendingFromHub();
+    this._sendToLocal(f);
+  }
+
+  _flushPendingFromHub() {
+    while (this._pendingFromHub.length && this.localWs && this.localWs.readyState === WebSocket.OPEN) {
+      this._sendToLocal(this._pendingFromHub.shift());
+    }
+  }
+
+  _sendToLocal(f) {
+    const data = Buffer.from(f.data_b64 || '', 'base64');
+    if (f.bt === 'bin') this.localWs.send(data, { binary: true });
+    else this.localWs.send(data.toString('utf8'), { binary: false });
+  }
+
+  closeFromHub(f) {
+    // hub 侧关闭 → 断本地; 不回发 ws_close (hub 已删流, 回发亦被忽略)
+    this.stopped = true;
+    if (this.localWs && this.localWs.readyState === WebSocket.OPEN) {
+      try { this.localWs.close(1000, Buffer.from(String(f.reason || ''))); } catch (ignored) { /* 忽略 */ }
+    }
+  }
+
+  stop() {
+    // 隧道收尾: 断本地连接 (客户端侧由 hub 以 1011 统一关闭)
+    this.stopped = true;
+    if (this.localWs && this.localWs.readyState !== WebSocket.CLOSED) {
+      try { this.localWs.close(1001); } catch (ignored) { /* 忽略 */ }
+    }
+  }
+}
+
+// ============================================================================
 // KMODE 启动模式 (docs/API.MD 第九节)
 // KMODE=1 时: 启动即建临时隧道并把域名写入 KPATH 文件 (缺省 $HOME/domain.txt);
 // 第一次 /api/baseinfo 成功响应后删除该文件; stdin 收到 /domain 指令时输出域名。
@@ -8339,6 +8993,81 @@ class ArgoTunnelManager {
 // 🛡️ 守护自愈: 隧道凭据被 Cloudflare 回收时自动重新注册, 域名会变化 ——
 // KMODE=1 自动重写域名文件, KMODE=2 自动重新上报 shz.al (409 冲突走 PUT 覆盖)。
 // ============================================================================
+// ----------------------------------------------------------------------------
+// HubTunnelRegistrar — hub 注册表 (0.6.6 续批, docs/API.MD 19.10)
+// 管理多条 HubTunnelManager (kname 唯一键): KMODE=3 静态项 (source=startup) 与
+// POST /api/hub 动态项 (source=dynamic, 持久化到 kstore data.hubregs) 共存;
+// register 同步等待注册结果 (waitConnected), 永久性错误 (name_taken 等) 不保留
+// 注册项, 网络类错误保留并继续退避 (状态后查 GET /api/hub)。
+// ----------------------------------------------------------------------------
+class HubTunnelRegistrar {
+  constructor(logger) {
+    this.items = new Map();            // kname -> HubTunnelManager
+    this.log = logger || Logger;
+    // 🧪 注入缝 (生产恒为 null): (hubUrl, kname, port, ports, logger, source) => manager 实例
+    this._managerFactory = null;
+  }
+
+  async register(hubUrl, kname, ports, source = 'dynamic', waitTimeout = 15000) {
+    // 返回 {snapshot, code, message}: code=null 成功; 'unreachable'=网络类 (保留);
+    // 其余为 HubRegisterError.code / name_taken (不保留)
+    const nameErr = hubKnameError(kname);
+    if (nameErr) {
+      return { snapshot: { kname: (kname || '').trim().toLowerCase(), hub: (hubUrl || '').trim().replace(/\/+$/, ''),
+                           source, tunnel_status: 'failed', ports: [...(ports || [])].sort((a, b) => a - b) },
+               code: 'invalid_name', message: nameErr };
+    }
+    const normKname = kname.trim().toLowerCase();
+    if (this.items.has(normKname)) {
+      return { snapshot: this.items.get(normKname).snapshot(), code: 'name_taken', message: 'KNAME 已在本 agent 注册表中 (kname 唯一)' };
+    }
+    const manager = this._managerFactory
+      ? this._managerFactory(hubUrl, kname, Config.PORT, ports, this.log, source)
+      : new HubTunnelManager(hubUrl, kname, Config.PORT, ports, this.log, source);
+    manager.start();
+    const { ok, err } = await manager.waitConnected(waitTimeout);
+    if (ok) {
+      this.items.set(normKname, manager);
+      return { snapshot: manager.snapshot(), code: null, message: null };
+    }
+    if (err instanceof HubRegisterError) {
+      manager.stop();
+      const snap = manager.snapshot();
+      snap.tunnel_status = 'failed';
+      return { snapshot: snap, code: err.code, message: err.message };
+    }
+    // 网络类: 保留继续退避
+    const snap = manager.snapshot();
+    snap.tunnel_status = 'reconnecting';
+    this.items.set(normKname, manager);
+    return { snapshot: snap, code: 'unreachable', message: String((err && err.message) || 'hub 连接未确认') };
+  }
+
+  unregister(kname) {
+    // 注销并停止隧道; 返回 snapshot (未注册 → null)
+    const normKname = (kname || '').trim().toLowerCase();
+    const manager = this.items.get(normKname);
+    if (!manager) return null;
+    const snap = manager.snapshot();
+    this.items.delete(normKname);
+    manager.stop();
+    return snap;
+  }
+
+  get(kname) {
+    return this.items.get((kname || '').trim().toLowerCase()) || null;
+  }
+
+  list() {
+    return [...this.items.values()].map((m) => m.snapshot());
+  }
+
+  stopAll() {
+    for (const manager of this.items.values()) manager.stop();
+    this.items.clear();
+  }
+}
+
 class KModeController {
   static _baseinfoHooked = false; // 域名文件只删一次
   static _domain = null;          // 内存中最后已知域名 (文件删除后 /domain 仍可用)
@@ -8879,8 +9608,8 @@ class TerminalSessionHandler {
         this.useNoise = !token; 
         log(this.useNoise ? "🔗 检测到 WS 连接，启用 Noise 加密" : "🔐 检测到 Token，视为 WSS 链路，跳过 Noise");
 
-        // 🚀 核心防丢包：一连上立刻全量接管所有报文！
-        ws.on('message', (msg) => this._handleRawMessage(msg));
+    // 🚀 核心防丢包：一连上立刻全量接管所有报文！
+    ws.on('message', (msg) => this._handleRawMessage(msg));
 
         try {
             if (this.useNoise) {
@@ -8901,8 +9630,8 @@ class TerminalSessionHandler {
         if (!pty) {
             const reason = ptyUnavailableReason || 'pty 实现不可用';
             log(`❌ 终端基础设施不可用: ${reason}`);
-            // close reason 上限 123 字节: 超长 (中文 3 字节/字) 会让 ws 库抛异常, 1011 帧发不出去
-            try { this.websocket.close(1011, 'terminal unavailable: pty probe failed'); } catch (e) {}
+            // close reason 用短码常量 (上限 123 字节), 真实 reason 已在上一行 ERROR 日志
+            try { this.websocket.close(1011, PTY_CLOSE_REASON); } catch (e) {}
             throw new Error(reason);
         }
         const shell = this.getAvailableShell();
@@ -9570,7 +10299,7 @@ async function main(options = {}) {
       const result = await TaskManager.setOnetimeTasks(req.body);
       res.json(result);
     } catch (e) {
-      res.status(500).json({ status: 'error', message: e.message });
+      res.status(e.status || 500).json({ status: 'error', message: e.message });
     }
   });
 
@@ -9640,6 +10369,92 @@ async function main(options = {}) {
     warning: (...parts) => Logger.warn(parts.join(' '))
   };
   const argoTunnelManager = new ArgoTunnelManager(argoTunnelLogger);
+
+  // KMODE=3: kisama-hub 出站隧道 (docs/API.MD 十九); KHUB/KNAME 缺失或非法时告警并保持普通启动。
+  // 0.6.6 续批: 引入 HubTunnelRegistrar 注册表 — KMODE=3 静态项 (source=startup) 与动态注册项
+  // (source=dynamic, 持久化于 kstore data.hubregs) 共存, GET/POST/DELETE /api/hub 管理。
+  // start 统一延迟到 listen 回调 (回环目标就绪后), 恢复的动态注册项也在此点启动。
+  const hubRegistrar = new HubTunnelRegistrar(argoTunnelLogger);
+  const hubPendingRestore = [];   // kstore 恢复的动态注册项 (restoreFromStore 后填充, listen 回调执行)
+  let hubTunnelManager = null;
+  if (Config.KMODE === '3') {
+    const nameErr = hubKnameError(Config.KNAME);
+    if (!Config.KHUB) {
+      Logger.warn('[KMODE3] ⚠️ KHUB 未设置, KMODE=3 未生效 (本地服务照常)');
+    } else if (nameErr) {
+      Logger.warn(`[KMODE3] ⚠️ ${nameErr}, KMODE=3 未生效 (本地服务照常)`);
+    } else {
+      if (!Config.KHUB_PORTS.length) {
+        Logger.info('[KMODE3] 💡 KHUB_PORTS 未配置, 端口反代已禁用 (仅中继 /api 与终端)');
+      }
+      const manager = new HubTunnelManager(Config.KHUB, Config.KNAME, Config.PORT, Config.KHUB_PORTS, argoTunnelLogger, 'startup');
+      hubRegistrar.items.set(Config.KNAME.trim().toLowerCase(), manager); // 启动项不等待连接, 直接入表
+      hubTunnelManager = manager;  // 兼容字段: GET /api/hub 的 tunnel 指向静态实例
+    }
+  }
+
+  const persistHubregs = () => {
+    // 注册表状态落盘到 kstore data.hubregs (KSTORE 未启用时 false, 注册仅内存)
+    return TaskStore.saveHubregs(hubRegistrar.list().map((r) => ({ hub: r.hub, kname: r.kname, ports: r.ports })));
+  };
+
+  // 查询临时隧道列表
+  app.get('/api/argo', (req, res) => {
+    const tunnels = argoTunnelManager.list();
+    res.json({ status: 'ok', count: tunnels.length, tunnels });
+  });
+
+  // KMODE=3 / 动态注册的 kisama-hub 隧道状态 (docs/API.MD 十九 19.8/19.10)。
+  // additive 兼容: tunnel = KMODE=3 静态实例快照 (无则 null); registrations = 注册表全量列表。
+  // 该端点走验签 (非白名单)
+  app.get('/api/hub', (req, res) => {
+    const registrations = hubRegistrar.list();
+    if (!hubTunnelManager && registrations.length === 0) {
+      return res.json({ status: 'ok', enabled: false, message: '无 hub 注册 (KMODE=3 或 POST /api/hub 动态注册)' });
+    }
+    res.json({
+      status: 'ok',
+      enabled: registrations.length > 0,
+      tunnel: hubTunnelManager ? hubTunnelManager.snapshot() : null,
+      registrations
+    });
+  });
+
+  // 动态注册到 kisama-hub (docs/API.MD 19.10): 同步等待注册结果 (15s), 永久性错误
+  // (invalid_name/name_taken/full) 不保留注册项, 网络类失败保留并继续退避 (500, 后查 GET)。
+  // 注册成功立即落盘 kstore data.hubregs (KSTORE 启用时), 重启自动恢复; 未启用 persisted=false。
+  app.post('/api/hub', async (req, res) => {
+    const body = parseJsonBody(req.body) || {};
+    const hubUrl = String(body.hub || '').trim().replace(/\/+$/, '');
+    if (!/^https?:\/\//i.test(hubUrl)) {
+      return res.status(422).json({ status: 'error', code: 'invalid_hub', message: 'hub 必须以 http:// 或 https:// 开头' });
+    }
+    const ports = Array.isArray(body.ports) ? body.ports.filter((p) => Number.isInteger(p) && p >= 1 && p <= 65535) : [];
+    const { snapshot, code, message } = await hubRegistrar.register(hubUrl, String(body.kname || ''), ports, 'dynamic', 15000);
+    if (code === null) {
+      const persisted = persistHubregs();
+      return res.json({ status: 'ok', persisted, registration: snapshot });
+    }
+    if (code === 'unreachable') {
+      // 网络类失败: 注册项保留继续退避 (意图落盘), 状态后查 GET /api/hub
+      const persisted = persistHubregs();
+      return res.status(500).json({ status: 'error', persisted, code, message, registration: snapshot });
+    }
+    const httpCode = code === 'name_taken' || code === 'full' ? 409 : 422;
+    res.status(httpCode).json({ status: 'error', persisted: false, code, message, registration: snapshot });
+  });
+
+  // 注销一条注册 (stop 隧道 + 移出注册表 + 落盘同步删除); 未注册 → 404
+  app.delete('/api/hub', (req, res) => {
+    const body = parseJsonBody(req.body) || {};
+    const kname = String(body.kname || '');
+    const removed = hubRegistrar.unregister(kname);
+    if (!removed) {
+      return res.status(404).json({ status: 'error', message: `KNAME ${kname} 未注册` });
+    }
+    const persisted = persistHubregs();
+    res.json({ status: 'ok', persisted, removed });
+  });
 
   // 查询临时隧道列表
   app.get('/api/argo', (req, res) => {
@@ -9767,6 +10582,12 @@ async function main(options = {}) {
   // 💾 任务持久化恢复 (0.5.7, docs/API.MD 十三): listen 之前恢复, 离线自治
   TaskManager.restoreFromStore();
 
+  // 0.6.6 续批: kstore data.hubregs 的动态注册项读取暂存 (listen 回调统一启动——
+  // 回环目标 (自身 HTTP 服务) 就绪后才拨本地; 与 KMODE=3 静态项同点)
+  for (const reg of TaskStore.getHubregs()) {
+    hubPendingRestore.push(reg);
+  }
+
   // 启动服务器
   Logger.debug('Starting HTTP server...');
   const server = app.listen(Config.PORT, Config.HOST, () => {
@@ -9776,6 +10597,22 @@ async function main(options = {}) {
     // KMODE=2 但 KNAME 缺失/非法时退化为普通启动 (等同 KMODE=0)
     if (Config.KMODE === '1' || (Config.KMODE === '2' && KModeController.knameValid())) {
       KModeController.activate(argoTunnelManager);
+    }
+    // KMODE=3: kisama-hub 出站隧道启动 (server 就绪后, 回环目标可达)
+    if (Config.KMODE === '3' && hubTunnelManager) {
+      hubTunnelManager.start();
+    }
+    // 启动任务子类型恢复: kstore hubregs 的动态注册项在此统一启动 (静态项 kname 冲突时跳过告警)
+    for (const reg of hubPendingRestore) {
+      const normKname = String(reg.kname || '').trim().toLowerCase();
+      if (hubRegistrar.get(normKname)) {
+        Logger.warn(`[KMODE3] ⚠️ 恢复注册项 ${normKname} 与静态项 KNAME 冲突, 跳过 (kstore 条目保留)`);
+        continue;
+      }
+      const manager = new HubTunnelManager(reg.hub, reg.kname, Config.PORT, reg.ports, argoTunnelLogger, 'dynamic');
+      hubRegistrar.items.set(normKname, manager);
+      manager.start();
+      Logger.info(`[KMODE3] ✅ 已恢复动态注册项: ${normKname} → ${reg.hub}`);
     }
     // 🐚 linux/node: 启动即预取 pty 降级链 (含缺二进制时的 npm 自愈补装), 首个终端会话零等待;
     // 失败只记日志, 会话到来时按 ptyUnavailableReason 优雅拒绝
@@ -9803,4 +10640,4 @@ if (require.main === module||require.main?.filename?.includes('ts-node')) {
   main().catch(Logger.error);
 }
 
-module.exports = { main, loadCurves, Config, CryptoManager, SystemInfoCollector, CommandExecutor, FileManager, TaskManager, TaskStore, ArgoTunnelManager, argoBackoffSeconds, argoTruncateError, argoRetryBaseSeconds, argoRetryMaxSeconds, argoReregisterAfter, KModeController, ZipArchiver, TempKeyManager, SecureDns, installDnsHook, patchDnsLookup, QuicConnection, QuicSession, QuicTlsClient, QuicKeys, QuicReader, quicInitialKeys, quicNextKeys, quicWriteVarint, quicReadVarint, quicDecodePacketNumber, quicApplyProtection, quicRemoveProtection, quicEncodeTransportParameters, quicDecodeTransportParameters, quicEncodeAck, quicRangesFromAck, hkdfExpandLabel, CapnpBuilder, capnpMessages, capnpWords, capnpStruct, capnpText, capnpStructList, capnpReturnResult, capnpConnectRequest, capnpConnectResponse, connectEdgeQuic, buildQuicRequest, verifyEdgeQuicCertificate, QUIC_DATA_STREAM_PREAMBLE, QUIC_SERVER_NAME, QUIC_ALPN, __ptySelector: { detectLinuxLibc, ptyCandidateOrder, probePtyModule, ensurePty, PTY_QWQO_VERSION, getState: () => ({ ready: !!pty, reason: ptyUnavailableReason }) } };
+module.exports = { main, loadCurves, Config, CryptoManager, SystemInfoCollector, CommandExecutor, FileManager, TaskManager, TaskStore, ArgoTunnelManager, argoBackoffSeconds, argoTruncateError, argoRetryBaseSeconds, argoRetryMaxSeconds, argoReregisterAfter, KModeController, HubTunnelManager, HubWSStream, HubRegisterError, HubTunnelRegistrar, hubKnameError, hubPublicUrlError, deriveHubWsUrl, filterLoopbackHeaders, hubBackoffSeconds, parseHubPorts, ZipArchiver, TempKeyManager, SecureDns, installDnsHook, patchDnsLookup, QuicConnection, QuicSession, QuicTlsClient, QuicKeys, QuicReader, quicInitialKeys, quicNextKeys, quicWriteVarint, quicReadVarint, quicDecodePacketNumber, quicApplyProtection, quicRemoveProtection, quicEncodeTransportParameters, quicDecodeTransportParameters, quicEncodeAck, quicRangesFromAck, hkdfExpandLabel, CapnpBuilder, capnpMessages, capnpWords, capnpStruct, capnpText, capnpStructList, capnpReturnResult, capnpConnectRequest, capnpConnectResponse, connectEdgeQuic, buildQuicRequest, verifyEdgeQuicCertificate, QUIC_DATA_STREAM_PREAMBLE, QUIC_SERVER_NAME, QUIC_ALPN, __ptySelector: { detectLinuxLibc, ptyCandidateOrder, probePtyModule, ensurePty, PTY_QWQO_VERSION, PTY_CLOSE_REASON, qwqoPlatformBinaryPath, selectPtyImplementation, getState: () => ({ ready: !!pty, reason: ptyUnavailableReason }) } };

@@ -182,10 +182,12 @@ function testConfigMarks() {
     'disabled store misses kstore');
   // kmode: 按归一化后的 Config.KMODE 配置值判定 (2q/2quic → '2' 发生在 Config 定义处);
   // 不校验 KNAME 生效条件 (docs/API.MD 15.9/15.10)
-  const cases = { '0': [false, false], '1': [true, false], '2': [false, true], '3': [false, false], 'abc': [false, false] };
-  for (const [kmode, [kmode1, kmode2]] of Object.entries(cases)) {
+  // 0.6.6 新增 kmode3 (KMODE=3 kisama-hub 出站隧道, docs/API.MD 15.11)
+  const cases = { '0': [false, false, false], '1': [true, false, false], '2': [false, true, false], '3': [false, false, true], 'abc': [false, false, false] };
+  for (const [kmode, [kmode1, kmode2, kmode3]] of Object.entries(cases)) {
     assert.strictEqual(withConfigState({ kmode }, () => c._markKmode1()), kmode1, `KMODE=${kmode} kmode1`);
     assert.strictEqual(withConfigState({ kmode }, () => c._markKmode2()), kmode2, `KMODE=${kmode} kmode2`);
+    assert.strictEqual(withConfigState({ kmode }, () => c._markKmode3()), kmode3, `KMODE=${kmode} kmode3`);
   }
   // 非 Linux (真实 process.platform): 配置类标记仍输出, 主机探测跳过
   assert.deepStrictEqual(

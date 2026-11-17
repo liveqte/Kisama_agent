@@ -53,6 +53,20 @@ public class kisama {
     private final String KPATH;
     private final String KNAME;
     private final String KNAME_KEY;
+    // KMODE=3 kisama-hub 中继 (docs/API.MD 十九): KHUB=hub 基址 (ws/wss 由 scheme 推导),
+    // KHUB_PORTS=端口反代白名单 (逗号分隔, 缺省空=禁用; 非法条目忽略);
+    // 行为参数 env 可调 (KISAMA_HUB_*), 存毫秒便于统一比较; 不进烘焙构造 (决策: 避免插件仓同步负担)
+    private final String KHUB;
+    // KHUB_PUBLIC_URL=hub 对面板/客户端暴露的公网基址覆盖值 (可选, 0.6.6 续批二): 注册时经
+    // public_url 字段上报, hub 拼订阅/页面/ack url 时优先用它; 未配置时缺省自动上报 KHUB 派生
+    // 基址, 本变量用于内网 KHUB 等派生值 ≠ 公网地址的部署; 非法值告警并回退 KHUB 派生 (hubPublicUrlError 判定)
+    private final String KHUB_PUBLIC_URL;
+    private final java.util.Set<Integer> KHUB_PORTS;
+    private final long KISAMA_HUB_RETRY_BASE_MS;
+    private final long KISAMA_HUB_RETRY_MAX_MS;
+    private final long KISAMA_HUB_PING_INTERVAL_MS;
+    private final long KISAMA_HUB_RELAY_TIMEOUT_MS;
+    private final long KISAMA_HUB_MAX_BODY;
     private final String FILE_ROOT;
     private final String KEYS_DIR;
     private final String ECDSA_PUBLIC_KEY_B64;
@@ -118,6 +132,11 @@ public class kisama {
 
     private final TempKeyManager tempKeyManager = new TempKeyManager();
     private final ArgoTunnelManager argoTunnelManager = new ArgoTunnelManager();
+    // KMODE=3 hub 注册表 (0.6.6 续批, docs/API.MD 19.10): KMODE=3 静态项 (source=startup) 与
+    // POST /api/hub 动态项 (source=dynamic, 持久化 kstore data.hubregs) 共存, kname 唯一键
+    private final HubTunnelRegistrar hubRegistrar = new HubTunnelRegistrar();
+    // KMODE=3 静态注册成功的 kname (GET /api/hub 的 tunnel 兼容字段指向该实例; 0.6.6 消费方语义)
+    private volatile String hubStaticKname = null;
 
     private final List<String> onetime = Collections.synchronizedList(new ArrayList<>());
     private final List<Map<String, Object>> onetime_log = Collections.synchronizedList(new ArrayList<>());
@@ -146,6 +165,8 @@ public class kisama {
     // 宿主烘焙 KSTORE/KSTORE_KEY (9 参构造注入; null=未提供, initTaskStore 经 resolveSetting 走统一优先级)
     private final String BAKED_KSTORE;
     private final String BAKED_KSTORE_KEY;
+    // hub 注册任务子类型 (data.hubregs, 0.6.6 起; additive 键, 老版本回写会丢弃 — load 填充/saveHubRegs 更新)
+    private final List<Map<String, Object>> hubregs = Collections.synchronizedList(new ArrayList<>());
 
     private volatile boolean isRunning = false;
 
@@ -202,7 +223,7 @@ public class kisama {
     // 其余 (无 opt-in 头/超阈值) 保持原始字节流——旧客户端零适配, 大文件不付 Base64+33% 与
     // 整读内存的代价。0 = 关闭加密 (恒明文)。
     private static final long DOWNLOAD_ENCRYPT_MAX = Long.parseLong(DOTENV.getOrDefault("DOWNLOAD_ENCRYPT_MAX", "4194304"));
-    private static final String AGENT_VERSION = "0.6.5-java";
+    private static final String AGENT_VERSION = "0.6.6-java";
     // 内置加密 DNS (DoH, docs/API.MD 第十八节): off=系统解析 (默认, 零行为变化);
     // on=全部出站域名解析走 DoH JSON API 防污染。KISAMA_DOH_SERVERS 逗号分隔自定义链,
     // 缺省 阿里 223.5.5.5 → Cloudflare 1.1.1.1 → Google 8.8.8.8
@@ -251,6 +272,15 @@ public class kisama {
         this.KNAME_KEY = knameKey.isEmpty() ? kname : knameKey;
         // 域名文件路径, 缺省 $HOME/domain.txt, 支持 $HOME / ~ 前缀
         this.KPATH = DOTENV.getOrDefault("KPATH", "");
+        // KMODE=3 kisama-hub 中继 (docs/API.MD 十九): 纯 DOTENV 解析 (无参/独立运行无烘焙通道)
+        this.KHUB = trimHubUrl(DOTENV.get("KHUB"));
+        this.KHUB_PUBLIC_URL = trimHubUrl(DOTENV.get("KHUB_PUBLIC_URL"));
+        this.KHUB_PORTS = parseHubPorts(DOTENV.get("KHUB_PORTS"));
+        this.KISAMA_HUB_RETRY_BASE_MS = parseHubSecondsMs(DOTENV.get("KISAMA_HUB_RETRY_BASE_SECONDS"), 2000L);
+        this.KISAMA_HUB_RETRY_MAX_MS = parseHubSecondsMs(DOTENV.get("KISAMA_HUB_RETRY_MAX_SECONDS"), 60000L);
+        this.KISAMA_HUB_PING_INTERVAL_MS = parseHubSecondsMs(DOTENV.get("KISAMA_HUB_PING_INTERVAL"), 20000L);
+        this.KISAMA_HUB_RELAY_TIMEOUT_MS = parseHubSecondsMs(DOTENV.get("KISAMA_HUB_RELAY_TIMEOUT"), 60000L);
+        this.KISAMA_HUB_MAX_BODY = parseHubMaxBody(DOTENV.get("KISAMA_HUB_MAX_BODY"));
         this.FILE_ROOT = resolveSafeFileRoot();
         this.KEYS_DIR = DOTENV.getOrDefault("KEYS_DIR", "./keys");
         this.ECDSA_PUBLIC_KEY_B64 = getKeyWithFallback("ECDSA_PUBKEY", "agent_ecdsa_pub.pem", "YOUR_HARDCODED_ECDSA_PUBLIC_KEY_HERE");
@@ -299,6 +329,16 @@ public class kisama {
         this.KNAME = kname2;
         this.KNAME_KEY = knameKey2.isEmpty() ? kname2 : knameKey2;
         this.KPATH = resolveSetting("KPATH", bakedKpath, "");
+        // KMODE=3 kisama-hub 中继 (docs/API.MD 十九): resolveSetting 统一优先级 (真实 env > .env > 内置缺省);
+        // 决策: KHUB 家族不进烘焙构造, 避免插件仓同步负担
+        this.KHUB = trimHubUrl(resolveSetting("KHUB", null, ""));
+        this.KHUB_PUBLIC_URL = trimHubUrl(resolveSetting("KHUB_PUBLIC_URL", null, ""));
+        this.KHUB_PORTS = parseHubPorts(resolveSetting("KHUB_PORTS", null, ""));
+        this.KISAMA_HUB_RETRY_BASE_MS = parseHubSecondsMs(resolveSetting("KISAMA_HUB_RETRY_BASE_SECONDS", null, ""), 2000L);
+        this.KISAMA_HUB_RETRY_MAX_MS = parseHubSecondsMs(resolveSetting("KISAMA_HUB_RETRY_MAX_SECONDS", null, ""), 60000L);
+        this.KISAMA_HUB_PING_INTERVAL_MS = parseHubSecondsMs(resolveSetting("KISAMA_HUB_PING_INTERVAL", null, ""), 20000L);
+        this.KISAMA_HUB_RELAY_TIMEOUT_MS = parseHubSecondsMs(resolveSetting("KISAMA_HUB_RELAY_TIMEOUT", null, ""), 60000L);
+        this.KISAMA_HUB_MAX_BODY = parseHubMaxBody(resolveSetting("KISAMA_HUB_MAX_BODY", null, ""));
         this.FILE_ROOT = resolveSafeFileRoot();
         this.KEYS_DIR = DOTENV.getOrDefault("KEYS_DIR", "./keys");
         this.BAKED_KSTORE = bakedKstore;
@@ -1373,6 +1413,84 @@ public class kisama {
             return "";
         });
 
+        // ==================== 🌐 kisama-hub 注册路由 (0.6.6 续批, docs/API.MD 19.9/19.10) ====================
+        // KMODE=3 / 动态注册的 kisama-hub 隧道状态; 该端点走验签 (非白名单), 与 /api/argo 同区
+        get("/api/hub", (req, res) -> {
+            res.type("application/json");
+            List<Map<String, Object>> registrations = this.hubRegistrar.list();
+            HubTunnelManager staticMgr = this.hubStaticKname != null ? this.hubRegistrar.get(this.hubStaticKname) : null;
+            if (staticMgr == null && registrations.isEmpty()) {
+                return this.gson.toJson(Map.of(
+                        "status", "ok", "enabled", false,
+                        "message", "无 hub 注册 (KMODE=3 或 POST /api/hub 动态注册)"));
+            }
+            Map<String, Object> payload = new LinkedHashMap<>();
+            payload.put("status", "ok");
+            payload.put("enabled", !registrations.isEmpty());
+            if (staticMgr != null) {
+                // additive 兼容: tunnel = KMODE=3 静态实例快照 (无则省略)
+                payload.put("tunnel", staticMgr.snapshot());
+            }
+            payload.put("registrations", registrations);
+            return this.gson.toJson(payload);
+        });
+
+        post("/api/hub", (req, res) -> {
+            res.type("application/json");
+            Map<String, Object> body = req.attribute("json_body");
+            String hub = trimHubUrl(body != null && body.get("hub") != null ? String.valueOf(body.get("hub")) : "");
+            String kname = body != null && body.get("kname") != null ? String.valueOf(body.get("kname")) : "";
+            List<Integer> ports = new ArrayList<>();
+            if (body != null && body.get("ports") instanceof List) {
+                for (Object p : (List<?>) body.get("ports")) {
+                    if (p instanceof Number) {
+                        int v = ((Number) p).intValue();
+                        if (v >= 1 && v <= 65535) ports.add(v);
+                    }
+                }
+            }
+            String hubLower = hub.toLowerCase(Locale.ROOT);
+            if (!hubLower.startsWith("http://") && !hubLower.startsWith("https://")) {
+                halt(422, this.gson.toJson(Map.of(
+                        "status", "error", "persisted", false, "code", "invalid_hub",
+                        "message", "hub 必须以 http:// 或 https:// 开头")));
+            }
+            // 动态注册到 kisama-hub (docs/API.MD 19.10): 同步等待注册结果 (15s), 永久性错误
+            // (invalid_name/name_taken/full) 不保留注册项, 网络类失败保留并继续退避 (500, 后查 GET)。
+            // 注册成功立即落盘 kstore data.hubregs (KSTORE 启用时), 重启自动恢复; 未启用 persisted=false。
+            HubTunnelRegistrar.HubRegisterResult rr = this.hubRegistrar.register(hub, kname, ports, "dynamic", 15000);
+            if (rr.code == null) {
+                boolean persisted = persistHubRegs();
+                return this.gson.toJson(Map.of("status", "ok", "persisted", persisted, "registration", rr.snapshot));
+            }
+            if ("unreachable".equals(rr.code)) {
+                // 网络类失败: 注册项保留继续退避 (意图落盘), 状态后查 GET /api/hub
+                boolean persisted = persistHubRegs();
+                halt(500, this.gson.toJson(Map.of("status", "error", "persisted", persisted,
+                        "code", rr.code, "message", rr.message == null ? "" : rr.message, "registration", rr.snapshot)));
+            }
+            int httpCode = ("name_taken".equals(rr.code) || "full".equals(rr.code)) ? 409 : 422;
+            halt(httpCode, this.gson.toJson(Map.of("status", "error", "persisted", false,
+                    "code", rr.code, "message", rr.message == null ? "" : rr.message, "registration", rr.snapshot)));
+            return "";
+        });
+
+        delete("/api/hub", (req, res) -> {
+            res.type("application/json");
+            Map<String, Object> body = req.attribute("json_body");
+            String kname = body != null && body.get("kname") != null ? String.valueOf(body.get("kname")) : "";
+            if (kname.trim().isEmpty()) {
+                halt(422, this.gson.toJson(Map.of("status", "error", "message", "kname is required")));
+            }
+            // 注销一条注册 (stop 隧道 + 移出注册表 + 落盘同步删除); 未注册 → 404
+            Map<String, Object> snap = this.hubRegistrar.unregister(kname);
+            if (snap == null) {
+                halt(404, this.gson.toJson(Map.of("status", "error", "message", "KNAME " + kname + " 未注册")));
+            }
+            boolean persisted = persistHubRegs();
+            return this.gson.toJson(Map.of("status", "ok", "persisted", persisted, "removed", snap));
+        });
+
         get("/", (req, res) -> "kisama-running");
 
         after((req, res) -> {
@@ -1429,7 +1547,8 @@ public class kisama {
 
         // KMODE=1: 隧道 + 域名文件 + stdin 监听; KMODE=2: 隧道 + shz.al 静默上报 (docs/API.MD 第九节)
         // KMODE=2 但 KNAME 缺失/非法时退化为普通启动 (等同 KMODE=0)
-        if (this.KMODE == 1 || (this.KMODE == 2 && knameValid())) {
+        // KMODE=3: kisama-hub 公网中继 (docs/API.MD 十九, 0.6.6); KHUB/KNAME 缺失时退化普通启动
+        if (this.KMODE == 1 || (this.KMODE == 2 && knameValid()) || this.KMODE == 3) {
             activateKMode();
         }
     }
@@ -1438,6 +1557,8 @@ public class kisama {
         if (!isRunning) return;
         log("[TRACE-INIT] 正在关闭 Kisama Agent...");
         this.argoTunnelManager.shutdownAll();
+        // 🌐 停止全部 kisama-hub 注册隧道 (静态项 + 动态项, 0.6.6 续批)
+        this.hubRegistrar.stopAll();
         spark.Spark.stop();
         // 🌟 核心补全：在内部强制阻塞主线程，死等 Jetty 清理完所有 Servlet 并彻底烟消云散！
         // 这样可以确保在该方法返回前，所有类加载行为全部安全结束。
@@ -1461,6 +1582,7 @@ public class kisama {
     private static int parseKmode(String raw) {
         if ("1".equals(raw)) return 1;
         if ("2".equals(raw) || "2q".equalsIgnoreCase(raw) || "2quic".equalsIgnoreCase(raw)) return 2;
+        if ("3".equals(raw)) return 3;   // KMODE=3: kisama-hub 公网中继 (docs/API.MD 十九, 0.6.6)
         return 0;
     }
 
@@ -2188,6 +2310,58 @@ public class kisama {
     public void activateKMode() {
         // 生效横幅走 consoleOut 自适配通道, 不走 LOG_LEVEL 阈值: 运维需要一眼确认烘焙值是否生效、被谁压住
         consoleOut("[KMODE] active mode=" + KMODE + " src=" + KMODE_SOURCE);
+        // KMODE=3: kisama-hub 出站隧道 (docs/API.MD 十九, 0.6.6 续批); KHUB/KNAME 缺失或非法时
+        // 告警并保持普通启动 (本地服务照常, 静态注册不建立)。
+        // HubTunnelRegistrar 注册表 — KMODE=3 静态项 (source=startup) 与动态注册项
+        // (source=dynamic, 持久化于 kstore data.hubregs) 共存, GET/POST/DELETE /api/hub 管理
+        if (KMODE == 3) {
+            String nameErr = hubKnameError(KNAME);
+            if (KHUB == null || KHUB.isEmpty()) {
+                logWarn("[KMODE3] ⚠️ KHUB 未设置, KMODE=3 未生效 (本地服务照常)");
+            } else if (nameErr != null) {
+                logWarn("[KMODE3] ⚠️ " + nameErr + ", KMODE=3 未生效 (本地服务照常)");
+            } else {
+                List<Integer> hubPorts = new ArrayList<>(KHUB_PORTS);
+                if (hubPorts.isEmpty()) {
+                    log("[KMODE3] 💡 KHUB_PORTS 未配置, 端口反代已禁用 (仅中继 /api 与终端)");
+                }
+                // 启动注册不等待连接 (wait 0 → 至多 1s 确认窗口), 失败项按退避自治重连
+                HubTunnelRegistrar.HubRegisterResult rr = this.hubRegistrar.register(KHUB, KNAME, hubPorts, "startup", 0);
+                if (rr.code != null) {
+                    logWarn("[KMODE3] ⚠️ 静态注册失败 (" + rr.code + ": " + rr.message + "), KMODE=3 未生效");
+                } else {
+                    // 兼容字段: GET /api/hub 的 tunnel 指向静态实例 (0.6.6 消费方语义)
+                    this.hubStaticKname = KNAME.trim().toLowerCase(Locale.ROOT);
+                    log("[KMODE3] ✅ 已注册静态项: " + KNAME + " → " + KHUB);
+                }
+            }
+            // 启动任务子类型恢复: kstore data.hubregs 的动态注册项自动重建 (KSTORE 启用时;
+            // 静态项 kname 冲突时跳过恢复项并告警; 启动时不等待连接, 失败项按退避自治重连)
+            for (Map<String, Object> reg : getHubRegs()) {
+                try {
+                    String regHub = String.valueOf(reg.get("hub"));
+                    String regKname = String.valueOf(reg.get("kname"));
+                    List<Integer> regPorts = new ArrayList<>();
+                    if (reg.get("ports") instanceof List) {
+                        for (Object p : (List<?>) reg.get("ports")) {
+                            if (p instanceof Number) {
+                                int v = ((Number) p).intValue();
+                                if (v >= 1 && v <= 65535) regPorts.add(v);
+                            }
+                        }
+                    }
+                    HubTunnelRegistrar.HubRegisterResult rrr = this.hubRegistrar.register(regHub, regKname, regPorts, "dynamic", 0);
+                    if (rrr.code != null) {
+                        logWarn("[KMODE3] ⚠️ 恢复注册项 " + regKname + " 失败 (" + rrr.code + ": " + rrr.message + "), 该项不注册 (kstore 条目保留)");
+                    } else {
+                        log("[KMODE3] ✅ 已恢复动态注册项: " + regKname + " → " + regHub);
+                    }
+                } catch (Exception e) {
+                    logWarn("[KMODE3] ⚠️ 恢复注册项异常: " + e.getMessage());
+                }
+            }
+            return;
+        }
         // KMODE=1: 隧道 + 域名文件 + stdin 监听; KMODE=2: 隧道 + shz.al 静默上报
         if (KMODE == 2 && knameValid()) {
             log("[KMODE] 🚀 KMODE=2: 隧道域名将上报至外部平台");
@@ -2222,6 +2396,963 @@ public class kisama {
         Thread stdinThread = new Thread(this::kmodeStdinLoop, "kmode-stdin");
         stdinThread.setDaemon(true);
         stdinThread.start();
+    }
+
+    // ==================== 🌐 KMODE=3 kisama-hub 出站隧道 (docs/API.MD 十九) ====================
+    // agent 主动向 hub 建立出站 WebSocket 长连接 (ws/wss 由 KHUB scheme 推导), 首帧注册;
+    // hub 把 /{KNAME}/api/* 与 /{KNAME}/{PORT}/* 的外部请求封装成 req 帧经隧道下发:
+    // api 模式回环到 agent 自身服务 (验签/加密/白名单全链路不变, 中间件零改动),
+    // port 模式回环到 KHUB_PORTS 白名单端口 (缺省空=禁用; 拒绝时不发起连接, 无侧信道);
+    // ws_open 帧 → 回环拨号本地 WS (终端 Noise/降级令牌字节级透传, 帧级双向转发);
+    // 断线指数退避重连, 状态三态 alive|reconnecting|failed 对齐 argo 0.6.4 惯例。
+    // 签名口径: 签名 PATH = 剥离 KNAME 前缀后的本地路径 (hub 侧剥前缀), 与面板 getSignPath /
+    // tools/control.py 相对路径签名天然一致, 本端无需任何中间件改动。
+    // 传输实现: JDK 11 内置 java.net.http (HttpClient/WebSocket, 零新依赖);
+    // JDK WebSocket 单条连接同时只允许一个未完成 send, 出站统一经单线程串行执行器。
+    private static final java.util.Set<String> HUB_RESERVED_KNAMES = new java.util.HashSet<>(Arrays.asList(
+            "api", "agents", "health", "tunnel", "static", "sub", "favicon.ico"));
+    private static final java.util.regex.Pattern HUB_KNAME_RE =
+            java.util.regex.Pattern.compile("^[a-z0-9][a-z0-9-]{1,62}$");
+    // hop-by-hop 与内部命名空间头 (回环纵深过滤, hub 已滤一遍, 防伪造穿透)
+    private static final java.util.Set<String> HUB_HOP_HEADERS = new java.util.HashSet<>(Arrays.asList(
+            "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+            "te", "trailer", "trailers", "transfer-encoding", "upgrade", "host"));
+    // JDK HttpClient/WebSocket 受限头 (携带即 IllegalArgumentException, 本端自行补齐/由 body 推导)
+    private static final java.util.Set<String> HUB_JDK_RESTRICTED_HEADERS = new java.util.HashSet<>(Arrays.asList(
+            "content-length", "expect"));
+    // HubWSStream 泵退出哨兵 (fromHubQueue.offer 传播关闭; 静态成员不能放内部类, 上提到外部类)
+    private static final Map<String, Object> HUB_STREAM_POISON =
+            Collections.<String, Object>singletonMap("__poison__", Boolean.TRUE);
+
+    /** KHUB 基址归一 (trim + 剥尾部斜杠) */
+    private static String trimHubUrl(String raw) {
+        String u = raw == null ? "" : raw.trim();
+        while (u.endsWith("/")) {
+            u = u.substring(0, u.length() - 1);
+        }
+        return u;
+    }
+
+    /** KHUB_PORTS 白名单解析 (逗号分隔; 非法/越界条目忽略, 缺省空=端口反代禁用) */
+    private static java.util.Set<Integer> parseHubPorts(String raw) {
+        java.util.Set<Integer> out = new java.util.TreeSet<>();
+        if (raw != null) {
+            for (String p : raw.split(",")) {
+                String t = p == null ? "" : p.trim();
+                if (t.isEmpty()) continue;
+                try {
+                    int v = Integer.parseInt(t);
+                    if (v >= 1 && v <= 65535) out.add(v);
+                } catch (NumberFormatException ignored) {
+                }
+            }
+        }
+        return out;
+    }
+
+    /** KISAMA_HUB_* 秒值解析 (浮点秒 → 毫秒; 非法回退缺省, 语义对齐 py float() 回退) */
+    private static long parseHubSecondsMs(String raw, long defaultMs) {
+        if (raw != null && !raw.trim().isEmpty()) {
+            try {
+                return (long) (Double.parseDouble(raw.trim()) * 1000.0);
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return defaultMs;
+    }
+
+    private static long parseHubMaxBody(String raw) {
+        if (raw != null && !raw.trim().isEmpty()) {
+            try {
+                return Long.parseLong(raw.trim());
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return 64L * 1024 * 1024;
+    }
+
+    /** hub 注册名帧 id 归一 (Gson Object 数字恒为 Double) */
+    private static int hubFrameId(Object v) {
+        if (v instanceof Number) {
+            return ((Number) v).intValue();
+        }
+        if (v != null) {
+            try {
+                return (int) Double.parseDouble(String.valueOf(v));
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return 0;
+    }
+
+    private static byte[] hubDecodeB64(String raw) {
+        if (raw == null || raw.isEmpty()) return new byte[0];
+        try {
+            return Base64.getDecoder().decode(raw);
+        } catch (Exception e) {
+            return new byte[0];
+        }
+    }
+
+    private static String hubTruncate(String s, int max) {
+        if (s == null) return "";
+        return s.length() > max ? s.substring(0, max) : s;
+    }
+
+    /** hub 注册被拒 (invalid_name / name_taken / full / invalid_version), 永久性错误 */
+    static final class HubRegisterError extends RuntimeException {
+        final String code;
+        final String message;
+
+        HubRegisterError(String code, String message) {
+            super("[" + code + "] " + message);
+            this.code = code;
+            this.message = message;
+        }
+    }
+
+    /** hub 注册名校验 (与 hub 端 ValidateKName 同源契约); 返回错误文本, 合法返回 null */
+    private static String hubKnameError(String name) {
+        String normalized = name == null ? "" : name.trim().toLowerCase(Locale.ROOT);
+        if (normalized.isEmpty()) {
+            return "KNAME 未设置";
+        }
+        if (!HUB_KNAME_RE.matcher(normalized).matches()) {
+            return "KNAME '" + name + "' 非法: 限 2-63 字符小写字母/数字/连字符, 首位字母或数字";
+        }
+        if (HUB_RESERVED_KNAMES.contains(normalized)) {
+            return "KNAME '" + name + "' 是保留名, 不可注册";
+        }
+        return null;
+    }
+
+    private static final java.util.regex.Pattern HUB_PUBLIC_URL_RE =
+            java.util.regex.Pattern.compile("^https?://\\S+$");
+
+    /** agent 上报公网基址校验 (与 hub 端 ValidatePublicURL 同源契约); 返回错误文本, 合法返回 null
+     * 空值 = 未配置 (合法缺省, 条目回落 hub 侧推导)。scheme 白名单 http/https (该值会成为
+     * hub /agents 页 href, 拒绝 javascript: 等危险 scheme), 上限 512 字符, 尾部斜杠已剥离 */
+    private static String hubPublicUrlError(String url) {
+        String normalized = trimHubUrl(url);
+        if (normalized.isEmpty()) {
+            return null;
+        }
+        if (normalized.length() > 512) {
+            return "public_url 过长 (" + normalized.length() + " > 512 字符)";
+        }
+        if (!HUB_PUBLIC_URL_RE.matcher(normalized).matches()) {
+            return "public_url '" + normalized + "' 非法: 必须以 http:// 或 https:// 开头且无空白字符";
+        }
+        return null;
+    }
+
+    /** KHUB 基址 → 隧道 WS 地址 (https→wss, http→ws, 裸 host 按 ws) */
+    private static String deriveHubWsUrl(String hubUrl) {
+        String url = trimHubUrl(hubUrl);
+        if (url.startsWith("https://")) return "wss://" + url.substring("https://".length()) + "/tunnel";
+        if (url.startsWith("http://")) return "ws://" + url.substring("http://".length()) + "/tunnel";
+        return "ws://" + url + "/tunnel";
+    }
+
+    /** 回环请求头纵深过滤 (hub 已滤一遍): 剥 hop-by-hop 与内部命名空间, 防伪造穿透 */
+    private static Map<String, String> filterLoopbackHeaders(Object headers) {
+        Map<String, String> out = new LinkedHashMap<>();
+        if (!(headers instanceof Map)) {
+            return out;
+        }
+        for (Map.Entry<?, ?> e : ((Map<?, ?>) headers).entrySet()) {
+            if (e.getKey() == null) continue;
+            String lk = String.valueOf(e.getKey()).toLowerCase(Locale.ROOT);
+            if (HUB_HOP_HEADERS.contains(lk) || HUB_JDK_RESTRICTED_HEADERS.contains(lk)
+                    || lk.startsWith("x-kisama-hub-") || lk.startsWith("x-forwarded-")) {
+                continue;
+            }
+            out.put(lk, e.getValue() == null ? "" : String.valueOf(e.getValue()));
+        }
+        return out;
+    }
+
+    /** KMODE=3 出站隧道管理器 (结构镜像 ArgoTunnelManager / 0.6.4 状态惯例) */
+    private final class HubTunnelManager {
+        final String hubUrl;
+        final String kname;
+        final int port;
+        final java.util.Set<Integer> ports;   // KHUB_PORTS 白名单快照
+        final String source;                  // startup | dynamic
+        final String publicUrl;               // KHUB_PUBLIC_URL 修正值 (null=未配置, 条目按 hub 推导)
+        final String relayUrl;
+        // 🛡️ 状态透明: 三态 + 失败原因, 供 GET /api/hub 暴露给 Panel
+        volatile String status = "reconnecting";   // alive | reconnecting | failed
+        volatile String lastError = null;
+        volatile String lastErrorAt = null;
+        volatile int consecutiveFailures = 0;
+        volatile String lastConnectedAt = null;
+        final java.util.concurrent.atomic.AtomicLong relayCount = new java.util.concurrent.atomic.AtomicLong();
+        // 最近一次永久性注册错误 (HubRegisterError; 网络类置 null, 供 waitConnected 判别)
+        volatile HubRegisterError registerError = null;
+        // 行为参数 (env 可调, docs 十九; 下限钳制对齐 py)
+        final long pingIntervalMs;
+        final long retryBaseMs;
+        final long retryMaxMs;
+        final long relayTimeoutMs;
+        final long maxBody;
+        // 运行态
+        final java.util.concurrent.atomic.AtomicBoolean stopped = new java.util.concurrent.atomic.AtomicBoolean(false);
+        volatile java.net.http.WebSocket hubWs = null;
+        final Map<Integer, HubWSStream> streams = new ConcurrentHashMap<>();
+        final java.net.http.HttpClient http = java.net.http.HttpClient.newBuilder()
+                .version(java.net.http.HttpClient.Version.HTTP_1_1)
+                .connectTimeout(java.time.Duration.ofSeconds(10))
+                .build();
+        final ExecutorService reqExecutor;    // req/ws_open 分发 (阻塞回环请求不卡隧道读循环)
+        final ExecutorService sendExecutor;   // hub ws 出站串行执行器 (JDK 单连接只允许一个未完成 send)
+        final ScheduledExecutorService pingExecutor;
+        Thread thread = null;
+
+        HubTunnelManager(String hubUrl, String kname, int port, List<Integer> ports, String source) {
+            this.hubUrl = trimHubUrl(hubUrl);
+            this.kname = kname == null ? "" : kname.trim().toLowerCase(Locale.ROOT);
+            this.port = port;
+            java.util.Set<Integer> ps = new java.util.TreeSet<>();
+            if (ports != null) {
+                for (Integer p : ports) {
+                    if (p != null && p >= 1 && p <= 65535) ps.add(p);
+                }
+            }
+            this.ports = ps;
+            this.source = source;
+            // KHUB_PUBLIC_URL 公网基址覆盖值 (可选): 注册时上报 public_url, hub 拼订阅/页面/ack url 优先用;
+            // 0.6.6 续批二起缺省自动上报 KHUB 派生基址, 此变量用于内网 KHUB 等派生值 ≠ 公网地址的部署
+            String pubErr = hubPublicUrlError(KHUB_PUBLIC_URL);
+            if (pubErr != null) {
+                logWarn("[KMODE3] ⚠️ KHUB_PUBLIC_URL " + pubErr + ", 回退 KHUB 派生基址上报");
+                this.publicUrl = null;
+            } else {
+                this.publicUrl = KHUB_PUBLIC_URL == null || KHUB_PUBLIC_URL.isEmpty() ? null : KHUB_PUBLIC_URL;
+            }
+            // 中继地址: 上报基址 = 覆盖值 || KHUB 派生 (与注册帧 public_url 字段一致)
+            this.relayUrl = (this.publicUrl != null ? this.publicUrl : this.hubUrl) + "/" + this.kname;
+            this.pingIntervalMs = Math.max(5000L, KISAMA_HUB_PING_INTERVAL_MS);
+            this.retryBaseMs = Math.max(500L, KISAMA_HUB_RETRY_BASE_MS);
+            this.retryMaxMs = Math.max(this.retryBaseMs, KISAMA_HUB_RETRY_MAX_MS);
+            this.relayTimeoutMs = Math.max(5000L, KISAMA_HUB_RELAY_TIMEOUT_MS);
+            this.maxBody = Math.max(1L, KISAMA_HUB_MAX_BODY);
+            this.reqExecutor = Executors.newCachedThreadPool(r -> {
+                Thread t = new Thread(r, "hub-req-" + this.kname);
+                t.setDaemon(true);
+                return t;
+            });
+            this.sendExecutor = Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "hub-send-" + this.kname);
+                t.setDaemon(true);
+                return t;
+            });
+            this.pingExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "hub-ping-" + this.kname);
+                t.setDaemon(true);
+                return t;
+            });
+        }
+
+        // ---- 状态快照 (GET /api/hub) ----
+        Map<String, Object> snapshot() {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("tunnel_status", status);
+            m.put("source", source);
+            m.put("hub", hubUrl);
+            m.put("kname", kname);
+            m.put("url", relayUrl);
+            m.put("public_url", publicUrl != null ? publicUrl : hubUrl);   // 注册帧实际上报基址 (覆盖值 || KHUB 派生)
+            m.put("ports", new ArrayList<>(ports));
+            m.put("consecutive_failures", consecutiveFailures);
+            m.put("last_error", lastError);
+            m.put("last_error_at", lastErrorAt);
+            m.put("last_connected_at", lastConnectedAt);
+            m.put("relay_count", relayCount.get());
+            return m;
+        }
+
+        /** 同步等待注册结果 (POST /api/hub 用): null=成功; HubRegisterError=永久性;
+         * 其余 Exception=网络类 (unreachable, 注册项保留继续退避) */
+        Exception waitConnected(long timeoutMs) {
+            long deadline = System.currentTimeMillis() + Math.max(1000L, timeoutMs);
+            while (System.currentTimeMillis() < deadline) {
+                if (stopped.get()) return new IOException("tunnel stopped");
+                HubRegisterError re = this.registerError;
+                if (re != null) return re;
+                if ("alive".equals(status)) return null;
+                try {
+                    Thread.sleep(200);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return new IOException("interrupted");
+                }
+            }
+            return new TimeoutException("register not confirmed in " + (Math.max(1000L, timeoutMs) / 1000) + "s");
+        }
+
+        void recordFailure(String message) {
+            this.consecutiveFailures = this.consecutiveFailures + 1;
+            this.status = "reconnecting";
+            this.lastError = hubTruncate(message, 300);
+            this.lastErrorAt = java.time.Instant.now().toString();
+        }
+
+        // 指数退避: base * 2^(failures-1), 上限 retry_max (对齐 argo 0.6.4 惯例)
+        long backoffMs() {
+            int f = Math.max(0, consecutiveFailures - 1);
+            if (f > 30) f = 30;
+            return Math.min(retryBaseMs * (1L << f), retryMaxMs);
+        }
+
+        // ---- 生命周期 ----
+        void start() {
+            if (this.thread != null && this.thread.isAlive()) return;
+            this.stopped.set(false);
+            Thread t = new Thread(this::run, "hub-tunnel-" + this.kname);
+            t.setDaemon(true);
+            this.thread = t;
+            t.start();
+        }
+
+        void stop() {
+            this.stopped.set(true);
+            java.net.http.WebSocket w = this.hubWs;
+            if (w != null) {
+                try { w.abort(); } catch (Exception ignored) {}
+            }
+            this.reqExecutor.shutdownNow();
+            this.sendExecutor.shutdownNow();
+            this.pingExecutor.shutdownNow();
+            Thread t = this.thread;
+            if (t != null) {
+                try { t.join(3000); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+            }
+        }
+
+        private void run() {
+            while (!stopped.get()) {
+                try {
+                    connectOnce();   // 断开/失败一律抛出, 正常不返回
+                } catch (HubRegisterError hre) {
+                    // 🛡️ 永久性注册错误 (name_taken/full/invalid_*) 记录到 registerError,
+                    // 供 waitConnected 判别; 网络类错误置 null (保留注册项继续退避)
+                    this.registerError = hre;
+                    recordFailure(hre.code + ": " + hre.message);
+                } catch (Exception e) {
+                    this.registerError = null;
+                    recordFailure(e.getMessage() != null ? e.getMessage() : e.toString());
+                }
+                if (stopped.get()) break;
+                long wait = backoffMs();
+                logWarn("[KMODE3] ⚠️ 隧道断开 (" + this.lastError + "), " + (wait / 1000.0) + "s 后第 " + this.consecutiveFailures + " 次重连");
+                interruptibleSleep(wait);
+            }
+        }
+
+        // 分片睡眠, stop() 置位后最多 0.25s 内退出 (避免长退避拖住进程收尾)
+        private void interruptibleSleep(long ms) {
+            long deadline = System.currentTimeMillis() + ms;
+            while (!stopped.get() && System.currentTimeMillis() < deadline) {
+                try {
+                    Thread.sleep(Math.min(250, Math.max(1, deadline - System.currentTimeMillis())));
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        }
+
+        /** 单条连接的全局状态 (ack 应答 / 连接关闭传播, listener 回调与 connectOnce 共享) */
+        private static final class ConnectState {
+            final CountDownLatch ackLatch = new CountDownLatch(1);
+            volatile HubRegisterError ackFail = null;
+            final CompletableFuture<Void> done = new CompletableFuture<>();
+        }
+
+        private void connectOnce() throws Exception {
+            final ConnectState st = new ConnectState();
+            final StringBuilder textBuf = new StringBuilder();   // 分片聚合 (ws_data 大帧可能跨多个 onText 回调)
+            java.net.http.WebSocket.Listener listener = new java.net.http.WebSocket.Listener() {
+                @Override
+                public void onOpen(java.net.http.WebSocket w) { w.request(1); }
+
+                @Override
+                public CompletableFuture<?> onText(java.net.http.WebSocket w, CharSequence data, boolean last) {
+                    w.request(1);
+                    String piece;
+                    synchronized (textBuf) {
+                        textBuf.append(data);
+                        if (!last) return null;
+                        piece = textBuf.toString();
+                        textBuf.setLength(0);
+                    }
+                    try {
+                        Object parsed = gson.fromJson(piece, new TypeToken<Map<String, Object>>() {}.getType());
+                        if (parsed instanceof Map) {
+                            handleTunnelFrame((Map<String, Object>) parsed, st);
+                        }
+                    } catch (Exception e) {
+                        logDebug("[KMODE3] hub 帧处理失败: " + e.getMessage());
+                    }
+                    return null;
+                }
+
+                @Override
+                public CompletableFuture<?> onBinary(java.net.http.WebSocket w, java.nio.ByteBuffer msg, boolean last) {
+                    w.request(1);
+                    return null;   // 隧道全为 JSON 文本帧, 二进制忽略
+                }
+
+                @Override
+                public CompletableFuture<?> onPing(java.net.http.WebSocket w, java.nio.ByteBuffer msg) {
+                    w.request(1);
+                    return null;
+                }
+
+                @Override
+                public CompletableFuture<?> onPong(java.net.http.WebSocket w, java.nio.ByteBuffer msg) {
+                    w.request(1);
+                    return null;
+                }
+
+                @Override
+                public CompletionStage<?> onClose(java.net.http.WebSocket w, int statusCode, String reason) {
+                    st.done.complete(null);
+                    return null;
+                }
+
+                @Override
+                public void onError(java.net.http.WebSocket w, Throwable error) {
+                    st.done.completeExceptionally(error);
+                }
+            };
+            java.net.http.WebSocket w = this.http.newWebSocketBuilder()
+                    .connectTimeout(java.time.Duration.ofSeconds(10))
+                    .buildAsync(java.net.URI.create(deriveHubWsUrl(this.hubUrl)), listener)
+                    .get(15, TimeUnit.SECONDS);
+            this.hubWs = w;
+            try {
+                Map<String, Object> reg = new LinkedHashMap<>();
+                reg.put("t", "register");
+                reg.put("v", 1);
+                reg.put("kname", this.kname);
+                reg.put("version", AGENT_VERSION);
+                reg.put("ports", new ArrayList<>(this.ports));
+                if (this.publicUrl != null) {
+                    reg.put("public_url", this.publicUrl != null ? this.publicUrl : this.hubUrl);   // 公网基址: 覆盖值优先, 缺省 KHUB 派生 (0.6.6 续批二起恒携带)
+                }
+                sendHubFrame(reg);
+                if (!st.ackLatch.await(15, TimeUnit.SECONDS)) {
+                    throw new IOException("hub 注册应答超时");
+                }
+                if (st.ackFail != null) {
+                    throw st.ackFail;
+                }
+                // 注册成功 → 状态复位 (对齐 argo _run_loop 的 failures 归零)
+                this.status = "alive";
+                this.consecutiveFailures = 0;
+                this.lastError = null;
+                this.lastConnectedAt = java.time.Instant.now().toString();
+                log("[KMODE3] ✅ 已连接 hub " + this.hubUrl + " (注册名 " + this.kname + ", 中继地址 " + this.relayUrl + ")");
+                final java.net.http.WebSocket connWs = w;
+                java.util.concurrent.ScheduledFuture<?> pingTask = this.pingExecutor.scheduleAtFixedRate(() -> {
+                    if (!stopped.get() && hubWs == connWs) {
+                        Map<String, Object> ping = new LinkedHashMap<>();
+                        ping.put("t", "ping");
+                        sendHubFrame(ping);
+                    }
+                }, pingIntervalMs, pingIntervalMs, TimeUnit.MILLISECONDS);
+                try {
+                    st.done.get();   // 阻塞直到连接关闭/错误 (onError 以 ExecutionException 传播, onClose 正常返回)
+                } finally {
+                    pingTask.cancel(false);
+                    for (HubWSStream s : this.streams.values()) {
+                        s.teardown();
+                    }
+                    this.streams.clear();
+                }
+                throw new IOException("hub 连接关闭");
+            } finally {
+                if (this.hubWs == w) this.hubWs = null;
+                try { w.abort(); } catch (Exception ignored) {}
+            }
+        }
+
+        private void handleTunnelFrame(Map<String, Object> f, ConnectState st) {
+            String t = f.get("t") == null ? "" : String.valueOf(f.get("t"));
+            if ("pong".equals(t)) {
+                return;
+            }
+            if ("ack".equals(t)) {
+                boolean ok = Boolean.TRUE.equals(f.get("ok"));
+                if (!ok) {
+                    st.ackFail = new HubRegisterError(
+                            f.get("code") == null ? "unknown" : String.valueOf(f.get("code")),
+                            f.get("message") == null ? "" : String.valueOf(f.get("message")));
+                }
+                st.ackLatch.countDown();
+                return;
+            }
+            if ("req".equals(t)) {
+                dispatchReq(f);
+                return;
+            }
+            if ("ws_open".equals(t)) {
+                openStream(f);
+                return;
+            }
+            if ("ws_data".equals(t)) {
+                HubWSStream s = this.streams.get(hubFrameId(f.get("id")));
+                if (s != null) s.fromHub(f);
+                return;
+            }
+            if ("ws_close".equals(t)) {
+                HubWSStream s = this.streams.remove(hubFrameId(f.get("id")));
+                if (s != null) s.closeFromHub();
+            }
+        }
+
+        /** hub ws 出站串行发送 (JDK 单连接只允许一个未完成 send; 失败静默, 读循环将因连接断开退出) */
+        void sendHubFrame(Map<String, Object> frame) {
+            final java.net.http.WebSocket w = this.hubWs;
+            if (w == null || stopped.get()) return;
+            final String payload = gson.toJson(frame);
+            try {
+                this.sendExecutor.execute(() -> {
+                    try {
+                        w.sendText(payload, true).get(15, TimeUnit.SECONDS);
+                    } catch (Exception ignored) {
+                    }
+                });
+            } catch (RejectedExecutionException ignored) {
+            }
+        }
+
+        void sendHubErr(int rid, String code, String message) {
+            Map<String, Object> err = new LinkedHashMap<>();
+            err.put("t", "err");
+            err.put("id", rid);
+            err.put("code", code);
+            err.put("message", message == null ? "" : message);
+            sendHubFrame(err);
+        }
+
+        // ---- HTTP 中继 req 分发 ----
+        private void dispatchReq(Map<String, Object> f) {
+            final int rid = hubFrameId(f.get("id"));
+            final String mode = f.get("mode") == null ? "api" : String.valueOf(f.get("mode"));
+            final String method = (f.get("method") == null ? "GET" : String.valueOf(f.get("method"))).toUpperCase(Locale.ROOT);
+            final String path = f.get("path") == null ? "/" : String.valueOf(f.get("path"));
+            final String query = f.get("query") == null ? "" : String.valueOf(f.get("query"));
+            final byte[] body = hubDecodeB64(f.get("body_b64") == null ? null : String.valueOf(f.get("body_b64")));
+            this.relayCount.incrementAndGet();
+            try {
+                this.reqExecutor.execute(() -> handleReq(rid, mode, method, path, query, body, f));
+            } catch (RejectedExecutionException ignored) {
+            }
+        }
+
+        private void handleReq(int rid, String mode, String method, String path, String query, byte[] body, Map<String, Object> f) {
+            try {
+                String url;
+                if ("port".equals(mode)) {
+                    int port = hubFrameId(f.get("port"));
+                    if (!this.ports.contains(port)) {
+                        // 白名单拒绝: 不发起连接, 无端口扫描侧信道
+                        sendHubErr(rid, "port_not_allowed", "KHUB_PORTS 未放行端口 " + port);
+                        return;
+                    }
+                    url = "http://127.0.0.1:" + port + path;
+                } else {
+                    url = "http://127.0.0.1:" + this.port + path;
+                }
+                if (!query.isEmpty()) url += "?" + query;
+                java.net.http.HttpRequest.Builder rb = java.net.http.HttpRequest.newBuilder(java.net.URI.create(url))
+                        .timeout(java.time.Duration.ofMillis(this.relayTimeoutMs));
+                for (Map.Entry<String, String> h : filterLoopbackHeaders(f.get("headers")).entrySet()) {
+                    rb.header(h.getKey(), h.getValue());
+                }
+                switch (method) {
+                    case "GET":
+                        // GET 缺省无 body; 携带 body 时走 method() 通路 (rb.GET() 无法挂 body)
+                        if (body.length == 0) {
+                            rb.GET();
+                        } else {
+                            rb.method("GET", java.net.http.HttpRequest.BodyPublishers.ofByteArray(body));
+                        }
+                        break;
+                    case "HEAD":
+                        rb.method("HEAD", java.net.http.HttpRequest.BodyPublishers.noBody());
+                        break;
+                    default:
+                        // DELETE/POST/PUT/PATCH 等统一走 method(): 签名绑定 body 摘要,
+                        // Builder.DELETE() 会丢弃 body 导致回环验签失败 (E2E 实测)
+                        rb.method(method, java.net.http.HttpRequest.BodyPublishers.ofByteArray(body));
+                        break;
+                }
+                java.net.http.HttpResponse<byte[]> resp =
+                        this.http.send(rb.build(), java.net.http.HttpResponse.BodyHandlers.ofByteArray());
+                byte[] respBody = resp.body() == null ? new byte[0] : resp.body();
+                if (respBody.length > this.maxBody) {
+                    sendHubErr(rid, "body_too_large", "响应体超过 KISAMA_HUB_MAX_BODY (" + this.maxBody + " 字节)");
+                    return;
+                }
+                Map<String, Object> res = new LinkedHashMap<>();
+                res.put("t", "res");
+                res.put("id", rid);
+                res.put("status", resp.statusCode());
+                Map<String, String> hh = new LinkedHashMap<>();
+                for (Map.Entry<String, List<String>> e : resp.headers().map().entrySet()) {
+                    if (e.getValue() != null && !e.getValue().isEmpty()) {
+                        hh.put(e.getKey(), e.getValue().get(0));
+                    }
+                }
+                res.put("headers", hh);
+                res.put("body_b64", Base64.getEncoder().encodeToString(respBody));
+                sendHubFrame(res);
+            } catch (Exception e) {
+                String msg = e.getMessage() != null ? e.getMessage() : e.toString();
+                try {
+                    sendHubErr(rid, "loopback_unreachable", hubTruncate(msg, 300));
+                } catch (Exception ignored) {
+                }
+            }
+        }
+
+        private void openStream(Map<String, Object> f) {
+            final int sid = hubFrameId(f.get("id"));
+            HubWSStream s = new HubWSStream(sid, f);
+            this.streams.put(sid, s);
+            try {
+                this.reqExecutor.execute(s::run);
+            } catch (RejectedExecutionException e) {
+                this.streams.remove(sid, s);
+            }
+        }
+
+        /** 单条 WS 流: 回环拨号本地服务, hub↔local 帧级双向转发 (binary/text 保真)
+         *
+         * 两种模式 (ws_open 帧的 port 字段区分, 0.6.6 续批):
+         * - api 模式 (无 port / port=0): 回环 agent 自身 /api/ws/* (终端, Noise/令牌透传)
+         * - 端口反代模式 (port>0): 回环 127.0.0.1:{port} — KHUB_PORTS 白名单校验 (拒绝时
+         *   ws_ack ok:false, hub 以 close 3001 关客户端; 与 HTTP 端口反代同语义, 不发起回环连接)
+         *
+         * CONNECTING 缓冲: hub 会在本地 WS 握手完成前转发客户端帧, 拨号完成前先入队,
+         * 泵线程打开后按序发出 (与 py asyncio.Queue / js _pendingFromHub 同源修复)。
+         */
+        private final class HubWSStream {
+            final int sid;
+            final String path;
+            final String query;
+            final int port;                          // >0 = 端口反代模式 (目标端口)
+            volatile java.net.http.WebSocket localWs = null;
+            volatile boolean stoppedByHub = false;   // hub 侧关闭/隧道收尾 → 不回发 ws_close
+            volatile int localCloseCode = 1000;      // 本地侧关闭码 (LocalListener 采集)
+            volatile boolean localDone = false;
+            final LinkedBlockingQueue<Map<String, Object>> fromHubQueue = new LinkedBlockingQueue<>();
+
+            HubWSStream(int sid, Map<String, Object> f) {
+                this.sid = sid;
+                this.path = f.get("path") == null ? "/api/ws/terminal" : String.valueOf(f.get("path"));
+                this.query = f.get("query") == null ? "" : String.valueOf(f.get("query"));
+                this.port = hubFrameId(f.get("port"));
+            }
+
+            void fromHub(Map<String, Object> f) {
+                this.fromHubQueue.offer(f);
+            }
+
+            void closeFromHub() {
+                // hub 侧关闭 → 断本地; 不回发 ws_close (hub 已删流, 回发亦被忽略)
+                this.stoppedByHub = true;
+                this.fromHubQueue.offer(HUB_STREAM_POISON);
+            }
+
+            void teardown() {
+                // 隧道收尾: 断本地连接, 泵退出 (不回发 ws_close)
+                this.stoppedByHub = true;
+                this.fromHubQueue.offer(HUB_STREAM_POISON);
+                java.net.http.WebSocket lw = this.localWs;
+                if (lw != null) {
+                    try { lw.abort(); } catch (Exception ignored) {}
+                }
+            }
+
+            /** reqExecutor 线程体: 拨号 → ws_ack → hub→local 泵 → 收尾联动 */
+            void run() {
+                String url;
+                if (this.port > 0) {
+                    // 端口反代模式: KHUB_PORTS 白名单校验 (拒绝时不发起连接, 无扫描侧信道)
+                    if (!HubTunnelManager.this.ports.contains(this.port)) {
+                        Map<String, Object> nack = new LinkedHashMap<>();
+                        nack.put("t", "ws_ack");
+                        nack.put("id", this.sid);
+                        nack.put("ok", false);
+                        nack.put("message", "KHUB_PORTS 未放行端口 " + this.port);
+                        HubTunnelManager.this.sendHubFrame(nack);
+                        return;
+                    }
+                    url = "ws://127.0.0.1:" + this.port + this.path;
+                } else {
+                    url = "ws://127.0.0.1:" + HubTunnelManager.this.port + this.path;
+                }
+                if (!this.query.isEmpty()) url += "?" + this.query;
+                java.net.http.WebSocket lw;
+                try {
+                    lw = HubTunnelManager.this.http.newWebSocketBuilder()
+                            .connectTimeout(java.time.Duration.ofSeconds(10))
+                            .buildAsync(java.net.URI.create(url), new LocalListener())
+                            .get(15, TimeUnit.SECONDS);
+                } catch (Exception e) {
+                    // 拨号失败 → ack 失败, hub 以 3001 关闭客户端
+                    String msg = e.getMessage() != null ? e.getMessage() : e.toString();
+                    Map<String, Object> nack = new LinkedHashMap<>();
+                    nack.put("t", "ws_ack");
+                    nack.put("id", this.sid);
+                    nack.put("ok", false);
+                    nack.put("message", hubTruncate(msg, 200));
+                    HubTunnelManager.this.sendHubFrame(nack);
+                    return;
+                }
+                this.localWs = lw;
+                Map<String, Object> ack = new LinkedHashMap<>();
+                ack.put("t", "ws_ack");
+                ack.put("id", this.sid);
+                ack.put("ok", true);
+                HubTunnelManager.this.sendHubFrame(ack);
+                // 泵: hub→local (CONNECTING 期间 hub 帧在队列缓冲, 打开后按序发出)
+                try {
+                    while (true) {
+                        Map<String, Object> frame = this.fromHubQueue.poll(500, TimeUnit.MILLISECONDS);
+                        if (frame == HUB_STREAM_POISON) return;
+                        if (frame == null) {
+                            if (this.localDone) return;
+                            continue;
+                        }
+                        byte[] data = hubDecodeB64(frame.get("data_b64") == null ? null : String.valueOf(frame.get("data_b64")));
+                        try {
+                            if ("bin".equals(frame.get("bt"))) {
+                                lw.sendBinary(java.nio.ByteBuffer.wrap(data), true).get(15, TimeUnit.SECONDS);
+                            } else {
+                                lw.sendText(new String(data, StandardCharsets.UTF_8), true).get(15, TimeUnit.SECONDS);
+                            }
+                        } catch (Exception se) {
+                            return;   // 本地发送失败 → 结束 → ws_close 联动
+                        }
+                    }
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    teardownLocal();
+                    if (!this.stoppedByHub) {
+                        Map<String, Object> close = new LinkedHashMap<>();
+                        close.put("t", "ws_close");
+                        close.put("id", this.sid);
+                        close.put("ws_code", this.localCloseCode);
+                        close.put("reason", "closed");
+                        HubTunnelManager.this.sendHubFrame(close);
+                    }
+                    HubTunnelManager.this.streams.remove(this.sid, this);
+                }
+            }
+
+            private void teardownLocal() {
+                // 泵退出收尾: 本地未关闭时主动关闭 (py: local_ws.close(code=1001))
+                java.net.http.WebSocket lw = this.localWs;
+                if (lw == null) return;
+                try {
+                    lw.sendClose(1001, "").get(3, TimeUnit.SECONDS);
+                } catch (Exception ignored) {
+                }
+                try { lw.abort(); } catch (Exception ignored) {}
+            }
+
+            /** 本地 WS 侦听器: local→hub 单向转发 (text/binary 保真), 关闭/错误 → 泵退出 */
+            private final class LocalListener implements java.net.http.WebSocket.Listener {
+                final StringBuilder textBuf = new StringBuilder();
+                final java.io.ByteArrayOutputStream binBuf = new java.io.ByteArrayOutputStream();
+
+                @Override
+                public void onOpen(java.net.http.WebSocket w) { w.request(1); }
+
+                @Override
+                public CompletableFuture<?> onText(java.net.http.WebSocket w, CharSequence data, boolean last) {
+                    w.request(1);
+                    String piece;
+                    synchronized (textBuf) {
+                        textBuf.append(data);
+                        if (!last) return null;
+                        piece = textBuf.toString();
+                        textBuf.setLength(0);
+                    }
+                    Map<String, Object> frame = new LinkedHashMap<>();
+                    frame.put("t", "ws_data");
+                    frame.put("id", HubWSStream.this.sid);
+                    frame.put("bt", "txt");
+                    frame.put("data_b64", Base64.getEncoder().encodeToString(piece.getBytes(StandardCharsets.UTF_8)));
+                    HubTunnelManager.this.sendHubFrame(frame);
+                    return null;
+                }
+
+                @Override
+                public CompletableFuture<?> onBinary(java.net.http.WebSocket w, java.nio.ByteBuffer msg, boolean last) {
+                    w.request(1);
+                    synchronized (binBuf) {
+                        java.nio.ByteBuffer c = msg.duplicate();
+                        byte[] chunk = new byte[c.remaining()];
+                        c.get(chunk);
+                        binBuf.write(chunk, 0, chunk.length);
+                        if (!last) return null;
+                        byte[] all = binBuf.toByteArray();
+                        binBuf.reset();
+                        Map<String, Object> frame = new LinkedHashMap<>();
+                        frame.put("t", "ws_data");
+                        frame.put("id", HubWSStream.this.sid);
+                        frame.put("bt", "bin");
+                        frame.put("data_b64", Base64.getEncoder().encodeToString(all));
+                        HubTunnelManager.this.sendHubFrame(frame);
+                    }
+                    return null;
+                }
+
+                @Override
+                public CompletableFuture<?> onPing(java.net.http.WebSocket w, java.nio.ByteBuffer msg) {
+                    w.request(1);
+                    try { w.sendPong(msg); } catch (Exception ignored) {}
+                    return null;
+                }
+
+                @Override
+                public CompletableFuture<?> onPong(java.net.http.WebSocket w, java.nio.ByteBuffer msg) {
+                    w.request(1);
+                    return null;
+                }
+
+                @Override
+                public CompletionStage<?> onClose(java.net.http.WebSocket w, int statusCode, String reason) {
+                    HubWSStream.this.localCloseCode = statusCode > 0 ? statusCode : 1000;
+                    HubWSStream.this.localDone = true;
+                    HubWSStream.this.fromHubQueue.offer(HUB_STREAM_POISON);
+                    return null;
+                }
+
+                @Override
+                public void onError(java.net.http.WebSocket w, Throwable error) {
+                    HubWSStream.this.localCloseCode = 1011;
+                    HubWSStream.this.localDone = true;
+                    HubWSStream.this.fromHubQueue.offer(HUB_STREAM_POISON);
+                }
+            }
+        }
+    }
+
+    /** HubTunnelRegistrar — hub 注册表 (0.6.6 续批, docs/API.MD 19.10)
+     * 管理多条 HubTunnelManager (kname 唯一键): KMODE=3 静态项 (source=startup) 与
+     * POST /api/hub 动态项 (source=dynamic, 持久化到 kstore data.hubregs) 共存;
+     * register 同步等待注册结果 (waitConnected), 永久性错误 (name_taken 等) 不保留
+     * 注册项, 网络类错误保留并继续退避 (状态后查 GET /api/hub)。 */
+    private final class HubTunnelRegistrar {
+        final Map<String, HubTunnelManager> items = new LinkedHashMap<>();
+
+        /** hub 注册结果: snapshot + 错误分类 (code=null 成功; unreachable=网络类; 其余 HubRegisterError.code) */
+        static final class HubRegisterResult {
+            final Map<String, Object> snapshot;
+            final String code;
+            final String message;
+
+            HubRegisterResult(Map<String, Object> snapshot, String code, String message) {
+                this.snapshot = snapshot;
+                this.code = code;
+                this.message = message;
+            }
+        }
+
+        HubRegisterResult register(String hubUrl, String kname, List<Integer> ports, String source, long waitTimeoutMs) {
+            String nameErr = hubKnameError(kname);
+            String normKname = kname == null ? "" : kname.trim().toLowerCase(Locale.ROOT);
+            String normHub = trimHubUrl(hubUrl);
+            if (nameErr != null) {
+                Map<String, Object> snap = new LinkedHashMap<>();
+                snap.put("tunnel_status", "failed");
+                snap.put("source", source);
+                snap.put("hub", normHub);
+                snap.put("kname", normKname);
+                snap.put("ports", ports == null ? new ArrayList<>() : new ArrayList<>(new java.util.TreeSet<>(ports)));
+                return new HubRegisterResult(snap, "invalid_name", nameErr);
+            }
+            HubTunnelManager existing;
+            synchronized (items) {
+                existing = items.get(normKname);
+            }
+            if (existing != null) {
+                // 本地 KNAME 冲突 (同 registrar 内) 同 name_taken 语义
+                Map<String, Object> snap = existing.snapshot();
+                snap.put("tunnel_status", "failed");
+                return new HubRegisterResult(snap, "name_taken", "KNAME 已在本 agent 注册表中 (kname 唯一)");
+            }
+            HubTunnelManager manager = new HubTunnelManager(hubUrl, kname, PORT, ports, source);
+            manager.start();
+            Exception err = manager.waitConnected(waitTimeoutMs);
+            if (err == null) {
+                synchronized (items) { items.put(normKname, manager); }
+                return new HubRegisterResult(manager.snapshot(), null, null);
+            }
+            if (err instanceof HubRegisterError) {
+                // 失败分类: 永久性错误 → 移除不保留; 网络类 → 保留继续退避
+                manager.stop();
+                Map<String, Object> snap = manager.snapshot();
+                snap.put("tunnel_status", "failed");
+                HubRegisterError hre = (HubRegisterError) err;
+                return new HubRegisterResult(snap, hre.code, hre.message);
+            }
+            Map<String, Object> snap = manager.snapshot();
+            snap.put("tunnel_status", "reconnecting");
+            synchronized (items) { items.put(normKname, manager); }
+            return new HubRegisterResult(snap, "unreachable",
+                    err.getMessage() == null ? err.toString() : err.getMessage());
+        }
+
+        /** 注销并停止隧道; 返回 snapshot (未注册 → null) */
+        Map<String, Object> unregister(String kname) {
+            String norm = kname == null ? "" : kname.trim().toLowerCase(Locale.ROOT);
+            HubTunnelManager manager;
+            synchronized (items) {
+                manager = items.remove(norm);
+            }
+            if (manager == null) return null;
+            Map<String, Object> snap = manager.snapshot();
+            manager.stop();
+            return snap;
+        }
+
+        HubTunnelManager get(String kname) {
+            String norm = kname == null ? "" : kname.trim().toLowerCase(Locale.ROOT);
+            synchronized (items) { return items.get(norm); }
+        }
+
+        List<Map<String, Object>> list() {
+            List<HubTunnelManager> managers;
+            synchronized (items) {
+                managers = new ArrayList<>(items.values());
+            }
+            List<Map<String, Object>> out = new ArrayList<>();
+            for (HubTunnelManager m : managers) {
+                out.add(m.snapshot());
+            }
+            return out;
+        }
+
+        void stopAll() {
+            List<HubTunnelManager> managers;
+            synchronized (items) {
+                managers = new ArrayList<>(items.values());
+                items.clear();
+            }
+            for (HubTunnelManager m : managers) {
+                m.stop();
+            }
+        }
     }
 
     // ==================== 任务持久化存储实现 (0.5.7, docs/API.MD 十三) ====================
@@ -2290,8 +3421,10 @@ public class kisama {
     }
 
     // 加载持久化任务; 文件缺失/损坏一律安全降级, 返回 {"onetasks":[...], "crontasks":{...}}
+    // 同时把 hub 注册任务子类型 (data.hubregs, 0.6.6 起) 填充到 this.hubregs (启动恢复语义)
     @SuppressWarnings("unchecked")
     private Map<String, Object> loadTaskStore() {
+        this.hubregs.clear();
         Map<String, Object> restored = new LinkedHashMap<>();
         restored.put("onetasks", new ArrayList<String>());
         restored.put("crontasks", new LinkedHashMap<String, String>());
@@ -2344,8 +3477,38 @@ public class kisama {
                         crontasks.put(String.valueOf(e.getKey()), String.valueOf(e.getValue()));
                     }
                 }
+                // hub 注册任务 (0.6.6): 结构化条目 {hub, kname, ports}, 非法条目静默过滤 (additive 键, 老版本回写会丢弃, 见 API.MD 十三)
+                List<Map<String, Object>> regs = new ArrayList<>();
+                if (data.get("hubregs") instanceof List) {
+                    for (Object o : (List<?>) data.get("hubregs")) {
+                        if (!(o instanceof Map)) continue;
+                        Map<?, ?> item = (Map<?, ?>) o;
+                        Object hub = item.get("hub");
+                        Object kname = item.get("kname");
+                        if (!(hub instanceof String) || ((String) hub).isEmpty()
+                                || !(kname instanceof String) || ((String) kname).isEmpty()) {
+                            continue;
+                        }
+                        Map<String, Object> reg = new LinkedHashMap<>();
+                        reg.put("hub", hub);
+                        reg.put("kname", kname);
+                        List<Integer> regPorts = new ArrayList<>();
+                        if (item.get("ports") instanceof List) {
+                            for (Object p : (List<?>) item.get("ports")) {
+                                if (p instanceof Number) {
+                                    int v = ((Number) p).intValue();
+                                    if (v >= 1 && v <= 65535) regPorts.add(v);
+                                }
+                            }
+                        }
+                        reg.put("ports", regPorts);
+                        regs.add(reg);
+                    }
+                }
                 this.taskStoreLastSavedAt = doc.get("saved_at") == null ? null : String.valueOf(doc.get("saved_at"));
-                log("[TaskStore] 💾 已恢复持久化任务: onetime=" + onetasks.size() + ", cron=" + crontasks.size());
+                log("[TaskStore] 💾 已恢复持久化任务: onetime=" + onetasks.size() + ", cron=" + crontasks.size()
+                        + ", hubreg=" + regs.size());
+                this.hubregs.addAll(regs);
                 restored.put("onetasks", onetasks);
                 restored.put("crontasks", crontasks);
                 return restored;
@@ -2585,6 +3748,8 @@ public class kisama {
                 Map<String, Object> data = new LinkedHashMap<>();
                 data.put("onetasks", new ArrayList<>(this.onetime));
                 data.put("crontasks", new LinkedHashMap<>(this.crons));
+                // hub 注册任务子类型一并写入容器 — 与 onetasks/crontasks 同生命周期 (0.6.6 起, additive 键)
+                data.put("hubregs", new ArrayList<>(this.hubregs));
                 String savedAt = java.time.Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS).toString();
                 Map<String, Object> doc = new LinkedHashMap<>();
                 doc.put("magic", TASK_STORE_MAGIC);
@@ -2612,6 +3777,59 @@ public class kisama {
                 return false;
             }
         }
+    }
+
+    // 启动恢复用: 读取内存中的 hub 注册任务条目 (loadTaskStore 填充; 未启用 KSTORE 恒为空)
+    private List<Map<String, Object>> getHubRegs() {
+        synchronized (this.hubregs) {
+            return new ArrayList<>(this.hubregs);
+        }
+    }
+
+    // 落盘 hub 注册任务 (additive 键); 合并当前内存任务表整体原子写, 返回是否成功
+    // 未启用/只读时直接返回 false 且不更新内存字段 (getHubRegs 仅反映启动恢复语义)
+    private boolean saveHubRegs(List<Map<String, Object>> items) {
+        if (!this.taskStoreEnabled || this.taskStoreLocked) {
+            return false;
+        }
+        List<Map<String, Object>> regs = new ArrayList<>();
+        if (items != null) {
+            for (Map<String, Object> i : items) {
+                if (i == null) continue;
+                Object hub = i.get("hub");
+                Object kname = i.get("kname");
+                if (hub == null || String.valueOf(hub).isEmpty() || kname == null || String.valueOf(kname).isEmpty()) {
+                    continue;
+                }
+                Map<String, Object> reg = new LinkedHashMap<>();
+                reg.put("hub", String.valueOf(hub));
+                reg.put("kname", String.valueOf(kname));
+                List<Integer> regPorts = new ArrayList<>();
+                if (i.get("ports") instanceof List) {
+                    for (Object p : (List<?>) i.get("ports")) {
+                        if (p instanceof Number) {
+                            int v = ((Number) p).intValue();
+                            if (v >= 1 && v <= 65535) regPorts.add(v);
+                        }
+                    }
+                }
+                reg.put("ports", regPorts);
+                regs.add(reg);
+            }
+        }
+        synchronized (this.hubregs) {
+            this.hubregs.clear();
+            this.hubregs.addAll(regs);
+        }
+        return saveTaskStore();
+    }
+
+    // 把注册表当前状态落盘到 kstore data.hubregs (KSTORE 未启用时返回 false, 注册仅内存)
+    private boolean persistHubRegs() {
+        if (!this.taskStoreEnabled || this.taskStoreLocked) {
+            return false;
+        }
+        return saveHubRegs(this.hubRegistrar.list());
     }
 
     public static void main(String[] args) throws Exception {
@@ -3371,6 +4589,7 @@ public class kisama {
         configProbes.put("kstore", this::markKstore);
         configProbes.put("kmode1", this::markKmode1);
         configProbes.put("kmode2", this::markKmode2);
+        configProbes.put("kmode3", this::markKmode3);
         for (Map.Entry<String, java.util.function.BooleanSupplier> probe : configProbes.entrySet()) {
             try {
                 if (probe.getValue().getAsBoolean()) marks.add(probe.getKey());
@@ -3396,6 +4615,11 @@ public class kisama {
     private boolean markKmode2() {
         // KMODE 配置为 2 (含 2q/2quic, parseKmode 归一化后为 2; 按配置值判定, 不校验 knameValid 生效条件)
         return this.KMODE == 2;
+    }
+
+    private boolean markKmode3() {
+        // KMODE 配置为 3 (kisama-hub 公网中继, docs/API.MD 十九/15.16; 按配置值判定, 不校验 KHUB/KNAME 生效条件)
+        return this.KMODE == 3;
     }
 
     private boolean markRoot() {

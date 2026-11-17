@@ -2006,8 +2006,11 @@ def _noise_initiator(ctrl_priv_b64: str, agent_pub_b64: str):
 
 
 def _ws_host_port():
+    # 0.6.6: 返回 (host, port, path_prefix) —— proxy_url 带路径前缀时 (kisama-hub 中继形态
+    # https://hub/{KNAME}, docs/API.MD 十九), /api/ws/* 的 WebSocket 路径必须携带该前缀
     parsed = urllib.parse.urlparse(CONFIG["proxy_url"])
-    return parsed.hostname or "127.0.0.1", parsed.port or 80
+    prefix = parsed.path.rstrip("/")
+    return parsed.hostname or "127.0.0.1", parsed.port or 80, prefix
 
 
 def _run_terminal_echo(ws: WsClient, use_noise: bool, proto, marker: str,
@@ -2067,16 +2070,17 @@ def test_ws_terminal():
     if not ctrl_priv or not agent_pub:
         return _test_result("ws: 获取 noise_key", False, "baseinfo 未下发 noise_key (未认证?)")
 
-    host, port = _ws_host_port()
+    host, port, hub_prefix = _ws_host_port()
     rid = int(time.time())
 
     # ── 负向: 伪造 token 必须被拒绝 (回归校验: 修复前任意 token 可直连明文终端) ──
-    # 合规拒绝形态有两种: 升级后收到 close 帧 1008, 或 Python 版在 accept 前 close → HTTP 403
+    # 合规拒绝形态有三种: 升级后收到 close 帧 1008 (直连/经 hub), agent 在 accept 前 close →
+    # HTTP 403 (直连), 或 hub 中继形态下 agent 拒绝拨号 → hub 以 close 3001 关闭客户端 (0.6.6)
     try:
-        ws = WsClient(host, port, f"/api/ws/terminal?request_id=wsneg{rid}&token=forged_token_{rid}")
+        ws = WsClient(host, port, f"{hub_prefix}/api/ws/terminal?request_id=wsneg{rid}&token=forged_token_{rid}")
         opcode, payload = ws.recv()
         close_code = struct.unpack(">H", payload[:2])[0] if opcode == 8 and len(payload) >= 2 else None
-        ok = opcode == 8 and close_code == 1008
+        ok = opcode == 8 and close_code in (1008, 3001)
         _test_result("ws: 非法 token 被拒绝", ok,
                      f"opcode={opcode} code={close_code}" if ok else f"期望 close 1008, 实际 opcode={opcode} code={close_code}")
         if not ok:
@@ -2099,7 +2103,7 @@ def test_ws_terminal():
         rnd.set_keypair_from_private_bytes(Keypair.STATIC, os.urandom(32))
         rnd.set_prologue(b'kisama_terminal_v1')
         rnd.start_handshake()
-        ws = WsClient(host, port, f"/api/ws/terminal?request_id=wsneg2{rid}")
+        ws = WsClient(host, port, f"{hub_prefix}/api/ws/terminal?request_id=wsneg2{rid}")
         ws.send(rnd.write_message(), WsClient.OP_BINARY)
         _, msg2 = ws.recv()
         rnd.read_message(msg2)
@@ -2121,7 +2125,7 @@ def test_ws_terminal():
     # ── 正向: Noise 端到端加密终端 (http 场景) ──
     marker = f"WSNOISE{rid}"
     try:
-        ws = WsClient(host, port, f"/api/ws/terminal?request_id=wsenc{rid}")
+        ws = WsClient(host, port, f"{hub_prefix}/api/ws/terminal?request_id=wsenc{rid}")
         proto = _noise_initiator(ctrl_priv, agent_pub)
         ws.send(proto.write_message(), WsClient.OP_BINARY)
         _, msg2 = ws.recv()
@@ -2146,7 +2150,7 @@ def test_ws_terminal():
         try:
             ws_token = _ws_downgrade_token(session_key)
             ws = WsClient(host, port,
-                          f"/api/ws/terminal?request_id=wstok{rid}&token={urllib.parse.quote(ws_token)}")
+                          f"{hub_prefix}/api/ws/terminal?request_id=wstok{rid}&token={urllib.parse.quote(ws_token)}")
             ok = _run_terminal_echo(ws, False, None, marker)
             _test_result("ws: token 认证终端回显", ok, "" if ok else f"输出未包含 {marker}")
             if not ok:
@@ -2286,12 +2290,12 @@ def test_ws_shell_meta():
     if not ctrl_priv or not agent_pub:
         return _test_result("ws-meta: 获取 noise_key", False, "baseinfo 未下发 noise_key (未认证?)")
 
-    host, port = _ws_host_port()
+    host, port, hub_prefix = _ws_host_port()
     rid = int(time.time())
 
     # ── 用例 A: Noise 模式 meta=1 (未请求无痕) → welcome 帧结构完整且 incognito=false ──
     try:
-        ws = WsClient(host, port, f"/api/ws/terminal?request_id=wsmeta1{rid}&meta=1")
+        ws = WsClient(host, port, f"{hub_prefix}/api/ws/terminal?request_id=wsmeta1{rid}&meta=1")
         proto = _noise_initiator(ctrl_priv, agent_pub)
         ws.send(proto.write_message(), WsClient.OP_BINARY)
         _, msg2 = ws.recv()
@@ -2320,7 +2324,7 @@ def test_ws_shell_meta():
         try:
             ws_token = _ws_downgrade_token(session_key)
             ws = WsClient(host, port,
-                          f"/api/ws/terminal?request_id=wsmeta2{rid}&meta=1&token={urllib.parse.quote(ws_token)}")
+                          f"{hub_prefix}/api/ws/terminal?request_id=wsmeta2{rid}&meta=1&token={urllib.parse.quote(ws_token)}")
             welcome = _ws_recv_welcome(ws, False, None)
             ok = (isinstance(welcome, dict)
                   and welcome.get("shell") in KNOWN_SHELL_NAMES
@@ -2354,12 +2358,12 @@ def test_ws_incognito():
     if not ctrl_priv or not agent_pub:
         return _test_result("ws-incog: 获取 noise_key", False, "baseinfo 未下发 noise_key (未认证?)")
 
-    host, port = _ws_host_port()
+    host, port, hub_prefix = _ws_host_port()
     rid = int(time.time())
     marker = f"KISAMAINCOG{rid}X"
 
     try:
-        ws = WsClient(host, port, f"/api/ws/terminal?request_id=wsinc{rid}&meta=1&incognito=1")
+        ws = WsClient(host, port, f"{hub_prefix}/api/ws/terminal?request_id=wsinc{rid}&meta=1&incognito=1")
         proto = _noise_initiator(ctrl_priv, agent_pub)
         ws.send(proto.write_message(), WsClient.OP_BINARY)
         _, msg2 = ws.recv()

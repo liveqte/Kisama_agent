@@ -59,7 +59,7 @@ agent 启动时自动读取**可执行文件同目录**（py/js 为脚本同目�
 
 > **ipv4/ipv6 上报口径（五语言统一语义）**：`ipv4`/`ipv6` 均以专用外部服务探测优先且对返回文本做族校验——`ipv6` 只接受**公网全局单播**（2000::/3；ULA(fc00::/7)、链路本地(fe80::/10)、多播、回环、未指定、IPv4-mapped、站点本地一律拒绝），本地网卡地址仅在外部探测全失败时兜底（v6 兜底同样必须全局单播）。**无公网 IPv6 时 `ipv6` 报 `null`，不会用容器内网地址（如 docker 网络的 fdXX::）回填**。
 
-> **marks 主机标记（可选字段，additive）**：字符串数组，标识当前进程视角下**已确认成立**的事实，分两类：主机探测标记 `root`、`kvm`、`pterodactyl`、`systemd`、`fuse`（Linux 语义），与配置类标记 `kstore`（任务持久化已启用）、`kmode1`/`kmode2`（KMODE 配置为 1/2，go 未实现 KMODE 故不输出）。可同时出现多个，顺序固定（主机探测标记在前、配置类标记追加在末尾）。**字段可能缺失**（旧版代理未实现），缺失与空数组语义不同：缺失 = 未探测或不适用，`[]` = 已探测且无命中；`null` 非法，客户端按缺失处理。客户端必须忽略未知取值。判据、实现方式、性能与误报边界见「十五、`/api/baseinfo` 可选字段 `marks`（主机标记）探测规范」。
+> **marks 主机标记（可选字段，additive）**：字符串数组，标识当前进程视角下**已确认成立**的事实，分两类：主机探测标记 `root`、`kvm`、`pterodactyl`、`systemd`、`fuse`（Linux 语义），与配置类标记 `kstore`（任务持久化已启用）、`kmode1`/`kmode2`（KMODE 配置为 1/2，go 未实现 KMODE 故不输出）、`kmode3`（0.6.6 起 KMODE=3 kisama-hub 中继，Py/Js/Java/Java11）。可同时出现多个，顺序固定（主机探测标记在前、配置类标记追加在末尾）。**字段可能缺失**（旧版代理未实现），缺失与空数组语义不同：缺失 = 未探测或不适用，`[]` = 已探测且无命中；`null` 非法，客户端按缺失处理。客户端必须忽略未知取值。判据、实现方式、性能与误报边界见「十五、`/api/baseinfo` 可选字段 `marks`（主机标记）探测规范」。
 
 > **字段缓存分级（P 级 / T 级）**：baseinfo 系统信息按字段分两级缓存——**P 级（进程级静态）**如 `marks`、`virtualization`、`os`、`kernel_version`、`arch` 等，在进程生命周期内只探测一次并一直复用快照（TTL 过期与密钥轮换都不重探）；**T 级（TTL 快照）**按各自 TTL 重探：`disk_total`/`mem_total`/`swap_total` 为 30 秒，`ipv4`/`ipv6` 为 3600 秒。`session_key`/`noise_key` 属每请求凭证材料，**绝不进入任何快照**。完整字段表、失效规则与验收断言见「十六、`/api/baseinfo` 字段分级缓存与快照语义」。
 
@@ -814,7 +814,7 @@ KMODE 是代理端的一个启动模式开关，通过环境变量取值，用�
 | KNAME | 无 | 仅 KMODE=2 有效：shz.al 自定义名（≥3 字符，限字母、数字及 `+_-[]*$=@,;/`），同时是可预测访问 URL 的组成部分；未设置时 KMODE=2 退化为普通启动（等同 KMODE=0），不报错 |
 | KNAME_KEY | `$KNAME` | 仅 KMODE=2 有效：上报的管理/修改密钥（即 shz.al 的密码）；缺省复用 KNAME 本身。**注意：shz.al 平台要求密码 ≥8 字符，若最终生效的密钥（KNAME_KEY 或复用的 KNAME）短于 8 字符，上报会被平台以 `400 Password too short` 拒绝，粘贴不会创建（KMODE=2 可视为未生效）** |
 
-> 🏷️ **0.6.4 起 KMODE 配置值经 baseinfo `marks` 暴露**：`KMODE=1` → `kmode1`、`KMODE=2`（含 `2q`/`2quic`）→ `kmode2`（按配置值判定，`KNAME` 缺失退化场景仍报，见「十五」15.9/15.10）。go 端未实现 KMODE，不输出这两个标记。
+> 🏷️ **0.6.4 起 KMODE 配置值经 baseinfo `marks` 暴露**：`KMODE=1` → `kmode1`、`KMODE=2`（含 `2q`/`2quic`）→ `kmode2`（按配置值判定，`KNAME` 缺失退化场景仍报，见「十五」15.9/15.10）；**0.6.6 起 `KMODE=3` → `kmode3`（kisama-hub 中继，Py/Js/Java/Java11，见「十五」15.16 与「十九」）**。go 端未实现 KMODE，不输出这些标记。
 
 ### KMODE=0（默认）
 与正常启动完全一致，不会在启动时创建临时隧道，也不会开启标准流输入监听。
@@ -1044,6 +1044,9 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，请求
 | **临时隧道-查** | GET | `/api/argo` | 查询临时隧道列表（Py/Js） | ✅ | ✅ |
 | **临时隧道-建** | POST | `/api/argo` | 创建临时隧道（Py/Js） | ✅ | ✅ |
 | **临时隧道-删** | DELETE | `/api/argo` | 删除临时隧道（Py/Js） | ✅ | ✅ |
+| **hub 中继状态** | GET | `/api/hub` | KMODE=3 kisama-hub 隧道状态（Py/Js/Java/Java11，0.6.6 起，见十九） | ✅ | ✅ |
+| **hub 动态注册** | POST | `/api/hub` | 动态注册到 kisama-hub（Py/Js/Java/Java11，0.6.6 续批起，见 19.9） | ✅ | ✅ |
+| **hub 注销** | DELETE | `/api/hub` | 注销一条 hub 注册（Py/Js/Java/Java11，0.6.6 续批起，见 19.9） | ✅ | ✅ |
 ---
 > 注：上表「认证/加密」为常规生产模式（`DEBUG=false, PLAIN_MODE=false`）语义。PHP 版配置 `PLAIN_MODE=true` 后，全部接口**认证列不变**（ECDSA 签名照常强制），**加密列改为明文直发**（请求体明文 JSON、响应明文 + `x-encrypted: plain`，且 `/api/baseinfo` 不下发 `session_key`）；`DEBUG=true` 时认证与加密均豁免（详见「十、x-encrypted 响应模式头规范」）。
 
@@ -1159,6 +1162,7 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，请求
 ```
 
 - `data` 信封为后续扩展预留，当前仅含任务定义；
+- **0.6.6 续批起 `data.hubregs`**：hub 注册任务子类型（kisama-hub 动态注册项，见「十九」19.9），元素 `{hub, kname, ports}`（ports 非法/越界值加载时过滤）；由 `POST/DELETE /api/hub` 自动落盘与删除，启动恢复流程自动重建注册。**additive 键**：`version` 保持 1，老版本 agent 回写容器会丢弃该键（混部期边界：老 agent 任务落盘会静默移除本端 hub 注册持久化，注册表内存态不受影响）——(补充于 19.9)。
 - **任务命令为 shell 字符串，多行脚本原样支持**（JSON 自动转义换行）；
 - 写盘时机：POST `/api/task/onetime`、POST `/api/task/cron`（含清空）成功后同步落盘；原子写（同目录 tmp 文件 + fsync + rename/replace）；
 - 所有存储 I/O 故障只记日志降级，**绝不影响内存任务、请求成功与 agent 启动**。
@@ -1170,6 +1174,13 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，请求
 3. 恢复 `onetasks` / `crontasks` 到内存；
 4. `crontasks` 非空 → 启动既有 cron 调度循环；
 5. 恢复出的启动任务**后台执行一次**（不阻塞 HTTP 就绪），结果写入既有 onetime 日志环形缓冲（重启后仍可经 `/api/task/log/onetime` 查证）。
+
+### hub 注册任务子类型（0.6.6 续批起，Py/Js）
+
+- KSTORE `data.hubregs` 持久化的是 **kisama-hub 动态注册项**（`POST /api/hub` 写入、`DELETE /api/hub` 移除，见「十九」19.9），元素为结构化对象 `{hub, kname, ports}`——**不是 shell 命令**，不进入 onetime/cron 执行流，与两者是并列的任务子类型。
+- **启动恢复**：agent 启动时在恢复流程中自动重建注册（逐项 `register`，不等待连接结果，失败项按指数退避自治重连；与 KMODE=3 静态项 KNAME 冲突时跳过恢复项并告警）。
+- **持久化随 KSTORE**：`KSTORE` 未启用时动态注册仅本进程内存活（重启即失，`POST` 响应 `persisted:false` 告知）；启用后重启自动恢复。
+- **混部边界**：老版本 agent（无 hubregs 解析）回写容器会丢弃该键（见「存储文件格式」）。
 
 ### onetime 单次执行语义（重要）
 
@@ -1242,8 +1253,8 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，请求
 
 - 类型 `string[]`，元素为小写 ASCII 短名，当前定义八个值，分两类：
   - **主机探测标记**（Linux 语义，探测判定，见 15.3–15.7）：`root`、`kvm`、`pterodactyl`、`systemd`、`fuse`；
-  - **配置类标记**（agent 自身启动配置事实，见 15.8–15.10）：`kstore`、`kmode1`、`kmode2`。
-- 顺序固定为 `root` → `kvm` → `pterodactyl` → `systemd` → `fuse` → `kstore` → `kmode1` → `kmode2`（主机探测标记在前、配置类标记在其后追加，新增标记一律追加在末尾），同一标记只出现一次；客户端必须按集合处理，不得依赖顺序。
+  - **配置类标记**（agent 自身启动配置事实，见 15.8–15.16）：`kstore`、`kmode1`、`kmode2`、`kmode3`（0.6.6 起，Py/Js/Java/Java11，见 15.16）。
+- 顺序固定为 `root` → `kvm` → `pterodactyl` → `systemd` → `fuse` → `kstore` → `kmode1` → `kmode2` → `kmode3`（主机探测标记在前、配置类标记在其后追加，新增标记一律追加在末尾），同一标记只出现一次；客户端必须按集合处理，不得依赖顺序。
 - 语义：每一项都表示"在 **agent 进程视角**下已确认成立"的客观事实，不表示程度，也不代表宿主机或其它命名空间的状态（见 15.3）。
 - 缺失 / 空数组 / null 三态语义：
   - **字段缺失**：代理未实现该字段（旧版）、部署方禁用，或低权限模拟器副本不实现探测（PHP 两个 emulator 副本按此例外省略字段，不得用 `[]` 冒充"已探测且无命中"）→ 控制端按"未知"处理，不得假设无能力；
@@ -1252,7 +1263,7 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，请求
 - 前向兼容：客户端遇到未知取值必须忽略（不得报错，也不得因此丢弃整个响应）。
 - 客户端读取（零依赖）：baseinfo 响应本身就是 JSON，`marks` 是标准 JSON 字符串数组，浏览器/Node 内置 `JSON.parse` 后即为原生 Array，不需要任何三方库：`const marks = Array.isArray(info.marks) ? info.marks : []; marks.includes('kvm')`（IE11 等旧环境用 `marks.indexOf('kvm') !== -1`）。**禁止**对原始响应文本做正则或字符串切分来提取该字段。
 - 平台：五个主机探测标记均为 Linux 语义，Windows / macOS / \*BSD 上不输出、不得伪造；三个配置类标记与平台无关，**全平台输出**。因此非 Linux 平台的 `marks` 不再必然为 `[]`（例如启用了持久化的 Windows 节点返回 `["kstore"]`）。
-- 可用性：additive 可选字段。主机探测标记五端（`0.6.0-*`）与 PHP 两个完整副本（`0.6.0-php`、`0.6.0-php-cpanel-ai`）已实现；配置类标记自 `0.6.4` 起由 py / js / java / java11 实现（go 未实现 KMODE，只可能命中 `kstore`），PHP 四个副本无 KSTORE/KMODE 实现、不输出配置类标记；两个 emulator 副本按上述例外省略字段。控制端以"字段是否存在"判定，不要求版本号门槛。
+- 可用性：additive 可选字段。主机探测标记五端（`0.6.0-*`）与 PHP 两个完整副本（`0.6.0-php`、`0.6.0-php-cpanel-ai`）已实现；配置类标记自 `0.6.4` 起由 py / js / java / java11 实现（`kmode3` 自 0.6.6 续批起四端同步；go 未实现 KMODE，只可能命中 `kstore`），PHP 四个副本无 KSTORE/KMODE 实现、不输出配置类标记；两个 emulator 副本按上述例外省略字段。控制端以"字段是否存在"判定，不要求版本号门槛。
 - 生命周期：进程级静态属性（P 级）——进程启动后首次 baseinfo 计算一次并写入快照，生命周期内不再重探；**不随 T 级 TTL 过期、也不随临时密钥轮换而重跑**（见「十六」）。配置类标记由启动期环境变量决定、进程内恒定，进 P 级快照无时效问题。
 
 ### 15.2 探测总则（准确优先、零子进程、零网络）
@@ -1491,7 +1502,20 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，请求
 
 - 交叉核对（只读命令）：`id -u; id -g; grep -E '^(CapEff|Uid|Gid)' /proc/self/status; stat -c '%F %t:%T %a' /dev/kvm /dev/fuse 2>&1; test -d /run/systemd/system && echo systemd-ok; tr '\0' '\n' < /proc/1/environ | grep -E '^P_SERVER_(UUID|LOCATION)='`。
 - 性能门限：冷态 ≤ 5 ms、热态 ≤ 0.5 ms；以 `strace -f -e trace=process` 断言探测路径零 `fork`/`clone`。
-- 一致性：五端（py/js/go/java/java11）对同一台真机必须给出相同的**主机探测标记**集合（顺序按 15.1）；配置类标记按端能力输出——py/js/java/java11 可输出 `kstore`/`kmode1`/`kmode2`，go 只可能输出 `kstore`（未实现 KMODE，见「九」）；PHP 端不在本仓，以分发 dist 实测为准（两个 emulator 副本不探测、按 15.1 省略字段；四副本均无 KSTORE/KMODE，不输出配置类标记）。
+- 一致性：五端（py/js/go/java/java11）对同一台真机必须给出相同的**主机探测标记**集合（顺序按 15.1）；配置类标记按端能力输出——py/js/java/java11 可输出 `kstore`/`kmode1`/`kmode2`/`kmode3`（`kmode3` 0.6.6 续批起，见 15.16），go 只可能输出 `kstore`（未实现 KMODE，见「九」）；PHP 端不在本仓，以分发 dist 实测为准（两个 emulator 副本不探测、按 15.1 省略字段；四副本均无 KSTORE/KMODE，不输出配置类标记）。
+
+### 15.16 `kmode3` —— KMODE 配置为 3，kisama-hub 中继（配置类，0.6.6 起，Py/Js/Java/Java11）
+
+判据：`KMODE` 环境变量经各端既有归一化解析后等于 `3`（py/js `Config.KMODE == '3'`；java/java11 `parseKmode()` 对字面值 `"3"` 返回 3；归一化仅处理 `2q`/`2quic`）。按配置值判定，不校验 `KHUB`/`KNAME` 生效条件——`KHUB` 缺失时「十九」规定隧道不建立，此时本标记**仍报**（语义与 15.10 一致：报告"配置了 KMODE=3 启动模式"这一配置事实）。控制端不得把 `kmode3` 当作"hub 中继已就绪"的承诺；判断隧道可用性应调 `GET /api/hub`（19.8）。
+
+实现：marks 探测直读归一化后的 KMODE 配置值，O(1) 常量比较（py/js 类属性比较、java/java11 `markKmode3()` 判 final 实例字段）。
+
+排除条件：
+
+- `KMODE` 为 `0`/`1`/`2`（含 `2q`/`2quic` 归一化）/ 未设置或非法值 → 不报；
+- **go 端未实现 KMODE**，go 永不输出 `kmode3`。
+
+实测（2026-11-16，Windows 10 实机）：py agent `KMODE=3 KHUB=http://127.0.0.1:18080 KNAME=demo1 KHUB_PORTS=7788` 启动并注册成功 → 未认证 `GET /api/baseinfo` → `marks` 含 `kmode3`；0.6.6 续批 java/java11 实机同拓扑（KHUB=http://127.0.0.1:18080，注册经 hub 成功）→ 经 hub 中继的 `GET /api/baseinfo` 响应 `marks` 含 `kmode3`（java 版本号 `0.6.5-java`、java11 `0.6.5-java11`）。取值矩阵（0/1/2/3/非法值）由离线单测覆盖（tests/py/test_marks.py / tests/js/test_marks.js）。
 
 ## 十六、`/api/baseinfo` 字段分级缓存与快照语义
 
@@ -1742,3 +1766,164 @@ agent 为纯入站服务端（面板 → agent 是入站连接），DNS 污染�
 
 - 单测（全部 mock 网络层，不依赖外网）：`tests/py/test_secure_dns.py`（22 例）、`tests/js/test_secure_dns.js`（11 组）、`go/utils/dns_test.go`（14 个测试函数，含 httptest 假 DoH 与真实拨号链路）。
 - 已知限制：DoH 供应商被网络整体阻断时行为等价 off（全部回落系统解析）；php 端、js `dns.Resolver`、py `gethostbyname` 不在覆盖面（本仓出站路径均未使用）。
+
+---
+
+## 十九、kisama-hub 中继协议（KMODE=3，0.6.6 起）
+
+> **0.6.6 新增**：KMODE=3 让 agent 通过一条**出站 WebSocket 长连接**把自身服务"借道"自建的公网汇聚服务 **kisama-hub**（独立项目，仓库 `kisama-hub`）对外开放，覆盖三类流量：`/api/*` 中继、指定端口 HTTP 服务反代、终端 WS 中继。核心价值：内网无公网 IP 的机器复用 hub 的公网线路开放，无需依赖 Cloudflare 免费隧道（KMODE=1/2 的 trycloudflare 有按 IP 限流与配额不确定性）。**实现端：py / js / java / java11**（java/java11 于 0.6.6 续批补齐，传输层用 JDK 11 内置 java.net.http，零新依赖）；go 待后续批次跟进（支持矩阵见下）。
+
+### 19.1 角色与拓扑
+
+```
+访问方（面板 / control.py / 浏览器）
+        │  https://hub.example.com/{KNAME}/...
+        ▼
+kisama-hub（公网，无认证，纯传输层）
+        │  出站 WebSocket 长连接（agent 主动发起，NAT 友好）
+        ▼
+kisama-agent（内网，KMODE=3，回环分发到自身 /api 或 KHUB_PORTS 端口）
+```
+
+- hub 是**纯传输层**：验签（`X-Nonce`/`X-Timestamp`/`X-Auth-Token`）与响应加密（`x-encrypted`）端到端不变，hub 看不到任何业务明文。
+- hub 不设认证（Owner 拍板项，见 docs/SECURITY-AUDIT.md 设计特性记录）；agent 注册与中继遵循本文约定即合法使用。
+
+### 19.2 agent 端配置（KMODE=3）
+
+| 环境变量 | 缺省 | 说明 |
+| :--- | :--- | :--- |
+| `KMODE` | `0` | 设为 `3` 启用 kisama-hub 中继 |
+| `KHUB` | （空） | hub 基址，如 `https://hub.example.com`（尾斜杠剥除）；隧道 WS 地址自动推导（https→wss、http→ws、裸 host 按 ws，为字符串拼接、基址可含路径）；hub 启用路径前缀（19.3 `HUB_BASE_PATH`）时**必须带前缀**，如 `https://hub.example.com/hide1` |
+| `KHUB_PUBLIC_URL` | （空） | **公网基址覆盖值（可选，0.6.6 续批二）**：面板/客户端实际访问该 agent 中继地址的公网基址（可含路径前缀，如 `https://pub.example.com/hub`）。注册时经注册帧 `public_url` 字段上报，hub 拼 `/sub`、`/agents` 页与 ack `url` 时**优先用它**（优先级见 19.7）。**未配置时自动上报 KHUB 派生基址**（即 `KHUB` 本身——agent 知道 hub 公网地址的场景零配置）；本变量用于内网 KHUB 等派生值 ≠ 公网地址的部署。校验：`http(s)://` 开头、无空白、≤512 字符、尾斜杠剥除；非法值告警一次并回退 KHUB 派生基址 |
+| `KNAME` | （空） | hub 注册名，**单个 hub 内唯一**；校验规则独立于 shz.al（见 19.4），不要求 `KNAME_KEY` |
+| `KHUB_PORTS` | （空） | 端口反代白名单（逗号分隔，如 `7788,9090`）；**缺省空 = 端口反代禁用**，非法/越界条目静默忽略 |
+| `KISAMA_HUB_RETRY_BASE_SECONDS` | `2` | 断线重连指数退避基数（秒） |
+| `KISAMA_HUB_RETRY_MAX_SECONDS` | `60` | 退避上限（秒）；公式 `BASE × 2^(failures-1)` 封顶 MAX，与 argo 0.6.4 同构 |
+| `KISAMA_HUB_PING_INTERVAL` | `20` | 隧道应用层心跳间隔（秒） |
+| `KISAMA_HUB_RELAY_TIMEOUT` | `60` | agent 侧回环请求超时（秒；应大于 hub 侧 30s，让 hub 先超时） |
+| `KISAMA_HUB_MAX_BODY` | `67108864` | 请求/响应体上限（字节，64MB） |
+
+- `KMODE=3` 但 `KHUB` 或 `KNAME` 缺失/非法时：告警并保持普通启动（本地服务照常，不建隧道）。
+- 注册成功后 baseinfo `marks` 追加 `kmode3`（见 15.16）。
+
+### 19.3 hub 端点清单
+
+| 路由 | 说明 |
+| :--- | :--- |
+| `GET /` | 落地页（在线数与入口链接） |
+| `GET /agents` | 注册列表页（KNAME/版本/端口入口/中继 URL/注册时间/最近心跳/中继计数；每行一键复制 kisama:// 链接；10s 自刷新） |
+| `GET /api/agents` | JSON 列表（`{hub_version, count, agents:[{kname, version, ports, registered_at, last_seen, relay_count, url}]}`） |
+| `GET /sub` | 订阅：text/plain，每行一条 `kisama://node?domain=<enc>&name=<enc>`（见 19.7） |
+| `GET /sub?format=json` | 面板批量导入格式 `NodeConfigExport {version, exportedAt, nodes:[...]}`（面板「导入配置」直接消费） |
+| `GET /health` | 健康检查 `{status, hub_version, agents}` |
+| `WS /tunnel` | agent 注册与隧道（唯一 agent 入口，见 19.5） |
+| `ANY /{KNAME}/api/*` | API 中继 → agent 自身 `/api/*` |
+| `GET /{KNAME}/api/ws/*` | 终端 WS 中继（帧级多路复用，见 19.6） |
+| `ANY /{KNAME}/{PORT}/*` | 端口反代 → agent 回环 `127.0.0.1:{PORT}`（`PORT` 须 1-65535） |
+
+hub 环境变量：`HUB_PORT`(8080)、`HUB_MAX_AGENTS`(256)、`HUB_RELAY_TIMEOUT`(30s)、`HUB_MAX_BODY`(64MB)、`HUB_HEARTBEAT_TIMEOUT`(60s)、`HUB_WS_IDLE_TIMEOUT`(600s)、`HUB_PUBLIC_URL`（可选，订阅 domain 与 ack url 的公网基址，不含路径前缀；缺省按 `X-Forwarded-Proto` + Host 推导，生产 TLS 反代后建议显式设置）、`HUB_BASE_PATH`（可选，路由前缀如 `hide1` → 上表全部路由挂 `/hide1/` 下，根路径与其余未挂前缀路径 404 隐藏、`/hide1` 自动重定向 `/hide1/`；前缀段限字母/数字/连字符/下划线，非法回退根路径；此时 agent 的 `KHUB` 与订阅/面板 domain 均须带前缀——四端 KHUB→WS 地址为字符串拼接天然携带前缀，agent 端零改动；隐藏属轻微混淆非认证，代理/枚举仍可发现）。hub 全部响应（含中继，上游同名头剥除后统一裁定）带 CORS 头 `Access-Control-Allow-Origin: *` 等（0.6.6 批次，语义对齐 kpng/kisamaproxy；带 `Origin` 的 OPTIONS 预检由 hub 本地 204 应答，无 `Origin` 的 OPTIONS 照旧透传）。
+
+### 19.4 KNAME 规则与注册抢占
+
+- **格式**：`^[a-z0-9][a-z0-9-]{1,62}$`（输入小写归一化，2-63 字符，首位字母或数字）。
+- **保留名**（与 hub 自有路由冲突，注册即拒）：`api`、`agents`、`health`、`tunnel`、`static`、`sub`、`favicon.ico`。
+- **抢占规则**：槽位空闲（旧连接已断并注销）才可注册；活跃连接在位时返回 `name_taken`，**不发生替换**（杜绝抢名战争）。进程重启后旧 WS 已死可自然重占。hub 重启后注册表清空，agent 自动重连重注册（注册表纯内存，无持久化）。
+- **注册帧**（WS /tunnel 首帧）：`{"t":"register","v":1,"kname":"...","version":"0.6.5-python","ports":[7788]}`，可选字段 `public_url`（公网基址，0.6.6 续批起；**0.6.6 续批二起缺省自动上报**——`KHUB_PUBLIC_URL` 合法配置值优先，未配置取 KHUB 派生基址（`KHUB` 本身）；hub 校验同 agent 端——`http(s)://` 开头、无空白、≤512 字符、尾斜杠剥除，非法即拒 `invalid_public_url`，旧版 agent 不携带时回落 hub 推导）；应答 `{"t":"ack","ok":true,"kname":"...","url":"https://<host>/<kname>"}`（`url` 按 19.7 优先级拼装，agent 上报了 `public_url` 时即为其修正值）或 `{"t":"ack","ok":false,"code":"invalid_name"|"name_taken"|"full"|"invalid_version"|"invalid_frame"|"invalid_public_url","message":"..."}`。
+- **心跳**：agent 每 20s 发 `{"t":"ping"}`，hub 回 `{"t":"pong"}`；hub 读空闲超时 `HUB_HEARTBEAT_TIMEOUT`（60s，任何帧重置），超时断开并注销。
+
+### 19.5 HTTP 中继 envelope（req/res/err）
+
+单一 JSON 文本帧承载；body 一律 base64（`body_b64`）。
+
+- 请求帧：`{"t":"req","id":N,"mode":"api"|"port","port":7788,"method":"GET","path":"/api/baseinfo","query":"a=1","headers":{...},"body_b64":"..."}`
+  - api 模式：`path` = 剥离 `/{KNAME}` 后的路径（`/api/baseinfo`），agent 回环到 `http://127.0.0.1:{自身端口}{path}`；
+  - port 模式：`path` = 剥离 `/{KNAME}/{PORT}` 后的剩余路径，agent 回环到 `http://127.0.0.1:{PORT}{path}`；
+  - 头部处理：hub 剥 hop-by-hop（connection/keep-alive/transfer-encoding/upgrade/host/proxy-\*）、内部命名空间 `x-kisama-hub-*`、注入头 `x-forwarded-*`，并注入 `x-forwarded-for`（hub 所见客户端 IP）；agent 回环前再做一次同规则纵深过滤。
+- 响应帧：`{"t":"res","id":N,"status":200,"headers":{...},"body_b64":"..."}`（`content-length` 由 hub 依实际 body 重写）。
+- 错误帧：`{"t":"err","id":N,"code":"...","message":"..."}`，hub 按码映射 HTTP 状态：`port_not_allowed`→403、`body_too_large`→413、`relay_timeout`→504、`loopback_unreachable`/`agent_disconnected`/`tunnel_write_failed`→502、未知→502。
+- agent 离线 / KNAME 未注册 → hub 直接 404（`unknown_agent`）；body 超 `HUB_MAX_BODY` → 413（hub 与 agent 双侧限额）。
+- **端口反代的白名单校验在 agent 侧**（`KHUB_PORTS`）：hub 无状态转发，agent 对未放行端口拒绝且不发起回环连接（无端口扫描侧信道）。
+
+### 19.6 终端 WS 中继（ws_open/ws_ack/ws_data/ws_close）
+
+- 客户端对 `/{KNAME}/api/ws/terminal?request_id=...` 发起 WebSocket 升级，hub 立即升级并分配流 ID，发 `{"t":"ws_open","id":N,"path":"/api/ws/terminal","query":"...","headers":{...}}`。
+- agent 收到后回环拨号 `ws://127.0.0.1:{自身端口}{path}?{query}`（Noise XX 握手 / 降级令牌字节级透传，端到端加密不变），成功回 `{"t":"ws_ack","id":N,"ok":true}`；失败回 `ok:false`，hub 以 close 3001 关闭客户端。
+- 双向数据 `{"t":"ws_data","id":N,"bt":"bin"|"txt","data_b64":"..."}`（binary/text 语义保真）；任一侧关闭发 `{"t":"ws_close","id":N,"ws_code":<int>,"reason":"..."}` 对侧联动（`ws_code` 为独立整型键名，与 err 帧的字符串 `code` 区分）。
+- **hub 在收到 ws_ack(ok:true) 前缓冲客户端帧**（agent 本地 WS 握手仍在进行，提前下发会被其 CONNECTING 状态丢弃——Noise msg1 丢失会让会话静默挂死）；ack 到达后按序 flush。agent 侧对称：本地握手完成前的下行帧入队缓冲，open 后按序 flush。
+- 流级空闲超时 `HUB_WS_IDLE_TIMEOUT`（600s，任何帧重置）；隧道断开 → 该 agent 全部客户端流以 1011 关闭。hub 对客户端 ping/pong 自行应答（不上隧道）。
+- **端口反代模式也支持 WS 透传（0.6.6 续批）**：`/{KNAME}/{PORT}/*` 的 WebSocket 升级分流到同一帧协议，`ws_open` 帧携带 `port` 字段（`{"t":"ws_open","id":N,"port":7788,"path":"/剩余路径",...}`），agent 校验 `KHUB_PORTS` 白名单后回环拨 `ws://127.0.0.1:{port}{path}`——**目标服务的 WS（含其自有认证）端到端透传**；白名单未放行时 agent 回 `ws_ack ok:false`，hub 以 close 3001 关客户端（与 HTTP 端口反代的 403 同语义）。api 模式的 `ws_open` 无 `port` 字段（agent 回环自身）。
+
+### 19.7 订阅与连接串契约（对齐 kisama-panel share-link.ts）
+
+- hub 生成的链接形态：`kisama://node?domain=<enc>&name=<enc>`；值编码严格对齐面板 `encodeURIComponent` 语义（`+` 必须转 `%2B`，解析侧不做 `+`→空格）；可选字段为空不写。
+- **domain 基址来源三级优先级（0.6.6 续批起；0.6.6 续批二起 public_url 缺省自动上报）**：该 agent 注册时上报的 `public_url`（注册帧字段，`KHUB_PUBLIC_URL` 覆盖值优先、缺省取 KHUB 派生基址——agent 已声明其实际基址，无需 hub 侧配置）> hub 全局 `HUB_PUBLIC_URL` > 请求推导（`X-Forwarded-Proto` + Host，或 TLS 判定 https）。`/sub`（文本与 `?format=json` 的 `domain`）、`/agents` 页与 `/api/agents` 的 `url`、注册 ack 的 `url` 四处统一按此优先级拼装（`{基址}/{KNAME}`）；`/api/agents` 条目 additive 增加 `public_url` 字段（非空才输出，标示该条目 url 来源）。未上报任何值时行为与 0.6.6 首批完全一致。
+- **不带任何私钥字段**：连接串里的 `ecdsaprikey`/`eciesprikey` 是**面板侧私钥**，hub 不可能持有；面板导入后节点级缺省由其全局密钥兜底（`node.key || globalConfig.key`）。
+- 面板节点 URL 配置为 `https://hub/{KNAME}`：面板 `getSignPath` 对任意前缀取最后一个 `/api/` 锚点签名，签名 PATH 即 agent 实际分发的路径——**签名口径 = 剥离 KNAME 前缀后的本地路径**，面板与 `tools/control.py`（相对路径签名）均零改动兼容。
+- 面板现状**没有订阅 URL 定时拉取器**：`/sub` 文本可逐条复制进 NodeForm 粘贴导入，`/sub?format=json` 可经面板「导入配置」批量导入；订阅 URL 自动拉取为 kisama-panel 侧后续改动预留。
+
+### 19.8 中继状态端点 `GET /api/hub`（Py/Js/Java/Java11）
+
+走验签（非白名单），返回：
+
+```json
+{
+  "status": "ok",
+  "enabled": true,
+  "tunnel": {
+    "tunnel_status": "alive",          // alive | reconnecting | failed（对齐 /api/argo 三态惯例）
+    "hub": "https://hub.example.com",
+    "kname": "demo1",
+    "url": "https://hub.example.com/demo1",
+    "ports": [7788],
+    "consecutive_failures": 0,
+    "last_error": null,
+    "last_error_at": null,
+    "last_connected_at": "2026-11-16T00:00:00Z",
+    "relay_count": 12
+  }
+}
+```
+
+**0.6.6 续批 additive 扩展**：响应新增 `registrations` 数组（注册表全量，元素在 snapshot 基础上含 `source: "startup"|"dynamic"`）；`tunnel` 字段保留（KMODE=3 静态实例快照，无则 null）；`enabled` 语义更新为"注册表非空"。非 KMODE=3 且无动态注册时返回 `{"status":"ok","enabled":false,"registrations":[],"tunnel":null}`。
+
+**0.6.6 续批新增 `POST/DELETE /api/hub`（动态注册，见 19.9）**——注册项持久化于 kstore `data.hubregs`（第十三节），agent 重启自动恢复。
+
+### 19.9 动态注册 API（POST/DELETE /api/hub，0.6.6 续批，Py/Js/Java/Java11）
+
+运行时动态指挥 agent 注册/注销到 kisama-hub，**不依赖 KMODE=3 启动配置**。三条路由均走验签（非白名单）。注册项持久化于 kstore `data.hubregs`（第十三节"hub 注册任务子类型"），agent 重启自动恢复。
+
+**`POST /api/hub`** — 动态注册：
+
+```json
+{ "hub": "https://hub.example.com", "kname": "myhost", "ports": [7788] }
+```
+
+- 同步等待注册结果（15s 超时）；成功 → `200 {"status":"ok","persisted":<bool>,"registration":{...snapshot, "source":"dynamic"}}`（`persisted=false` 表示 KSTORE 未启用，注册仅本进程内存活）；
+- `KNAME` 非法/保留名 → `422 {"code":"invalid_name",...}`；hub 基址非 http(s) → `422 {"code":"invalid_hub"}`；本 agent 已有同名注册 → `409 {"code":"name_taken"}`（kname 唯一键）；hub 侧 name_taken/full → `409`——以上**均不保留注册项**；
+- 网络类失败（hub 不可达/超时）→ `500 {"code":"unreachable","persisted":<bool>,...}`——**注册项保留**，按指数退避自治重连，状态后查 GET（无重复 POST 的必要）。
+
+**`DELETE /api/hub`** — 注销：
+
+```json
+{ "kname": "myhost" }
+```
+
+- 成功 → `200 {"status":"ok","persisted":<bool>,"removed":{...snapshot}}`（隧道 stop + 注册表移除 + 落盘同步删除）；
+- 未注册 → `404`。
+
+**KMODE=3 与动态注册共存**：静态项（source=startup）与动态项（source=dynamic）在同一注册表（kname 唯一键）；KMODE=3 未启用时仅动态项生效。注册表全量见 GET 的 `registrations`。
+
+**支持矩阵补充**：动态注册与持久化恢复当前 Py/Js/Java/Java11（与 19.10 矩阵同步演进）。
+
+### 19.10 支持矩阵与遗留
+
+| 能力 | py | js | go | java | java11 |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| KMODE=3（API 中继 / 端口反代 / 终端中继 / 订阅） | ✅ | ✅ | ❌（KMODE 全系未实现） | ✅（0.6.6 续批） | ✅（0.6.6 续批） |
+| 动态注册（POST/DELETE /api/hub + kstore 持久化恢复，19.9） | ✅ | ✅ | ❌ | ✅ | ✅ |
+| 端口反代 WS 透传（ws_open.port，19.6） | ✅ | ✅ | ❌ | ✅ | ✅ |
+| marks `kmode3` | ✅ | ✅ | ❌ | ✅ | ✅ |
+| `GET /api/hub` | ✅ | ✅ | ❌ | ✅ | ✅ |
+| public_url 上报（缺省 KHUB 派生，KHUB_PUBLIC_URL 覆盖；19.4/19.7，0.6.6 续批二） | ✅ | ✅ | ❌ | ✅ | ✅ |
+
+遗留（后续批次）：go 的 KMODE=3 实现（需先补 KMODE/KNAME/KHUB/KHUB_PORTS 配置基建）；php 端无 WS 客户端、不做 hub 接入；面板订阅 URL 自动拉取（kisama-panel 侧）。

@@ -10,6 +10,9 @@ function resetKmodeConfig() {
   Config.KNAME = '';
   Config.KNAME_KEY = '';
   Config.KPATH = '';
+  Config.KHUB = '';
+  Config.KHUB_PUBLIC_URL = '';
+  Config.KHUB_PORTS = [];
 }
 
 function caseMainOptions() {
@@ -81,8 +84,24 @@ function caseOriginalApiUnaffected() {
   assert.strictEqual(Config.ECIES_PUBLIC_KEY_PEM, 'pub-b');
 }
 
+function caseKmode3AndHubOptions() {
+  // 0.6.6: KMODE=3 (kisama-hub 出站隧道) 为合法取值; KHUB 尾斜杠剥除; KHUB_PORTS 去重排序
+  Config.merge({ KMODE: '3', KNAME: 'demo1', KHUB: 'http://hub.example.com/', KHUB_PORTS: '7788, 9090, abc, 0, 70000, 8080, 7788' });
+  assert.strictEqual(Config.KMODE, '3');
+  assert.strictEqual(Config.KHUB, 'http://hub.example.com');
+  assert.deepStrictEqual(Config.KHUB_PORTS, [7788, 8080, 9090]);
+  Config.merge({ KMODE: '3', KHUB: 'https://hub2.example.com', KHUB_PUBLIC_URL: 'https://pub.example.com/hub///', KHUB_PORTS: '' });
+  assert.strictEqual(Config.KMODE, '3');
+  assert.strictEqual(Config.KHUB, 'https://hub2.example.com');
+  assert.strictEqual(Config.KHUB_PUBLIC_URL, 'https://pub.example.com/hub', '公网基址修正值尾斜杠剥除 (0.6.6 续批)');
+  assert.deepStrictEqual(Config.KHUB_PORTS, [], '空串清空白名单');
+  Config.merge({ KMODE: '3', KHUB_PUBLIC_URL: '' });
+  assert.strictEqual(Config.KHUB_PUBLIC_URL, '', '空串清空修正值 (未配置=不上报)');
+}
+
 const cases = [
   ['接入 main(Options) 完整 KMODE 配置', caseMainOptions],
+  ['KMODE=3 与 KHUB/KHUB_PORTS 合并 (0.6.6)', caseKmode3AndHubOptions],
   ['KMODE 数字入参 / 显式 0 覆盖', caseNumericKmode],
   ['KMODE 非法取值回退 0', caseInvalidKmodeFallback],
   ['未传 KMODE 不改动现有值', caseUndefinedLeavesValue],

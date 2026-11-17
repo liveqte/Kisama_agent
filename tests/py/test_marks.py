@@ -279,18 +279,20 @@ class MarksProbeTest(unittest.TestCase):
             self.assertFalse(self.collector._mark_kstore())
 
     def test_kmode_marks_by_config_value(self):
-        # 2q/2quic → "2" 的归一化发生在 Config 定义处 (py :936), marks 只消费归一化结果
+        # 2q/2quic → "2" 的归一化发生在 Config 定义处 (py :936), marks 只消费归一化结果;
+        # 0.6.6 新增 kmode3 (KMODE=3 kisama-hub 出站隧道, docs/API.MD 15.11)
         cases = {
-            "0": (False, False),
-            "1": (True, False),
-            "2": (False, True),
-            "3": (False, False),
-            "abc": (False, False),
+            "0": (False, False, False),
+            "1": (True, False, False),
+            "2": (False, True, False),
+            "3": (False, False, True),
+            "abc": (False, False, False),
         }
-        for kmode, (kmode1, kmode2) in cases.items():
+        for kmode, (kmode1, kmode2, kmode3) in cases.items():
             with mock.patch.object(agent.Config, "KMODE", kmode):
                 self.assertEqual(self.collector._mark_kmode1(), kmode1, f"KMODE={kmode}")
                 self.assertEqual(self.collector._mark_kmode2(), kmode2, f"KMODE={kmode}")
+                self.assertEqual(self.collector._mark_kmode3(), kmode3, f"KMODE={kmode}")
 
     def test_detect_marks_appends_config_marks_after_host_marks(self):
         with mock.patch.object(agent.platform, "system", return_value="Linux"), \
@@ -301,9 +303,10 @@ class MarksProbeTest(unittest.TestCase):
              mock.patch.object(self.collector, "_mark_fuse", return_value=False), \
              mock.patch.object(self.collector, "_mark_kstore", return_value=True), \
              mock.patch.object(self.collector, "_mark_kmode1", return_value=False), \
-             mock.patch.object(self.collector, "_mark_kmode2", return_value=True):
+             mock.patch.object(self.collector, "_mark_kmode2", return_value=False), \
+             mock.patch.object(self.collector, "_mark_kmode3", return_value=True):
             self.assertEqual(self.collector._detect_marks(),
-                             ["root", "kstore", "kmode2"])
+                             ["root", "kstore", "kmode3"])
 
     def test_detect_marks_isolates_config_probe_exceptions(self):
         with mock.patch.object(agent.platform, "system", return_value="Linux"), \

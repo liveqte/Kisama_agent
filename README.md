@@ -10,6 +10,7 @@ Kisama_Panel的agent
 ## KMODE 启动模式（🆕 0.4.8 新增支持特性，KMODE=2 为 0.4.8 后期迭代新增）
 
 > 🏷️ 0.6.4 起 KMODE=1/2 会经 `/api/baseinfo` 的 `marks` 字段暴露为 `kmode1`/`kmode2` 标记（按配置值判定；go 端未实现 KMODE 故不输出），详见 `docs/API.MD` 第十五节 15.9/15.10。
+> 🆕 **0.6.6 新增 KMODE=3（kisama-hub 自建公网中继，Py/Js/Java/Java11）**：不依赖 trycloudflare，agent 向自建的公网汇聚服务 **kisama-hub** 建立出站 WebSocket 长连接，把 `/api`、指定端口 HTTP 服务（`KHUB_PORTS` 白名单）与交互终端借 hub 公网线路对外开放；验签与响应加密端到端不变，hub 纯传输层看不到明文。hub 提供 `/agents` 注册列表页与 `/sub` 订阅（`kisama://` 连接串，面板粘贴/导入配置批量接入）。配置：`KMODE=3 KHUB=https://hub.example.com KNAME=<注册名> KHUB_PORTS=7788`，可选 `KHUB_PUBLIC_URL=https://实际公网基址`（hub 反代/隧道后自行推导不准时，由 agent 注册时上报修正订阅/页面/ack 的中继 URL）。协议、envelope、KNAME 规则与 hub 部署见 `docs/API.MD` 第十九节；hub 源码见 `kisama-hub` 仓库。
 
 ### 什么情况下应该使用
 

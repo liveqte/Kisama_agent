@@ -1,6 +1,6 @@
 {
   "name": "kisama-js",
-  "version": "0.6.5",
+  "version": "0.6.6",
   "description": "Kisama Agent - Node.js implementation",
   "main": "index.js",
   "scripts": {
@@ -21,7 +21,8 @@
     "express-ws": "^5.0.2",
     "node-cron": "^4.2.1",
     "noise-c.wasm": "^0.4.0",
-    "systeminformation": "^5.21.15"
+    "systeminformation": "^5.21.15",
+    "ws": "^8.21.0"
   },
   "engines": {
     "node": ">=16.0.0"

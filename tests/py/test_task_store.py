@@ -180,3 +180,65 @@ class TaskManagerRestoreTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TaskStoreHubRegTest(unittest.TestCase):
+    """hub 注册任务子类型 (data.hubregs, 0.6.6 续批): round-trip / 旧格式兼容 / 非法过滤"""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+
+    def test_save_hubregs_load_roundtrip(self):
+        s = make_store(self.d)
+        self.assertTrue(s.save_hubregs([{"hub": "https://hub.example.com", "kname": "demo1", "ports": [7788]}]))
+        # load 填充 hubregs (TaskManager 启动恢复语义)
+        s2 = make_store(self.d)
+        onetasks, crontasks = s2.load()
+        self.assertEqual((onetasks, crontasks), ([], {}))
+        self.assertEqual(len(s2.hubregs), 1)
+        self.assertEqual(s2.hubregs[0], {"hub": "https://hub.example.com", "kname": "demo1", "ports": [7788]})
+        self.assertEqual(s2.get_hubregs(), s2.hubregs)
+
+    def test_save_preserves_existing_hubregs(self):
+        # 既有任务 API 落盘 (save 两键) 不得丢掉已存的 hubregs
+        s = make_store(self.d)
+        s.save_hubregs([{"hub": "https://hub.example.com", "kname": "demo1", "ports": []}])
+        self.assertTrue(s.save(["echo hi"], {"*/5 * * * *": "echo cron"}))
+        s2 = make_store(self.d)
+        s2.load()
+        self.assertEqual(len(s2.hubregs), 1, "save(onetasks, crontasks) 必须保留 hubregs 键")
+        self.assertEqual(s2.get_hubregs()[0]["kname"], "demo1")
+        self.assertEqual(s2.get_hubregs()[0]["ports"], [])
+
+    def test_legacy_file_without_hubregs_key(self):
+        # 老版本写入的容器 (data 只有 onetasks/crontasks) 加载 → hubregs=[] 不报错
+        s = make_store(self.d)
+        s.save(["echo legacy"], {})
+        s2 = make_store(self.d)
+        s2.load()
+        self.assertEqual(s2.hubregs, [])
+        self.assertEqual(s2.get_hubregs(), [])
+
+    def test_invalid_hubreg_entries_filtered(self):
+        s = make_store(self.d)
+        self.assertTrue(s.save_hubregs([
+            {"hub": "https://hub.example.com", "kname": "ok1", "ports": [7788, 99999, "x"]},
+            "not-a-dict",
+            {"kname": "no-hub"},
+            {"hub": 123, "kname": 456, "ports": None},
+        ]))
+        s2 = make_store(self.d)
+        s2.load()
+        self.assertEqual(len(s2.hubregs), 2)  # ok1 与 {hub:123,kname:456} (str 化合法)
+        by_kname = {r["kname"]: r for r in s2.hubregs}
+        self.assertEqual(by_kname["ok1"]["ports"], [7788])  # 越界/非法端口过滤
+        self.assertEqual(by_kname["456"]["ports"], [])
+
+    def test_save_hubregs_disabled_store(self):
+        d = tempfile.mkdtemp()
+        with mock.patch.dict(os.environ, {"KSTORE": "off", "KSTORE_KEY": TEST_KEY_HEX}, clear=False):
+            os.environ.pop("KSTORE_KEY", None)
+            s = agent.TaskStore()
+        self.assertFalse(s.enabled)
+        self.assertFalse(s.save_hubregs([{"hub": "https://h", "kname": "x", "ports": []}]))
+        self.assertEqual(s.get_hubregs(), [])
