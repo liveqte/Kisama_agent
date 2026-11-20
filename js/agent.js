@@ -589,6 +589,239 @@ function filterLoopbackHeaders(headers) {
   return out;
 }
 
+// ============================================================================
+// 📡 本地端口反代路由 (0.6.7, docs/API.MD 二十): 回环转发核心 (一份实现两处消费,
+// 与 py 端 loopback_relay_request 同源契约)。hub req 帧路径 (HubTunnelManager._handleReq,
+// whitelist=HUB 组聚合, requestFn=注入缝) 与本地路由路径 (/api/proxy/{port}/*,
+// whitelist=本地组聚合, forwardedFor=真实客户端 IP) 共用同一份实现。
+// ============================================================================
+const PROXY_STRIPPED_AUTH_HEADERS = ['x-nonce', 'x-timestamp', 'x-auth-token', 'x-aes-encrypted',
+  'x-encrypted', 'x-agent-version'];
+
+// 📡 运行时白名单 (0.6.7 续批六分组口径, docs/API.MD 20.2/20.8): 两组独立管理 ——
+// HUB 组 (env KHUB_PORTS ∪ hub 运行时) 只约束 hub 链路端口反代 (/{KNAME}/{PORT}/*, 0.6.6);
+// 本地组 (env KPROXY_PORTS ∪ 本地运行时) 只约束本地路由 /api/proxy/{port} 与 /api/proxyws/{port}。
+// 运行时列表经 POST /api/proxy/config (scope 区分组, 整体覆盖) 设置, KSTORE data.proxyports
+// 持久化重启恢复; env 为部署者意愿下限, 运行时列表只增; 收紧用 DELETE 回落 env。
+// POST /api/hub 注册端口并入 HUB 组 (19.9)。修订 0.6.7 续批二"单一白名单口径" (Owner 拍板 2026-11-20)。
+const PROXY_GROUP_HUB = 'hub';
+const PROXY_GROUP_LOCAL = 'local';
+const PROXY_RUNTIME_PORTS = { [PROXY_GROUP_HUB]: new Set(), [PROXY_GROUP_LOCAL]: new Set() };
+
+function proxyEnvPorts(group) {
+  // 组 env 下限: HUB 组取 KHUB_PORTS, 本地组取 KPROXY_PORTS (未知组视为空)
+  return group === PROXY_GROUP_HUB ? (Array.isArray(Config.KHUB_PORTS) ? Config.KHUB_PORTS : [])
+    : group === PROXY_GROUP_LOCAL ? (Array.isArray(Config.KPROXY_PORTS) ? Config.KPROXY_PORTS : []) : [];
+}
+
+function proxyRuntimePorts(group) {
+  // 组运行时列表快照 (排序; 不含 env 部分)
+  return [...(PROXY_RUNTIME_PORTS[group] || new Set())].sort((a, b) => a - b);
+}
+
+function proxyGroupsSnapshot() {
+  // 两组运行时快照 (KSTORE data.proxyports 对象形状落盘用)
+  return { [PROXY_GROUP_HUB]: proxyRuntimePorts(PROXY_GROUP_HUB),
+           [PROXY_GROUP_LOCAL]: proxyRuntimePorts(PROXY_GROUP_LOCAL) };
+}
+
+function proxyEffectivePorts(group) {
+  // 组聚合端口白名单 (group: 'hub'/'local'): 组 env 下限 ∪ 组运行时列表, 排序去重
+  return [...new Set([...proxyEnvPorts(group), ...(PROXY_RUNTIME_PORTS[group] || new Set())])]
+    .sort((a, b) => a - b);
+}
+
+function cleanPortList(ports) {
+  // 端口列表清洗: 数字/数字字符串 → 1-65535 去重集合, 其余静默丢弃 (bool 排除)
+  const cleaned = new Set();
+  for (const p of (ports || [])) {
+    if (typeof p === 'boolean') continue;
+    const v = Number(p);
+    if (!Number.isInteger(v) || v < 1 || v > 65535) continue;
+    cleaned.add(v);
+  }
+  return cleaned;
+}
+
+function proxySetRuntimePorts(group, ports) {
+  // 整体覆盖组运行时白名单 (POST /api/proxy/config, scope 选组); 非法/越界条目静默过滤
+  if (!PROXY_RUNTIME_PORTS[group]) PROXY_RUNTIME_PORTS[group] = new Set();
+  const cleaned = cleanPortList(ports);
+  PROXY_RUNTIME_PORTS[group].clear();
+  for (const v of cleaned) PROXY_RUNTIME_PORTS[group].add(v);
+}
+
+function proxyMergeRuntimePorts(group, ports) {
+  // 并入组运行时白名单 (POST /api/hub 注册端口并入 HUB 组, docs/API.MD 19.9/20.8):
+  // 同组只增不覆盖, 同规则静默过滤
+  if (!PROXY_RUNTIME_PORTS[group]) PROXY_RUNTIME_PORTS[group] = new Set();
+  const cleaned = cleanPortList(ports);
+  for (const v of cleaned) PROXY_RUNTIME_PORTS[group].add(v);
+}
+
+async function proxyWsRelayHandler(ws, req) {
+  // 📡 本地端口反代 WS 透传 (0.6.7, docs/API.MD 20.6): 白名单唯一门禁 (匿名放行, Owner 拍板
+  // 2026-11-18) —— 回环拨 ws://127.0.0.1:{port} 双向泵 (text/binary 保真); 白名单拒绝不发起
+  // 回环连接 (close 1008, 与 HTTP 端口反代 403 同语义); CONNECTING 缓冲镜像 HubWSStream._pendingFromHub
+  const port = parseInt(req.params.port, 10);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    ws.close(1008, 'invalid_port: ' + String(req.params.port).slice(0, 80));
+    return;
+  }
+  if (!proxyEffectivePorts(PROXY_GROUP_LOCAL).includes(port)) {
+    ws.close(1008, 'port_not_allowed: 端口 ' + port + ' 未在本地反代白名单');
+    return;
+  }
+  const rest = req.params[0] || '';
+  const query = req.url.includes('?') ? req.url.slice(req.url.indexOf('?') + 1) : '';
+  const url = `ws://127.0.0.1:${port}/${rest}${query ? '?' + query : ''}`;
+  const dialHeaders = {};
+  for (const [k, v] of Object.entries(req.headers || {})) {
+    const lk = String(k).toLowerCase();
+    // 剥 hop-by-hop/host 与 sec-websocket-* (防 permessage-deflate 协商错乱, 对齐 py 端) 与 agent 认证头
+    if (HUB_HOP_HEADERS.has(lk) || lk.startsWith('sec-websocket-') || lk.startsWith('x-kisama-hub-')) continue;
+    if (PROXY_STRIPPED_AUTH_HEADERS.includes(lk)) continue;
+    dialHeaders[k] = Array.isArray(v) ? v[0] : v;
+  }
+  let upstream;
+  try {
+    upstream = new WebSocket(url, { headers: dialHeaders });
+  } catch (err) {
+    ws.close(1011, String((err && err.message) || err).slice(0, 100));
+    return;
+  }
+  const pending = [];           // 回环拨号 CONNECTING 期间到达的客户端帧, open 后按序 flush
+  let upstreamOpen = false;
+  upstream.on('open', () => {
+    upstreamOpen = true;
+    for (const m of pending) upstream.send(m.data, { binary: m.binary });
+    pending.length = 0;
+  });
+  upstream.on('message', (data, isBinary) => {
+    // 上游 → 客户端 (text/binary 保真)
+    if (ws.readyState === ws.OPEN) ws.send(data, { binary: isBinary });
+  });
+  upstream.on('close', () => { try { ws.close(1000, 'closed'); } catch (e) { /* 忽略 */ } });
+  upstream.on('error', () => { try { ws.close(1011, 'upstream error'); } catch (e) { /* 忽略 */ } });
+  ws.on('message', (data, isBinary) => {
+    // 客户端 → 上游
+    if (upstreamOpen) upstream.send(data, { binary: isBinary });
+    else pending.push({ data, binary: isBinary });
+  });
+  ws.on('close', () => { try { upstream.close(); } catch (e) { /* 忽略 */ } });
+  ws.on('error', () => { try { upstream.close(); } catch (e) { /* 忽略 */ } });
+}
+
+function makeRelayError(code, message) {
+  // 回环转发失败 (code: port_not_allowed / body_too_large / loopback_unreachable, 与 hub 错误映射对齐);
+  // relayCode 区别于 node err.code (系统错误码)
+  const err = new Error(message);
+  err.relayCode = code;
+  return err;
+}
+
+function httpRequestRaw(method, url, headers, body, timeoutMs, maxBody) {
+  // 回环 http://127.0.0.1:{port} 原始请求 (node http/https, 字节保真: 不解压、不改写);
+  // 响应边收边计数, 超 maxBody 立即中断 (超限提前止损, 语义与 0.6.6 _httpRequest 一致)
+  return new Promise((resolve, reject) => {
+    let u;
+    try { u = new URL(url); } catch (err) { return reject(err); }
+    const mod = u.protocol === 'https:' ? https : http;
+    const req = mod.request(u, { method, headers }, (res) => {
+      const chunks = [];
+      let size = 0;
+      let tooLarge = false;
+      res.on('data', (c) => {
+        size += c.length;
+        if (size > maxBody + 1) { tooLarge = true; res.destroy(); return; }
+        chunks.push(c);
+      });
+      res.on('end', () => {
+        if (tooLarge) {
+          return reject(makeRelayError('body_too_large', 'response body exceeds KISAMA_HUB_MAX_BODY'));
+        }
+        resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) });
+      });
+      res.on('error', reject);
+    });
+    req.setTimeout(timeoutMs, () => req.destroy(new Error('loopback request timeout')));
+    req.on('error', reject);
+    if (body && body.length) req.write(body);
+    req.end();
+  });
+}
+
+function filterProxyResponseHeaders(headers) {
+  // 代理响应头过滤: 剥 hop-by-hop 与 content-length (按实长重算)、access-control-*
+  // (CORS 由本端统一裁定, 与 hub relay.go 同口径)
+  const out = {};
+  for (const [k, v] of Object.entries(headers || {})) {
+    const lk = String(k).toLowerCase();
+    if (HUB_HOP_HEADERS.has(lk) || lk === 'content-length' || lk.startsWith('access-control-')) continue;
+    out[k] = v;
+  }
+  return out;
+}
+
+function relayLoopbackPrepare(opts) {
+  // 回环转发前置检查与构造 (0.6.7 一份实现多层共用): 白名单/请求体超限 + URL 与头构造。
+  // 白名单拒绝不发起连接 (无扫描侧信道); 请求体超限回 body_too_large (响应头未发出, 可回 JSON)
+  const { port, whitelist, path, query, headers, body, maxBody } = opts;
+  if (whitelist && !whitelist.includes(port)) {
+    throw makeRelayError('port_not_allowed', `端口 ${port} 未在反代白名单`);
+  }
+  if (body && body.length > maxBody) {
+    throw makeRelayError('body_too_large', `请求体超过 KISAMA_HUB_MAX_BODY (${maxBody} 字节)`);
+  }
+  const url = `http://127.0.0.1:${port}${path}${query ? '?' + query : ''}`;
+  const reqHeaders = filterLoopbackHeaders(headers);
+  if (opts.forwardedFor) reqHeaders['x-forwarded-for'] = opts.forwardedFor;
+  return { url, headers: reqHeaders };
+}
+
+function httpRequestStream(method, url, headers, body, timeoutMs) {
+  // 回环流式原语 (node http/https, 字节保真): 返回 Promise<{status, headers, res}> —— res 为
+  // IncomingMessage, 调用方 pipe 到客户端响应 (SSE/大文件; 响应体不受 MAX_BODY 限制)。
+  // setTimeout 为 socket 空闲超时 (SSE 心跳刷新保活); 连接失败 reject (响应头未发出, 可回 JSON)
+  return new Promise((resolve, reject) => {
+    let u;
+    try { u = new URL(url); } catch (err) { return reject(err); }
+    const mod = u.protocol === 'https:' ? https : http;
+    const req = mod.request(u, { method, headers }, (res) => {
+      resolve({ status: res.statusCode, headers: res.headers, res });
+    });
+    req.setTimeout(timeoutMs, () => req.destroy(new Error('loopback request timeout')));
+    req.on('error', reject);
+    if (body && body.length) req.write(body);
+    req.end();
+  });
+}
+
+async function relayLoopbackHttp(opts) {
+  // 缓冲版 (hub req 帧路径用, docs/API.MD 十九/二十): prepare 前置层 + httpRequestRaw 全量
+  // 收集 + 响应体超限检查 — 白名单语义一份实现。
+  // opts: { port, whitelist, method, path, query, headers, body, maxBody, relayTimeout(ms),
+  //         requestFn(注入缝), forwardedFor } → { status, headers, body }
+  // whitelist=null: api 模式 (回环 agent 自身端口, 不做白名单校验); 传数组则 port 必须在列
+  const { url, headers: reqHeaders } = relayLoopbackPrepare(opts);
+  const { port, maxBody, relayTimeout, method, body } = opts;
+  let status, respHeaders, respBody;
+  try {
+    if (opts.requestFn) {
+      ({ status, headers: respHeaders, body: respBody } = await opts.requestFn(method, url, reqHeaders, body));
+    } else {
+      ({ status, headers: respHeaders, body: respBody } = await httpRequestRaw(method, url, reqHeaders, body, relayTimeout, maxBody));
+    }
+  } catch (err) {
+    if (err && err.relayCode) throw err;
+    throw makeRelayError('loopback_unreachable', String((err && err.message) || err).slice(0, 300));
+  }
+  if (respBody.length > maxBody) {
+    throw makeRelayError('body_too_large', `响应体超过 KISAMA_HUB_MAX_BODY (${maxBody} 字节)`);
+  }
+  return { status, headers: respHeaders, body: respBody };
+}
+
 function hubBackoffSeconds(failures, base, max) {
   // 指数退避: base × 2^(failures-1), 封顶 max (对齐 argoBackoffSeconds 与 py 端惯例)
   const b = Math.max(0.5, base || 2);
@@ -670,7 +903,8 @@ class Config {
   static KPATH = process.env.KPATH || '';
   // KMODE=3 kisama-hub 中继 (docs/API.MD 十九): KHUB=hub 基址 (ws/wss 由 scheme 推导),
   // KNAME 复用为 hub 注册名 (独立于 shz.al 的校验, hubKnameError 判定);
-  // KHUB_PORTS=端口反代白名单 (逗号分隔, 缺省空=禁用; 非法条目忽略);
+  // KHUB_PORTS=HUB 组反代白名单 env 下限 (逗号分隔, 缺省空=禁用; 非法条目忽略),
+  // KPROXY_PORTS=本地组反代白名单 env 下限 (0.6.7 续批六分组口径), 两组互不影响 (docs/API.MD 20.2);
   // 重试/心跳/限额与 py 端同键名 env 可调
   static KHUB = (process.env.KHUB || '').trim().replace(/\/+$/, '');
   // KHUB_PUBLIC_URL=hub 对面板/客户端暴露的公网基址覆盖值 (可选, 0.6.6 续批二): 注册时经
@@ -678,6 +912,7 @@ class Config {
   // 基址, 本变量用于内网 KHUB 等派生值 ≠ 公网地址的部署; 非法值告警并回退 KHUB 派生 (hubPublicUrlError 判定)
   static KHUB_PUBLIC_URL = (process.env.KHUB_PUBLIC_URL || '').trim().replace(/\/+$/, '');
   static KHUB_PORTS = parseHubPorts(process.env.KHUB_PORTS || '');
+  static KPROXY_PORTS = parseHubPorts(process.env.KPROXY_PORTS || '');
   static KISAMA_HUB_RETRY_BASE_SECONDS = parseFloat(process.env.KISAMA_HUB_RETRY_BASE_SECONDS || '2') || 2;
   static KISAMA_HUB_RETRY_MAX_SECONDS = parseFloat(process.env.KISAMA_HUB_RETRY_MAX_SECONDS || '60') || 60;
   static KISAMA_HUB_PING_INTERVAL = parseFloat(process.env.KISAMA_HUB_PING_INTERVAL || '20') || 20;
@@ -689,7 +924,7 @@ class Config {
   static DNS_MODE = (process.env.KISAMA_DNS || 'off').trim().toLowerCase();
   static DOH_SERVERS = (process.env.KISAMA_DOH_SERVERS || '').trim();
   static DOH_SERVERS_DEFAULT = ['https://223.5.5.5/resolve', 'https://1.1.1.1/dns-query', 'https://8.8.8.8/resolve'];
-  static AGENT_VERSION = process.env.AGENT_VERSION || '0.6.6-js';
+  static AGENT_VERSION = process.env.AGENT_VERSION || '0.6.7-js';
   static SESSION_KEY = crypto.randomBytes(32).toString('base64');
   // static SESSION_KEY =""
   static NOISE_KEYS_INTERNAL = NoiseKeyGenerator.generatePair();
@@ -920,7 +1155,7 @@ class Config {
     }
 
     // 5. KMODE=3 配套参数: KHUB (hub 基址, ws/wss 由 scheme 推导);
-    //    KHUB_PORTS (端口反代白名单, 逗号分隔, 非法条目忽略)
+    //    KHUB_PORTS (HUB 组白名单 env 下限) / KPROXY_PORTS (本地组白名单 env 下限, 续批六)
     if (options.KHUB !== undefined && options.KHUB !== null) {
       this.KHUB = String(options.KHUB).trim().replace(/\/+$/, '');
     }
@@ -929,6 +1164,9 @@ class Config {
     }
     if (options.KHUB_PORTS !== undefined && options.KHUB_PORTS !== null) {
       this.KHUB_PORTS = parseHubPorts(String(options.KHUB_PORTS));
+    }
+    if (options.KPROXY_PORTS !== undefined && options.KPROXY_PORTS !== null) {
+      this.KPROXY_PORTS = parseHubPorts(String(options.KPROXY_PORTS));
     }
   }
 }
@@ -1500,10 +1738,25 @@ function authEncryptMiddleware(cryptoManager, tempKeyManager = null) {
       return next();
     }
 
+    // === 阶段 0.1: /api/proxy/* 本地端口反代放行 (0.6.7) ===
+    // 白名单唯一门禁 (Owner 拍板 2026-11-18, 与 hub 公开模型一致) —— 匿名放行不验签;
+    // 端口白名单校验在路由/共享核心内 (拒绝 403 port_not_allowed 且不发起连接);
+    // 认证头剥离在路由 handler 内保留; 此处不安装 send/end 拦截器 (响应字节保真)。
+    // /api/proxy/config 管理端点不在此列 (控制暴露面, 必须验签)
+    if ((req.path.startsWith('/api/proxy/') && !req.path.startsWith('/api/proxy/config'))
+        || req.path.startsWith('/api/proxyws/')) {
+      return next();
+    }
+
     // === 阶段 0.5: 安装 x-encrypted 模式位出口拦截器（docs/API.MD 第十节）===
     // 必须先于 OPTIONS/HEAD 与 DEBUG 早退安装，确保 debug 一切响应恒 false、生产匿名响应不设头
     const originalSend = res.send;
     res.send = function(data) {
+      // 📡 /api/proxy/* 本地端口反代 (0.6.7, docs/API.MD 二十): 响应原样透传 ——
+      // 不缓冲、不加密、不改写头, 上游 content-type 与字节保真 (请求侧验签照常)
+      if (req.path.startsWith('/api/proxy/')) {
+        return originalSend.call(this, data);
+      }
       // 🌟 模式位规范：DEBUG 模式一切响应恒 false（Buffer 二进制体原样透传，仅盖头）
       if (Config.DEBUG) {
         const encoded = typeof data === 'string' ? data : (Buffer.isBuffer(data) ? data : JSON.stringify(data));
@@ -1564,7 +1817,8 @@ function authEncryptMiddleware(cryptoManager, tempKeyManager = null) {
     // express 默认 404 等经 res.end 直出的场景）也必须携带 false
     const originalEnd = res.end;
     res.end = function(...endArgs) {
-      if (Config.DEBUG && !res.get('x-encrypted')) {
+      // /api/proxy/* 反代响应不盖章 (字节保真, 0.6.7 docs/API.MD 二十)
+      if (Config.DEBUG && !req.path.startsWith('/api/proxy/') && !res.get('x-encrypted')) {
         res.set('x-encrypted', 'false');
       }
       return originalEnd.apply(this, endArgs);
@@ -1605,9 +1859,11 @@ function authEncryptMiddleware(cryptoManager, tempKeyManager = null) {
     // 🌟 3. 核心修复：直接执行真验签 (静态 + 有效期内临时密钥), 不再套用 if(req.is_authenticated) 的死锁外壳
     try {
       // 🔐 签名绑定 method/path/body 摘要：req.body 已由前置 express.text/urlencoded 解析
-      // (fileraw 除外，其 body 在路由层才消费，统一按空 body 计算摘要)
+      // (fileraw 与 /api/proxy 数据面除外——大文件裸流与反代透传体 (任意二进制, docs/API.MD 二十)
+      // 统一按空 body 计算摘要; /api/proxy/config 管理端点无特例, 0.6.7 续批四起按十二节
+      // v2 规范签真实 body —— 空体特例曾使按规范签名的面板 401)
       let bodyBuf = Buffer.alloc(0);
-      if (req.path !== '/api/fileraw') {
+      if (req.path !== '/api/fileraw' && !(req.path.startsWith('/api/proxy/') && req.path !== '/api/proxy/config')) {
         if (Buffer.isBuffer(req.body)) bodyBuf = req.body;
         else if (typeof req.body === 'string') bodyBuf = Buffer.from(req.body, 'utf-8');
       }
@@ -3326,7 +3582,8 @@ class TaskStore {
     path: null,
     key: null,
     lastSavedAt: null,
-    hubregs: []         // hub 注册任务子类型 (data.hubregs, 0.6.6 续批; load 时填充)
+    hubregs: [],        // hub 注册任务子类型 (data.hubregs, 0.6.6 续批; load 时填充)
+    proxyports: { hub: [], local: [] }      // 反代运行时白名单子类型 (data.proxyports, 0.6.7 续批六起对象形状; load 时填充)
   };
 
   static homeDir() {
@@ -3405,6 +3662,7 @@ class TaskStore {
   static load() {
     const state = TaskStore.state;
     state.hubregs = [];
+    state.proxyports = { hub: [], local: [] };
     if (!state.enabled) return { onetasks: [], crontasks: {} };
     try {
       if (!fs.existsSync(state.path)) return { onetasks: [], crontasks: {} };
@@ -3438,7 +3696,15 @@ class TaskStore {
           kname: r.kname,
           ports: Array.isArray(r.ports) ? r.ports.filter((p) => Number.isInteger(p) && p >= 1 && p <= 65535) : []
         }));
-      Logger.info(`[TaskStore] 💾 已恢复持久化任务: onetime=${onetasks.length}, cron=${Object.keys(crontasks).length}, hubreg=${state.hubregs.length}`);
+      // 反代运行时白名单 (0.6.7 续批六, docs/API.MD 20.8): 对象形状 {"hub":[..],"local":[..]},
+      // 各组整数端口列表, 非法条目静默过滤; 兼容旧平铺数组形状 (归入本地组)
+      const _cleanPP = (arr) => (Array.isArray(arr) ? arr : []).filter((p) => Number.isInteger(p) && p >= 1 && p <= 65535);
+      if (data.proxyports && !Array.isArray(data.proxyports)) {
+        state.proxyports = { hub: _cleanPP(data.proxyports.hub), local: _cleanPP(data.proxyports.local) };
+      } else {
+        state.proxyports = { hub: [], local: _cleanPP(data.proxyports) };
+      }
+      Logger.info(`[TaskStore] 💾 已恢复持久化任务: onetime=${onetasks.length}, cron=${Object.keys(crontasks).length}, hubreg=${state.hubregs.length}, proxyport(hub)=${state.proxyports.hub.length}, proxyport(local)=${state.proxyports.local.length}`);
       return { onetasks, crontasks };
     } catch (e) {
       TaskStore.quarantine(`加载失败: ${e.message}`);
@@ -3462,6 +3728,34 @@ class TaskStore {
         kname: String(r.kname),
         ports: (r.ports || []).filter((p) => Number.isInteger(p) && p >= 1 && p <= 65535)
       }));
+    return TaskStore.save(Config.onetasks, Config.crontasks);
+  }
+
+  static getProxyports() {
+    // 启动恢复用: 读取内存中的反代运行时白名单 (对象形状 {"hub":..,"local":..};
+    // load 时填充; 未启用 KSTORE 恒为空)
+    const pp = TaskStore.state.proxyports || {};
+    return { hub: [...(pp.hub || [])], local: [...(pp.local || [])] };
+  }
+
+  static saveProxyports(ports) {
+    // 落盘反代运行时白名单 (additive 键, 0.6.7 续批六 docs/API.MD 20.8): 接受对象形状
+    // {"hub":[..],"local":[..]} (兼容平铺数组 → 归入本地组); 未启用/只读时返回 false 且不更新内存字段
+    const state = TaskStore.state;
+    if (!state.enabled || state.locked) return false;
+    const cleanGroup = (arr) => {
+      const cleaned = new Set();
+      for (const p of (arr || [])) {
+        if (typeof p === 'boolean') continue;
+        const v = Number(p);
+        if (!Number.isInteger(v) || v < 1 || v > 65535) continue;
+        cleaned.add(v);
+      }
+      return [...cleaned].sort((a, b) => a - b);
+    };
+    state.proxyports = (ports && !Array.isArray(ports))
+      ? { hub: cleanGroup(ports.hub), local: cleanGroup(ports.local) }
+      : { hub: [], local: cleanGroup(ports) };
     return TaskStore.save(Config.onetasks, Config.crontasks);
   }
 
@@ -3489,7 +3783,7 @@ class TaskStore {
         magic: TaskStore.MAGIC,
         version: TaskStore.VERSION,
         saved_at: new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
-        data: { onetasks: onetasks || [], crontasks: crontasks || {}, hubregs: state.hubregs || [] }
+        data: { onetasks: onetasks || [], crontasks: crontasks || {}, hubregs: state.hubregs || [], proxyports: state.proxyports || { hub: [], local: [] } }
       };
       const payload = TaskStore.encrypt(state.key, JSON.stringify(doc));
       fs.mkdirSync(path.dirname(state.path), { recursive: true });
@@ -8236,6 +8530,15 @@ const argoIdleTimeoutMs = (() => {
 })();
 
 function parseJsonBody(raw) {
+  if (Buffer.isBuffer(raw)) {
+    // 防御分支: 反代数据面透传体为 Buffer (config 已回归 express.text 常规管线, 0.6.7 续批四)
+    try {
+      const parsed = JSON.parse(raw.toString('utf8'));
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch (ignored) {
+      return {};
+    }
+  }
   if (typeof raw === 'string') {
     const trimmed = raw.trim();
     if (trimmed) {
@@ -8799,66 +9102,34 @@ class HubTunnelManager {
     const body = f.body_b64 ? Buffer.from(f.body_b64, 'base64') : Buffer.alloc(0);
     this.relayCount += 1;
     try {
-      let url;
+      let port, whitelist;
       if (mode === 'port') {
-        const port = parseInt(f.port, 10) || 0;
-        if (!this.ports.includes(port)) {
-          // 白名单拒绝: 不发起连接, 无端口扫描侧信道
-          return this._sendErr(rid, 'port_not_allowed', `KHUB_PORTS 未放行端口 ${port}`);
-        }
-        url = `http://127.0.0.1:${port}${path}${query ? '?' + query : ''}`;
+        port = parseInt(f.port, 10) || 0;
+        whitelist = proxyEffectivePorts(PROXY_GROUP_HUB); // HUB 组聚合 (env KHUB_PORTS ∪ hub 运行时, 0.6.7 续批六)
       } else {
-        url = `http://127.0.0.1:${this.port}${path}${query ? '?' + query : ''}`;
+        port = this.port;
+        whitelist = null; // api 模式回环 agent 自身, 不做白名单校验
       }
-      const headers = filterLoopbackHeaders(f.headers);
-      let status, respHeaders, respBody;
-      if (this._request) {
-        ({ status, headers: respHeaders, body: respBody } = await this._request(method, url, headers, body));
-      } else {
-        ({ status, headers: respHeaders, body: respBody } = await this._httpRequest(method, url, headers, body, this._relayTimeout));
-      }
-      if (respBody.length > this._maxBody) {
-        return this._sendErr(rid, 'body_too_large', `响应体超过 KISAMA_HUB_MAX_BODY (${this._maxBody} 字节)`);
-      }
+      const { status, headers: respHeaders, body: respBody } = await relayLoopbackHttp({
+        port, whitelist, method, path, query, headers: f.headers, body,
+        maxBody: this._maxBody, relayTimeout: this._relayTimeout,
+        requestFn: this._request || undefined,
+      });
       this._send({
         t: 'res', id: rid, status: status,
         headers: respHeaders, body_b64: respBody.toString('base64')
       });
     } catch (err) {
-      const code = err && err.code === 'body_too_large' ? 'body_too_large' : 'loopback_unreachable';
+      const code = err && err.relayCode ? err.relayCode
+        : (err && err.code === 'body_too_large' ? 'body_too_large' : 'loopback_unreachable');
       this._sendErr(rid, code, String((err && err.message) || err).slice(0, 300));
     }
   }
 
   _httpRequest(method, url, headers, body, timeoutMs) {
-    return new Promise((resolve, reject) => {
-      let u;
-      try { u = new URL(url); } catch (err) { return reject(err); }
-      const mod = u.protocol === 'https:' ? https : http;
-      const req = mod.request(u, { method, headers }, (res) => {
-        const chunks = [];
-        let size = 0;
-        let tooLarge = false;
-        res.on('data', (c) => {
-          size += c.length;
-          if (size > this._maxBody + 1) { tooLarge = true; res.destroy(); return; }
-          chunks.push(c);
-        });
-        res.on('end', () => {
-          if (tooLarge) {
-            const err = new Error('response body exceeds KISAMA_HUB_MAX_BODY');
-            err.code = 'body_too_large';
-            return reject(err);
-          }
-          resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) });
-        });
-        res.on('error', reject);
-      });
-      req.setTimeout(timeoutMs, () => req.destroy(new Error('loopback request timeout')));
-      req.on('error', reject);
-      if (body && body.length) req.write(body);
-      req.end();
-    });
+    // 0.6.7 起委托模块级 httpRequestRaw (本地 /api/proxy 路由共用同一份实现);
+    // 保留方法缝兼容既有测试与外部调用
+    return httpRequestRaw(method, url, headers, body, timeoutMs, this._maxBody);
   }
 
   _sendErr(rid, code, message) {
@@ -8894,10 +9165,11 @@ class HubWSStream {
   }
 
   start() {
-    // 端口反代模式: KHUB_PORTS 白名单校验 (拒绝时不发起连接, 无扫描侧信道)
-    if (this.port && !this.mgr.ports.includes(this.port)) {
+    // 端口反代模式: HUB 组聚合白名单校验 (env KHUB_PORTS ∪ hub 运行时, 0.6.7 续批六分组口径;
+    // 拒绝时不发起连接, 无扫描侧信道)
+    if (this.port && !proxyEffectivePorts(PROXY_GROUP_HUB).includes(this.port)) {
       this.stopped = true;
-      this.mgr._send({ t: 'ws_ack', id: this.sid, ok: false, message: `KHUB_PORTS 未放行端口 ${this.port}` });
+      this.mgr._send({ t: 'ws_ack', id: this.sid, ok: false, message: `端口 ${this.port} 未在 HUB 反代白名单` });
       return;
     }
     const targetPort = this.port || this.mgr.port;
@@ -9900,6 +10172,11 @@ async function main(options = {}) {
 
       // 快速放行 OPTIONS 预检请求 (Preflight)
       if (req.method === 'OPTIONS') {
+        // 📡 /api/proxy 前缀的普通 OPTIONS (无 Origin, 非浏览器预检) 穿透到反代路由转发上游
+        // (0.6.7 续批, 四端语义统一); 带预检特征 (Origin) 的仍本地应答 —— agent 统一裁定 CORS
+        if (req.path.startsWith('/api/proxy/') && !req.headers['origin']) {
+          return next();
+        }
         // 🌟 x-encrypted 模式位规范 (docs/API.MD 第十节)：DEBUG 模式预检响应也恒 false（生产不发送该头）
         if (Config.DEBUG) {
           res.set('x-encrypted', 'false');
@@ -9909,12 +10186,29 @@ async function main(options = {}) {
 
       next();
     });
+  // 📡 本地端口反代路由 (0.6.7, docs/API.MD 二十): /api/proxy 数据面请求体按原始字节
+  // 读取 (Buffer 保真转发, 注册在 express.text 之前拦截), 超限 413 JSON 化。
+  // /api/proxy/config 管理端点排除在外 (0.6.7 续批四): 走常规 express.text 管线 ——
+  // raw 的 Buffer 会击穿阶段 1.5 的 string 门 (AES 密文体不解密 → 422), 且 config 与
+  // 其他路由一样按十二节 v2 规范签真实 body, 无特例。
+  app.use('/api/proxy', (req, res, next) => {
+    if (req.path === '/config' || req.path.startsWith('/config/')) return next();
+    express.raw({ type: () => true, limit: Math.max(1, Config.KISAMA_HUB_MAX_BODY) })(req, res, next);
+  });
+  app.use('/api/proxy', (err, req, res, next) => {
+    if (err && (err.type === 'entity.too.large' || err.status === 413)) {
+      return res.status(413).json({ status: 'error', code: 'body_too_large',
+        message: `请求体超过 KISAMA_HUB_MAX_BODY (${Config.KISAMA_HUB_MAX_BODY} 字节)` });
+    }
+    next(err);
+  });
+
   // 🚀 核心暴力修复：删掉 app.use(express.json()) !
   // 强制把所有请求体 (无论 Content-Type 是 application/json 还是别的) 都读取为纯字符串
   // 🛑 核心修复：显式拒绝拦截 /api/fileraw 接口，防止二进制流被提前转化为文本
-  app.use(express.text({ 
-    type: (req) => req.path !== '/api/fileraw', 
-    limit: '50mb' 
+  app.use(express.text({
+    type: (req) => req.path !== '/api/fileraw',
+    limit: '50mb'
   }));
   
   app.use(express.urlencoded({ extended: true }));
@@ -10431,6 +10725,15 @@ async function main(options = {}) {
     }
     const ports = Array.isArray(body.ports) ? body.ports.filter((p) => Number.isInteger(p) && p >= 1 && p <= 65535) : [];
     const { snapshot, code, message } = await hubRegistrar.register(hubUrl, String(body.kname || ''), ports, 'dynamic', 15000);
+    if (code === null || code === 'unreachable') {
+      // 注册端口并入 HUB 组运行时白名单 (0.6.7 续批六分组口径, docs/API.MD 19.9/20.8): 注册项
+      // 成立 (含退避中) 即生效, 永久拒绝 (invalid_name/name_taken/full) 不并入; DELETE
+      // /api/proxy/config?scope=hub 可整体收回, hubregs 恢复路径不重新并入 (与管理动作一致)
+      if (ports.length) {
+        proxyMergeRuntimePorts(PROXY_GROUP_HUB, ports);
+        TaskStore.saveProxyports(proxyGroupsSnapshot());
+      }
+    }
     if (code === null) {
       const persisted = persistHubregs();
       return res.json({ status: 'ok', persisted, registration: snapshot });
@@ -10455,6 +10758,113 @@ async function main(options = {}) {
     const persisted = persistHubregs();
     res.json({ status: 'ok', persisted, removed });
   });
+
+  // 📡 反代白名单配置 (0.6.7 续批六分组口径, docs/API.MD 20.8): 验签管理端点 (中间件 bypass
+  // 排除本路径); 注册在 /api/proxy/:port 之前 (express 顺序匹配, 避免 "config" 被当作端口段);
+  // GET 返回 HUB 组/本地组各自 env/运行时/聚合三视图; POST scope 选组 ("local"|"hub", 缺省 local)
+  // 整体覆盖; DELETE 无 scope 清两组回落各自 env, ?scope= 只清一组 (KSTORE data.proxyports 持久化)
+  app.get('/api/proxy/config', (req, res) => {
+    const st = TaskStore.state;
+    res.json({
+      status: 'ok',
+      hub: { env_ports: [...new Set(Config.KHUB_PORTS || [])].sort((a, b) => a - b),
+             runtime_ports: proxyRuntimePorts(PROXY_GROUP_HUB),
+             effective_ports: proxyEffectivePorts(PROXY_GROUP_HUB) },
+      local: { env_ports: [...new Set(Config.KPROXY_PORTS || [])].sort((a, b) => a - b),
+               runtime_ports: proxyRuntimePorts(PROXY_GROUP_LOCAL),
+               effective_ports: proxyEffectivePorts(PROXY_GROUP_LOCAL) },
+      kstore_enabled: !!(st && st.enabled && !st.locked)
+    });
+  });
+  app.post('/api/proxy/config', (req, res) => {
+    const body = parseJsonBody(req.body) || {};
+    const scope = body.scope || PROXY_GROUP_LOCAL;
+    if (scope !== PROXY_GROUP_HUB && scope !== PROXY_GROUP_LOCAL) {
+      return res.status(422).json({ status: 'error', code: 'invalid_scope',
+        message: 'scope 必须为 "local" 或 "hub"' });
+    }
+    if (!Array.isArray(body.ports)) {
+      return res.status(422).json({ status: 'error', code: 'invalid_ports',
+        message: 'ports 必须为端口数组, 如 {"ports":[7788,9090]}' });
+    }
+    proxySetRuntimePorts(scope, body.ports);
+    const persisted = TaskStore.saveProxyports(proxyGroupsSnapshot());
+    res.json({ status: 'ok', persisted, scope, runtime_ports: proxyRuntimePorts(scope),
+               effective_ports: proxyEffectivePorts(scope) });
+  });
+  app.delete('/api/proxy/config', (req, res) => {
+    const scope = req.query.scope || '';
+    if (scope && scope !== PROXY_GROUP_HUB && scope !== PROXY_GROUP_LOCAL) {
+      return res.status(422).json({ status: 'error', code: 'invalid_scope',
+        message: 'scope 必须为 "local" 或 "hub"' });
+    }
+    for (const grp of (scope ? [scope] : [PROXY_GROUP_HUB, PROXY_GROUP_LOCAL])) {
+      proxySetRuntimePorts(grp, []);
+    }
+    const persisted = TaskStore.saveProxyports(proxyGroupsSnapshot());
+    res.json({ status: 'ok', persisted, scope: scope || 'all',
+               hub: { runtime_ports: proxyRuntimePorts(PROXY_GROUP_HUB),
+                      effective_ports: proxyEffectivePorts(PROXY_GROUP_HUB) },
+               local: { runtime_ports: proxyRuntimePorts(PROXY_GROUP_LOCAL),
+                        effective_ports: proxyEffectivePorts(PROXY_GROUP_LOCAL) } });
+  });
+
+  // 📡 本地端口反代路由 (0.6.7, docs/API.MD 二十): 不注册 hub 时, 控制端经 agent 自身
+  // 路由访问本机端口 HTTP 服务。语义与 hub /{KNAME}/{PORT}/* 对齐: 本地组白名单
+  // (env KPROXY_PORTS ∪ 本地运行时, 缺省空=禁用, 拒绝不发起连接无扫描侧信道)、缓冲全量、
+  // KISAMA_HUB_MAX_BODY 双向限制; 回环转发核心与 hub req 帧共用 relayLoopbackHttp (一份实现两处消费)。
+  const proxyRelayHandler = async (req, res) => {
+    const port = parseInt(req.params.port, 10);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      return res.status(404).json({ status: 'error', code: 'invalid_port',
+        message: `端口必须为 1-65535 的整数: ${req.params.port}` });
+    }
+    const headers = { ...req.headers };
+    // agent 认证头不透传上游服务 (防密钥材料泄漏); hub 路径无此风险 (帧内无认证头)
+    for (const h of PROXY_STRIPPED_AUTH_HEADERS) delete headers[h];
+    const clientIp = (req.socket && req.socket.remoteAddress) || '';
+    let status, respHeaders, upstream;
+    try {
+      // 流式转发原语 (0.6.7): 响应边收边回传, 响应体不受 KISAMA_HUB_MAX_BODY 限制 (SSE/大文件);
+      // 白名单/请求体超限错误在响应头发出前抛出, 可回 JSON 错误体
+      const prepared = relayLoopbackPrepare({
+        port, whitelist: proxyEffectivePorts(PROXY_GROUP_LOCAL), method: req.method,
+        path: '/' + (req.params[0] || ''),
+        query: req.url.includes('?') ? req.url.slice(req.url.indexOf('?') + 1) : '',
+        headers, body: req.body || Buffer.alloc(0),
+        maxBody: Math.max(1, Config.KISAMA_HUB_MAX_BODY),
+        relayTimeout: Math.max(5, Config.KISAMA_HUB_RELAY_TIMEOUT) * 1000,
+        forwardedFor: clientIp || undefined,
+      });
+      ({ status, headers: respHeaders, res: upstream } = await httpRequestStream(
+        req.method, prepared.url, prepared.headers, req.body || Buffer.alloc(0),
+        Math.max(5, Config.KISAMA_HUB_RELAY_TIMEOUT) * 1000));
+    } catch (err) {
+      const code = err && err.relayCode ? err.relayCode : 'loopback_unreachable';
+      const httpCode = code === 'port_not_allowed' ? 403 : (code === 'body_too_large' ? 413 : 502);
+      return res.status(httpCode).json({ status: 'error', code,
+        message: String((err && err.message) || err).slice(0, 300) });
+    }
+    res.status(status).set(filterProxyResponseHeaders(respHeaders)).flushHeaders();
+    upstream.on('error', () => { if (!res.writableEnded) res.destroy(); });
+    upstream.pipe(res);
+  };
+  // 📡 同路径 upgrade 嗅探 (0.6.7 续批三, Owner 拍板仅 py/js, docs/API.MD 20.6): 浏览器应用
+  // 从页面 URL 派生 WS 地址, upgrade 与 HTTP 反代同路径直达 —— 同一 proxyWsRelayHandler 泵。
+  // express-ws 机制 (实锤): upgrade 请求由 ws 包拦截后改写 url 加 /.websocket 后缀注入同一
+  // 条 express 层栈, ws 路由实为 <route>/.websocket 的 GET 层 —— 必须注册在 app.all 之前,
+  // 否则 upgrade 先被 HTTP 层吞掉; 普通 HTTP 不匹配 /.websocket 后缀, 落回 app.all (共存不
+  // 互吞)。java/java11 的 Spark/Jetty WebSocketServlet 按路径前缀整树接管、与 HTTP 路由结
+  // 构性二选一 (同路径实测 upgrade 被吞成 :port="ws" 404), 不支持同路径 —— 保持
+  // /api/proxyws 专前缀 (URL 契约按端分叉, 矩阵如实标注)。
+  app.ws('/api/proxy/:port/*', proxyWsRelayHandler);
+  app.ws('/api/proxy/:port', proxyWsRelayHandler);
+  app.all('/api/proxy/:port', proxyRelayHandler);
+  app.all('/api/proxy/:port/*', proxyRelayHandler);
+
+  // 📡 本地端口反代 WS 透传路由 (0.6.7, handler 见模块级 proxyWsRelayHandler)
+  app.ws('/api/proxyws/:port/*', proxyWsRelayHandler);
+  app.ws('/api/proxyws/:port', proxyWsRelayHandler);
 
   // 查询临时隧道列表
   app.get('/api/argo', (req, res) => {
@@ -10582,6 +10992,15 @@ async function main(options = {}) {
   // 💾 任务持久化恢复 (0.5.7, docs/API.MD 十三): listen 之前恢复, 离线自治
   TaskManager.restoreFromStore();
 
+  // 📡 反代运行时白名单恢复 (0.6.7 续批六分组口径, docs/API.MD 20.8): kstore data.proxyports
+  // → 两组运行时列表 (getProxyports 恒返回对象形状, 旧平铺形状已在 load 兼容归入本地组)
+  const restoredProxyports = TaskStore.getProxyports();
+  if (restoredProxyports.hub.length || restoredProxyports.local.length) {
+    if (restoredProxyports.hub.length) proxySetRuntimePorts(PROXY_GROUP_HUB, restoredProxyports.hub);
+    if (restoredProxyports.local.length) proxySetRuntimePorts(PROXY_GROUP_LOCAL, restoredProxyports.local);
+    Logger.info(`[ProxyRoute] 💡 已恢复反代运行时白名单: HUB 组 ${restoredProxyports.hub.length} 个, 本地组 ${restoredProxyports.local.length} 个`);
+  }
+
   // 0.6.6 续批: kstore data.hubregs 的动态注册项读取暂存 (listen 回调统一启动——
   // 回环目标 (自身 HTTP 服务) 就绪后才拨本地; 与 KMODE=3 静态项同点)
   for (const reg of TaskStore.getHubregs()) {
@@ -10640,4 +11059,4 @@ if (require.main === module||require.main?.filename?.includes('ts-node')) {
   main().catch(Logger.error);
 }
 
-module.exports = { main, loadCurves, Config, CryptoManager, SystemInfoCollector, CommandExecutor, FileManager, TaskManager, TaskStore, ArgoTunnelManager, argoBackoffSeconds, argoTruncateError, argoRetryBaseSeconds, argoRetryMaxSeconds, argoReregisterAfter, KModeController, HubTunnelManager, HubWSStream, HubRegisterError, HubTunnelRegistrar, hubKnameError, hubPublicUrlError, deriveHubWsUrl, filterLoopbackHeaders, hubBackoffSeconds, parseHubPorts, ZipArchiver, TempKeyManager, SecureDns, installDnsHook, patchDnsLookup, QuicConnection, QuicSession, QuicTlsClient, QuicKeys, QuicReader, quicInitialKeys, quicNextKeys, quicWriteVarint, quicReadVarint, quicDecodePacketNumber, quicApplyProtection, quicRemoveProtection, quicEncodeTransportParameters, quicDecodeTransportParameters, quicEncodeAck, quicRangesFromAck, hkdfExpandLabel, CapnpBuilder, capnpMessages, capnpWords, capnpStruct, capnpText, capnpStructList, capnpReturnResult, capnpConnectRequest, capnpConnectResponse, connectEdgeQuic, buildQuicRequest, verifyEdgeQuicCertificate, QUIC_DATA_STREAM_PREAMBLE, QUIC_SERVER_NAME, QUIC_ALPN, __ptySelector: { detectLinuxLibc, ptyCandidateOrder, probePtyModule, ensurePty, PTY_QWQO_VERSION, PTY_CLOSE_REASON, qwqoPlatformBinaryPath, selectPtyImplementation, getState: () => ({ ready: !!pty, reason: ptyUnavailableReason }) } };
+module.exports = { main, loadCurves, Config, CryptoManager, SystemInfoCollector, CommandExecutor, FileManager, TaskManager, TaskStore, ArgoTunnelManager, argoBackoffSeconds, argoTruncateError, argoRetryBaseSeconds, argoRetryMaxSeconds, argoReregisterAfter, KModeController, HubTunnelManager, HubWSStream, HubRegisterError, HubTunnelRegistrar, hubKnameError, hubPublicUrlError, deriveHubWsUrl, filterLoopbackHeaders, hubBackoffSeconds, parseHubPorts, PROXY_STRIPPED_AUTH_HEADERS, makeRelayError, httpRequestRaw, httpRequestStream, relayLoopbackPrepare, filterProxyResponseHeaders, relayLoopbackHttp, proxyRuntimePorts, proxyEffectivePorts, proxySetRuntimePorts, proxyMergeRuntimePorts, proxyGroupsSnapshot, cleanPortList, PROXY_GROUP_HUB, PROXY_GROUP_LOCAL, PROXY_RUNTIME_PORTS, proxyWsRelayHandler, ZipArchiver, TempKeyManager, SecureDns, installDnsHook, patchDnsLookup, QuicConnection, QuicSession, QuicTlsClient, QuicKeys, QuicReader, quicInitialKeys, quicNextKeys, quicWriteVarint, quicReadVarint, quicDecodePacketNumber, quicApplyProtection, quicRemoveProtection, quicEncodeTransportParameters, quicDecodeTransportParameters, quicEncodeAck, quicRangesFromAck, hkdfExpandLabel, CapnpBuilder, capnpMessages, capnpWords, capnpStruct, capnpText, capnpStructList, capnpReturnResult, capnpConnectRequest, capnpConnectResponse, connectEdgeQuic, buildQuicRequest, verifyEdgeQuicCertificate, QUIC_DATA_STREAM_PREAMBLE, QUIC_SERVER_NAME, QUIC_ALPN, __ptySelector: { detectLinuxLibc, ptyCandidateOrder, probePtyModule, ensurePty, PTY_QWQO_VERSION, PTY_CLOSE_REASON, qwqoPlatformBinaryPath, selectPtyImplementation, getState: () => ({ ready: !!pty, reason: ptyUnavailableReason }) } };

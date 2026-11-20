@@ -13,6 +13,7 @@ import json
 import time
 import base64
 import hashlib
+import asyncio
 import urllib.request
 import urllib.error
 import tempfile
@@ -196,11 +197,17 @@ def build_signature_message(method: str, path: str, body: bytes, nonce: str, tim
     """组装签名消息 (五版本统一): method\\npath\\nsha256hex(body)\\nnonce\\ntimestamp
 
     🔐 签名绑定 method/path/body 摘要，防止捕获的签名头被改换请求体后重放。
-    空请求体使用 sha256("")；/api/fileraw (大文件裸流) 客户端与服务端统一按空 body 计算。
+    空请求体使用 sha256("")；/api/fileraw (大文件裸流) 与 /api/proxy 数据面 (反代透传体,
+    任意二进制, docs/API.MD 二十) 客户端与服务端统一按空 body 计算; /api/proxy/config
+    管理端点无特例 (0.6.7 续批四: 与十二节 v2 规范一致签真实 body, AES 体签密文)。
     """
     if not body:
         body = b""
-    body_hash = hashlib.sha256(body).hexdigest()
+    bare_path = path.split("?", 1)[0]
+    if bare_path == "/api/fileraw" or (bare_path.startswith("/api/proxy/") and bare_path != "/api/proxy/config"):
+        body_hash = hashlib.sha256(b"").hexdigest()
+    else:
+        body_hash = hashlib.sha256(body).hexdigest()
     return f"{method}\n{path}\n{body_hash}\n{nonce}\n{timestamp}"
 
 
@@ -1473,6 +1480,292 @@ def download_enc_check() -> bool:
         return False
 
 
+# ============================================================================
+# 📡 本地端口反代路由验收 (0.6.7, docs/API.MD 二十; verify_all.py 场景 11 调用)
+# verify_all 同机部署: echo 上游起在 control 侧 (aiohttp, 独立线程事件循环), agent
+# 回环 127.0.0.1 可达; agent 启动 env 需带 KHUB_PORTS=58088,58089 (缺省空白名单时失败)。
+# 白名单唯一门禁 (Owner 拍板 2026-11-18): 11g 匿名断言 + 11h 运行时白名单 API 动态生效。
+# ============================================================================
+PROXY_ROUTE_ECHO_PORT = 58088    # echo/stream/sse/ws 上游端口 (KHUB_PORTS 放行)
+PROXY_ROUTE_DEAD_PORT = 58089    # 无监听端口 (KHUB_PORTS 放行, 502 断言用)
+PROXY_ROUTE_DYNAMIC_PORT = 58090  # 运行时白名单动态放行端口 (POST /api/proxy/config)
+
+PROXY_ECHO_SEEN = {"headers": None, "paths": [], "methods": []}
+
+
+def _proxy_route_upstream_app():
+    """回环上游 (aiohttp): /echo 回显头与 body / /stream 3MB / /sse 3 chunk 间隔 / /ws echo"""
+    import asyncio
+    from aiohttp import web as _web
+    import aiohttp as _aio
+
+    async def echo(request):
+        body = await request.read()
+        PROXY_ECHO_SEEN["headers"] = {k.lower(): v for k, v in request.headers.items()}
+        PROXY_ECHO_SEEN["paths"].append(request.path_qs)
+        PROXY_ECHO_SEEN["methods"].append(request.method)
+        return _web.Response(status=200, body=b"echo:" + body, headers={"X-Upstream": "yes"})
+
+    async def stream(request):
+        return _web.Response(status=200, body=b"x" * (3 * 1024 * 1024))
+
+    async def sse(request):
+        resp = _web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream"})
+        await resp.prepare(request)
+        for i in range(3):
+            await resp.write(("data: chunk%d\n\n" % i).encode())
+            await asyncio.sleep(0.05)
+        await resp.write_eof()
+        return resp
+
+    async def ws_echo(request):
+        ws = _web.WebSocketResponse()
+        await ws.prepare(request)
+        async for msg in ws:
+            if msg.type == _aio.WSMsgType.TEXT:
+                await ws.send_str("echo:" + msg.data)
+            elif msg.type == _aio.WSMsgType.BINARY:
+                await ws.send_bytes(b"echo:" + msg.data)
+            else:
+                break
+        return ws
+
+    app = _web.Application()
+    app.router.add_route("*", "/echo", echo)
+    app.router.add_get("/stream", stream)
+    app.router.add_get("/sse", sse)
+    app.router.add_get("/ws", ws_echo)
+    return app
+
+
+def _start_upstream_thread():
+    """上游跑在独立线程的独立事件循环 (control.py 同步脚本的主线程在 agent 请求期间
+    会阻塞等待响应, 主线程 loop 无法处理事件 —— 上游必须独立于主线程)"""
+    import threading
+    import time
+    holder = {}
+    stop_holder = {}
+
+    def _run():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        async def _setup():
+            from aiohttp import web as _web
+            runner = _web.AppRunner(_proxy_route_upstream_app())
+            await runner.setup()
+            # 双端口: 58088 (env 放行) 与 58090 (运行时白名单动态放行断言用, 同一 app)
+            site1 = _web.TCPSite(runner, "127.0.0.1", PROXY_ROUTE_ECHO_PORT)
+            await site1.start()
+            site2 = _web.TCPSite(runner, "127.0.0.1", PROXY_ROUTE_DYNAMIC_PORT)
+            await site2.start()
+            return runner
+
+        holder["runner"] = loop.run_until_complete(_setup())
+        stop_holder["stop"] = lambda: loop.call_soon_threadsafe(loop.stop)
+        loop.run_forever()
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    for _ in range(80):
+        if "runner" in holder:
+            break
+        time.sleep(0.05)
+    if "runner" not in holder:
+        raise RuntimeError("反代上游未在 4s 内就绪")
+    return stop_holder["stop"]
+
+
+def _proxy_sign_headers(method: str, path: str, body: bytes = b""):
+    """反代请求签名头 (/api/proxy/* 按空 body 口径, build_signature_message 集中特判)"""
+    ecdsa_sk, _ = load_control_keys()
+    return generate_auth_headers(ecdsa_sk, method, path.split("?", 1)[0], body)
+
+
+async def _proxy_route_checks() -> bool:
+    import json as _json
+    import aiohttp as _aio
+
+    ok_all = True
+    PROXY_ECHO_SEEN["headers"] = None
+    PROXY_ECHO_SEEN["paths"] = []
+    PROXY_ECHO_SEEN["methods"] = []
+    EP, DP, DY = PROXY_ROUTE_ECHO_PORT, PROXY_ROUTE_DEAD_PORT, PROXY_ROUTE_DYNAMIC_PORT
+    agent_host = str(CONFIG["proxy_url"]).split("//")[1]
+
+    async with _aio.ClientSession(timeout=_aio.ClientTimeout(total=60)) as http:
+        async def signed(method, path_, body_=b"", sign_=True):
+            headers = _proxy_sign_headers(method, path_, body_) if sign_ else {}
+            async with http.request(method, f"{CONFIG['proxy_url']}{path_}",
+                                    data=body_ if body_ else None, headers=headers) as resp:
+                return resp.status, await resp.read(), dict(resp.headers)
+
+        def check(tag, ok, detail=""):
+            nonlocal ok_all
+            print(("✅" if ok else "❌ FAIL") + f" {tag}: {detail}")
+            return ok
+
+        # 11a 放行转发 (匿名+签名头两种形态都放行 —— 白名单唯一门禁)
+        st, body, _ = await signed("GET", f"/api/proxy/{EP}/echo?x=1&y=%2B", b"probe", sign_=True)
+        ok_all &= check("11a: 放行 GET 转发 (签名头形态)",
+                        st == 200 and body == b"echo:probe", f"status={st} body={body[:30]!r}")
+        st, body, _ = await signed("GET", f"/api/proxy/{EP}/echo?x=1&y=%2B", b"", sign_=False)
+        ok_all &= check("11g: 匿名放行 (白名单唯一门禁, 无签名头)",
+                        st == 200 and body == b"echo:", f"status={st} body={body[:30]!r}")
+        echo_path = PROXY_ECHO_SEEN["paths"][-1] if PROXY_ECHO_SEEN["paths"] else ""
+        ok_all &= check("11a+: query 保真", echo_path == "/echo?x=1&y=%2B", f"echo_path={echo_path!r}")
+
+        # 11b POST 二进制逐字节保真 (匿名)
+        binary = bytes(range(256))
+        st, body, _ = await signed("POST", f"/api/proxy/{EP}/echo", binary, sign_=False)
+        ok_all &= check("11b: POST 二进制逐字节保真", st == 200 and body == b"echo:" + binary,
+                        f"status={st} len={len(body)}")
+
+        # 11c/11d/11e 错误映射
+        st, body, _ = await signed("GET", f"/api/proxy/1/echo", b"", sign_=False)
+        ok_all &= check("11c: 未放行端口 403 port_not_allowed", st == 403 and b"port_not_allowed" in body,
+                        f"status={st}")
+        st, body, _ = await signed("GET", f"/api/proxy/0x99/echo", b"", sign_=False)
+        ok_all &= check("11d: 非法端口 404 invalid_port", st == 404 and b"invalid_port" in body, f"status={st}")
+        st, body, _ = await signed("GET", f"/api/proxy/{DP}/echo", b"", sign_=False)
+        ok_all &= check("11e: 上游不可达 502 loopback_unreachable", st == 502 and b"loopback_unreachable" in body,
+                        f"status={st}")
+
+        # 11f 认证头剥离 + x-forwarded-for 注入 (签名头形态请求, 上游侧断言)
+        seen = PROXY_ECHO_SEEN["headers"] or {}
+        leaked = bool(seen.get("x-auth-token") or seen.get("x-nonce"))
+        xff = bool(seen.get("x-forwarded-for"))
+        ok_all &= check("11f: 认证头剥离 + x-forwarded-for 注入", not leaked and xff,
+                        f"leaked={leaked}, xff={xff}")
+
+        # 11i 流式: 3MB 大响应不受 KISAMA_HUB_MAX_BODY 限制 (响应体完整到达)
+        st, body, _ = await signed("GET", f"/api/proxy/{EP}/stream", b"", sign_=False)
+        ok_all &= check("11i: 流式 3MB 大响应完整 (缓冲语义已移除)", st == 200 and len(body) == 3 * 1024 * 1024,
+                        f"status={st} len={len(body)}")
+
+        # 11j SSE: chunk 间隔到达 (agent 流式转发, 非缓冲一次性)
+        import time as _time
+        marks = []
+        async with http.get(f"{CONFIG['proxy_url']}/api/proxy/{EP}/sse") as resp:
+            async for chunk in resp.content.iter_any():
+                if b"chunk" in chunk:
+                    marks.append((len(marks), _time.monotonic(), chunk))
+        sse_ok = len(marks) == 3 and (marks[-1][1] - marks[0][1]) >= 0.08
+        ok_all &= check("11j: SSE 3 chunk 间隔到达 (流式转发)", sse_ok,
+                        f"count={len(marks)}, span={round(marks[-1][1] - marks[0][1], 3) if marks else -1}s")
+
+        # 11h 运行时白名单 API (签名, config 端点走验签; 0.6.7 续批六分组口径): scope 缺省 local
+        # 动态放行 → 匿名可达 → scope=hub 两组隔离 → DELETE ?scope= 单组 → DELETE 无 scope 回落 403
+        cfg = _json.dumps({"ports": [EP, DP, DY]}).encode()
+        cfg_headers = _proxy_sign_headers("POST", "/api/proxy/config", cfg)
+        cfg_headers["Content-Type"] = "application/json"
+        async with http.post(f"{CONFIG['proxy_url']}/api/proxy/config", data=cfg, headers=cfg_headers) as resp:
+            st, body = resp.status, await resp.read()
+        cfg_ok = st == 200 and b'"scope":"local"' in body.replace(b' ', b'')
+        ok_all &= check("11h-a: POST config 缺省 scope=local 整体覆盖本地组", cfg_ok, f"status={st} body={body[:80]!r}")
+        st, body, _ = await signed("GET", "/api/proxy/config", b"", sign_=True)
+        cfg_view = _json.loads(body.decode()) if st == 200 else {}
+        ok_all &= check("11h-b: GET 两组快照 (local 含动态端口, hub 运行时空)",
+                        DY in ((cfg_view.get("local") or {}).get("effective_ports") or [])
+                        and not ((cfg_view.get("hub") or {}).get("runtime_ports") or []),
+                        f"hub={cfg_view.get('hub')}, local_runtime={(cfg_view.get('local') or {}).get('runtime_ports')}")
+        st, body, _ = await signed("GET", f"/api/proxy/{DY}/echo", b"", sign_=False)
+        ok_all &= check("11h-c: 动态放行端口匿名可达 (即时生效)", st == 200 and body == b"echo:", f"status={st}")
+        cfg2 = _json.dumps({"ports": [DY], "scope": "hub"}).encode()
+        cfg2_headers = _proxy_sign_headers("POST", "/api/proxy/config", cfg2)
+        cfg2_headers["Content-Type"] = "application/json"
+        async with http.post(f"{CONFIG['proxy_url']}/api/proxy/config", data=cfg2, headers=cfg2_headers) as resp:
+            st, body = resp.status, await resp.read()
+        ok_all &= check("11h-d: POST scope=hub 覆盖 HUB 组 (本地组不受影响)",
+                        st == 200 and b'"scope":"hub"' in body.replace(b' ', b''), f"status={st} body={body[:80]!r}")
+        st, body, _ = await signed("GET", "/api/proxy/config", b"", sign_=True)
+        cfg_view = _json.loads(body.decode()) if st == 200 else {}
+        ok_all &= check("11h-e: 两组隔离 (hub.runtime=[DY], local.runtime 不变)",
+                        (cfg_view.get("hub") or {}).get("runtime_ports") == [DY]
+                        and DY in ((cfg_view.get("local") or {}).get("runtime_ports") or []),
+                        f"hub={cfg_view.get('hub')}, local_runtime={(cfg_view.get('local') or {}).get('runtime_ports')}")
+        st, body, _ = await signed("DELETE", "/api/proxy/config?scope=hub", b"", sign_=True)
+        ok_all &= check("11h-f: DELETE ?scope=hub 只清 HUB 组", st == 200 and b'"scope":"hub"' in body.replace(b' ', b''),
+                        f"status={st}")
+        st, body, _ = await signed("GET", f"/api/proxy/{DY}/echo", b"", sign_=False)
+        ok_all &= check("11h-g: 本地组运行时仍在 (清 HUB 组不影响本地路由)", st == 200 and body == b"echo:", f"status={st}")
+        st, body, _ = await signed("DELETE", "/api/proxy/config", b"", sign_=True)
+        ok_all &= check("11h-h: DELETE 无 scope 清两组回落 env", st == 200 and b'"scope":"all"' in body.replace(b' ', b''),
+                        f"status={st}")
+        st, body, _ = await signed("GET", f"/api/proxy/{DY}/echo", b"", sign_=False)
+        ok_all &= check("11h-i: 清空后动态端口回落 403", st == 403 and b"port_not_allowed" in body, f"status={st}")
+        bad = _json.dumps({"ports": [DY], "scope": "global"}).encode()
+        bad_headers = _proxy_sign_headers("POST", "/api/proxy/config", bad)
+        bad_headers["Content-Type"] = "application/json"
+        async with http.post(f"{CONFIG['proxy_url']}/api/proxy/config", data=bad, headers=bad_headers) as resp:
+            st, body = resp.status, await resp.read()
+        ok_all &= check("11h-j: POST 非法 scope 422 invalid_scope", st == 422 and b"invalid_scope" in body,
+                        f"status={st} body={body[:60]!r}")
+
+        # 11k WS 透传: text/binary 保真回环 + 白名单拒绝 close 1008
+        ws_ok = False
+        try:
+            async with http.ws_connect(f"ws://{agent_host}/api/proxyws/{EP}/ws?w=1") as ws:
+                await ws.send_str("hello")
+                got = await ws.receive()
+                text_ok = got.type == _aio.WSMsgType.TEXT and got.data == "echo:hello"
+                await ws.send_bytes(b"\x00\x01")
+                got2 = await ws.receive()
+                bin_ok = got2.type == _aio.WSMsgType.BINARY and got2.data == b"echo:\x00\x01"
+                ws_ok = text_ok and bin_ok
+        except Exception:
+            ws_ok = False
+        ok_all &= check("11k: WS 透传 text/binary 保真", ws_ok)
+        ws_code = None
+        try:
+            async with http.ws_connect(f"ws://{agent_host}/api/proxyws/1/echo") as ws:
+                msg = await ws.receive()
+                ws_code = getattr(msg, "data", None) if msg.type == _aio.WSMsgType.CLOSE else None
+        except Exception as e:
+            ws_code = f"exc: {str(e)[:60]}"
+        ok_all &= check("11k+: WS 白名单拒绝 close 1008", ws_code == 1008, f"code={ws_code!r}")
+
+        # 11l OPTIONS 透传统一 (0.6.7 续批, 四端语义统一): 普通 OPTIONS (无 Origin) 穿透转发上游,
+        # 带预检特征 (Origin) 的由 agent 本地应答 (上游不收到) —— py CORSMiddleware / js CORS 块 /
+        # java+java11 options("/*") 前置 proxy 路由三种实现同语义
+        n_before = len(PROXY_ECHO_SEEN["methods"])
+        st, body, _ = await signed("OPTIONS", f"/api/proxy/{EP}/echo", b"", sign_=False)
+        methods_after = PROXY_ECHO_SEEN["methods"][n_before:]
+        ok_all &= check("11l-a: 普通 OPTIONS 穿透转发上游", st == 200 and methods_after == ["OPTIONS"],
+                        f"status={st}, upstream_methods={methods_after}")
+        n_before = len(PROXY_ECHO_SEEN["methods"])
+        async with http.options(f"{CONFIG['proxy_url']}/api/proxy/{EP}/echo",
+                                headers={"Origin": "http://browser.example",
+                                         "Access-Control-Request-Method": "GET"}) as resp:
+            await resp.read()
+            pre_status = resp.status
+        pre_reach = len(PROXY_ECHO_SEEN["methods"]) > n_before
+        ok_all &= check("11l-b: 预检特征 (带 Origin) 本地应答上游不收", pre_status in (200, 204) and not pre_reach,
+                        f"status={pre_status}, upstream_reach={pre_reach}")
+    return ok_all
+
+
+def proxy_route_check() -> bool:
+    """📡 场景 11 (0.6.7, docs/API.MD 二十): 本地端口反代路由验收 (verify_all.py 调用)
+    11a 放行转发 GET (签名头形态) / 11g 匿名放行 (白名单唯一门禁) / query 保真 /
+    11b POST 二进制保真 / 11c 未放行 403 / 11d 非法端口 404 / 11e 上游不可达 502 /
+    11f 认证头剥离 + xff / 11i 流式 3MB / 11j SSE chunk 间隔 /
+    11h 白名单 API 分组口径 (scope 缺省 local / scope=hub 两组隔离 / DELETE 单组与清两组 / invalid_scope) /
+    11k WS 透传保真 + 拒绝 close 1008"""
+    print("\n🔹 [proxy-route] 本地端口反代路由验收 (docs/API.MD 二十)")
+    if not _ensure_session_key():
+        print("❌ FAIL baseinfo 握手未取得 session_key")
+        return False
+    stop = _start_upstream_thread()
+    try:
+        return asyncio.run(_proxy_route_checks())
+    except Exception as e:
+        print(f"❌ FAIL proxy-route 异常: {e}")
+        return False
+    finally:
+        stop()
+
+
 def tempkey_short_check() -> bool:
     """🔑 场景 8 (0.5.8, docs/API.MD 十四): tempkey format=short 短格式下发 + 短私钥端到端验收
 
@@ -2441,6 +2734,12 @@ def main():
             # 🔐 场景 10 (0.6.1): 下载加密契约三断言 (verify_all.py 调用)
             ok = download_enc_check()
             print("DOWNLOAD_ENC_OK" if ok else "DOWNLOAD_ENC_FAILED")
+            sys.exit(0 if ok else 1)
+        elif sys.argv[1] == "--proxy-route":
+            # 📡 场景 11 (0.6.7): 本地端口反代路由验收 (verify_all.py 调用; 需 agent
+            # 启动 env 带 KHUB_PORTS=58088,58089, echo server 起在 control 侧)
+            ok = proxy_route_check()
+            print("PROXY_ROUTE_OK" if ok else "PROXY_ROUTE_FAILED")
             sys.exit(0 if ok else 1)
         elif sys.argv[1] in ["--status", "-s"]:
             _, ecies_sk = load_control_keys()

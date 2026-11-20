@@ -17,7 +17,7 @@ from typing import Union,List, Dict, Any, Optional
 
 # FastAPI 相关
 from fastapi import FastAPI, Request, Response, HTTPException, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from urllib.parse import unquote, urlsplit
 # 加密相关
@@ -943,7 +943,10 @@ class Config:
 
     # KMODE=3 kisama-hub 中继 (docs/API.MD 十九): KHUB=hub 基址 (ws/wss 由 scheme 推导),
     # KNAME 复用为 hub 注册名 (独立于 shz.al 的校验, hub_kname_error 判定);
-    # KHUB_PORTS=端口反代白名单 (逗号分隔, 缺省空=禁用; 非法条目忽略, activate 时提示);
+    # KHUB_PORTS=HUB 组反代白名单 env 下限 (逗号分隔, 缺省空=禁用; 非法条目忽略, activate 时提示),
+    # 只约束 hub 链路端口反代 (/{KNAME}/{PORT}/*);
+    # KPROXY_PORTS=本地组反代白名单 env 下限 (0.6.7 续批六分组口径), 只约束本地路由
+    # /api/proxy/{port} 与 /api/proxyws/{port}; 两组互不影响 (docs/API.MD 20.2);
     # 重试/心跳/限额与 argo 同风格 env 可调
     KHUB = os.getenv("KHUB", "").strip().rstrip("/")
     # KHUB_PUBLIC_URL=hub 对面板/客户端暴露的公网基址覆盖值 (可选, 0.6.6 续批二): 注册时经 public_url 字段
@@ -952,6 +955,10 @@ class Config:
     KHUB_PUBLIC_URL = os.getenv("KHUB_PUBLIC_URL", "").strip().rstrip("/")
     KHUB_PORTS = tuple(sorted({
         int(p.strip()) for p in os.getenv("KHUB_PORTS", "").split(",")
+        if p.strip().isdigit() and 1 <= int(p.strip()) <= 65535
+    }))
+    KPROXY_PORTS = tuple(sorted({
+        int(p.strip()) for p in os.getenv("KPROXY_PORTS", "").split(",")
         if p.strip().isdigit() and 1 <= int(p.strip()) <= 65535
     }))
     KISAMA_HUB_RETRY_BASE_SECONDS = float(os.getenv("KISAMA_HUB_RETRY_BASE_SECONDS", "2") or 2)
@@ -967,7 +974,7 @@ class Config:
     DOH_SERVERS = os.getenv("KISAMA_DOH_SERVERS", "").strip()
 
     # 代理版本信息
-    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.6.6-python")
+    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.6.7-python")
     
     # ================= 启动校验 =================
     
@@ -1906,7 +1913,15 @@ class AuthEncryptMiddleware(BaseHTTPMiddleware):
         headers = request.headers
         path = request.url.path  # 获取当前请求路径
         bypass_paths = ["/api/baseinfo", "/api/status"]
-        
+
+        # 📡 /api/proxy/* 本地端口反代 (0.6.7): 白名单唯一门禁 (Owner 拍板 2026-11-18,
+        # 与 hub 公开模型一致) —— 匿名放行不验签; 端口白名单校验在路由/共享核心内
+        # (拒绝 403 port_not_allowed 且不发起连接, 无扫描侧信道); 认证头剥离在路由
+        # handler 内保留 (携带签名头也不透传上游); 响应字节保真 (不进加密阶段)。
+        # /api/proxy/config 管理端点不在此列 (控制暴露面, 必须验签)
+        if path.startswith("/api/proxy/") and not path.startswith("/api/proxy/config"):
+            return await call_next(request)
+
         # 🌟 核心修复 1：零信任原则，默认初始化认证状态为 False
         request.state.is_authenticated = False  
         
@@ -1923,11 +1938,14 @@ class AuthEncryptMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         # 🔐 安全修复：提前读取请求体，将 method/path/body 摘要纳入签名消息，
-        # 防止捕获的签名头被改换请求体后重放。/api/fileraw (大文件裸流) 统一按空
-        # body 计算摘要，避免中间件整体缓冲大文件。
+        # 防止捕获的签名头被改换请求体后重放。/api/fileraw (大文件裸流) 与 /api/proxy
+        # 数据面 (反代透传体, 任意二进制, docs/API.MD 二十) 统一按空 body 计算摘要;
+        # /api/proxy/config 管理端点无特例 (0.6.7 续批四: 按十二节 v2 规范签真实 body,
+        # 与其他路由同管线 —— 空体特例曾使按规范签名的面板 401)。
         raw_request_body = await request.body()
         body_hash = ""
-        if raw_request_body and path != "/api/fileraw":
+        if raw_request_body and path != "/api/fileraw" \
+                and not (path.startswith("/api/proxy/") and path != "/api/proxy/config"):
             body_hash = hashlib.sha256(raw_request_body).hexdigest()
 
         # 生产环境：强制执行严格签名校验
@@ -2021,6 +2039,11 @@ class AuthEncryptMiddleware(BaseHTTPMiddleware):
             response = await call_next(request)
         except Exception as exc:
             raise exc
+
+        # 📡 /api/proxy/* 本地端口反代 (0.6.7, docs/API.MD 二十): 响应原样透传 ——
+        # 不缓冲、不加密、不改写头, 上游 content-type 与字节保真 (请求侧验签照常)
+        if path.startswith("/api/proxy/"):
+            return response
 
         # === 阶段 3: 响应加密 ===
         if response.headers.get("content-type", "").startswith("application/json"):
@@ -8102,6 +8125,95 @@ class HubRegisterError(Exception):
         self.message = message
 
 
+class LoopbackRelayError(Exception):
+    """回环转发失败 (0.6.7: hub req 帧与本地 /api/proxy 路由共用核心, docs/API.MD 二十)
+
+    code 枚举 (与 hub 端 relay.go 错误映射对齐):
+    - port_not_allowed: KHUB_PORTS 未放行 (拒绝时不发起连接, 无端口扫描侧信道)
+    - body_too_large:   请求/响应体超过 KISAMA_HUB_MAX_BODY
+    - loopback_unreachable: 回环连接失败
+    """
+
+    def __init__(self, code, message):
+        super().__init__("[%s] %s" % (code, message))
+        self.code = code
+        self.message = message
+
+
+def _loopback_relay_prepare(port, whitelist, method, path, query, headers, body, max_body,
+                            forwarded_for=None):
+    """回环转发前置检查与构造 (0.6.7 一份实现三层共用): 白名单/请求体超限检查 + URL 与头构造。
+    白名单拒绝不发起连接 (无扫描侧信道); 请求体超限回 body_too_large (响应头未发出, 可回 JSON)"""
+    if whitelist is not None and port not in whitelist:
+        raise LoopbackRelayError("port_not_allowed", "端口 %d 未在反代白名单" % port)
+    if body is not None and len(body) > max_body:
+        raise LoopbackRelayError("body_too_large",
+                                 "请求体超过 KISAMA_HUB_MAX_BODY (%d 字节)" % max_body)
+    url = "http://127.0.0.1:%d%s" % (port, path)
+    if query:
+        url += "?" + query
+    req_headers = filter_loopback_headers(headers)
+    if forwarded_for:
+        req_headers["x-forwarded-for"] = forwarded_for
+    return url, req_headers
+
+
+async def loopback_relay_stream(session, *, port, whitelist, method, path, query, headers, body,
+                                relay_timeout, max_body, forwarded_for=None):
+    """回环流式转发原语 (本地 /api/proxy 路由用, 0.6.7): 响应流式回传不缓冲, 响应体不受
+    KISAMA_HUB_MAX_BODY 限制 (SSE/大文件; 响应头已发出后无法回 413)。会话 auto_decompress=False
+    字节保真; 超时 total 不设限 + sock_read=relay_timeout (SSE 心跳刷新保活)。
+    返回 (status, resp_headers, resp)——resp 为 aiohttp ClientResponse, 调用方负责消费与释放;
+    连接失败 raise LoopbackRelayError (响应头未发出, 调用方可回 JSON 错误体)"""
+    url, req_headers = _loopback_relay_prepare(port, whitelist, method, path, query, headers,
+                                               body, max_body, forwarded_for)
+    try:
+        resp = await session.request(method, url, data=body if body else None,
+                                     headers=req_headers,
+                                     timeout=aiohttp.ClientTimeout(total=None, connect=10,
+                                                                   sock_connect=10,
+                                                                   sock_read=relay_timeout))
+        return resp.status, dict(resp.headers), resp
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        raise LoopbackRelayError("loopback_unreachable", str(exc)[:300])
+
+
+async def loopback_relay_request(session, *, port, whitelist, method, path, query, headers, body,
+                                 relay_timeout, max_body, request_fn=None, forwarded_for=None):
+    """回环缓冲转发 (hub req 帧路径用, docs/API.MD 十九/二十): 全量 read + 响应体超限检查,
+    与本地路由共用前置检查层 (_loopback_relay_prepare) — 白名单语义一份实现。
+
+    - whitelist=None: api 模式 (回环 agent 自身端口, 不做白名单校验); 传容器则 port 必须在列
+    - request_fn: 测试注入缝 (HubTunnelManager._request 透传), 生产恒 None
+    - forwarded_for: 过滤后注入 x-forwarded-for (本地路由填真实客户端 IP; hub 路径不传)
+    - 返回 (status, resp_headers, resp_body); 失败 raise LoopbackRelayError
+    """
+    url, req_headers = _loopback_relay_prepare(port, whitelist, method, path, query, headers,
+                                               body, max_body, forwarded_for)
+    try:
+        if request_fn is not None:
+            status, resp_headers, resp_body = await request_fn(session, method, url, req_headers, body)
+        else:
+            async with session.request(method, url, data=body if body else None,
+                                       headers=req_headers,
+                                       timeout=aiohttp.ClientTimeout(total=relay_timeout)) as resp:
+                status = resp.status
+                resp_headers = dict(resp.headers)
+                resp_body = await resp.read()
+    except asyncio.CancelledError:
+        raise
+    except LoopbackRelayError:
+        raise
+    except Exception as exc:
+        raise LoopbackRelayError("loopback_unreachable", str(exc)[:300])
+    if len(resp_body) > max_body:
+        raise LoopbackRelayError("body_too_large",
+                                 "响应体超过 KISAMA_HUB_MAX_BODY (%d 字节)" % max_body)
+    return status, resp_headers, resp_body
+
+
 class HubTunnelManager:
     """KMODE=3 出站隧道管理器 (结构镜像 ArgoTunnelManager / 0.6.4 状态惯例)
 
@@ -8242,7 +8354,10 @@ class HubTunnelManager:
 
     async def _run_loop(self):
         connector = aiohttp.TCPConnector(limit=16)
-        async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=None)) as session:
+        # auto_decompress=False: 上游响应字节保真 (0.6.7, 与 js 端 node http 语义一致;
+        # 缺省 True 会解压 body 而 headers 保留 content-encoding, 帧透传即损坏)
+        async with aiohttp.ClientSession(connector=connector, auto_decompress=False,
+                                         timeout=aiohttp.ClientTimeout(total=None)) as session:
             while not self._stop.is_set():
                 try:
                     await self._connect_once(session)
@@ -8366,34 +8481,25 @@ class HubTunnelManager:
         try:
             if mode == "port":
                 port = int(f.get("port") or 0)
-                if port not in self.ports:
-                    # 白名单拒绝: 不发起连接, 无端口扫描侧信道
-                    await self._send_err(ws, rid, "port_not_allowed", "KHUB_PORTS 未放行端口 %d" % port)
-                    return
-                url = "http://127.0.0.1:%d%s" % (port, path)
+                whitelist = proxy_effective_ports("hub")  # HUB 组聚合 (env KHUB_PORTS ∪ hub 运行时, 0.6.7 续批六)
             else:
-                url = "http://127.0.0.1:%d%s" % (self.port, path)
-            if query:
-                url += "?" + query
-            headers = filter_loopback_headers(f.get("headers"))
-            if self._request is not None:
-                status, resp_headers, resp_body = await self._request(session, method, url, headers, body)
-            else:
-                async with session.request(method, url, data=body if body else None,
-                                           headers=headers,
-                                           timeout=aiohttp.ClientTimeout(total=self._relay_timeout)) as resp:
-                    status = resp.status
-                    resp_headers = dict(resp.headers)
-                    resp_body = await resp.read()
-            if len(resp_body) > self._max_body:
-                await self._send_err(ws, rid, "body_too_large",
-                                     "响应体超过 KISAMA_HUB_MAX_BODY (%d 字节)" % self._max_body)
-                return
+                port = self.port
+                whitelist = None  # api 模式回环 agent 自身, 不做白名单校验
+            status, resp_headers, resp_body = await loopback_relay_request(
+                session, port=port, whitelist=whitelist, method=method, path=path,
+                query=query, headers=f.get("headers"), body=body,
+                relay_timeout=self._relay_timeout, max_body=self._max_body,
+                request_fn=self._request)
             await self._send(ws, {
                 "t": "res", "id": rid, "status": int(status),
                 "headers": resp_headers,
                 "body_b64": base64.b64encode(resp_body).decode("ascii"),
             })
+        except LoopbackRelayError as exc:
+            try:
+                await self._send_err(ws, rid, exc.code, exc.message)
+            except Exception:
+                pass
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -8451,11 +8557,12 @@ class HubWSStream:
 
     async def _run(self):
         if self.port:
-            # 端口反代模式: KHUB_PORTS 白名单校验 (拒绝时不发起连接, 无扫描侧信道)
-            if self.port not in self.mgr.ports:
+            # 端口反代模式: HUB 组聚合白名单校验 (env KHUB_PORTS ∪ hub 运行时, 0.6.7 续批六分组口径;
+            # 拒绝时不发起连接, 无扫描侧信道)
+            if self.port not in proxy_effective_ports("hub"):
                 try:
                     await self.mgr._send(self.hub_ws, {"t": "ws_ack", "id": self.sid, "ok": False,
-                                                       "message": "KHUB_PORTS 未放行端口 %d" % self.port})
+                                                       "message": "端口 %d 未在 HUB 反代白名单" % self.port})
                 except Exception:
                     pass
                 return
@@ -8857,7 +8964,7 @@ class HubRegisterRequest(BaseModel):
     # POST /api/hub 请求体 (0.6.6 续批, docs/API.MD 19.10 动态注册)
     hub: str = Field(..., description="kisama-hub 基址 (http/https 前缀)", examples=["https://hub.example.com"])
     kname: str = Field(..., description="注册名 (单个 hub 内唯一, 规则见 19.4)", examples=["myhost"])
-    ports: Optional[List[int]] = Field(default=None, description="端口反代白名单 (缺省空=禁用)", examples=[[7788]])
+    ports: Optional[List[int]] = Field(default=None, description="端口反代白名单 (注册项成立即自动并入; 缺省空=不改白名单)", examples=[[7788]])
 
 
 class HubDeleteRequest(BaseModel):
@@ -8913,6 +9020,9 @@ async def lifespan(app: FastAPI):
 
     app.state.argo_tunnel_manager = ArgoTunnelManager()
 
+    # 📡 本地端口反代共享回环会话 (0.6.7, docs/API.MD 二十): auto_decompress=False 字节保真
+    app.state.loopback_session = aiohttp.ClientSession(auto_decompress=False)
+
     # KMODE=1: 隧道 + 域名文件 + stdin 监听; KMODE=2: 隧道 + shz.al 静默上报 (docs/API.MD 第九节)
     # KMODE=2 但 KNAME 缺失/非法时退化为普通启动 (等同 KMODE=0)
     if Config.KMODE == "1" or (Config.KMODE == "2" and KModeController.kname_valid()):
@@ -8961,6 +9071,26 @@ async def lifespan(app: FastAPI):
         except Exception as _exc:
             Logger.warning(f"[KMODE3] ⚠️ 恢复注册项 {_reg.get('kname')} 异常: {_exc}")
 
+    # 📡 反代运行时白名单恢复 (0.6.7 续批六分组口径, docs/API.MD 20.8): kstore data.proxyports
+    # → 两组运行时列表; 兼容旧平铺数组形状 (归入本地组)
+    _tm_pp = getattr(app.state, "task_manager", None)
+    if _tm_pp is not None and getattr(_tm_pp, "store", None) is not None:
+        try:
+            _pp_data = _tm_pp.store.get_proxyports()
+            if isinstance(_pp_data, dict):
+                for _grp in (PROXY_GROUP_HUB, PROXY_GROUP_LOCAL):
+                    _items = _pp_data.get(_grp) or []
+                    if _items:
+                        proxy_set_runtime_ports(_grp, _items)
+                _hub_n, _local_n = len(_pp_data.get("hub") or []), len(_pp_data.get("local") or [])
+                Logger.info(f"[ProxyRoute] 💡 已恢复反代运行时白名单: HUB 组 {_hub_n} 个, 本地组 {_local_n} 个")
+            elif isinstance(_pp_data, (list, tuple)) and _pp_data:
+                # 旧平铺数组 (0.6.7 未发布期形状) → 归入本地组
+                proxy_set_runtime_ports(PROXY_GROUP_LOCAL, _pp_data)
+                Logger.info(f"[ProxyRoute] 💡 已恢复反代运行时白名单 (旧形状归入本地组): {len(_pp_data)} 个端口")
+        except Exception as _exc:
+            Logger.debug(f"[ProxyRoute] 反代白名单恢复读取失败: {_exc}", 11)
+
     if Config.DEBUG:
         Logger.debug(f"✅ 管理器已挂载到 app.state")
         Logger.debug(f"   • file_manager: {app.state.file_manager}")
@@ -8994,6 +9124,13 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass  # 忽略清理错误
 
+    # 📡 关闭时: 释放本地端口反代回环会话
+    if hasattr(app.state, 'loopback_session'):
+        try:
+            await app.state.loopback_session.close()
+        except Exception:
+            pass  # 忽略清理错误
+
 # ============================================================================
 # 📊 业务路由: 状态接口等
 # ============================================================================
@@ -9006,15 +9143,21 @@ app = FastAPI(
     lifespan=lifespan  # 🔧 添加这行!
 )
 from fastapi.middleware.cors import CORSMiddleware
+# 🔐 认证中间件先 add → 内层; CORS 后 add → 最外层 (0.6.7 续批五): 401/400 等错误响应
+# 也统一盖 CORS 头 —— 此前 AuthEncrypt 最外层短路, 错误响应无 ACAO, 浏览器只见 Failed
+# to fetch、错误详情不可读。安全口径: CORS 仅是浏览器展示层策略, 不是认证边界 —— agent
+# 认证为每请求 ECDSA 签名头 (无 cookie 类环境凭据, 未启用 allow_credentials), 未认证方在
+# 浏览器外本就能直接构造请求取得同样的错误体, 错误文案不含密钥材料; 带预检特征 (Origin+
+# Access-Control-Request-Method) 的 OPTIONS 由本层本地应答, 普通 OPTIONS 仍穿透反代路由
+# (20.4 差异记录的 py 语义与场景 11l 不变)。
+app.add_middleware(AuthEncryptMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
-    allow_headers=["*"],   # 或指定 ["X-Nonce", "X-Timestamp", ...]
-    expose_headers=["x-encrypted"], 
+    allow_headers=["*"],
+    expose_headers=["x-encrypted"],
 )
-# 注册中间件
-app.add_middleware(AuthEncryptMiddleware)
 
 # ============================================================================
 # 🌐 Argo 临时隧道模块: RESTful 路由
@@ -9109,6 +9252,13 @@ async def register_hub(request: Request, payload: HubRegisterRequest = Body(...)
         return JSONResponse(status_code=422, content={"status": "error", "code": "invalid_hub", "message": "hub 必须以 http:// 或 https:// 开头"})
     snap, code, msg = registrar.register(hub_url, payload.kname, ports=payload.ports or [],
                                          source="dynamic", wait_timeout=15.0)
+    if code is None or code == "unreachable":
+        # 注册端口并入 HUB 组运行时白名单 (0.6.7 续批六分组口径, docs/API.MD 19.9/20.8): 注册项
+        # 成立 (含退避中) 即生效, 永久拒绝 (invalid_name/name_taken/full) 不并入; DELETE
+        # /api/proxy/config?scope=hub 可整体收回, hubregs 恢复路径不重新并入 (与管理动作一致)
+        if payload.ports:
+            proxy_merge_runtime_ports("hub", payload.ports)
+            _persist_proxyports(request.app.state)
     if code is None:
         persisted = _persist_hubregs(request.app.state)
         return {"status": "ok", "persisted": persisted, "registration": snap}
@@ -9133,6 +9283,311 @@ async def unregister_hub(request: Request, payload: HubDeleteRequest = Body(...)
         return JSONResponse(status_code=404, content={"status": "error", "message": f"KNAME {payload.kname} 未注册"})
     persisted = _persist_hubregs(request.app.state)
     return {"status": "ok", "persisted": persisted, "removed": snap}
+
+
+# ============================================================================
+# 📡 本地端口反代路由 (0.6.7, docs/API.MD 二十): 不注册 hub 时, 控制端经 agent 自身
+# 路由访问本机端口 HTTP 服务。语义与 hub /{KNAME}/{PORT}/* 对齐: KHUB_PORTS 白名单
+# (缺省空=禁用, 拒绝不发起连接无扫描侧信道)、缓冲全量、KISAMA_HUB_MAX_BODY 双向限制;
+# 回环转发核心与 hub req 帧共用 loopback_relay_request (一份实现两处消费)。
+# ============================================================================
+_PROXY_STRIPPED_AUTH_HEADERS = (
+    # agent 认证头不透传给上游服务 (防密钥材料泄漏); hub 路径无此风险 (帧内无认证头)
+    "x-nonce", "x-timestamp", "x-auth-token", "x-aes-encrypted",
+    "x-encrypted", "x-agent-version",
+)
+_PROXY_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
+
+# 📡 运行时白名单 (0.6.7 续批六分组口径, docs/API.MD 20.2/20.8): 两组独立管理 ——
+# HUB 组 (env KHUB_PORTS ∪ hub 运行时) 只约束 hub 链路端口反代 (/{KNAME}/{PORT}/*, 0.6.6);
+# 本地组 (env KPROXY_PORTS ∪ 本地运行时) 只约束本地路由 /api/proxy/{port} 与 /api/proxyws/{port}。
+# 运行时列表经 POST /api/proxy/config (scope 区分组, 整体覆盖) 设置, KSTORE data.proxyports
+# 持久化重启恢复; env 为部署者意愿下限, 运行时列表只增; 收紧用 DELETE 回落 env。
+# POST /api/hub 注册端口并入 HUB 组 (19.9)。修订 0.6.7 续批二"单一白名单口径" (Owner 拍板 2026-11-20)。
+PROXY_GROUP_HUB = "hub"
+PROXY_GROUP_LOCAL = "local"
+_PROXY_RUNTIME_PORTS_LOCK = threading.Lock()
+_PROXY_RUNTIME_PORTS = {PROXY_GROUP_HUB: set(), PROXY_GROUP_LOCAL: set()}
+
+
+def _proxy_env_ports(group):
+    """组 env 下限: HUB 组取 KHUB_PORTS, 本地组取 KPROXY_PORTS (未知组视为空)"""
+    return {"hub": Config.KHUB_PORTS, "local": Config.KPROXY_PORTS}.get(group, ())
+
+
+def proxy_effective_ports(group) -> list:
+    """组聚合端口白名单 (group: "hub"/"local"): 组 env 下限 ∪ 组运行时列表, 排序去重
+    (拒绝时不发起连接, 无扫描侧信道)"""
+    with _PROXY_RUNTIME_PORTS_LOCK:
+        return sorted(set(_proxy_env_ports(group)) | _PROXY_RUNTIME_PORTS.get(group, set()))
+
+
+def _clean_port_list(ports) -> set:
+    """端口列表清洗: 数字/数字字符串 → 1-65535 去重集合, 其余静默丢弃 (bool 排除)"""
+    cleaned = set()
+    for p in (ports or []):
+        if isinstance(p, bool):
+            continue
+        try:
+            v = int(p)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= v <= 65535:
+            cleaned.add(v)
+    return cleaned
+
+
+def proxy_set_runtime_ports(group, ports) -> None:
+    """整体覆盖组运行时白名单 (POST /api/proxy/config, scope 选组); 非法/越界条目静默过滤"""
+    cleaned = _clean_port_list(ports)
+    with _PROXY_RUNTIME_PORTS_LOCK:
+        _PROXY_RUNTIME_PORTS.setdefault(group, set())
+        _PROXY_RUNTIME_PORTS[group].clear()
+        _PROXY_RUNTIME_PORTS[group].update(cleaned)
+
+
+def proxy_merge_runtime_ports(group, ports) -> None:
+    """并入组运行时白名单 (POST /api/hub 注册端口并入 HUB 组, docs/API.MD 19.9/20.8):
+    同组只增不覆盖, 同规则静默过滤"""
+    cleaned = _clean_port_list(ports)
+    if not cleaned:
+        return
+    with _PROXY_RUNTIME_PORTS_LOCK:
+        _PROXY_RUNTIME_PORTS.setdefault(group, set()).update(cleaned)
+
+
+def _persist_proxyports(state) -> bool:
+    """把两组运行时白名单落盘到 kstore data.proxyports (KSTORE 未启用时返回 False, 仅内存)"""
+    tm = getattr(state, "task_manager", None)
+    store = getattr(tm, "store", None) if tm is not None else None
+    if store is None:
+        return False
+    return store.save_proxyports({"hub": proxy_runtime_ports("hub"),
+                                  "local": proxy_runtime_ports("local")})
+
+
+def proxy_runtime_ports(group) -> list:
+    """组运行时列表快照 (排序; 不含 env 部分)"""
+    with _PROXY_RUNTIME_PORTS_LOCK:
+        return sorted(_PROXY_RUNTIME_PORTS.get(group, set()))
+
+
+def _proxy_error_response(exc):
+    # 错误映射与 hub relay.go 对齐: 403 port_not_allowed / 413 body_too_large / 502 其余
+    http_code = {"port_not_allowed": 403, "body_too_large": 413}.get(exc.code, 502)
+    return JSONResponse(status_code=http_code,
+                        content={"status": "error", "code": exc.code, "message": exc.message})
+
+
+@app.get("/api/proxy/config")
+async def get_proxy_config(request: Request):
+    # 反代白名单配置查询 (验签, docs/API.MD 20.8, 0.6.7 续批六分组口径): HUB 组/本地组
+    # 各自 env/运行时/聚合三视图 (HUB 组 env=KHUB_PORTS, 本地组 env=KPROXY_PORTS)。
+    # 路由注册在 /api/proxy/{port} 之前 (FastAPI 顺序匹配, 避免 "config" 被当作端口段);
+    # /api/proxy/config 不走中间件 bypass (管理端点必须验签)
+    tm = getattr(request.app.state, "task_manager", None)
+    store = getattr(tm, "store", None) if tm is not None else None
+    kstore_enabled = bool(store is not None and getattr(store, "enabled", False)
+                          and not getattr(store, "locked", False))
+    return {
+        "status": "ok",
+        "hub": {"env_ports": sorted(set(Config.KHUB_PORTS)),
+                "runtime_ports": proxy_runtime_ports("hub"),
+                "effective_ports": proxy_effective_ports("hub")},
+        "local": {"env_ports": sorted(set(Config.KPROXY_PORTS)),
+                  "runtime_ports": proxy_runtime_ports("local"),
+                  "effective_ports": proxy_effective_ports("local")},
+        "kstore_enabled": kstore_enabled,
+    }
+
+
+@app.post("/api/proxy/config")
+async def set_proxy_config(request: Request, payload: dict = Body(...)):
+    # 整体覆盖组运行时白名单 (幂等, 非法/越界条目静默过滤); scope 选组 ("local"|"hub",
+    # 缺省 local); KSTORE 启用时落盘 data.proxyports (重启恢复), 未启用 persisted:false 仅内存
+    if not isinstance(payload, dict):
+        return JSONResponse(status_code=422, content={"status": "error", "code": "invalid_ports",
+                                                      "message": "ports 必须为端口数组, 如 {\"ports\":[7788,9090]}"})
+    ports = payload.get("ports")
+    scope = payload.get("scope", PROXY_GROUP_LOCAL)
+    if scope not in (PROXY_GROUP_HUB, PROXY_GROUP_LOCAL):
+        return JSONResponse(status_code=422, content={"status": "error", "code": "invalid_scope",
+                                                      "message": "scope 必须为 \"local\" 或 \"hub\""})
+    if not isinstance(ports, list):
+        return JSONResponse(status_code=422, content={"status": "error", "code": "invalid_ports",
+                                                      "message": "ports 必须为端口数组, 如 {\"ports\":[7788,9090]}"})
+    proxy_set_runtime_ports(scope, ports)
+    persisted = _persist_proxyports(request.app.state)
+    return {"status": "ok", "persisted": persisted, "scope": scope,
+            "runtime_ports": proxy_runtime_ports(scope), "effective_ports": proxy_effective_ports(scope)}
+
+
+@app.delete("/api/proxy/config")
+async def clear_proxy_config(request: Request, scope: str = ""):
+    # 清空组运行时白名单回落 env (env 部分仍生效): 无 scope 清两组, ?scope=hub|local 只清一组;
+    # 落盘同步清空
+    if scope and scope not in (PROXY_GROUP_HUB, PROXY_GROUP_LOCAL):
+        return JSONResponse(status_code=422, content={"status": "error", "code": "invalid_scope",
+                                                      "message": "scope 必须为 \"local\" 或 \"hub\""})
+    cleared = [scope] if scope else [PROXY_GROUP_HUB, PROXY_GROUP_LOCAL]
+    for grp in cleared:
+        proxy_set_runtime_ports(grp, [])
+    persisted = _persist_proxyports(request.app.state)
+    return {"status": "ok", "persisted": persisted,
+            "scope": scope or "all",
+            "hub": {"runtime_ports": proxy_runtime_ports("hub"),
+                    "effective_ports": proxy_effective_ports("hub")},
+            "local": {"runtime_ports": proxy_runtime_ports("local"),
+                      "effective_ports": proxy_effective_ports("local")}}
+
+
+@app.api_route("/api/proxy/{port}", methods=_PROXY_METHODS)
+@app.api_route("/api/proxy/{port}/{rest:path}", methods=_PROXY_METHODS)
+async def proxy_port_relay(request: Request, port: str, rest: str = ""):
+    # /api/proxy/{port}/{rest} → http://127.0.0.1:{port}/{rest}
+    # 全程走验签中间件 (OPTIONS/HEAD 沿用既有放行惯例), 响应在中间件豁免加密。
+    try:
+        port_num = int(port)
+        if not 1 <= port_num <= 65535:
+            raise ValueError(port)
+    except ValueError:
+        return JSONResponse(status_code=404, content={"status": "error", "code": "invalid_port",
+                                                      "message": "端口必须为 1-65535 的整数: %r" % port})
+    body = await request.body()
+    headers = dict(request.headers)
+    for _h in _PROXY_STRIPPED_AUTH_HEADERS:
+        headers.pop(_h, None)
+    client_ip = request.client.host if request.client else None
+    session = getattr(request.app.state, "loopback_session", None)
+    if session is None or session.closed:
+        # 惰性兜底 (常规由 lifespan 创建): auto_decompress=False 字节保真, 同共享核心语义
+        session = aiohttp.ClientSession(auto_decompress=False)
+        request.app.state.loopback_session = session
+    try:
+        # 流式转发原语 (0.6.7): 响应边收边回传, 响应体不受 KISAMA_HUB_MAX_BODY 限制 (SSE/大文件);
+        # 白名单/请求体超限错误在响应头发出前抛出, 可回 JSON 错误体
+        status, resp_headers, resp = await loopback_relay_stream(
+            session, port=port_num, whitelist=proxy_effective_ports("local"), method=request.method,
+            path="/" + rest,
+            query=request.scope.get("query_string", b"").decode("ascii", "replace"),
+            headers=headers, body=body,
+            relay_timeout=max(5.0, float(Config.KISAMA_HUB_RELAY_TIMEOUT)),
+            max_body=max(1, int(Config.KISAMA_HUB_MAX_BODY)),
+            forwarded_for=client_ip)
+    except LoopbackRelayError as exc:
+        return _proxy_error_response(exc)
+    out_headers = {k: v for k, v in resp_headers.items()
+                   if str(k).lower() not in _HUB_HOP_HEADERS
+                   and str(k).lower() != "content-length"}
+
+    async def _relay_iter():
+        try:
+            # iter_any(): 逐 chunk 原样透传 (resp.content 直接 async-for 是按行 readline,
+            # 无换行大响应会触发 LineTooLong; readany 语义才是字节保真流式)
+            async for chunk in resp.content.iter_any():
+                yield chunk
+        finally:
+            resp.release()  # 客户端中断/迭代结束时归还连接
+
+    return StreamingResponse(_relay_iter(), status_code=status, headers=out_headers)
+
+
+def _proxy_ws_dial_headers(scope_headers):
+    """WS 回环拨号头 (0.6.7): 剥 hop-by-hop/host 与 sec-websocket-* (防 permessage-deflate
+    协商错乱, 对齐 js 端) 与 agent 认证头 (防御纵深); 其余业务头透传上游"""
+    out = {}
+    for k, v in (scope_headers or []):
+        lk = k.decode("latin-1").lower() if isinstance(k, bytes) else str(k).lower()
+        if lk in _HUB_HOP_HEADERS or lk.startswith("sec-websocket-") or lk.startswith("x-kisama-hub-"):
+            continue
+        if lk in _PROXY_STRIPPED_AUTH_HEADERS:
+            continue
+        val = v.decode("latin-1") if isinstance(v, bytes) else str(v)
+        out[k.decode("latin-1") if isinstance(k, bytes) else str(k)] = val
+    return out
+
+
+async def _proxy_ws_pump_client_to_upstream(websocket, upstream):
+    """本地反代 WS 泵: 客户端 → 上游 (text/binary 保真; disconnect 返回触发联动关闭)"""
+    while True:
+        msg = await websocket.receive()
+        if msg.get("type") == "websocket.disconnect":
+            return
+        if msg.get("type") == "websocket.receive":
+            if msg.get("text") is not None:
+                await upstream.send_str(msg["text"])
+            else:
+                await upstream.send_bytes(msg.get("bytes") or b"")
+
+
+async def _proxy_ws_pump_upstream_to_client(upstream, websocket):
+    """本地反代 WS 泵: 上游 → 客户端 (text/binary 保真; 上游关闭返回触发联动关闭)"""
+    async for msg in upstream:
+        if msg.type == aiohttp.WSMsgType.BINARY:
+            await websocket.send_bytes(msg.data)
+        elif msg.type == aiohttp.WSMsgType.TEXT:
+            await websocket.send_text(msg.data)
+        elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING,
+                          aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+            return
+
+
+@app.websocket("/api/proxyws/{port}/{rest:path}")
+@app.websocket("/api/proxyws/{port}")
+async def proxy_port_ws(websocket: WebSocket, port: str, rest: str = ""):
+    # 本地端口反代 WS 透传 (0.6.7, docs/API.MD 20.6): 白名单唯一门禁 (匿名放行, Owner 拍板
+    # 2026-11-18) —— Starlette websocket scope 不经 HTTP 认证中间件, 白名单即为全部门禁。
+    # 回环拨 ws://127.0.0.1:{port} 双向泵 (text/binary 保真, 任一侧关闭联动);
+    # 白名单拒绝不发起回环连接 (与 HTTP 端口反代同语义), Starlette 无法回 HTTP 403 → close 1008
+    try:
+        port_num = int(port)
+        if not 1 <= port_num <= 65535:
+            raise ValueError(port)
+    except ValueError:
+        # 拒绝: accept 后 close 1008 (ASGI 在 accept 前关闭会被 uvicorn 回 HTTP 403,
+        # accept 后关闭才能携带 WS close code; 与 hub ws_ack 失败 → close 的语义一致)
+        await websocket.accept()
+        await websocket.close(code=1008, reason="invalid_port: %s" % port[:80])
+        return
+    if port_num not in proxy_effective_ports("local"):
+        await websocket.accept()
+        await websocket.close(code=1008, reason="port_not_allowed: 端口 %d 未在本地反代白名单" % port_num)
+        return
+    query = websocket.scope.get("query_string", b"").decode("ascii", "replace")
+    dial_headers = _proxy_ws_dial_headers(websocket.scope.get("headers"))
+    url = "ws://127.0.0.1:%d/%s" % (port_num, rest)
+    if query:
+        url += "?" + query
+    session = getattr(websocket.app.state, "loopback_session", None)
+    if session is None or session.closed:
+        session = aiohttp.ClientSession(auto_decompress=False)
+        websocket.app.state.loopback_session = session
+    await websocket.accept()
+    try:
+        async with session.ws_connect(url, headers=dial_headers, autoping=True, timeout=None) as upstream:
+            client_task = asyncio.create_task(_proxy_ws_pump_client_to_upstream(websocket, upstream))
+            upstream_task = asyncio.create_task(_proxy_ws_pump_upstream_to_client(upstream, websocket))
+            await asyncio.wait({client_task, upstream_task}, return_when=asyncio.FIRST_COMPLETED)
+            for p in (client_task, upstream_task):
+                p.cancel()
+    except Exception:
+        pass  # 拨号失败/泵异常 → 断开客户端 (连接已 accepted, 无法回 HTTP 错误体)
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
+# 📡 同路径 upgrade 嗅探 (0.6.7 续批三, Owner 拍板仅 py/js, docs/API.MD 20.6): 浏览器应用
+# 从页面 URL 派生 WS 地址, upgrade 与 HTTP 反代同路径直达 → Starlette 按 scope type 分发、
+# 同路径可共存, 与 /api/proxyws 同一泵。java/java11 的 Spark/Jetty WebSocketServlet 按
+# 路径前缀整树接管、与 HTTP 路由结构性二选一 (同路径实测 upgrade 被路由吞成 :port="ws"
+# 404), 不支持同路径 —— 保持 /api/proxyws 专前缀 (URL 契约按端分叉, 矩阵如实标注)。
+@app.websocket("/api/proxy/{port}/{rest:path}")
+@app.websocket("/api/proxy/{port}")
+async def proxy_port_ws_samepath(websocket: WebSocket, port: str, rest: str = ""):
+    await proxy_port_ws(websocket, port, rest)
 
 
 async def get_smart_payload(request: Request) -> ExecRequestJSON:
@@ -9366,6 +9821,7 @@ class TaskStore:
         self.key = None
         self.last_saved_at = None
         self.hubregs = []            # hub 注册任务子类型 (data.hubregs, 0.6.6 起; load 时填充)
+        self.proxyports = {}         # 反代运行时白名单子类型 (data.proxyports, 0.6.7 续批六起对象形状 {"hub":..,"local":..}; load 时填充)
         self._lock = threading.Lock()
         self._resolve_config()
 
@@ -9453,8 +9909,10 @@ class TaskStore:
 
     def load(self):
         """加载持久化任务, 返回 (onetasks, crontasks); 文件缺失/损坏一律安全降级为空表
-        同时把 hub 注册任务子类型 (data.hubregs, 0.6.6 起) 填充到 self.hubregs"""
+        同时把 hub 注册任务子类型 (data.hubregs, 0.6.6 起) 与反代运行时白名单
+        (data.proxyports, 0.6.7 起) 填充到对应字段"""
         self.hubregs = []
+        self.proxyports = {}
         doc = self._load_doc()
         if doc is None:
             return [], {}
@@ -9472,13 +9930,53 @@ class TaskStore:
                     "ports": [int(p) for p in ports if isinstance(p, (int, float)) and 1 <= int(p) <= 65535] if isinstance(ports, list) else [],
                 })
         self.hubregs = regs
+        # 反代运行时白名单 (0.6.7 续批六, docs/API.MD 20.8): 对象形状 {"hub": [..], "local": [..]},
+        # 各组整数端口列表, 非法条目静默过滤; 兼容旧平铺数组形状 (归入本地组)
+        raw_pp = data.get("proxyports")
+        if isinstance(raw_pp, dict):
+            self.proxyports = {
+                "hub": [int(p) for p in (raw_pp.get("hub") or [])
+                        if isinstance(p, (int, float)) and 1 <= int(p) <= 65535],
+                "local": [int(p) for p in (raw_pp.get("local") or [])
+                          if isinstance(p, (int, float)) and 1 <= int(p) <= 65535],
+            }
+        else:
+            self.proxyports = {"hub": [], "local": [int(p) for p in (raw_pp or [])
+                                                    if isinstance(p, (int, float)) and 1 <= int(p) <= 65535]}
         self.last_saved_at = doc.get("saved_at")
-        Logger.info(f"[TaskStore] 💾 已恢复持久化任务: onetime={len(onetasks)}, cron={len(crontasks)}, hubreg={len(regs)}")
+        Logger.info(f"[TaskStore] 💾 已恢复持久化任务: onetime={len(onetasks)}, cron={len(crontasks)}, "
+                    f"hubreg={len(regs)}, proxyport(hub)={len(self.proxyports['hub'])}, "
+                    f"proxyport(local)={len(self.proxyports['local'])}")
         return onetasks, crontasks
 
     def get_hubregs(self):
         """启动恢复用: 读取内存中的 hub 注册任务条目 (load 时填充; 未启用 KSTORE 恒为空)"""
         return list(self.hubregs or [])
+
+    def get_proxyports(self):
+        """启动恢复用: 读取内存中的反代运行时白名单 (对象形状 {"hub":..,"local":..};
+        load 时填充; 未启用 KSTORE 恒为空)"""
+        return {"hub": list((self.proxyports or {}).get("hub") or []),
+                "local": list((self.proxyports or {}).get("local") or [])}
+
+    def save_proxyports(self, ports) -> bool:
+        """落盘反代运行时白名单 (additive 键, 0.6.7 续批六 docs/API.MD 20.8): 接受对象形状
+        {"hub": [..], "local": [..]} (兼容平铺数组 → 归入本地组); 合并当前内存任务表
+        整体原子写, 返回是否成功。未启用/只读时直接返回 False 且不更新内存字段"""
+        if not self.enabled or self.locked:
+            return False
+
+        def _clean(items):
+            return sorted({int(p) for p in (items or [])
+                           if isinstance(p, (int, float)) and 1 <= int(p) <= 65535})
+
+        if isinstance(ports, dict):
+            cleaned = {"hub": _clean(ports.get("hub")),
+                       "local": _clean(ports.get("local"))}
+        else:
+            cleaned = {"hub": [], "local": _clean(ports)}
+        self.proxyports = cleaned
+        return self.save(Config.onetasks, Config.crontasks)
 
     def save_hubregs(self, items) -> bool:
         """落盘 hub 注册任务 (additive 键); 合并当前内存任务表整体原子写, 返回是否成功
@@ -9518,7 +10016,9 @@ class TaskStore:
                     "version": self.VERSION,
                     "saved_at": datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
                     "data": {"onetasks": list(onetasks or []), "crontasks": dict(crontasks or {}),
-                             "hubregs": list(self.hubregs or [])},
+                             "hubregs": list(self.hubregs or []),
+                             "proxyports": {"hub": list((self.proxyports or {}).get("hub") or []),
+                                            "local": list((self.proxyports or {}).get("local") or [])}},
                 }
                 plaintext = json.dumps(doc, ensure_ascii=False).encode("utf-8")
                 payload = CryptoManager.encrypt_data(plaintext, self.key)

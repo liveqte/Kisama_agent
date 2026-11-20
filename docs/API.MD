@@ -1796,7 +1796,8 @@ kisama-agent（内网，KMODE=3，回环分发到自身 /api 或 KHUB_PORTS 端�
 | `KHUB` | （空） | hub 基址，如 `https://hub.example.com`（尾斜杠剥除）；隧道 WS 地址自动推导（https→wss、http→ws、裸 host 按 ws，为字符串拼接、基址可含路径）；hub 启用路径前缀（19.3 `HUB_BASE_PATH`）时**必须带前缀**，如 `https://hub.example.com/hide1` |
 | `KHUB_PUBLIC_URL` | （空） | **公网基址覆盖值（可选，0.6.6 续批二）**：面板/客户端实际访问该 agent 中继地址的公网基址（可含路径前缀，如 `https://pub.example.com/hub`）。注册时经注册帧 `public_url` 字段上报，hub 拼 `/sub`、`/agents` 页与 ack `url` 时**优先用它**（优先级见 19.7）。**未配置时自动上报 KHUB 派生基址**（即 `KHUB` 本身——agent 知道 hub 公网地址的场景零配置）；本变量用于内网 KHUB 等派生值 ≠ 公网地址的部署。校验：`http(s)://` 开头、无空白、≤512 字符、尾斜杠剥除；非法值告警一次并回退 KHUB 派生基址 |
 | `KNAME` | （空） | hub 注册名，**单个 hub 内唯一**；校验规则独立于 shz.al（见 19.4），不要求 `KNAME_KEY` |
-| `KHUB_PORTS` | （空） | 端口反代白名单（逗号分隔，如 `7788,9090`）；**缺省空 = 端口反代禁用**，非法/越界条目静默忽略 |
+| `KHUB_PORTS` | （空） | **HUB 组反代白名单 env 下限（0.6.7 续批六起归属 HUB 组）**（逗号分隔，如 `7788,9090`）；只约束 hub 链路端口反代 `/{KNAME}/{PORT}/*`，缺省空 = HUB 端口反代禁用，非法/越界条目静默忽略。聚合公式：HUB 组有效白名单 = `KHUB_PORTS` ∪ HUB 运行时列表（运行时经 20.8 API `scope=hub` 设置与 `POST /api/hub` 注册端口并入（19.9）并 KSTORE 持久化）；拒绝语义见 20.2（403 `port_not_allowed`、不发起连接） |
+| `KPROXY_PORTS` | （空） | **本地组反代白名单 env 下限（0.6.7 续批六新增）**（逗号分隔）；只约束本地反代路由（第二十节 `/api/proxy/{port}/*`、WS `/api/proxyws/{port}/{rest}`），缺省空 = 本地反代禁用，非法/越界条目静默忽略。聚合公式：本地组有效白名单 = `KPROXY_PORTS` ∪ 本地运行时列表（20.8）；**与 `KHUB_PORTS` 互不影响**（两组独立存储与校验，续批六拍板修订续批二"单一白名单口径"） |
 | `KISAMA_HUB_RETRY_BASE_SECONDS` | `2` | 断线重连指数退避基数（秒） |
 | `KISAMA_HUB_RETRY_MAX_SECONDS` | `60` | 退避上限（秒）；公式 `BASE × 2^(failures-1)` 封顶 MAX，与 argo 0.6.4 同构 |
 | `KISAMA_HUB_PING_INTERVAL` | `20` | 隧道应用层心跳间隔（秒） |
@@ -1842,7 +1843,7 @@ hub 环境变量：`HUB_PORT`(8080)、`HUB_MAX_AGENTS`(256)、`HUB_RELAY_TIMEOUT
 - 响应帧：`{"t":"res","id":N,"status":200,"headers":{...},"body_b64":"..."}`（`content-length` 由 hub 依实际 body 重写）。
 - 错误帧：`{"t":"err","id":N,"code":"...","message":"..."}`，hub 按码映射 HTTP 状态：`port_not_allowed`→403、`body_too_large`→413、`relay_timeout`→504、`loopback_unreachable`/`agent_disconnected`/`tunnel_write_failed`→502、未知→502。
 - agent 离线 / KNAME 未注册 → hub 直接 404（`unknown_agent`）；body 超 `HUB_MAX_BODY` → 413（hub 与 agent 双侧限额）。
-- **端口反代的白名单校验在 agent 侧**（`KHUB_PORTS`）：hub 无状态转发，agent 对未放行端口拒绝且不发起回环连接（无端口扫描侧信道）。
+- **端口反代的白名单校验在 agent 侧**（HUB 组白名单 = env `KHUB_PORTS` ∪ HUB 运行时，0.6.7 续批六）：hub 无状态转发，agent 对未放行端口拒绝且不发起回环连接（无端口扫描侧信道）。
 
 ### 19.6 终端 WS 中继（ws_open/ws_ack/ws_data/ws_close）
 
@@ -1851,7 +1852,7 @@ hub 环境变量：`HUB_PORT`(8080)、`HUB_MAX_AGENTS`(256)、`HUB_RELAY_TIMEOUT
 - 双向数据 `{"t":"ws_data","id":N,"bt":"bin"|"txt","data_b64":"..."}`（binary/text 语义保真）；任一侧关闭发 `{"t":"ws_close","id":N,"ws_code":<int>,"reason":"..."}` 对侧联动（`ws_code` 为独立整型键名，与 err 帧的字符串 `code` 区分）。
 - **hub 在收到 ws_ack(ok:true) 前缓冲客户端帧**（agent 本地 WS 握手仍在进行，提前下发会被其 CONNECTING 状态丢弃——Noise msg1 丢失会让会话静默挂死）；ack 到达后按序 flush。agent 侧对称：本地握手完成前的下行帧入队缓冲，open 后按序 flush。
 - 流级空闲超时 `HUB_WS_IDLE_TIMEOUT`（600s，任何帧重置）；隧道断开 → 该 agent 全部客户端流以 1011 关闭。hub 对客户端 ping/pong 自行应答（不上隧道）。
-- **端口反代模式也支持 WS 透传（0.6.6 续批）**：`/{KNAME}/{PORT}/*` 的 WebSocket 升级分流到同一帧协议，`ws_open` 帧携带 `port` 字段（`{"t":"ws_open","id":N,"port":7788,"path":"/剩余路径",...}`），agent 校验 `KHUB_PORTS` 白名单后回环拨 `ws://127.0.0.1:{port}{path}`——**目标服务的 WS（含其自有认证）端到端透传**；白名单未放行时 agent 回 `ws_ack ok:false`，hub 以 close 3001 关客户端（与 HTTP 端口反代的 403 同语义）。api 模式的 `ws_open` 无 `port` 字段（agent 回环自身）。
+- **端口反代模式也支持 WS 透传（0.6.6 续批）**：`/{KNAME}/{PORT}/*` 的 WebSocket 升级分流到同一帧协议，`ws_open` 帧携带 `port` 字段（`{"t":"ws_open","id":N,"port":7788,"path":"/剩余路径",...}`），agent 校验 HUB 组白名单（env `KHUB_PORTS` ∪ HUB 运行时，0.6.7 续批六）后回环拨 `ws://127.0.0.1:{port}{path}`——**目标服务的 WS（含其自有认证）端到端透传**；白名单未放行时 agent 回 `ws_ack ok:false`，hub 以 close 3001 关客户端（与 HTTP 端口反代的 403 同语义）。api 模式的 `ws_open` 无 `port` 字段（agent 回环自身）。
 
 ### 19.7 订阅与连接串契约（对齐 kisama-panel share-link.ts）
 
@@ -1900,7 +1901,8 @@ hub 环境变量：`HUB_PORT`(8080)、`HUB_MAX_AGENTS`(256)、`HUB_RELAY_TIMEOUT
 
 - 同步等待注册结果（15s 超时）；成功 → `200 {"status":"ok","persisted":<bool>,"registration":{...snapshot, "source":"dynamic"}}`（`persisted=false` 表示 KSTORE 未启用，注册仅本进程内存活）；
 - `KNAME` 非法/保留名 → `422 {"code":"invalid_name",...}`；hub 基址非 http(s) → `422 {"code":"invalid_hub"}`；本 agent 已有同名注册 → `409 {"code":"name_taken"}`（kname 唯一键）；hub 侧 name_taken/full → `409`——以上**均不保留注册项**；
-- 网络类失败（hub 不可达/超时）→ `500 {"code":"unreachable","persisted":<bool>,...}`——**注册项保留**，按指数退避自治重连，状态后查 GET（无重复 POST 的必要）。
+- 网络类失败（hub 不可达/超时）→ `500 {"code":"unreachable","persisted":<bool>,...}`——**注册项保留**，按指数退避自治重连，状态后查 GET（无重复 POST 的必要）；
+- **`ports` 并入 HUB 组运行时白名单（0.6.7 续批六分组口径，Owner 拍板 2026-11-20，修订续批二"单一白名单"）**：注册项成立（成功或 `unreachable` 退避中）时 `ports` **自动并入 HUB 组运行时列表**（20.8，KSTORE `data.proxyports` 随落盘）——**注册带端口即 hub 端口反代生效**：hub `/{KNAME}/{PORT}/*` 立即可用，无需另调 `POST /api/proxy/config`，env `KHUB_PORTS` 为空的节点同样成立；**本地组不受注册影响**（`/api/proxy/{port}/*` 的白名单独立于注册端口，见 20.2）；永久拒绝（invalid_name/name_taken/full）不并入；`DELETE /api/hub` 注销不收回已并入端口（白名单由 20.8 独立管理），hubregs 恢复路径亦不重新并入（`DELETE /api/proxy/config?scope=hub` 的管理动作不被重启翻盘）。
 
 **`DELETE /api/hub`** — 注销：
 
@@ -1921,9 +1923,98 @@ hub 环境变量：`HUB_PORT`(8080)、`HUB_MAX_AGENTS`(256)、`HUB_RELAY_TIMEOUT
 | :--- | :---: | :---: | :---: | :---: | :---: |
 | KMODE=3（API 中继 / 端口反代 / 终端中继 / 订阅） | ✅ | ✅ | ❌（KMODE 全系未实现） | ✅（0.6.6 续批） | ✅（0.6.6 续批） |
 | 动态注册（POST/DELETE /api/hub + kstore 持久化恢复，19.9） | ✅ | ✅ | ❌ | ✅ | ✅ |
+| 注册端口并入 HUB 组白名单（19.9/20.8，分组白名单，0.6.7 续批六） | ✅ | ✅ | ❌ | ✅ | ✅ |
 | 端口反代 WS 透传（ws_open.port，19.6） | ✅ | ✅ | ❌ | ✅ | ✅ |
 | marks `kmode3` | ✅ | ✅ | ❌ | ✅ | ✅ |
 | `GET /api/hub` | ✅ | ✅ | ❌ | ✅ | ✅ |
 | public_url 上报（缺省 KHUB 派生，KHUB_PUBLIC_URL 覆盖；19.4/19.7，0.6.6 续批二） | ✅ | ✅ | ❌ | ✅ | ✅ |
 
 遗留（后续批次）：go 的 KMODE=3 实现（需先补 KMODE/KNAME/KHUB/KHUB_PORTS 配置基建）；php 端无 WS 客户端、不做 hub 接入；面板订阅 URL 自动拉取（kisama-panel 侧）。
+
+## 二十、本地端口反代路由 `/api/proxy/{port}/*`（0.6.7 起，Py/Js/Java/Java11）
+
+不注册 kisama-hub 时，控制端/浏览器经 agent 自身开放的路由访问本机端口 HTTP 服务。端口编码在路由里（对齐 hub `/{KNAME}/{PORT}/{rest}` 语义，构造 URL 即选定端口），白名单为**本地组**（env `KPROXY_PORTS` ∪ 本地运行时列表，见 20.2/20.8；0.6.7 续批六起与 hub 端口反代的 HUB 组**分设两组白名单，各管各的**），回环转发核心与 hub `req` 帧共用（一份实现多层消费）。
+
+**认证模型（Owner 拍板 2026-11-18）：白名单唯一门禁**——中间件对 `/api/proxy/` 前缀匿名放行（`/api/proxy/config` 管理端点除外，走验签），端口在白名单中即放行，不做验签；与 hub 公开模型一致，浏览器可直接交互，目标服务的认证取决于其自身。
+
+### 20.1 端点与语义
+
+`ANY /api/proxy/{port}/{rest...}`（+ 无 rest 的 `ANY /api/proxy/{port}`）→ `http://127.0.0.1:{port}/{rest}`（响应流式回传，见 20.7；py/js 端同路径 upgrade 由 WS 泵承接，见 20.6 续批三）：
+
+- **白名单唯一门禁**：中间件 bypass（匿名放行不验签）；白名单拒绝 403 `port_not_allowed` **且不发起连接**（无端口扫描侧信道）；`/api/proxy/config` 管理端点不在 bypass（控制暴露面，走验签）；
+- **认证头剥离（防御纵深）**：`x-nonce`/`x-timestamp`/`x-auth-token`/`x-aes-encrypted`/`x-encrypted`/`x-agent-version` 不透传上游服务（签名材料即使被携带也不泄漏给被代理服务）；
+- **签名口径**：数据面 `/api/proxy/{port}/*` 按空 body 计算摘要（透传体为任意二进制、不缓冲，与 `/api/fileraw` 同款；控制端 tools/control.py `build_signature_message` 同步特判）——bypass 后反代数据路径不参与签名；**`/api/proxy/config` 管理端点无特例**（0.6.7 续批四修正：按十二节 v2 规范签**真实 body**，AES 体签密文——曾与数据面统一按空 body 摘要，导致按规范签名的面板/客户端 401、skill AES 体不解密 422，见 SECURITY-AUDIT 十一、附记）；
+- **请求头纵深过滤**：hop-by-hop（connection/keep-alive/transfer-encoding/upgrade/host 等）与 `x-kisama-hub-*`、`x-forwarded-*` 剥除；`x-forwarded-for` 注入真实客户端 IP（过滤后注入，与 hub 侧注入语义一致）；
+- **响应原样透传**：响应加密阶段对 `/api/proxy/` 前缀豁免（上游 JSON 响应不会被 AES 包装、不盖 x-encrypted/x-agent-version），content-length 由框架按实长重算，上游 `access-control-*` 剥除（CORS 由本端统一裁定，与 hub 同口径）；
+- **py 端会话 `auto_decompress=False`**（响应字节保真，含 content-encoding 头——0.6.7 同步修正 hub 端口反代 py 端的同款行为，与 js/java 对齐：node http / JDK HttpClient 原生不解压）。
+
+### 20.2 白名单与错误映射
+
+- **本地组聚合白名单 = env `KPROXY_PORTS` ∪ 本地运行时列表**（0.6.7 续批六分组口径：本地路由只查本地组，hub 链路只查 HUB 组 = env `KHUB_PORTS` ∪ HUB 运行时；运行时列表经 20.8 API scope 选组设置，注册端口并入 HUB 组见 19.9，KSTORE 持久化重启恢复）；组内两者皆空 = 该组功能禁用；拒绝时 **403 `port_not_allowed` 且不发起连接**（无端口扫描侧信道，与 hub 同语义）；
+- 目标固定 `127.0.0.1`，白名单外无任何可达性 → 无任意 SSRF 面；
+- 请求体超限 413（响应头未发出，可回 JSON 错误体）；响应体不受 KISAMA_HUB_MAX_BODY 限制（流式，见 20.7）；
+- 错误映射（与 hub `relay.go` 对齐），错误体 JSON `{"status":"error","code":...,"message":...}`：
+
+| 条件 | 状态码 | code |
+| :--- | :--- | :--- |
+| 端口非数字 / 越界（1-65535 外） | 404 | `invalid_port` |
+| 端口未在本组白名单放行 | 403 | `port_not_allowed` |
+| 请求体超过 KISAMA_HUB_MAX_BODY | 413 | `body_too_large` |
+| 回环连接失败（上游不可达） | 502 | `loopback_unreachable` |
+
+### 20.3 实现共享与验收
+
+- **回环转发三层（一份实现多层消费）**：前置检查层（py `_loopback_relay_prepare` / js `relayLoopbackPrepare` / java+java11 `loopbackRelayPrepare`：白名单+请求体超限+URL/头构造）→ **流式原语**（py `loopback_relay_stream` / js `httpRequestStream` / java+java11 `loopbackRelayStream`：本地路由用，响应流式不限大小）→ **缓冲包装**（py `loopback_relay_request` / js `relayLoopbackHttp` / java+java11 `loopbackRelay`：hub `req` 帧用，响应体 ≤ MAX_BODY）；`whitelist=null` 为 hub api 模式（回环 agent 自身端口，跳过白名单）；js `HubTunnelManager._httpRequest` 保留薄委托（模块级 `httpRequestRaw` 兼容既有测试缝）；
+- 验收：py `tests/py/test_proxy_route.py`（回环核心/路由/中间件豁免 + 双组白名单 set/merge、注册并入 HUB 组、config 端点 scope 语义）、js `tests/js/test_proxy_route.js`（真实回环集成 + 双组隔离）；四端统一场景 11（tools/control.py `--proxy-route`，纳入 verify_all.py [3.9/6]；agent env `KPROXY_PORTS=58088,58089`——0.6.7 续批六起本地组 env 下限换用新变量，aiohttp 上游起在 control 侧同机部署）——四端实机 17/17 为 2026-11-19（单一白名单形态）验收记录，续批六分组口径实机复验见 UPDATE.MD 对应条目。**注册并入 hub 拓扑实机（2026-11-19，单一白名单形态）**：env `KHUB_PORTS` 为空的 py 节点 `POST /api/hub {"ports":[58088]}` → hub `/etest/58088/echo` 200、未声明端口 403——续批六起并入目标改为 HUB 组（hub 链路仍可达、本地路由查本地组不受影响），复验结论以 UPDATE.MD 条目为准。
+
+### 20.4 与各端框架的差异（如实记录）
+
+- **OPTIONS 透传已四端统一（Owner 拍板「仅反代路径统一」，2026-11-19 落地）**：带预检特征（`Origin` 头，浏览器预检）的 OPTIONS 由 agent 本地应答（统一裁定 CORS，py 为 CORSMiddleware 204、js/java/java11 为 200+CORS 头）；普通 OPTIONS（无 Origin）穿透到反代路由转发上游——py 现状即此语义；js CORS 块加 `/api/proxy/` 前缀 Origin 判断；java/java11 把 proxy 的 options 路由注册提前到 `options("/*")` 之前（Spark 按注册顺序匹配）+ handleProxyRelay 对带 Origin 的预检本地应答；/api/proxy 之外的 OPTIONS 行为零变化（js/java/java11 仍本地 200）；
+- **java/java11 端流式读取无空闲超时**（JDK `HttpRequest.timeout` 仅约束到响应头阶段，流读取无限）；py 空闲读超时 = `KISAMA_HUB_RELAY_TIMEOUT`（SSE 心跳刷新保活）、js socket 空闲超时同值；
+- **java/java11 端 WS 透传走专属前缀 `/api/proxyws/`**（Spark matcher 会把 upgrade 请求匹配进 `/api/proxy/:port` 的 HTTP 路由——`:port="ws"`——前缀不重叠才落到 WebSocketServlet；py/js 的框架按 scope type 分发、同路径升级即可，但为四端 URL 契约统一，**四端 WS 统一走 `/api/proxyws/{port}/{rest}`**）。
+
+**go 端不做实现**（Owner 指示，2026-11-18）：与 KMODE=3 的 Owner 决策一致，go 端不在本特性实现范围内，矩阵 ❌ 为定论而非遗留项。
+
+### 20.5 支持矩阵
+
+| 能力 | py | js | go | java | java11 |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| 本地端口反代路由（HTTP，20.1，流式） | ✅ | ✅ | ❌ | ✅ | ✅ |
+| 分组白名单（HUB 组/本地组各 env ∪ 各运行时，20.2/20.8，续批六） | ✅ | ✅ | ❌ | ✅ | ✅ |
+| WS 透传（20.6，`/api/proxyws/`） | ✅ | ✅ | ❌ | ✅ | ✅ |
+| 同路径 upgrade 嗅探（20.6 续批三，浏览器 WS 直达） | ✅ | ✅ | ❌ | ❌（框架结构性不支持，保持专前缀） | ❌（同左） |
+| 白名单 API（20.8，scope 选组，KSTORE 持久化） | ✅ | ✅ | ❌ | ✅ | ✅ |
+| 注册端口并入 HUB 组白名单（19.9/20.8，续批六） | ✅ | ✅ | ❌ | ✅ | ✅ |
+| 响应加密豁免 + 认证头剥离 + xff 注入 | ✅ | ✅ | ❌ | ✅ | ✅ |
+
+### 20.6 WS 透传 `/api/proxyws/{port}/{rest...}`（0.6.7 续批）
+
+`WS /api/proxyws/{port}/{rest...}`（+ 无 rest 的 `/api/proxyws/{port}`）→ 回环拨 `ws://127.0.0.1:{port}/{rest}`，双向泵 text/binary 保真：
+
+- **白名单唯一门禁**（匿名放行，同 20.1）；拒绝不发起回环连接——py accept 后 `close(1008, "port_not_allowed...")`、js/java/java11 `close(1008)`（各端 close reason 或 HTTP 形态携带 `port_not_allowed`；py 的 ASGI 在 accept 前关闭会被服务器回 HTTP 403，故先 accept 再 close 以携带 close code）；非法端口同款 close 1008 `invalid_port`；
+- **拨号头纵深过滤**：hop-by-hop/host 与 `sec-websocket-*` 剥除（防 permessage-deflate 协商错乱）与 agent 认证头剥除；业务头透传；
+- **CONNECTING 缓冲**：回环拨号完成前到达的客户端帧先入队、拨号完成后按序发出（0.6.6 线上教训同款）；
+- **实现**：py Starlette `@app.websocket` + aiohttp `ws_connect` 双泵（asyncio task）；js express-ws + `ws` 包客户端（事件泵）；java/java11 Jetty `webSocket("/api/proxyws/*")` + JDK `HttpClient.newWebSocketBuilder`（Listener 泵，分片缓冲组装后整帧转发）；
+- 与 hub 端口反代的 WS 透传（19.6 `ws_open` 帧）并存：hub 路径走 `ws_*` 帧协议，本地路径走直连泵，白名单分属两组（hub 查 HUB 组、本地查本地组，续批六）；
+- **同路径 upgrade 嗅探（0.6.7 续批三，Owner 拍板仅 py/js）**：py/js 额外在 `/api/proxy/{port}[/{rest}]` **同路径**接受 upgrade（与 HTTP 反代共用 URL）——浏览器应用从页面 URL 派生 WS 地址，打到同路径即由同一泵透传。Starlette 按 scope type 分发、同路径天然共存；express-ws 机制（vendored 源码实锤）：ws 包拦截 upgrade 后改写 url 加 `/.websocket` 后缀注入同一条 express 层栈，ws 路由实为 `<route>/.websocket` 的 GET 层——**js 端 ws 层必须注册在 `app.all('/api/proxy/:port...')` 之前**（顺序颠倒 upgrade 会被 HTTP 层先吞）；普通 HTTP 不匹配 `/.websocket` 后缀、落回 app.all（共存不互吞）。java/java11 的 Spark/Jetty WebSocketServlet 按路径前缀**整树接管**、与 HTTP 路由结构性二选一（同路径实测 upgrade 被吞成 `:port="ws"` 404），不支持同路径——**保持 `/api/proxyws/` 专前缀**（URL 契约按端分叉，矩阵如实标注）。拒绝语义两端完全一致：本地组白名单、不发起连接、close 1008。
+
+### 20.7 流式响应（0.6.7 续批）
+
+本地反代路由的响应**边收边回传**（不再缓冲全量）：大文件下载不受 64MB 限制、SSE 逐 chunk 到达（实测 3 chunk 间隔 0.1s 保真）：
+
+- **流式转发原语**（见 20.3 三层）：py aiohttp `resp.content.iter_any()` + `StreamingResponse`（注意：`resp.content` 直接 async-for 是按行 readline，无换行大响应会触发 LineTooLong——必须 `iter_any()`）；js upstream `res.pipe(client res)`；java/java11 `BodyHandlers.ofInputStream()` 边读边写 `res.raw().getOutputStream()`（**逐 chunk flush**——Jetty 缺省聚合缓冲会破坏 chunk 时序，探针实证 raw 写 + return "" 可行）；
+- **MAX_BODY 语义**：请求体仍缓冲受限（≤64MB，413）；**响应体不受限制**（响应头已发出无法回 413，截断更糟）；
+- **超时**：py 空闲读超时 = `KISAMA_HUB_RELAY_TIMEOUT`（SSE 心跳刷新保活）、js socket 空闲超时同值；java/java11 流读取无空闲超时（20.4 差异）；
+- 请求体仍为缓冲转发（请求流式列为后续可选）。
+
+### 20.8 运行时白名单 API `/api/proxy/config`（0.6.7 续批起，验签；续批六 scope 分组）
+
+**分组口径（0.6.7 续批六，Owner 拍板 2026-11-20，修订续批二"单一白名单"）**：反代白名单拆为两组独立管理——**HUB 组**（env `KHUB_PORTS` ∪ HUB 运行时列表，只约束 hub 链路 `/{KNAME}/{PORT}/*`）与**本地组**（env `KPROXY_PORTS` ∪ 本地运行时列表，只约束本地路由 `/api/proxy(/ws)`）。KMODE 只决定 hub 链路是否随启动注册，env 归属不随 KMODE 切换。管理入口统一在本节端点，`scope` 字段区分组。
+
+- **`GET /api/proxy/config`** → `{"status":"ok","hub":{"env_ports":[..],"runtime_ports":[..],"effective_ports":[..]},"local":{...},"kstore_enabled":<bool>}`——两组各自三视图快照（组 env 部署者意愿 / 组运行时列表 / 组聚合生效值）；`scope` 缺省语义不再存在（GET 恒返回两组）；
+- **`POST /api/proxy/config`** body `{"ports":[7788,9090],"scope":"local"|"hub"}` —— `scope` 缺省 `"local"`，非法值 422 `invalid_scope`；整体覆盖**所选组**的运行时列表（幂等，非法/越界条目静默过滤），KSTORE 启用时落盘 `data.proxyports` 重启恢复（未启用 → `"persisted":false` 仅内存）；响应 `{"status":"ok","persisted":..,"scope":..,"runtime_ports":[..],"effective_ports":[..]}`（所选组视图）；ports 非数组 → 422 `invalid_ports`；
+- **`DELETE /api/proxy/config`** —— 清空所选组运行时回落组 env（env 部分仍生效）：无 `scope` 清**两组**，`?scope=hub|local` 只清一组；非法 scope → 422 `invalid_scope`；响应含两组快照 `{"status":"ok","persisted":..,"scope":"all"|"hub"|"local","hub":{...},"local":{...}}`；
+- **生效语义**：各组 `effective = 组 env ∪ 组 runtime`（env 为部署者意愿下限，运行时列表只增；收紧用 DELETE 回落 env）；**即时生效且按链路分组**——hub `req` 帧 port 模式校验（含 HubWSStream）只查 HUB 组，本地路由校验只查本地组；**运行时列表的写入只有两处**——`POST /api/proxy/config`（scope 选组整体覆盖）与 `POST /api/hub` 注册端口并入 **HUB 组**（19.9，注册项成立即生效含 unreachable 退避中，永久拒绝不并入，恢复不重新并入）；
+- **验签**：`/api/proxy/config` 不在中间件 bypass（管理端点控制暴露面，必须验签）；签名按**十二节 v2 常规口径**（真实 body 参与摘要，AES 体签密文，与其他路由同管线——0.6.7 续批四起，见 20.1 签名口径）；
+- KSTORE 子类型：`data.proxyports`（0.6.7 续批六起**对象形状** `{"hub":[..],"local":[..]}`，照 `data.hubregs` 模式，四端同构；load 兼容旧平铺数组形状并归入本地组）；
+- 如实记录：hub 注册帧 `ports` 上报与 `/agents` 页展示仍为注册时快照，动态变更后展示会过时（hub 协议无更新消息，重注册刷新）。

@@ -86,15 +86,20 @@ function caseOriginalApiUnaffected() {
 
 function caseKmode3AndHubOptions() {
   // 0.6.6: KMODE=3 (kisama-hub 出站隧道) 为合法取值; KHUB 尾斜杠剥除; KHUB_PORTS 去重排序
-  Config.merge({ KMODE: '3', KNAME: 'demo1', KHUB: 'http://hub.example.com/', KHUB_PORTS: '7788, 9090, abc, 0, 70000, 8080, 7788' });
+  // 0.6.7 续批六: KPROXY_PORTS (本地组白名单 env 下限) 同口径合并, 与 KHUB_PORTS 互不影响
+  Config.merge({ KMODE: '3', KNAME: 'demo1', KHUB: 'http://hub.example.com/', KHUB_PORTS: '7788, 9090, abc, 0, 70000, 8080, 7788', KPROXY_PORTS: '3000, 5173, x, 0, 99999, 3000' });
   assert.strictEqual(Config.KMODE, '3');
   assert.strictEqual(Config.KHUB, 'http://hub.example.com');
   assert.deepStrictEqual(Config.KHUB_PORTS, [7788, 8080, 9090]);
+  assert.deepStrictEqual(Config.KPROXY_PORTS, [3000, 5173], '本地组 env 下限同口径解析 (去重排序非法忽略)');
   Config.merge({ KMODE: '3', KHUB: 'https://hub2.example.com', KHUB_PUBLIC_URL: 'https://pub.example.com/hub///', KHUB_PORTS: '' });
   assert.strictEqual(Config.KMODE, '3');
   assert.strictEqual(Config.KHUB, 'https://hub2.example.com');
   assert.strictEqual(Config.KHUB_PUBLIC_URL, 'https://pub.example.com/hub', '公网基址修正值尾斜杠剥除 (0.6.6 续批)');
   assert.deepStrictEqual(Config.KHUB_PORTS, [], '空串清空白名单');
+  assert.deepStrictEqual(Config.KPROXY_PORTS, [3000, 5173], 'KHUB_PORTS 空串不影响本地组');
+  Config.merge({ KPROXY_PORTS: '' });
+  assert.deepStrictEqual(Config.KPROXY_PORTS, [], 'KPROXY_PORTS 空串清空');
   Config.merge({ KMODE: '3', KHUB_PUBLIC_URL: '' });
   assert.strictEqual(Config.KHUB_PUBLIC_URL, '', '空串清空修正值 (未配置=不上报)');
 }

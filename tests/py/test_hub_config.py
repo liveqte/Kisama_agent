@@ -4,7 +4,7 @@
 覆盖:
 1. KMODE=3 合法 (解析点 py :936 对 "3" 原样保留, 归一化只处理 2q/2quic)
 2. KHUB 尾斜杠剥除 / 缺省空串
-3. KHUB_PORTS 逗号分隔解析: 合法收集、非法 (非数字/越界) 静默忽略、排序去重
+3. KHUB_PORTS / KPROXY_PORTS 逗号分隔解析: 合法收集、非法 (非数字/越界) 静默忽略、排序去重 (0.6.7 续批六分组口径)
 4. 重试/心跳/超时/限额缺省值与 env 覆盖
 """
 
@@ -20,6 +20,7 @@ PY_DIR = ROOT / "py"
 _PROBE_CODE = (
     "import sys; sys.path.insert(0, r'{py}'); import agent as a; "
     "print(repr((a.Config.KMODE, a.Config.KHUB, a.Config.KHUB_PORTS, "
+    "a.Config.KPROXY_PORTS, "
     "a.Config.KHUB_PUBLIC_URL, "
     "a.Config.KISAMA_HUB_RETRY_BASE_SECONDS, a.Config.KISAMA_HUB_RETRY_MAX_SECONDS, "
     "a.Config.KISAMA_HUB_PING_INTERVAL, a.Config.KISAMA_HUB_MAX_BODY)))"
@@ -41,24 +42,27 @@ def probe_env(env_extra):
 class HubConfigEnvTest(unittest.TestCase):
 
     def test_kmode3_full_config(self):
-        kmode, khub, ports, pub, base, mx, ping, max_body = probe_env({
+        kmode, khub, ports, kproxy_ports, pub, base, mx, ping, max_body = probe_env({
             "KMODE": "3",
             "KHUB": "http://hub.example.com/",
             "KHUB_PORTS": "7788, 9090, abc, 0, 70000, 8080, 7788",
+            "KPROXY_PORTS": "3000, 5173, x, 0, 99999, 3000",
             "KHUB_PUBLIC_URL": "https://pub.example.com/hub///",
         })
         self.assertEqual(kmode, "3")
         self.assertEqual(khub, "http://hub.example.com")  # 尾斜杠剥除
         self.assertEqual(ports, (7788, 8080, 9090))       # 非法/越界忽略, 去重排序
+        self.assertEqual(kproxy_ports, (3000, 5173))      # 本地组 env 下限, 同口径解析
         self.assertEqual(pub, "https://pub.example.com/hub")  # 公网基址修正值, 多重尾斜杠剥除
         self.assertEqual((base, mx, ping), (2.0, 60.0, 20.0))
         self.assertEqual(max_body, 64 * 1024 * 1024)
 
     def test_kmode3_without_hub(self):
-        kmode, khub, ports, pub, *_ = probe_env({"KMODE": "3"})
+        kmode, khub, ports, kproxy_ports, pub, *_ = probe_env({"KMODE": "3"})
         self.assertEqual(kmode, "3")
         self.assertEqual(khub, "")
         self.assertEqual(ports, ())
+        self.assertEqual(kproxy_ports, ())  # KPROXY_PORTS 缺省空 (本地反代禁用)
         self.assertEqual(pub, "")  # KHUB_PUBLIC_URL 缺省空 (未配置=不上报)
 
     def test_retry_env_overrides(self):

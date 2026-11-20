@@ -17,7 +17,7 @@
 
 const assert = require('assert');
 const http = require('http');
-const { HubTunnelManager, HubWSStream, HubTunnelRegistrar, HubRegisterError, hubKnameError, hubPublicUrlError, deriveHubWsUrl, filterLoopbackHeaders, hubBackoffSeconds, parseHubPorts, Config } = require('../../js/agent.js');
+const { HubTunnelManager, HubWSStream, HubTunnelRegistrar, HubRegisterError, hubKnameError, hubPublicUrlError, deriveHubWsUrl, filterLoopbackHeaders, hubBackoffSeconds, parseHubPorts, Config, proxySetRuntimePorts, proxyEffectivePorts } = require('../../js/agent.js');
 
 let failed = 0;
 async function test(name, fn) {
@@ -225,11 +225,13 @@ async function main() {
 
   await test('port 模式白名单放行', async () => {
     const mgr = makeManager({ ports: [7788] });
+    proxySetRuntimePorts('hub', [7788, 8080]); // 0.6.7 续批六分组口径: HUB 组运行时替代 mgr.ports 快照
     const seen = [];
     mgr._request = async (method, url) => { seen.push(url); return { status: 200, headers: {}, body: Buffer.alloc(0) }; };
     mgr._hubWs = { readyState: 1, OPEN: 1, send: () => {} };
     await mgr._handleReq({ t: 'req', id: 1, mode: 'port', port: 7788, method: 'GET', path: '/dir/file', query: 'q=1', headers: {}, body_b64: '' });
     assert.strictEqual(seen[0], 'http://127.0.0.1:7788/dir/file?q=1');
+    proxySetRuntimePorts('hub', []);
   });
 
   await test('port 模式白名单拒绝不发连接', async () => {
@@ -348,6 +350,7 @@ async function main() {
 
   await test('端口反代模式拨目标端口', async () => {
     const mgr = makeManager({ ports: [7788] });
+    proxySetRuntimePorts('hub', [7788]); // 0.6.7 续批六分组口径: HUB 组运行时
     let dialedUrl = null;
     mgr._wsFactory = (url) => {
       dialedUrl = url;
@@ -359,7 +362,8 @@ async function main() {
     const st = new HubWSStream(mgr, mgr._hubWs, 10, { t: 'ws_open', id: 10, port: 7788, path: '/echo', query: 'a=1' });
     st.start();
     await new Promise((r) => setImmediate(() => setImmediate(r)));
-    assert.ok(dialedUrl.startsWith('ws://127.0.0.1:7788/echo?a=1'), dialedUrl);
+    assert.ok(dialedUrl && dialedUrl.startsWith('ws://127.0.0.1:7788/echo?a=1'), dialedUrl);
+    proxySetRuntimePorts('hub', []);
   });
 
   await test('api 模式拨 agent 自身端口', async () => {

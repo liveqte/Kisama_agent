@@ -54,7 +54,8 @@ public class kisama {
     private final String KNAME;
     private final String KNAME_KEY;
     // KMODE=3 kisama-hub 中继 (docs/API.MD 十九): KHUB=hub 基址 (ws/wss 由 scheme 推导),
-    // KHUB_PORTS=端口反代白名单 (逗号分隔, 缺省空=禁用; 非法条目忽略);
+    // KHUB_PORTS=HUB 组反代白名单 env 下限 (逗号分隔, 缺省空=禁用; 非法条目忽略),
+    // KPROXY_PORTS=本地组反代白名单 env 下限 (0.6.7 续批六分组口径), 两组互不影响 (docs/API.MD 20.2);
     // 行为参数 env 可调 (KISAMA_HUB_*), 存毫秒便于统一比较; 不进烘焙构造 (决策: 避免插件仓同步负担)
     private final String KHUB;
     // KHUB_PUBLIC_URL=hub 对面板/客户端暴露的公网基址覆盖值 (可选, 0.6.6 续批二): 注册时经
@@ -62,6 +63,7 @@ public class kisama {
     // 基址, 本变量用于内网 KHUB 等派生值 ≠ 公网地址的部署; 非法值告警并回退 KHUB 派生 (hubPublicUrlError 判定)
     private final String KHUB_PUBLIC_URL;
     private final java.util.Set<Integer> KHUB_PORTS;
+    private final java.util.Set<Integer> KPROXY_PORTS;
     private final long KISAMA_HUB_RETRY_BASE_MS;
     private final long KISAMA_HUB_RETRY_MAX_MS;
     private final long KISAMA_HUB_PING_INTERVAL_MS;
@@ -167,6 +169,10 @@ public class kisama {
     private final String BAKED_KSTORE_KEY;
     // hub 注册任务子类型 (data.hubregs, 0.6.6 起; additive 键, 老版本回写会丢弃 — load 填充/saveHubRegs 更新)
     private final List<Map<String, Object>> hubregs = Collections.synchronizedList(new ArrayList<>());
+    // 反代运行时白名单子类型 (data.proxyports, 0.6.7 续批六起两组对象形状; load 填充=重启恢复, saveProxyports 更新):
+    // HUB 组只约束 hub 链路端口反代 (/{KNAME}/{PORT}/*), 本地组只约束本地路由 /api/proxy(/ws), 组间互不影响
+    private final java.util.Set<Integer> proxyportsHub = Collections.synchronizedSet(new java.util.TreeSet<>());
+    private final java.util.Set<Integer> proxyportsLocal = Collections.synchronizedSet(new java.util.TreeSet<>());
 
     private volatile boolean isRunning = false;
 
@@ -223,7 +229,7 @@ public class kisama {
     // 其余 (无 opt-in 头/超阈值) 保持原始字节流——旧客户端零适配, 大文件不付 Base64+33% 与
     // 整读内存的代价。0 = 关闭加密 (恒明文)。
     private static final long DOWNLOAD_ENCRYPT_MAX = Long.parseLong(DOTENV.getOrDefault("DOWNLOAD_ENCRYPT_MAX", "4194304"));
-    private static final String AGENT_VERSION = "0.6.6-java11";
+    private static final String AGENT_VERSION = "0.6.7-java11";
 
     // baseinfo 三组快照 (docs/API.MD 十六): P 级进程内只建一次; T-local 30s; T-net 3600s.
     // 快照只含系统字段, 凭证在路由层按请求装配, 轮换不再清空
@@ -265,6 +271,7 @@ public class kisama {
         this.KHUB = trimHubUrl(DOTENV.get("KHUB"));
         this.KHUB_PUBLIC_URL = trimHubUrl(DOTENV.get("KHUB_PUBLIC_URL"));
         this.KHUB_PORTS = parseHubPorts(DOTENV.get("KHUB_PORTS"));
+        this.KPROXY_PORTS = parseHubPorts(DOTENV.get("KPROXY_PORTS"));
         this.KISAMA_HUB_RETRY_BASE_MS = parseHubSecondsMs(DOTENV.get("KISAMA_HUB_RETRY_BASE_SECONDS"), 2000L);
         this.KISAMA_HUB_RETRY_MAX_MS = parseHubSecondsMs(DOTENV.get("KISAMA_HUB_RETRY_MAX_SECONDS"), 60000L);
         this.KISAMA_HUB_PING_INTERVAL_MS = parseHubSecondsMs(DOTENV.get("KISAMA_HUB_PING_INTERVAL"), 20000L);
@@ -321,6 +328,7 @@ public class kisama {
         this.KHUB = trimHubUrl(resolveSetting("KHUB", null, ""));
         this.KHUB_PUBLIC_URL = trimHubUrl(resolveSetting("KHUB_PUBLIC_URL", null, ""));
         this.KHUB_PORTS = parseHubPorts(resolveSetting("KHUB_PORTS", null, ""));
+        this.KPROXY_PORTS = parseHubPorts(resolveSetting("KPROXY_PORTS", null, ""));
         this.KISAMA_HUB_RETRY_BASE_MS = parseHubSecondsMs(resolveSetting("KISAMA_HUB_RETRY_BASE_SECONDS", null, ""), 2000L);
         this.KISAMA_HUB_RETRY_MAX_MS = parseHubSecondsMs(resolveSetting("KISAMA_HUB_RETRY_MAX_SECONDS", null, ""), 60000L);
         this.KISAMA_HUB_PING_INTERVAL_MS = parseHubSecondsMs(resolveSetting("KISAMA_HUB_PING_INTERVAL", null, ""), 20000L);
@@ -438,6 +446,8 @@ public class kisama {
         }
 
         webSocket("/api/ws/*", new KisamaWebSocketHandler(this));
+        // 📡 本地端口反代 WS 透传 (0.6.7, docs/API.MD 20.6): 白名单唯一门禁, 匿名放行
+        webSocket("/api/proxyws/*", new ProxyWebSocketHandler(this));
         port(this.PORT);
         ipAddress(this.HOST);
 
@@ -536,6 +546,12 @@ public class kisama {
             applyCorsHeaders(res);
         });
 
+        // 📡 /api/proxy 前缀的 OPTIONS 路由注册在 options("/*") 之前 (Spark 按注册顺序匹配)——
+        // 普通 OPTIONS (无 Origin, 非浏览器预检) 穿透到反代路由转发上游; 带预检特征 (Origin) 的由
+        // handleProxyRelay 本地应答 (agent 统一裁定 CORS) —— 0.6.7 续批, 四端语义统一
+        options("/api/proxy/:port", this::handleProxyRelay);
+        options("/api/proxy/:port/*", this::handleProxyRelay);
+
         options("/*", (req, res) -> {
             res.status(200);
             res.type("text/plain");
@@ -560,6 +576,17 @@ public class kisama {
             // 直达 handler。携带即拒绝, 合法控制端 (control.py / kisama-skill) 永远不发该头。
             if (req.headers("X-HTTP-Method-Override") != null) {
                 halt(400, this.gson.toJson(Map.of("error", "X-HTTP-Method-Override header is not allowed")));
+            }
+
+            // 📡 /api/proxy/* 本地端口反代 (0.6.7): 白名单唯一门禁 (Owner 拍板 2026-11-18,
+            // 与 hub 公开模型一致) —— 匿名放行不验签; 端口白名单校验在路由/共享核心内
+            // (拒绝 403 port_not_allowed 且不发起连接); 认证头剥离在路由 handler 内保留;
+            // X-HTTP-Method-Override 检查保持在前 (C4 防线对反代路径同样成立)。
+            // /api/proxy/config 管理端点不在此列 (控制暴露面, 必须验签)
+            if (endpoint != null && ((endpoint.startsWith("/api/proxy/")
+                    && !endpoint.startsWith("/api/proxy/config"))
+                    || endpoint.startsWith("/api/proxyws/"))) {
+                return;
             }
 
             boolean isBypassPath = "/api/baseinfo".equals(endpoint) || "/api/status".equals(endpoint);
@@ -591,9 +618,12 @@ public class kisama {
 
             // 执行货真价实的 ECDSA 椭圆曲线数字签名校验 (静态密钥优先, 无果再尝试有效期内临时密钥)
             try {
-                // 🔐 签名绑定 method/path/body 摘要：/api/fileraw (大文件裸流) 统一按空 body 计算摘要
+                // 🔐 签名绑定 method/path/body 摘要：/api/fileraw (大文件裸流) 与 /api/proxy
+                // 数据面 (反代透传体, 任意二进制, docs/API.MD 二十) 统一按空 body 计算摘要;
+                // /api/proxy/config 管理端点无特例 (0.6.7 续批四: 按十二节 v2 规范签真实 body)
                 String bodyHash = "";
-                if (req.body() != null && !req.body().isEmpty() && !"/api/fileraw".equals(endpoint)) {
+                if (req.body() != null && !req.body().isEmpty() && !"/api/fileraw".equals(endpoint)
+                        && !(endpoint.startsWith("/api/proxy/") && !"/api/proxy/config".equals(endpoint))) {
                     bodyHash = bytesToHex(java.security.MessageDigest.getInstance("SHA-256")
                             .digest(req.body().getBytes(StandardCharsets.UTF_8)));
                 }
@@ -1428,6 +1458,15 @@ public class kisama {
             // (invalid_name/name_taken/full) 不保留注册项, 网络类失败保留并继续退避 (500, 后查 GET)。
             // 注册成功立即落盘 kstore data.hubregs (KSTORE 启用时), 重启自动恢复; 未启用 persisted=false。
             HubRegisterResult rr = this.hubRegistrar.register(hub, kname, ports, "dynamic", 15000);
+            if (rr.code == null || "unreachable".equals(rr.code)) {
+                // 注册端口并入 HUB 组运行时白名单 (0.6.7 续批六分组口径, docs/API.MD 19.9/20.8): 注册项
+                // 成立 (含退避中) 即生效, 永久拒绝 (invalid_name/name_taken/full) 不并入; DELETE
+                // /api/proxy/config?scope=hub 可整体收回, hubregs 恢复路径不重新并入 (与管理动作一致)
+                if (!ports.isEmpty()) {
+                    proxyMergeRuntimePorts("hub", ports);
+                    saveProxyports(proxyGroupsSnapshot());
+                }
+            }
             if (rr.code == null) {
                 boolean persisted = persistHubRegs();
                 return this.gson.toJson(Map.of("status", "ok", "persisted", persisted, "registration", rr.snapshot));
@@ -1460,9 +1499,116 @@ public class kisama {
             return this.gson.toJson(Map.of("status", "ok", "persisted", persisted, "removed", snap));
         });
 
+        // 📡 反代白名单配置 (0.6.7 续批六分组口径, docs/API.MD 20.8): 验签管理端点 (before 过滤器
+        // bypass 排除本路径); 注册在 /api/proxy/:port 之前 (Spark 按注册顺序匹配, 避免 "config"
+        // 被当作端口段); GET 返回 HUB 组/本地组各自 env/运行时/聚合三视图; POST scope 选组
+        // ("local"|"hub", 缺省 local) 整体覆盖; DELETE 无 scope 清两组回落各自 env, ?scope= 只清一组
+        get("/api/proxy/config", (req, res) -> {
+            res.type("application/json");
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("status", "ok");
+            out.put("hub", Map.of("env_ports", new ArrayList<>(this.KHUB_PORTS),
+                    "runtime_ports", getProxyports("hub"),
+                    "effective_ports", new ArrayList<>(proxyEffectivePorts("hub"))));
+            out.put("local", Map.of("env_ports", new ArrayList<>(this.KPROXY_PORTS),
+                    "runtime_ports", getProxyports("local"),
+                    "effective_ports", new ArrayList<>(proxyEffectivePorts("local"))));
+            out.put("kstore_enabled", this.taskStoreEnabled && !this.taskStoreLocked);
+            return this.gson.toJson(out);
+        });
+        post("/api/proxy/config", (req, res) -> {
+            res.type("application/json");
+            Map<String, Object> body = req.attribute("json_body");
+            if (body == null) {
+                // 兜底: json_body 缺失 (如 content-type 非/json 时解析路径差异) 直接解析原始 body
+                try {
+                    String raw = req.body();
+                    if (raw != null && !raw.isBlank()) {
+                        Object parsed = this.gson.fromJson(raw, new TypeToken<Map<String, Object>>() {
+                        }.getType());
+                        if (parsed instanceof Map) {
+                            body = (Map<String, Object>) parsed;
+                        }
+                    }
+                } catch (Exception ignored) {
+                }
+            }
+            Object scopeRaw = body == null ? null : body.get("scope");
+            String scope = scopeRaw instanceof String && !((String) scopeRaw).isBlank() ? ((String) scopeRaw).trim() : "local";
+            if (!"hub".equals(scope) && !"local".equals(scope)) {
+                halt(422, this.gson.toJson(Map.of("status", "error", "code", "invalid_scope",
+                        "message", "scope 必须为 \"local\" 或 \"hub\"")));
+            }
+            if (body == null || !(body.get("ports") instanceof List)) {
+                halt(422, this.gson.toJson(Map.of("status", "error", "code", "invalid_ports",
+                        "message", "ports 必须为端口数组, 如 {\"ports\":[7788,9090]}")));
+            }
+            List<Integer> ports = new ArrayList<>();
+            for (Object p : (List<?>) body.get("ports")) {
+                if (p instanceof Number) {
+                    int v = ((Number) p).intValue();
+                    if (v >= 1 && v <= 65535) ports.add(v);
+                }
+            }
+            proxySetRuntimePorts(scope, ports);
+            boolean persisted = saveProxyports(proxyGroupsSnapshot());
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("status", "ok");
+            out.put("persisted", persisted);
+            out.put("scope", scope);
+            out.put("runtime_ports", getProxyports(scope));
+            out.put("effective_ports", new ArrayList<>(proxyEffectivePorts(scope)));
+            return this.gson.toJson(out);
+        });
+        delete("/api/proxy/config", (req, res) -> {
+            res.type("application/json");
+            String scope = req.queryParams("scope") == null ? "" : req.queryParams("scope").trim();
+            if (!scope.isEmpty() && !"hub".equals(scope) && !"local".equals(scope)) {
+                halt(422, this.gson.toJson(Map.of("status", "error", "code", "invalid_scope",
+                        "message", "scope 必须为 \"local\" 或 \"hub\"")));
+            }
+            for (String grp : (scope.isEmpty() ? new String[]{"hub", "local"} : new String[]{scope})) {
+                proxySetRuntimePorts(grp, new ArrayList<>());
+            }
+            boolean persisted = saveProxyports(proxyGroupsSnapshot());
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("status", "ok");
+            out.put("persisted", persisted);
+            out.put("scope", scope.isEmpty() ? "all" : scope);
+            out.put("hub", Map.of("runtime_ports", getProxyports("hub"),
+                    "effective_ports", new ArrayList<>(proxyEffectivePorts("hub"))));
+            out.put("local", Map.of("runtime_ports", getProxyports("local"),
+                    "effective_ports", new ArrayList<>(proxyEffectivePorts("local"))));
+            return this.gson.toJson(out);
+        });
+
+        // 📡 本地端口反代路由 (0.6.7, docs/API.MD 二十): 不注册 hub 时, 控制端经 agent 自身
+        // 路由访问本机端口 HTTP 服务。语义与 hub /{KNAME}/{PORT}/* 对齐: 本地组白名单
+        // (缺省空=禁用, 拒绝不发起连接无扫描侧信道)、缓冲全量、KISAMA_HUB_MAX_BODY 双向限制;
+        // 回环转发核心与 hub req 帧共用 loopbackRelay (一份实现两处消费)。
+        // 注: OPTIONS/HEAD 沿用既有认证过滤器放行惯例; /api/proxy 请求体签名按空 body 口径
+        // (与 /api/fileraw 同款), 响应在 after 过滤器豁免加密; 白名单为唯一门禁 (匿名放行,
+        // Owner 拍板 2026-11-18), before 过滤器对 /api/proxy/ 前缀 bypass (config 除外)。
+        get("/api/proxy/:port", this::handleProxyRelay);
+        get("/api/proxy/:port/*", this::handleProxyRelay);
+        post("/api/proxy/:port", this::handleProxyRelay);
+        post("/api/proxy/:port/*", this::handleProxyRelay);
+        put("/api/proxy/:port", this::handleProxyRelay);
+        put("/api/proxy/:port/*", this::handleProxyRelay);
+        delete("/api/proxy/:port", this::handleProxyRelay);
+        delete("/api/proxy/:port/*", this::handleProxyRelay);
+        patch("/api/proxy/:port", this::handleProxyRelay);
+        patch("/api/proxy/:port/*", this::handleProxyRelay);
+        head("/api/proxy/:port", this::handleProxyRelay);
+        head("/api/proxy/:port/*", this::handleProxyRelay);
         get("/", (req, res) -> "kisama-running");
 
         after((req, res) -> {
+            // 📡 /api/proxy/* 本地端口反代 (0.6.7, docs/API.MD 二十): 响应原样透传 ——
+            // 不加密、不盖模式头/X-Agent-Version, 上游字节与头保真 (请求侧验签照常)
+            if (req.pathInfo() != null && req.pathInfo().startsWith("/api/proxy/")) {
+                return;
+            }
             res.header("X-Agent-Version", AGENT_VERSION);
             // 🌟 x-encrypted 模式位规范 (docs/API.MD 第十节)：DEBUG 模式一切响应恒为 false
             if (this.DEBUG) {
@@ -1542,6 +1688,89 @@ public class kisama {
         }
         isRunning = false;
         log("[TRACE-INIT] ✅ Kisama Agent 已安全关闭。");
+    }
+
+    // ==================== 📡 本地端口反代路由 handler (0.6.7, docs/API.MD 二十) ====================
+    // /api/proxy/{port}/{rest} → http://127.0.0.1:{port}/{rest}。白名单唯一门禁 (匿名放行,
+    // Owner 拍板 2026-11-18), 响应在 after 过滤器豁免加密; 流式回写 (Spark raw 写实证可行)。
+    private Object handleProxyRelay(spark.Request req, spark.Response res) {
+        String endpoint = req.pathInfo();
+        // 📡 OPTIONS: 带 Origin (浏览器预检) 本地应答 —— agent 统一裁定 CORS (与 hub 同口径);
+        // 普通 OPTIONS (无 Origin) 透传上游 (0.6.7 续批, 四端语义统一)
+        if ("OPTIONS".equalsIgnoreCase(req.requestMethod()) && req.headers("Origin") != null) {
+            res.status(200);
+            res.type("text/plain");
+            return " ";
+        }
+        int port;
+        try {
+            port = Integer.parseInt(req.params(":port"));
+            if (port < 1 || port > 65535) {
+                throw new NumberFormatException();
+            }
+        } catch (NumberFormatException e) {
+            res.type("application/json");
+            halt(404, this.gson.toJson(Map.of("status", "error", "code", "invalid_port",
+                    "message", "端口必须为 1-65535 的整数: " + req.params(":port"))));
+            return "";
+        }
+        String rest = req.splat() != null && req.splat().length > 0 ? req.splat()[0] : "";
+        Map<String, String> headers = new LinkedHashMap<>();
+        for (String h : req.headers()) {
+            // agent 认证头不透传上游服务 (防密钥材料泄漏); hub 路径无此风险 (帧内无认证头)
+            if (PROXY_STRIPPED_AUTH_HEADERS.contains(h.toLowerCase(Locale.ROOT))) {
+                continue;
+            }
+            headers.put(h, req.headers(h));
+        }
+        String clientIp = req.raw().getRemoteAddr();
+        try {
+            // 流式转发原语 (0.6.7): 响应边收边回传, 响应体不受 KISAMA_HUB_MAX_BODY 限制 (SSE/大文件);
+            // 白名单/请求体超限错误在响应头发出前抛出, 可回 JSON 错误体
+            java.net.http.HttpResponse<java.io.InputStream> resp = loopbackRelayStream(
+                    port, proxyEffectivePorts("local"), req.requestMethod(),
+                    "/" + rest, req.queryString() == null ? "" : req.queryString(),
+                    headers, req.bodyAsBytes(), Math.max(1L, this.KISAMA_HUB_MAX_BODY),
+                    Math.max(5000L, this.KISAMA_HUB_RELAY_TIMEOUT_MS), PROXY_HTTP_CLIENT, clientIp);
+            // 响应头: 上游 content-length/access-control-*/hop 剥除 (Jetty chunked 按实长定)
+            res.raw().setStatus(resp.statusCode());
+            Map<String, String> hh = new LinkedHashMap<>();
+            for (Map.Entry<String, java.util.List<String>> e : resp.headers().map().entrySet()) {
+                if (e.getValue() != null && !e.getValue().isEmpty()) {
+                    hh.put(e.getKey(), e.getValue().get(0));
+                }
+            }
+            for (Map.Entry<String, String> h : filterProxyResponseHeaders(hh).entrySet()) {
+                res.raw().addHeader(h.getKey(), h.getValue());
+            }
+            // 流式回写: 边读边写 (Spark raw 写 + return "" 探针实证可行, chunked);
+            // 上游/客户端中途断开时连接已 committed, 仅中断不回错误体
+            try (java.io.InputStream in = resp.body()) {
+                java.io.OutputStream os = res.raw().getOutputStream();
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = in.read(buf)) != -1) {
+                    os.write(buf, 0, n);
+                    os.flush(); // 逐 chunk flush (SSE 间隔到达; Jetty 缺省聚合缓冲会破坏 chunk 时序)
+                }
+                os.flush();
+            } catch (java.io.IOException io) {
+                log("[ProxyRoute] ⚠️ 流式回传中断 (连接已 committed): " + String.valueOf(io.getMessage()));
+            }
+            return "";
+        } catch (LoopbackRelayException e) {
+            int httpCode = "port_not_allowed".equals(e.code) ? 403 : ("body_too_large".equals(e.code) ? 413 : 502);
+            res.type("application/json");
+            halt(httpCode, this.gson.toJson(Map.of("status", "error", "code", e.code,
+                    "message", e.getMessage() == null ? "" : e.getMessage())));
+            return "";
+        } catch (Exception e) {
+            String msg = e.getMessage() != null ? e.getMessage() : e.toString();
+            res.type("application/json");
+            halt(502, this.gson.toJson(Map.of("status", "error", "code", "loopback_unreachable",
+                    "message", hubTruncate(msg, 300))));
+            return "";
+        }
     }
 
     // ==================== 🚀 KMODE 启动模式 (docs/API.MD 第九节) ====================
@@ -1849,7 +2078,7 @@ public class kisama {
     // agent 主动向 hub 建立出站 WebSocket 长连接 (ws/wss 由 KHUB scheme 推导), 首帧注册;
     // hub 把 /{KNAME}/api/* 与 /{KNAME}/{PORT}/* 的外部请求封装成 req 帧经隧道下发:
     // api 模式回环到 agent 自身服务 (验签/加密/白名单全链路不变, 中间件零改动),
-    // port 模式回环到 KHUB_PORTS 白名单端口 (缺省空=禁用; 拒绝时不发起连接, 无侧信道);
+    // port 模式回环到 HUB 组白名单端口 (env KHUB_PORTS ∪ hub 运行时, 缺省空=禁用; 拒绝时不发起连接, 无侧信道);
     // ws_open 帧 → 回环拨号本地 WS (终端 Noise/降级令牌字节级透传, 帧级双向转发);
     // 断线指数退避重连, 状态三态 alive|reconnecting|failed 对齐 argo 0.6.4 惯例。
     // 签名口径: 签名 PATH = 剥离 KNAME 前缀后的本地路径 (hub 侧剥前缀), 与面板 getSignPath /
@@ -1888,7 +2117,7 @@ public class kisama {
         return u;
     }
 
-    /** KHUB_PORTS 白名单解析 (逗号分隔; 非法/越界条目忽略, 缺省空=端口反代禁用) */
+    /** KHUB_PORTS/KPROXY_PORTS 白名单解析 (逗号分隔; 非法/越界条目忽略, 缺省空=端口反代禁用) */
     private static java.util.Set<Integer> parseHubPorts(String raw) {
         java.util.Set<Integer> out = new java.util.TreeSet<>();
         if (raw != null) {
@@ -2027,12 +2256,172 @@ public class kisama {
         return out;
     }
 
+    // ============================================================================
+    // 📡 本地端口反代路由 (0.6.7, docs/API.MD 二十): 回环转发核心 (一份实现两处消费,
+    // 与 py/js 端同源契约)。hub req 帧路径 (HubTunnelManager.handleReq, whitelist=注册
+    // ports=HUB 组聚合) 与本地路由路径 (/api/proxy/{port}/*, whitelist=本地组聚合,
+    // forwardedFor=真实客户端 IP) 共用同一份实现。
+    // ============================================================================
+    /** agent 认证头不透传上游服务 (防密钥材料泄漏); hub 路径无此风险 (帧内无认证头) */
+    private static final java.util.Set<String> PROXY_STRIPPED_AUTH_HEADERS = new java.util.HashSet<>(java.util.Arrays.asList(
+            "x-nonce", "x-timestamp", "x-auth-token", "x-aes-encrypted", "x-encrypted", "x-agent-version"));
+    /** 本地端口反代共享回环客户端: JDK HttpClient 字节保真 (不透明解压), 线程安全单例 */
+    private static final java.net.http.HttpClient PROXY_HTTP_CLIENT = java.net.http.HttpClient.newBuilder()
+            .version(java.net.http.HttpClient.Version.HTTP_1_1)
+            .connectTimeout(java.time.Duration.ofSeconds(10))
+            .build();
+
+    /** 回环转发失败 (code: port_not_allowed / body_too_large / loopback_unreachable, 与 hub 错误映射对齐) */
+    static class LoopbackRelayException extends RuntimeException {
+        final String code;
+
+        LoopbackRelayException(String code, String message) {
+            super(message);
+            this.code = code;
+        }
+    }
+
+    /** 回环转发结果 (缓冲全量) */
+    static final class LoopbackRelayResult {
+        final int status;
+        final Map<String, String> headers;
+        final byte[] body;
+
+        LoopbackRelayResult(int status, Map<String, String> headers, byte[] body) {
+            this.status = status;
+            this.headers = headers;
+            this.body = body;
+        }
+    }
+
+    /** 代理响应头过滤: 剥 content-length (按实长重算) 与 access-control-* (CORS 由本端统一裁定, 与 hub 同口径) */
+    private static Map<String, String> filterProxyResponseHeaders(Map<String, String> headers) {
+        Map<String, String> out = new LinkedHashMap<>();
+        if (headers == null) {
+            return out;
+        }
+        for (Map.Entry<String, String> e : headers.entrySet()) {
+            String lk = String.valueOf(e.getKey()).toLowerCase(Locale.ROOT);
+            if (HUB_HOP_HEADERS.contains(lk) || "content-length".equals(lk) || lk.startsWith("access-control-")) {
+                continue;
+            }
+            out.put(e.getKey(), e.getValue());
+        }
+        return out;
+    }
+
+    /** 回环转发前置检查与构造 (0.6.7 一份实现多层共用): 白名单/请求体超限检查 + HttpRequest 构造。
+     * 白名单拒绝不发起连接 (无扫描侧信道); 请求体超限回 body_too_large (响应头未发出, 可回 JSON) */
+    private static java.net.http.HttpRequest loopbackRelayPrepare(int port, java.util.Set<Integer> whitelist,
+                                                                  String method, String path, String query,
+                                                                  Object headers, byte[] body,
+                                                                  long maxBody, long relayTimeoutMs,
+                                                                  String forwardedFor) {
+        if (whitelist != null && !whitelist.contains(port)) {
+            throw new LoopbackRelayException("port_not_allowed", "端口 " + port + " 未在反代白名单");
+        }
+        byte[] safeBody = body == null ? new byte[0] : body;
+        if (safeBody.length > maxBody) {
+            throw new LoopbackRelayException("body_too_large", "请求体超过 KISAMA_HUB_MAX_BODY (" + maxBody + " 字节)");
+        }
+        String url = "http://127.0.0.1:" + port + path;
+        if (query != null && !query.isEmpty()) url += "?" + query;
+        Map<String, String> reqHeaders = filterLoopbackHeaders(headers);
+        if (forwardedFor != null && !forwardedFor.isEmpty()) {
+            reqHeaders.put("x-forwarded-for", forwardedFor);
+        }
+        java.net.http.HttpRequest.Builder rb = java.net.http.HttpRequest.newBuilder(java.net.URI.create(url))
+                .timeout(java.time.Duration.ofMillis(relayTimeoutMs));
+        for (Map.Entry<String, String> h : reqHeaders.entrySet()) {
+            rb.header(h.getKey(), h.getValue());
+        }
+        switch (method) {
+            case "GET":
+                // GET 缺省无 body; 携带 body 时走 method() 通路 (rb.GET() 无法挂 body)
+                if (safeBody.length == 0) {
+                    rb.GET();
+                } else {
+                    rb.method("GET", java.net.http.HttpRequest.BodyPublishers.ofByteArray(safeBody));
+                }
+                break;
+            case "HEAD":
+                rb.method("HEAD", java.net.http.HttpRequest.BodyPublishers.noBody());
+                break;
+            default:
+                // DELETE/POST/PUT/PATCH 等统一走 method(): 签名绑定 body 摘要,
+                // Builder.DELETE() 会丢弃 body 导致回环验签失败 (E2E 实测)
+                rb.method(method, java.net.http.HttpRequest.BodyPublishers.ofByteArray(safeBody));
+                break;
+        }
+        return rb.build();
+    }
+
+    /**
+     * 回环流式转发原语 (本地 /api/proxy 路由用, 0.6.7): ofInputStream 响应体不受 KISAMA_HUB_MAX_BODY
+     * 限制 (SSE/大文件)。JDK 的 HttpRequest.timeout 仅约束到响应头阶段, 流读取无空闲超时 (SSE
+     * 友好, 与 py 的 sock_read 语义差异如实记录); 连接失败 throw LoopbackRelayException (响应头
+     * 未发出, 调用方可回 JSON 错误体)。调用方负责消费与关闭 InputStream。
+     */
+    private static java.net.http.HttpResponse<java.io.InputStream> loopbackRelayStream(
+            int port, java.util.Set<Integer> whitelist, String method, String path, String query,
+            Object headers, byte[] body, long maxBody, long relayTimeoutMs,
+            java.net.http.HttpClient httpClient, String forwardedFor) {
+        java.net.http.HttpRequest request = loopbackRelayPrepare(port, whitelist, method, path, query,
+                headers, body, maxBody, relayTimeoutMs, forwardedFor);
+        try {
+            java.net.http.HttpClient client = httpClient != null ? httpClient : PROXY_HTTP_CLIENT;
+            return client.send(request, java.net.http.HttpResponse.BodyHandlers.ofInputStream());
+        } catch (java.net.http.HttpTimeoutException e) {
+            throw new LoopbackRelayException("loopback_unreachable", "loopback request timeout");
+        } catch (Exception e) {
+            String msg = e.getMessage() != null ? e.getMessage() : e.toString();
+            throw new LoopbackRelayException("loopback_unreachable", hubTruncate(msg, 300));
+        }
+    }
+
+    /**
+     * 回环缓冲转发 (hub req 帧路径用, docs/API.MD 十九/二十): 全量 read + 响应体超限检查,
+     * 与本地路由共用前置检查层 (loopbackRelayPrepare) — 白名单语义一份实现。
+     * whitelist=null: api 模式 (回环 agent 自身端口, 不做白名单校验); 传集合则 port 必须在列,
+     * 拒绝时不发起连接 (无端口扫描侧信道, 与 hub 同语义)。headers 接受 hub 帧 Map 或本地路由 Map。
+     */
+    private static LoopbackRelayResult loopbackRelay(int port, java.util.Set<Integer> whitelist,
+                                                     String method, String path, String query,
+                                                     Object headers, byte[] body,
+                                                     long maxBody, long relayTimeoutMs,
+                                                     java.net.http.HttpClient httpClient,
+                                                     String forwardedFor) {
+        java.net.http.HttpRequest request = loopbackRelayPrepare(port, whitelist, method, path, query,
+                headers, body, maxBody, relayTimeoutMs, forwardedFor);
+        try {
+            java.net.http.HttpClient client = httpClient != null ? httpClient : PROXY_HTTP_CLIENT;
+            java.net.http.HttpResponse<byte[]> resp =
+                    client.send(request, java.net.http.HttpResponse.BodyHandlers.ofByteArray());
+            byte[] respBody = resp.body() == null ? new byte[0] : resp.body();
+            if (respBody.length > maxBody) {
+                throw new LoopbackRelayException("body_too_large", "响应体超过 KISAMA_HUB_MAX_BODY (" + maxBody + " 字节)");
+            }
+            Map<String, String> hh = new LinkedHashMap<>();
+            for (Map.Entry<String, java.util.List<String>> e : resp.headers().map().entrySet()) {
+                if (e.getValue() != null && !e.getValue().isEmpty()) {
+                    hh.put(e.getKey(), e.getValue().get(0));
+                }
+            }
+            return new LoopbackRelayResult(resp.statusCode(), hh, respBody);
+        } catch (LoopbackRelayException e) {
+            throw e;
+        } catch (Exception e) {
+            String msg = e.getMessage() != null ? e.getMessage() : e.toString();
+            throw new LoopbackRelayException("loopback_unreachable", hubTruncate(msg, 300));
+        }
+    }
+
     /** KMODE=3 出站隧道管理器 (结构镜像 ArgoTunnelManager / 0.6.4 状态惯例) */
     private final class HubTunnelManager {
         final String hubUrl;
         final String kname;
         final int port;
-        final java.util.Set<Integer> ports;   // KHUB_PORTS 白名单快照
+        final java.util.Set<Integer> ports;   // 注册 ports 快照 (注册帧上报/页面展示)
         final String source;                  // startup | dynamic
         final String publicUrl;               // KHUB_PUBLIC_URL 修正值 (null=未配置, 条目按 hub 推导)
         final String relayUrl;
@@ -2403,62 +2792,30 @@ public class kisama {
 
         private void handleReq(int rid, String mode, String method, String path, String query, byte[] body, Map<String, Object> f) {
             try {
-                String url;
+                int port;
+                java.util.Set<Integer> whitelist;
                 if ("port".equals(mode)) {
-                    int port = hubFrameId(f.get("port"));
-                    if (!this.ports.contains(port)) {
-                        // 白名单拒绝: 不发起连接, 无端口扫描侧信道
-                        sendHubErr(rid, "port_not_allowed", "KHUB_PORTS 未放行端口 " + port);
-                        return;
-                    }
-                    url = "http://127.0.0.1:" + port + path;
+                    port = hubFrameId(f.get("port"));
+                    whitelist = proxyEffectivePorts("hub"); // HUB 组聚合 (env KHUB_PORTS ∪ hub 运行时, 0.6.7 续批六)
                 } else {
-                    url = "http://127.0.0.1:" + this.port + path;
+                    port = this.port;
+                    whitelist = null; // api 模式回环 agent 自身, 不做白名单校验
                 }
-                if (!query.isEmpty()) url += "?" + query;
-                java.net.http.HttpRequest.Builder rb = java.net.http.HttpRequest.newBuilder(java.net.URI.create(url))
-                        .timeout(java.time.Duration.ofMillis(this.relayTimeoutMs));
-                for (Map.Entry<String, String> h : filterLoopbackHeaders(f.get("headers")).entrySet()) {
-                    rb.header(h.getKey(), h.getValue());
-                }
-                switch (method) {
-                    case "GET":
-                        // GET 缺省无 body; 携带 body 时走 method() 通路 (rb.GET() 无法挂 body)
-                        if (body.length == 0) {
-                            rb.GET();
-                        } else {
-                            rb.method("GET", java.net.http.HttpRequest.BodyPublishers.ofByteArray(body));
-                        }
-                        break;
-                    case "HEAD":
-                        rb.method("HEAD", java.net.http.HttpRequest.BodyPublishers.noBody());
-                        break;
-                    default:
-                        // DELETE/POST/PUT/PATCH 等统一走 method(): 签名绑定 body 摘要,
-                        // Builder.DELETE() 会丢弃 body 导致回环验签失败 (E2E 实测)
-                        rb.method(method, java.net.http.HttpRequest.BodyPublishers.ofByteArray(body));
-                        break;
-                }
-                java.net.http.HttpResponse<byte[]> resp =
-                        this.http.send(rb.build(), java.net.http.HttpResponse.BodyHandlers.ofByteArray());
-                byte[] respBody = resp.body() == null ? new byte[0] : resp.body();
-                if (respBody.length > this.maxBody) {
-                    sendHubErr(rid, "body_too_large", "响应体超过 KISAMA_HUB_MAX_BODY (" + this.maxBody + " 字节)");
-                    return;
-                }
+                // 0.6.7 起委托共享回环转发核心 (本地 /api/proxy 路由共用同一份实现)
+                LoopbackRelayResult r = loopbackRelay(port, whitelist, method, path, query,
+                        f.get("headers"), body, this.maxBody, this.relayTimeoutMs, this.http, null);
                 Map<String, Object> res = new LinkedHashMap<>();
                 res.put("t", "res");
                 res.put("id", rid);
-                res.put("status", resp.statusCode());
-                Map<String, String> hh = new LinkedHashMap<>();
-                for (Map.Entry<String, List<String>> e : resp.headers().map().entrySet()) {
-                    if (e.getValue() != null && !e.getValue().isEmpty()) {
-                        hh.put(e.getKey(), e.getValue().get(0));
-                    }
-                }
-                res.put("headers", hh);
-                res.put("body_b64", Base64.getEncoder().encodeToString(respBody));
+                res.put("status", r.status);
+                res.put("headers", r.headers);
+                res.put("body_b64", Base64.getEncoder().encodeToString(r.body));
                 sendHubFrame(res);
+            } catch (LoopbackRelayException e) {
+                try {
+                    sendHubErr(rid, e.code, e.getMessage() == null ? "" : e.getMessage());
+                } catch (Exception ignored) {
+                }
             } catch (Exception e) {
                 String msg = e.getMessage() != null ? e.getMessage() : e.toString();
                 try {
@@ -2483,7 +2840,7 @@ public class kisama {
          *
          * 两种模式 (ws_open 帧的 port 字段区分, 0.6.6 续批):
          * - api 模式 (无 port / port=0): 回环 agent 自身 /api/ws/* (终端, Noise/令牌透传)
-         * - 端口反代模式 (port>0): 回环 127.0.0.1:{port} — KHUB_PORTS 白名单校验 (拒绝时
+         * - 端口反代模式 (port>0): 回环 127.0.0.1:{port} — HUB 组白名单校验 (拒绝时
          *   ws_ack ok:false, hub 以 close 3001 关客户端; 与 HTTP 端口反代同语义, 不发起回环连接)
          *
          * CONNECTING 缓冲: hub 会在本地 WS 握手完成前转发客户端帧, 拨号完成前先入队,
@@ -2531,13 +2888,14 @@ public class kisama {
             void run() {
                 String url;
                 if (this.port > 0) {
-                    // 端口反代模式: KHUB_PORTS 白名单校验 (拒绝时不发起连接, 无扫描侧信道)
-                    if (!HubTunnelManager.this.ports.contains(this.port)) {
+                    // 端口反代模式: HUB 组聚合白名单校验 (env KHUB_PORTS ∪ hub 运行时, 0.6.7 续批六;
+                    // 拒绝时不发起连接, 无扫描侧信道)
+                    if (!proxyEffectivePorts("hub").contains(this.port)) {
                         Map<String, Object> nack = new LinkedHashMap<>();
                         nack.put("t", "ws_ack");
                         nack.put("id", this.sid);
                         nack.put("ok", false);
-                        nack.put("message", "KHUB_PORTS 未放行端口 " + this.port);
+                        nack.put("message", "端口 " + this.port + " 未在 HUB 反代白名单");
                         HubTunnelManager.this.sendHubFrame(nack);
                         return;
                     }
@@ -2874,6 +3232,8 @@ public class kisama {
     @SuppressWarnings("unchecked")
     private Map<String, Object> loadTaskStore() {
         this.hubregs.clear();
+        this.proxyportsHub.clear();
+        this.proxyportsLocal.clear();
         Map<String, Object> restored = new LinkedHashMap<>();
         restored.put("onetasks", new ArrayList<String>());
         restored.put("crontasks", new LinkedHashMap<String, String>());
@@ -2955,8 +3315,47 @@ public class kisama {
                     }
                 }
                 this.taskStoreLastSavedAt = doc.get("saved_at") == null ? null : String.valueOf(doc.get("saved_at"));
+                // 反代运行时白名单 (0.6.7 续批六, docs/API.MD 20.8): 对象形状 {"hub":[..],"local":[..]},
+                // 各组整数端口列表, 非法条目静默过滤; 兼容旧平铺数组形状 (归入本地组)
+                List<Integer> pportsHub = new ArrayList<>();
+                List<Integer> pportsLocal = new ArrayList<>();
+                if (data.get("proxyports") instanceof Map) {
+                    Map<?, ?> pp = (Map<?, ?>) data.get("proxyports");
+                    if (pp.get("hub") instanceof List) {
+                        for (Object p : (List<?>) pp.get("hub")) {
+                            if (p instanceof Number) {
+                                int v = ((Number) p).intValue();
+                                if (v >= 1 && v <= 65535) pportsHub.add(v);
+                            }
+                        }
+                    }
+                    if (pp.get("local") instanceof List) {
+                        for (Object p : (List<?>) pp.get("local")) {
+                            if (p instanceof Number) {
+                                int v = ((Number) p).intValue();
+                                if (v >= 1 && v <= 65535) pportsLocal.add(v);
+                            }
+                        }
+                    }
+                } else if (data.get("proxyports") instanceof List) {
+                    for (Object p : (List<?>) data.get("proxyports")) {
+                        if (p instanceof Number) {
+                            int v = ((Number) p).intValue();
+                            if (v >= 1 && v <= 65535) pportsLocal.add(v);
+                        }
+                    }
+                }
+                synchronized (this.proxyportsHub) {
+                    this.proxyportsHub.clear();
+                    this.proxyportsHub.addAll(pportsHub);
+                }
+                synchronized (this.proxyportsLocal) {
+                    this.proxyportsLocal.clear();
+                    this.proxyportsLocal.addAll(pportsLocal);
+                }
                 log("[TaskStore] 💾 已恢复持久化任务: onetime=" + onetasks.size() + ", cron=" + crontasks.size()
-                        + ", hubreg=" + regs.size());
+                        + ", hubreg=" + regs.size() + ", proxyport(hub)=" + pportsHub.size()
+                        + ", proxyport(local)=" + pportsLocal.size());
                 this.hubregs.addAll(regs);
                 restored.put("onetasks", onetasks);
                 restored.put("crontasks", crontasks);
@@ -2995,6 +3394,8 @@ public class kisama {
                 data.put("crontasks", new LinkedHashMap<>(this.crons));
                 // hub 注册任务子类型一并写入容器 — 与 onetasks/crontasks 同生命周期 (0.6.6 起, additive 键)
                 data.put("hubregs", new ArrayList<>(this.hubregs));
+                // 反代运行时白名单子类型一并写入 (0.6.7 续批六起两组对象形状, additive 键)
+                data.put("proxyports", proxyGroupsSnapshot());
                 String savedAt = java.time.Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS).toString();
                 Map<String, Object> doc = new LinkedHashMap<>();
                 doc.put("magic", TASK_STORE_MAGIC);
@@ -3075,6 +3476,83 @@ public class kisama {
             return false;
         }
         return saveHubRegs(this.hubRegistrar.list());
+    }
+
+    // ==================== 📡 反代运行时白名单 (0.6.7 续批六分组口径, docs/API.MD 20.2/20.8) ====================
+    // 两组独立管理: HUB 组 (env KHUB_PORTS ∪ hub 运行时) 只约束 hub 链路端口反代 (0.6.6);
+    // 本地组 (env KPROXY_PORTS ∪ 本地运行时) 只约束本地路由 /api/proxy(/ws)。运行时列表经
+    // POST /api/proxy/config (scope 区分组, 整体覆盖) 设置, KSTORE data.proxyports 持久化重启恢复。
+    // env 为部署者意愿下限, 运行时列表只增; 收紧清空回落 env。POST /api/hub 注册端口并入 HUB 组 (19.9)。
+    private java.util.Set<Integer> proxyGroupSet(String group) {
+        return "hub".equals(group) ? this.proxyportsHub : this.proxyportsLocal;
+    }
+
+    private java.util.Set<Integer> proxyEnvPorts(String group) {
+        return "hub".equals(group) ? this.KHUB_PORTS : this.KPROXY_PORTS;
+    }
+
+    private java.util.Set<Integer> proxyEffectivePorts(String group) {
+        java.util.TreeSet<Integer> out = new java.util.TreeSet<>(proxyEnvPorts(group));
+        java.util.Set<Integer> runtime = proxyGroupSet(group);
+        synchronized (runtime) {
+            out.addAll(runtime);
+        }
+        return out;
+    }
+
+    // 整体覆盖组运行时白名单 (非法/越界条目静默过滤)
+    private void proxySetRuntimePorts(String group, List<Integer> ports) {
+        java.util.TreeSet<Integer> cleaned = new java.util.TreeSet<>();
+        if (ports != null) {
+            for (Integer p : ports) {
+                if (p != null && p >= 1 && p <= 65535) cleaned.add(p);
+            }
+        }
+        java.util.Set<Integer> runtime = proxyGroupSet(group);
+        synchronized (runtime) {
+            runtime.clear();
+            runtime.addAll(cleaned);
+        }
+    }
+
+    // 并入组运行时白名单 (POST /api/hub 注册端口并入 HUB 组, docs/API.MD 19.9/20.8);
+    // 同组只增不覆盖, 非法/越界条目静默过滤
+    private void proxyMergeRuntimePorts(String group, List<Integer> ports) {
+        if (ports == null || ports.isEmpty()) {
+            return;
+        }
+        java.util.Set<Integer> runtime = proxyGroupSet(group);
+        synchronized (runtime) {
+            for (Integer p : ports) {
+                if (p != null && p >= 1 && p <= 65535) runtime.add(p);
+            }
+        }
+    }
+
+    // 启动恢复用: 读取组运行时白名单快照 (loadTaskStore 填充; 未启用 KSTORE 恒为空)
+    private List<Integer> getProxyports(String group) {
+        java.util.Set<Integer> runtime = proxyGroupSet(group);
+        synchronized (runtime) {
+            return new ArrayList<>(runtime);
+        }
+    }
+
+    // 两组运行时快照 (KSTORE data.proxyports 对象形状落盘用)
+    private java.util.Map<String, List<Integer>> proxyGroupsSnapshot() {
+        java.util.Map<String, List<Integer>> out = new java.util.LinkedHashMap<>();
+        out.put("hub", getProxyports("hub"));
+        out.put("local", getProxyports("local"));
+        return out;
+    }
+
+    // 落盘反代运行时白名单 (additive 键, 对象形状 {"hub":[..],"local":[..]}); 未启用/只读时返回 false 且不更新内存字段
+    private boolean saveProxyports(java.util.Map<String, List<Integer>> groups) {
+        if (!this.taskStoreEnabled || this.taskStoreLocked) {
+            return false;
+        }
+        proxySetRuntimePorts("hub", groups == null ? null : groups.get("hub"));
+        proxySetRuntimePorts("local", groups == null ? null : groups.get("local"));
+        return saveTaskStore();
     }
 
     public static void main(String[] args) throws Exception {
@@ -5272,6 +5750,231 @@ public class kisama {
             if (error.getCause() != null) {
                 agent.log("[TRACE-WS] 🚨 发现隐藏在框架底层的真实元凶：");
                 consoleTrace(error.getCause());
+            }
+        }
+    }
+
+    // ==================== 📡 本地端口反代 WS 透传 (0.6.7, docs/API.MD 20.6) ====================
+    // 白名单唯一门禁 (匿名放行, Owner 拍板 2026-11-18) —— 回环拨 JDK WebSocket 双向泵
+    // (text/binary 保真); 白名单拒绝不发起回环连接 (close 1008, 与 HTTP 端口反代 403 同语义);
+    // CONNECTING 缓冲: 回环拨号完成前到达的客户端帧先入队, 拨号完成后按序发出 (0.6.6 教训)
+    @WebSocket
+    public class ProxyWebSocketHandler {
+        private final kisama agent;
+        private final Map<Session, java.net.http.WebSocket> activeRelays = new ConcurrentHashMap<>();
+        private final Map<Session, List<Object>> pendingFrames = new ConcurrentHashMap<>();
+
+        public ProxyWebSocketHandler(kisama agent) {
+            this.agent = agent;
+        }
+
+        @OnWebSocketConnect
+        public void onConnect(Session session) {
+            try {
+                String path = session.getUpgradeRequest().getRequestURI().getPath();
+                // WS 专属前缀 /api/proxyws/ (与 HTTP 反代路径完全分离 —— Spark matcher 会把
+                // upgrade 请求匹配进 /api/proxy/:port 的 HTTP 路由(:port=ws), 前缀不重叠才落到 ws servlet)
+                String rest = path != null && path.startsWith("/api/proxyws/")
+                        ? path.substring("/api/proxyws/".length()) : "";
+                int slash = rest.indexOf('/');
+                String portStr = slash >= 0 ? rest.substring(0, slash) : rest;
+                String tail = slash >= 0 ? rest.substring(slash + 1) : "";
+                int port;
+                try {
+                    port = Integer.parseInt(portStr);
+                    if (port < 1 || port > 65535) {
+                        throw new NumberFormatException();
+                    }
+                } catch (NumberFormatException e) {
+                    session.close(1008, "invalid_port: " + hubTruncate(portStr, 60));
+                    return;
+                }
+                if (!proxyEffectivePorts("local").contains(port)) {
+                    session.close(1008, "port_not_allowed: 端口 " + port + " 未在本地反代白名单");
+                    return;
+                }
+                String query = session.getUpgradeRequest().getQueryString();
+                String url = "ws://127.0.0.1:" + port + "/" + tail
+                        + (query != null && !query.isEmpty() ? "?" + query : "");
+                // 拨号头: 剥 hop-by-hop/host 与 sec-websocket-* (防 permessage-deflate 协商错乱, 对齐 py/js 端)
+                // 与 agent 认证头; JDK 受限头携带即 IllegalArgumentException —— 逐个安全加 (host 等剥除跳过)
+                Map<String, String> dialHeaders = new LinkedHashMap<>();
+                for (Map.Entry<String, List<String>> h : session.getUpgradeRequest().getHeaders().entrySet()) {
+                    String lk = h.getKey().toLowerCase(Locale.ROOT);
+                    if (HUB_HOP_HEADERS.contains(lk) || lk.startsWith("sec-websocket-") || lk.startsWith("x-kisama-hub-")) {
+                        continue;
+                    }
+                    if (PROXY_STRIPPED_AUTH_HEADERS.contains(lk)) {
+                        continue;
+                    }
+                    if (h.getValue() != null && !h.getValue().isEmpty()) {
+                        dialHeaders.put(lk, h.getValue().get(0));
+                    }
+                }
+                final StringBuilder textBuf = new StringBuilder();
+                final java.io.ByteArrayOutputStream binBuf = new java.io.ByteArrayOutputStream();
+                java.net.http.WebSocket.Listener listener = new java.net.http.WebSocket.Listener() {
+                    @Override
+                    public void onOpen(java.net.http.WebSocket w) {
+                        w.request(1);
+                    }
+
+                    @Override
+                    public CompletableFuture<?> onText(java.net.http.WebSocket w, CharSequence data, boolean last) {
+                        w.request(1);
+                        String piece;
+                        synchronized (textBuf) {
+                            textBuf.append(data);
+                            if (!last) return null;
+                            piece = textBuf.toString();
+                            textBuf.setLength(0);
+                        }
+                        try {
+                            session.getRemote().sendString(piece);
+                        } catch (Exception ignored) {
+                        }
+                        return null;
+                    }
+
+                    @Override
+                    public CompletableFuture<?> onBinary(java.net.http.WebSocket w, java.nio.ByteBuffer msg, boolean last) {
+                        w.request(1);
+                        synchronized (binBuf) {
+                            java.nio.ByteBuffer c = msg.duplicate();
+                            byte[] chunk = new byte[c.remaining()];
+                            c.get(chunk);
+                            binBuf.write(chunk, 0, chunk.length);
+                            if (!last) return null;
+                            byte[] all = binBuf.toByteArray();
+                            binBuf.reset();
+                            try {
+                                session.getRemote().sendBytes(java.nio.ByteBuffer.wrap(all));
+                            } catch (Exception ignored) {
+                            }
+                        }
+                        return null;
+                    }
+
+                    @Override
+                    public CompletableFuture<?> onPing(java.net.http.WebSocket w, java.nio.ByteBuffer msg) {
+                        w.request(1);
+                        try {
+                            w.sendPong(msg);
+                        } catch (Exception ignored) {
+                        }
+                        return null;
+                    }
+
+                    @Override
+                    public CompletionStage<?> onClose(java.net.http.WebSocket w, int statusCode, String reason) {
+                        w.request(1);
+                        try {
+                            session.close(statusCode > 0 ? statusCode : 1000,
+                                    hubTruncate(reason == null ? "closed" : reason, 100));
+                        } catch (Exception ignored) {
+                        }
+                        activeRelays.remove(session);
+                        return null;
+                    }
+
+                    @Override
+                    public void onError(java.net.http.WebSocket w, Throwable error) {
+                        agent.log("[ProxyWS] ❌ 上游流错误: " + error);
+                        try {
+                            session.close(1011, "upstream error");
+                        } catch (Exception ignored) {
+                        }
+                        activeRelays.remove(session);
+                    }
+                };
+                java.net.http.WebSocket.Builder wb = PROXY_HTTP_CLIENT.newWebSocketBuilder()
+                        .connectTimeout(java.time.Duration.ofSeconds(10));
+                for (Map.Entry<String, String> h : dialHeaders.entrySet()) {
+                    try {
+                        wb.header(h.getKey(), h.getValue());
+                    } catch (IllegalArgumentException ignored) {
+                    }
+                }
+                java.net.http.WebSocket lw = wb.buildAsync(java.net.URI.create(url), listener)
+                        .get(15, TimeUnit.SECONDS);
+                activeRelays.put(session, lw);
+                agent.log("[ProxyWS] ✅ 回环拨号成功: " + url);
+                // CONNECTING 缓冲 flush: 拨号完成前到达的客户端帧按序发出
+                List<Object> pending = pendingFrames.remove(session);
+                if (pending != null) {
+                    for (Object f : pending) {
+                        if (f instanceof byte[]) {
+                            lw.sendBinary(java.nio.ByteBuffer.wrap((byte[]) f), true);
+                        } else {
+                            lw.sendText(String.valueOf(f), true);
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                Throwable cause = e.getCause() != null ? e.getCause() : e;
+                agent.log("[ProxyWS] ❌ 回环拨号失败: " + cause
+                        + (cause.getCause() != null ? " <- " + cause.getCause() : ""));
+                pendingFrames.remove(session);
+                try {
+                    session.close(1011, hubTruncate(String.valueOf(e.getMessage()), 80));
+                } catch (Exception ignored) {
+                }
+            }
+        }
+
+        @OnWebSocketMessage
+        public void onTextMessage(Session session, String message) {
+            java.net.http.WebSocket lw = activeRelays.get(session);
+            if (lw != null) {
+                try {
+                    lw.sendText(message, true);
+                } catch (Exception e) {
+                    agent.log("[ProxyWS] ❌ 客户端帧转发失败: " + e);
+                }
+            } else {
+                pendingFrames.computeIfAbsent(session, k -> Collections.synchronizedList(new ArrayList<>()))
+                        .add(message);
+            }
+        }
+
+        @OnWebSocketMessage
+        public void onBinaryMessage(Session session, byte[] payload, int offset, int length) {
+            byte[] frame = new byte[length];
+            System.arraycopy(payload, offset, frame, 0, length);
+            java.net.http.WebSocket lw = activeRelays.get(session);
+            if (lw != null) {
+                try {
+                    lw.sendBinary(java.nio.ByteBuffer.wrap(frame), true);
+                } catch (Exception ignored) {
+                }
+            } else {
+                pendingFrames.computeIfAbsent(session, k -> Collections.synchronizedList(new ArrayList<>()))
+                        .add(frame);
+            }
+        }
+
+        @OnWebSocketClose
+        public void onClose(Session session, int statusCode, String reason) {
+            java.net.http.WebSocket lw = activeRelays.remove(session);
+            pendingFrames.remove(session);
+            if (lw != null) {
+                try {
+                    lw.sendClose(statusCode > 0 ? statusCode : 1000,
+                            hubTruncate(reason == null ? "closed" : reason, 100));
+                } catch (Exception ignored) {
+                }
+            }
+        }
+
+        @OnWebSocketError
+        public void onError(Session session, Throwable error) {
+            java.net.http.WebSocket lw = activeRelays.remove(session);
+            pendingFrames.remove(session);
+            if (lw != null) {
+                try {
+                    lw.sendClose(1011, "client error");
+                } catch (Exception ignored) {
+                }
             }
         }
     }

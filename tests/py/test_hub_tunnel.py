@@ -217,6 +217,10 @@ class HandleReqTest(unittest.TestCase):
         self.ws = _FakeWS()
         self.session = object()
         self.requests = []
+        # 0.6.7 续批六分组口径: HUB 组聚合 (env KHUB_PORTS ∪ hub 运行时), 测试用运行时字典替代
+        patcher = mock.patch.object(agent, "_PROXY_RUNTIME_PORTS", {"hub": {7788, 8080}, "local": set()})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
         async def fake_request(session, method, url, headers, body):
             self.requests.append({"method": method, "url": url, "headers": headers, "body": body})
@@ -348,6 +352,9 @@ class HubWSStreamPortModeTest(unittest.TestCase):
 
     def test_port_not_in_whitelist_denied_without_dial(self):
         mgr = _make_manager(ports=[])  # 白名单空 → 7788 拒绝
+        patcher = mock.patch.object(agent, "_PROXY_RUNTIME_PORTS", {"hub": set(), "local": set()})
+        patcher.start()
+        self.addCleanup(patcher.stop)
         ws = _FakeWS()
         stream = agent.HubWSStream(mgr, object(), ws, 9, {"t": "ws_open", "id": 9,
                                                           "port": 7788, "path": "/x", "query": ""})
@@ -360,6 +367,9 @@ class HubWSStreamPortModeTest(unittest.TestCase):
 
     def test_port_mode_dials_target_port(self):
         mgr = _make_manager(ports=[7788])
+        patcher = mock.patch.object(agent, "_PROXY_RUNTIME_PORTS", {"hub": {7788}, "local": set()})
+        patcher.start()
+        self.addCleanup(patcher.stop)
         captured = {}
 
         def capture_factory(session, url):
