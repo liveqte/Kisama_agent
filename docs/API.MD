@@ -59,7 +59,7 @@ agent 启动时自动读取**可执行文件同目录**（py/js 为脚本同目�
 
 > **ipv4/ipv6 上报口径（五语言统一语义）**：`ipv4`/`ipv6` 均以专用外部服务探测优先且对返回文本做族校验——`ipv6` 只接受**公网全局单播**（2000::/3；ULA(fc00::/7)、链路本地(fe80::/10)、多播、回环、未指定、IPv4-mapped、站点本地一律拒绝），本地网卡地址仅在外部探测全失败时兜底（v6 兜底同样必须全局单播）。**无公网 IPv6 时 `ipv6` 报 `null`，不会用容器内网地址（如 docker 网络的 fdXX::）回填**。
 
-> **marks 主机标记（可选字段，additive）**：字符串数组，标识当前进程视角下**已确认成立**的事实，分两类：主机探测标记 `root`、`kvm`、`pterodactyl`、`systemd`、`fuse`（Linux 语义），与配置类标记 `kstore`（任务持久化已启用）、`kmode1`/`kmode2`（KMODE 配置为 1/2，go 未实现 KMODE 故不输出）、`kmode3`（0.6.6 起 KMODE=3 kisama-hub 中继，Py/Js/Java/Java11）。可同时出现多个，顺序固定（主机探测标记在前、配置类标记追加在末尾）。**字段可能缺失**（旧版代理未实现），缺失与空数组语义不同：缺失 = 未探测或不适用，`[]` = 已探测且无命中；`null` 非法，客户端按缺失处理。客户端必须忽略未知取值。判据、实现方式、性能与误报边界见「十五、`/api/baseinfo` 可选字段 `marks`（主机标记）探测规范」。
+> **marks 主机标记（可选字段，additive）**：字符串数组，标识当前进程视角下**已确认成立**的事实，分两类：主机探测标记 `root`、`kvm`、`pterodactyl`、`systemd`、`fuse`、`netadmin`（Linux 语义），与配置类标记 `kstore`（任务持久化已启用）、`kmode1`/`kmode2`（KMODE 配置为 1/2，go 未实现 KMODE 故不输出）、`kmode3`（0.6.6 起 KMODE=3 kisama-hub 中继，Py/Js/Java/Java11）。可同时出现多个，顺序固定（主机探测标记在前、配置类标记追加在末尾）。**字段可能缺失**（旧版代理未实现），缺失与空数组语义不同：缺失 = 未探测或不适用，`[]` = 已探测且无命中；`null` 非法，客户端按缺失处理。客户端必须忽略未知取值。判据、实现方式、性能与误报边界见「十五、`/api/baseinfo` 可选字段 `marks`（主机标记）探测规范」。
 
 > **字段缓存分级（P 级 / T 级）**：baseinfo 系统信息按字段分两级缓存——**P 级（进程级静态）**如 `marks`、`virtualization`、`os`、`kernel_version`、`arch` 等，在进程生命周期内只探测一次并一直复用快照（TTL 过期与密钥轮换都不重探）；**T 级（TTL 快照）**按各自 TTL 重探：`disk_total`/`mem_total`/`swap_total` 为 30 秒，`ipv4`/`ipv6` 为 3600 秒。`session_key`/`noise_key` 属每请求凭证材料，**绝不进入任何快照**。完整字段表、失效规则与验收断言见「十六、`/api/baseinfo` 字段分级缓存与快照语义」。
 
@@ -634,8 +634,8 @@ GET /kisamaproxy/https://host:8443/api/exec
   "status": "ok",
   "count": 2,
   "tunnels": [
-    { "tunnel_domain": "https://lucky-wildflower-1a2b3c4d.trycloudflare.com", "port": 8000, "created_at": "2026-08-18T10:00:00Z", "status": "alive", "last_error": null, "last_error_at": null, "consecutive_failures": 0, "last_registered_at": "2026-08-18T10:00:05Z" },
-    { "tunnel_domain": "https://quiet-cloud-9f8e7d6c.trycloudflare.com", "port": 8080, "created_at": "2026-08-18T11:30:00Z", "status": "failed", "last_error": "tunnel re-register failed", "last_error_at": "2026-08-18T12:05:00Z", "consecutive_failures": 5, "last_registered_at": "2026-08-18T11:30:04Z" }
+    { "tunnel_domain": "https://lucky-wildflower-1a2b3c4d.trycloudflare.com", "port": 8000, "created_at": "2026-08-18T10:00:00Z", "status": "alive", "last_error": null, "last_error_at": null, "consecutive_failures": 0, "last_registered_at": "2026-08-18T10:00:05Z", "shz_name": "myname-8000", "shz_url": "https://shz.al/~myname-8000" },
+    { "tunnel_domain": "https://quiet-cloud-9f8e7d6c.trycloudflare.com", "port": 8080, "created_at": "2026-08-18T11:30:00Z", "status": "failed", "last_error": "tunnel re-register failed", "last_error_at": "2026-08-18T12:05:00Z", "consecutive_failures": 5, "last_registered_at": "2026-08-18T11:30:04Z", "shz_name": null, "shz_url": null }
   ]
 }
 ```
@@ -653,6 +653,8 @@ GET /kisamaproxy/https://host:8443/api/exec
 | tunnels[].last_error_at | string \| null | 最近一次失败时间（ISO8601 UTC）；无失败为 `null`（java/java11 省略） |
 | tunnels[].consecutive_failures | number | 当前连续失败轮数（本轮注册成功即清零） |
 | tunnels[].last_registered_at | string \| null | 最近一次成功注册时间（ISO8601 UTC）；从未成功注册为 `null`（java/java11 省略） |
+| tunnels[].shz_name | string \| null | 绑定上报名（0.6.8 additive，四端统一；详见本节「动态绑定 shz.al 上报」小节）：未绑定为 `null`，绑定后恒可见（首次上报异步进行，不影响该字段出现）。java/java11 省略 |
+| tunnels[].shz_url | string \| null | 绑定上报地址（shz.al 发布页完整 URL，如 `https://shz.al/~myname-8000`）；未绑定为 `null`（java/java11 省略）。**管理密钥不随查询下发** |
 
 ### 28. 创建临时隧道
 路径：POST /api/argo  
@@ -667,11 +669,15 @@ GET /kisamaproxy/https://host:8443/api/exec
 | port | number | 否 | 隧道转发端口（整数，1~65535）。缺省时使用 agent 自身监听端口（按 KPORT → PORT → SERVER_PORT 优先级，默认 8000） |
 | duplicate | boolean | 否 | 是否允许同一端口重复创建隧道，默认 `false`。`false` 时若该端口已存在隧道则拒绝创建（409）；`true` 时强制创建，原隧道保留 |
 | quic | boolean | 否 | 该隧道边缘传输是否走 QUIC（UDP/7844），缺省 `false`（h2 over TCP/7844）。js 端已实机验证全链路可用（HTTP + WebSocket over QUIC）；py 端协议栈已实现（握手/密钥/帧层单测全绿）但控制流数据面遗留回退兜底；java 端协议栈原语已移植、数据面后续批次接线。所有端 QUIC 连续建连失败均自动回退 h2（同一注册凭据无需重注册，重启进程恢复 QUIC） |
+| shz | boolean | 否 | 创建后绑定 shz.al 上报（0.6.8 additive，四端统一；详见本节「动态绑定 shz.al 上报」小节），缺省 `false`。上报名缺省派生 `KNAME-端口`、管理密钥派生 `上报名+"123"`；与 `shz_name`/`shz_key` 任一非空时等效 |
+| shz_name | string | 否 | 显式指定上报名（完整覆盖派生值，不再拼接端口；≥3 字符且限字母数字及 `+_-$=@,;/[]*`）。非空时隐含绑定 |
+| shz_key | string | 否 | 显式指定管理密钥（完整覆盖派生值；≥8 字符，shz.al 平台密码约束）。非空时隐含绑定；**不随查询/绑定响应下发** |
 行为约定：
 - **重复策略**：默认阻止同一端口重复建隧道（409）；仅当请求体携带 `duplicate: true` 时才允许重复；
 - 端口缺省时取 agent 自身监听端口（与「默认端口」一节一致）；
 - `port` 非法（非整数 / 超出 1~65535）返回 422；
-- 隧道注册失败（网络异常 / 无法连接 trycloudflare）返回 500。
+- 隧道注册失败（网络异常 / 无法连接 trycloudflare）返回 500；
+- **绑定参数在注册前校验**（0.6.8）：上报名/管理密钥校验失败返回 400（KNAME 未设置或过短、名称非法字符、显式密钥 <8 字符）；该端口已有其他绑定隧道返回 409——两种错误均不创建隧道（无孤儿隧道）。
 
 返回示例（创建成功，HTTP 200）：
 ```
@@ -685,6 +691,22 @@ GET /kisamaproxy/https://host:8443/api/exec
   "last_error": null,
   "last_error_at": null,
   "consecutive_failures": 0
+}
+```
+返回示例（创建并绑定，HTTP 200，shz 相关字段 additive）：
+```
+{
+  "status": "ok",
+  "created": true,
+  "tunnel_domain": "https://sunny-breeze-5a6b7c8d.trycloudflare.com",
+  "port": 8080,
+  "created_at": "2026-08-18T12:00:00Z",
+  "tunnel_status": "alive",
+  "last_error": null,
+  "last_error_at": null,
+  "consecutive_failures": 0,
+  "shz_name": "myname-8080",
+  "shz_url": "https://shz.al/~myname-8080"
 }
 ```
 返回示例（同端口重复被拒，HTTP 409）：
@@ -718,6 +740,8 @@ GET /kisamaproxy/https://host:8443/api/exec
 | last_error | string \| null | 最近一次失败原因（新建成功恒为 `null`；java/java11 省略） |
 | last_error_at | string \| null | 最近一次失败时间（新建成功恒为 `null`；java/java11 省略） |
 | consecutive_failures | number | 连续失败轮数（新建成功恒为 `0`） |
+| shz_name | string \| null | 绑定上报名（0.6.8 additive）：仅绑定后返回；未绑定时无此字段（py response_model_exclude_none / js 恒含 null / java/java11 null 省略） |
+| shz_url | string \| null | 绑定上报地址（shz.al 发布页完整 URL）：仅绑定后返回；**首次上报异步进行，响应携带的是预测地址** |
 | message | string | 失败原因（仅 `status=error` 时出现） |
 
 ### 29. 删除临时隧道
@@ -737,7 +761,8 @@ GET /kisamaproxy/https://host:8443/api/exec
 - 端口上存在多条隧道且未指定 `tunnel_domain` 返回 409（提示需精确定位），避免误删；
 - 指定了 `tunnel_domain` 但该端口无匹配隧道返回 404；
 - `port` 非法 / 缺失返回 422；
-- 删除后该公网域名立即失效，并从 GET /api/argo 列表中移除。
+- 删除后该公网域名立即失效，并从 GET /api/argo 列表中移除；
+- **0.6.8 起被删除隧道若带 shz.al 绑定**：自动清绑定（`tunnels[].shz_name`/`shz_url` 携带删除前的绑定信息供复核）、移除 KSTORE `data.argobinds` 持久化条目，并**后台删除远端 shz.al 记录**（`DELETE https://shz.al/~名:密钥`；删除失败静默，远端记录 7 天自然过期兜底）。KMODE=1/2 自建隧道无绑定，行为不变。
 
 返回示例（删除成功，HTTP 200）：
 ```
@@ -774,8 +799,108 @@ GET /kisamaproxy/https://host:8443/api/exec
 | status | string | 请求处理结果：`"ok"` / `"error"` |
 | deleted | number | 实际删除的隧道数量（成功时 ≥1） |
 | port | number | 本次请求的端口 |
-| tunnels | array | 已删除隧道的明细（结构同 GET /api/argo 的 tunnels，0.6.4 起同样携带 `status`/`last_error` 等状态字段），失败时无此字段 |
+| tunnels | array | 已删除隧道的明细（结构同 GET /api/argo 的 tunnels，0.6.4 起同样携带 `status`/`last_error` 等状态字段；0.6.8 起绑定条目同样携带删除前的 `shz_name`/`shz_url`），失败时无此字段 |
 | message | string | 失败原因（仅 `status=error` 时出现） |
+
+### 30. 绑定隧道 shz.al 上报
+路径：POST /api/argo/bind  
+用途：给**已启动**的临时隧道绑定 shz.al 上报（0.6.8 新增，四端统一；`shz_name`/`shz_key` 可显式指定，缺省派生；语义详见本节「动态绑定 shz.al 上报」小节）  
+输入示例（缺省派生）：
+```
+{ "port": 8080 }
+```
+输入示例（显式指定上报名与密钥）：
+```
+{ "port": 8080, "tunnel_domain": "https://sunny-breeze-5a6b7c8d.trycloudflare.com", "shz_name": "myapp", "shz_key": "mysecret-key" }
+```
+输入字段：
+| 字段 | 类型 | 必填 | 说明 |
+| :--- | :--- | :---: | :--- |
+| port | number | 是 | 目标隧道转发端口（整数，1~65535） |
+| tunnel_domain | string | 否 | 同一端口存在多条隧道时用于精确定位；缺省且该端口仅一条隧道时直接绑定该条 |
+| shz_name | string | 否 | 显式指定上报名（完整覆盖派生值 `KNAME-端口`，不再拼接端口；≥3 字符且限字母数字及 `+_-$=@,;/[]*`） |
+| shz_key | string | 否 | 显式指定管理密钥（完整覆盖派生值 `上报名+"123"`；≥8 字符）。**不随查询/绑定响应下发** |
+行为约定：
+- **参数校验先行**：上报名/管理密钥校验失败返回 400（KNAME 未设置或过短、名称非法字符、显式密钥 <8 字符）；
+- 端口上无隧道 / `tunnel_domain` 无匹配返回 404；同端口多隧道未指定返回 409；
+- 目标隧道为 **KMODE=1/2 自建**（source=kmode）返回 409（`tunnel on port N is managed by KMODE`，语义冲突防护）；
+- 该端口已有**其他**隧道被绑定返回 409；重复绑定**同一**隧道视为幂等重报（重新触发首次上报）；
+- 绑定成功即写入 KSTORE `data.argobinds`（KSTORE_KEY 启用时）并**异步首次上报**；响应携带预测发布页地址，查询不等上报；
+- 守护重注册换新域名时按绑定名自动重报（409 → PUT 覆盖，同 KMODE=2）。
+
+返回示例（绑定成功，HTTP 200）：
+```
+{
+  "status": "ok",
+  "bound": true,
+  "port": 8080,
+  "tunnel_domain": "https://sunny-breeze-5a6b7c8d.trycloudflare.com",
+  "shz_name": "myname-8080",
+  "shz_url": "https://shz.al/~myname-8080"
+}
+```
+返回示例（KMODE 隧道拒绝，HTTP 409）：
+```
+{
+  "status": "error",
+  "bound": false,
+  "port": 8000,
+  "message": "tunnel on port 8000 is managed by KMODE, cannot bind via /api/argo/bind"
+}
+```
+字段说明：
+| 字段 | 类型 | 说明 |
+| :--- | :--- | :--- |
+| status | string | 请求处理结果：`"ok"` / `"error"` |
+| bound | boolean | 绑定结果：`true`=已绑定 / `false`=失败 |
+| port | number | 本次请求的端口 |
+| tunnel_domain | string | 目标隧道公网域名（成功时返回） |
+| shz_name | string | 绑定上报名（成功时返回） |
+| shz_url | string | 绑定上报地址（shz.al 发布页完整 URL，成功时返回） |
+| message | string | 失败原因（仅 `status=error` 时出现） |
+
+### 31. 解绑隧道 shz.al 上报
+路径：DELETE /api/argo/bind  
+用途：解绑指定隧道的 shz.al 上报（0.6.8 新增，四端统一）——**保留隧道本身**，清绑定字段与 KSTORE 持久化条目，并**后台删除远端 shz.al 记录**（`DELETE https://shz.al/~名:密钥`，删除失败静默，远端记录 7 天自然过期兜底）  
+输入示例：
+```
+{ "port": 8080 }
+```
+输入字段：
+| 字段 | 类型 | 必填 | 说明 |
+| :--- | :--- | :---: | :--- |
+| port | number | 是 | 目标隧道转发端口（整数，1~65535） |
+| tunnel_domain | string | 否 | 同一端口存在多条隧道时用于精确定位 |
+行为约定：
+- 定位语义与 DELETE /api/argo 一致：端口无隧道 / 无匹配域名 404，同端口多隧道未指定 409；
+- 目标隧道**无绑定**返回 404（`tunnel on port N has no shz.al binding`）；
+- `port` 非法 / 缺失返回 422；
+- 解绑后 GET /api/argo 该条目的 `shz_name`/`shz_url` 回归 `null`。
+
+返回示例（解绑成功，HTTP 200）：
+```
+{
+  "status": "ok",
+  "bound": false,
+  "port": 8080,
+  "tunnel_domain": "https://sunny-breeze-5a6b7c8d.trycloudflare.com",
+  "shz_name": null,
+  "shz_url": null
+}
+```
+
+### 32. 动态绑定 shz.al 上报语义（0.6.8 起）
+
+「KMODE=2 启动期静默上报」（第九节）机制向 `/api/argo` 动态隧道的延伸，四端统一实现、复用同一上报协议与代码路径：
+
+- **名称/密钥派生**：上报名缺省派生 `节点名-端口`（节点名取 KNAME 环境变量）；管理密钥缺省派生 **`上报名 + "123"`（字面后缀）**——最短合法名（3 字符名 + 单数字端口）也满足 shz.al 平台密钥 ≥8 字符约束。接口可显式指定 `shz_name`/`shz_key` 完整覆盖派生值（name 不再拼端口、key 不再拼 123）；只指定其一则另一项按上述规则基于**最终值**派生；
+- **上报协议**：逐字复用 KMODE=2 —— `POST https://shz.al/`（multipart 字段 `c`=隧道域名 / `n`=上报名 / `s`=管理密钥 / `e`=`7d`，UA `curl/8.5.0`），409 冲突 → `PUT https://shz.al/~名:密钥`（去 `n` 字段）覆盖；全程静默（`DEBUG`/`SHZAL_DEBUG=true` 才输出过程）；守护重注册换新域名时自动重报（2s/4s/8s 重试 3 次）；
+- **查询可见性**：绑定状态全程可查——GET /api/argo 条目与 POST /api/argo、POST /api/argo/bind 响应均携带 `shz_name`（上报名）与 `shz_url`（发布页完整 URL）；**管理密钥不随任何响应下发**（与 0.6.4 `last_error` 不含注册凭据同口径）；
+- **绑定唯一性**：每端口至多一条绑定（派生名含端口，同名必然冲突）；绑定其他隧道 409，重复绑定同一隧道 = 幂等重报；
+- **KMODE 隧道隔离**（语义冲突防护）：KMODE=1/2 启动自建隧道打 `source=kmode` 标记——**不可被动态绑定**（409）、**不进 `data.argobinds` 持久化**，其上报仍由 KMODE 配置管理，避免"两个位置管理同一个隧道"；删除 KMODE 隧道行为不变；
+- **KSTORE 持久化与启动恢复**（`KSTORE_KEY` 启用时，见第十三节）：绑定集合落盘 `data.argobinds`（条目 `{port, name, key?}`，**key 仅显式指定时持久化**——派生密钥确定性可重算，缺省场景 KSTORE 无密钥材料）；启动时逐条**新建隧道**（source=restore）并按持久化名称绑定上报——上报地址（`https://shz.al/~名称-端口`）分毫不差（trycloudflare 随机域名变化由 409→PUT 覆盖吸收）；恢复失败（端口被 KMODE 隧道占用 409、网络异常等）仅告警、条目保留；
+- **7 天过期**：与 KMODE=2 同口径——仅启动/换域名/重新绑定时上报，隧道长存活且无域名变化时远端记录按 shz.al 平台规则 7 天过期（周期性续报为遗留项）；
+- **支持矩阵**：py / js / java / java11 ✅（绑定 + 解绑 + 持久化恢复全量）；Go ❌（无 argo 模块，既有口径）。
 
 
 ## 八、FastAPI 自动帮助页面说明
@@ -871,6 +996,16 @@ curl -X PUT "https://shz.al/~env01a:s3cret-key" -F "c=new-value"
 ```
 
 安全提示：预测 URL 无认证即可读（shz.al 平台特性），其暴露的仅是隧道域名本身；隧道背后的 agent 接口仍有完整认证与加密，风险面与 KMODE=1 写本地域名文件相当。
+
+**0.6.8 交叉引用（动态隧道绑定上报）**：本节的上报机制自 0.6.8 起延伸到 `/api/argo` 动态隧道——经 `POST /api/argo`（`shz`/`shz_name`/`shz_key` 参数）或 `POST /api/argo/bind` 可给任意动态隧道绑定同一 shz.al 上报（名称/密钥派生规则、409→PUT 覆盖、查询可见性、KSTORE 持久化恢复等，详见「七」新增的「动态绑定 shz.al 上报」小节，接口定义见其 §30/§31/§32）。与 KMODE=2 的差异对照：
+| 维度 | KMODE=2（本节） | 动态绑定（七 §30-32） |
+| :--- | :--- | :--- |
+| 触发 | 启动期自动（配置驱动） | 接口按隧道显式绑定 |
+| 上报名 | `$KNAME` 原值 | 缺省 `KNAME-端口`，可显式指定 |
+| 管理密钥 | `KNAME_KEY` 缺省复用 KNAME | 缺省 `上报名+"123"`，可显式指定 |
+| 隧道端口 | 固定 agent 自身监听端口 | 任意 `/api/argo` 转发端口 |
+| 持久化 | 不落盘（KNAME 为启动配置，重启自然重报同一 URL） | `KSTORE data.argobinds`（KSTORE_KEY 启用时），重启自动重建隧道并按持久化名称上报 |
+| 互斥 | KMODE=1/2 自建隧道不可被动态绑定（source=kmode 标记，防两个位置管理同一隧道） | 同左 |
 
 ### KMODE=2q / 2quic：QUIC 边缘传输（0.6.1，三端移植）
 
@@ -1041,9 +1176,11 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，请求
 | **临时密钥** | GET | `/api/tempkey`（`format=short` 短格式，0.5.8 起） | 获取临时授权密钥对 | ✅ | ✅ |
 | **超级终端** | WS | `/api/ws/terminal` | 使用交互性终端 | ✅ | ✅ |
 | **代理转发** | ANY | `/kisamaproxy/*` | 转发至任意地址（仅GO） | ❌ | ❌ |
-| **临时隧道-查** | GET | `/api/argo` | 查询临时隧道列表（Py/Js） | ✅ | ✅ |
-| **临时隧道-建** | POST | `/api/argo` | 创建临时隧道（Py/Js） | ✅ | ✅ |
-| **临时隧道-删** | DELETE | `/api/argo` | 删除临时隧道（Py/Js） | ✅ | ✅ |
+| **临时隧道-查** | GET | `/api/argo` | 查询临时隧道列表（Py/Js；0.6.8 起条目含 shz 绑定字段） | ✅ | ✅ |
+| **临时隧道-建** | POST | `/api/argo` | 创建临时隧道（Py/Js；0.6.8 起支持 `shz`/`shz_name`/`shz_key` 创建并绑定） | ✅ | ✅ |
+| **临时隧道-删** | DELETE | `/api/argo` | 删除临时隧道（Py/Js；0.6.8 起删除绑定隧道自动清持久化并删远端记录） | ✅ | ✅ |
+| **隧道绑定上报** | POST | `/api/argo/bind` | 给已启动隧道绑定 shz.al 上报（Py/Js/Java/Java11，0.6.8 起，见七 §30） | ✅ | ✅ |
+| **隧道解绑上报** | DELETE | `/api/argo/bind` | 解绑隧道的 shz.al 上报（保留隧道，Py/Js/Java/Java11，0.6.8 起，见七 §31） | ✅ | ✅ |
 | **hub 中继状态** | GET | `/api/hub` | KMODE=3 kisama-hub 隧道状态（Py/Js/Java/Java11，0.6.6 起，见十九） | ✅ | ✅ |
 | **hub 动态注册** | POST | `/api/hub` | 动态注册到 kisama-hub（Py/Js/Java/Java11，0.6.6 续批起，见 19.9） | ✅ | ✅ |
 | **hub 注销** | DELETE | `/api/hub` | 注销一条 hub 注册（Py/Js/Java/Java11，0.6.6 续批起，见 19.9） | ✅ | ✅ |
@@ -1163,6 +1300,7 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，请求
 
 - `data` 信封为后续扩展预留，当前仅含任务定义；
 - **0.6.6 续批起 `data.hubregs`**：hub 注册任务子类型（kisama-hub 动态注册项，见「十九」19.9），元素 `{hub, kname, ports}`（ports 非法/越界值加载时过滤）；由 `POST/DELETE /api/hub` 自动落盘与删除，启动恢复流程自动重建注册。**additive 键**：`version` 保持 1，老版本 agent 回写容器会丢弃该键（混部期边界：老 agent 任务落盘会静默移除本端 hub 注册持久化，注册表内存态不受影响）——(补充于 19.9)。
+- **0.6.8 起 `data.argobinds`**：argo shz.al 绑定子类型（`/api/argo` 动态隧道的 shz.al 上报绑定，见「七」§32），元素 `{port, name, key?}`——`key`（管理密钥）**仅接口显式指定时持久化**，缺省派生密钥（`name+"123"`）确定性可重算、不落盘（缺省场景 KSTORE 无密钥材料）；port/name 非法条目加载时过滤。由 `POST/DELETE /api/argo/bind` 与带绑定参数的 `POST /api/argo` 自动落盘，隧道删除/解绑自动移除，启动恢复流程自动重建隧道并按持久化名称上报。**additive 键**：`version` 保持 1，老版本 agent 回写容器会丢弃该键（同 hubregs 混部边界）。
 - **任务命令为 shell 字符串，多行脚本原样支持**（JSON 自动转义换行）；
 - 写盘时机：POST `/api/task/onetime`、POST `/api/task/cron`（含清空）成功后同步落盘；原子写（同目录 tmp 文件 + fsync + rename/replace）；
 - 所有存储 I/O 故障只记日志降级，**绝不影响内存任务、请求成功与 agent 启动**。
@@ -1173,7 +1311,8 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，请求
 2. 加载存储：文件缺失 → 空表（首次运行）；解密失败 / JSON 损坏 / magic 不符 / 版本不支持 → 原文件**隔离改名** `store.enc.bad-<时间戳>` + ERROR 日志 + 以空任务启动；版本**高于**当前支持 → 保留原文件不覆盖，本次以空任务启动且持久化只读（防止旧版本 agent 覆盖新版本数据）；
 3. 恢复 `onetasks` / `crontasks` 到内存；
 4. `crontasks` 非空 → 启动既有 cron 调度循环；
-5. 恢复出的启动任务**后台执行一次**（不阻塞 HTTP 就绪），结果写入既有 onetime 日志环形缓冲（重启后仍可经 `/api/task/log/onetime` 查证）。
+5. 恢复出的启动任务**后台执行一次**（不阻塞 HTTP 就绪），结果写入既有 onetime 日志环形缓冲（重启后仍可经 `/api/task/log/onetime` 查证）；
+6. **0.6.8 起（argo 绑定子类型，四端统一）**：恢复 `data.argobinds` 绑定条目 → 逐条**新建隧道**（source=restore）并按持久化名称绑定 shz.al 上报（key 缺省时按最终 name 重算派生密钥）→ 上报地址分毫不差；恢复失败（端口被 KMODE 隧道占用 409、创建失败等）仅告警、条目保留；hubregs 恢复同理但为注册语义（见下）。
 
 ### hub 注册任务子类型（0.6.6 续批起，Py/Js）
 
@@ -1251,10 +1390,10 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，请求
 
 ### 15.1 字段契约
 
-- 类型 `string[]`，元素为小写 ASCII 短名，当前定义八个值，分两类：
-  - **主机探测标记**（Linux 语义，探测判定，见 15.3–15.7）：`root`、`kvm`、`pterodactyl`、`systemd`、`fuse`；
+- 类型 `string[]`，元素为小写 ASCII 短名，当前定义九个值，分两类：
+  - **主机探测标记**（Linux 语义，探测判定，见 15.3–15.7、15.17）：`root`、`kvm`、`pterodactyl`、`systemd`、`fuse`、`netadmin`（0.6.8 起，见 15.17）；
   - **配置类标记**（agent 自身启动配置事实，见 15.8–15.16）：`kstore`、`kmode1`、`kmode2`、`kmode3`（0.6.6 起，Py/Js/Java/Java11，见 15.16）。
-- 顺序固定为 `root` → `kvm` → `pterodactyl` → `systemd` → `fuse` → `kstore` → `kmode1` → `kmode2` → `kmode3`（主机探测标记在前、配置类标记在其后追加，新增标记一律追加在末尾），同一标记只出现一次；客户端必须按集合处理，不得依赖顺序。
+- 顺序固定为 `root` → `kvm` → `pterodactyl` → `systemd` → `fuse` → `netadmin` → `kstore` → `kmode1` → `kmode2` → `kmode3`（主机探测标记在前、配置类标记在其后追加；新增主机探测标记追加在主机组末尾，新增配置类标记追加在配置组末尾——0.6.8 起 `netadmin` 即按此规则插入主机组末尾），同一标记只出现一次；客户端必须按集合处理，不得依赖顺序。
 - 语义：每一项都表示"在 **agent 进程视角**下已确认成立"的客观事实，不表示程度，也不代表宿主机或其它命名空间的状态（见 15.3）。
 - 缺失 / 空数组 / null 三态语义：
   - **字段缺失**：代理未实现该字段（旧版）、部署方禁用，或低权限模拟器副本不实现探测（PHP 两个 emulator 副本按此例外省略字段，不得用 `[]` 冒充"已探测且无命中"）→ 控制端按"未知"处理，不得假设无能力；
@@ -1262,8 +1401,8 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，请求
   - **`null`**：非法值，实现不得输出；客户端遇到时按"字段缺失"处理。
 - 前向兼容：客户端遇到未知取值必须忽略（不得报错，也不得因此丢弃整个响应）。
 - 客户端读取（零依赖）：baseinfo 响应本身就是 JSON，`marks` 是标准 JSON 字符串数组，浏览器/Node 内置 `JSON.parse` 后即为原生 Array，不需要任何三方库：`const marks = Array.isArray(info.marks) ? info.marks : []; marks.includes('kvm')`（IE11 等旧环境用 `marks.indexOf('kvm') !== -1`）。**禁止**对原始响应文本做正则或字符串切分来提取该字段。
-- 平台：五个主机探测标记均为 Linux 语义，Windows / macOS / \*BSD 上不输出、不得伪造；三个配置类标记与平台无关，**全平台输出**。因此非 Linux 平台的 `marks` 不再必然为 `[]`（例如启用了持久化的 Windows 节点返回 `["kstore"]`）。
-- 可用性：additive 可选字段。主机探测标记五端（`0.6.0-*`）与 PHP 两个完整副本（`0.6.0-php`、`0.6.0-php-cpanel-ai`）已实现；配置类标记自 `0.6.4` 起由 py / js / java / java11 实现（`kmode3` 自 0.6.6 续批起四端同步；go 未实现 KMODE，只可能命中 `kstore`），PHP 四个副本无 KSTORE/KMODE 实现、不输出配置类标记；两个 emulator 副本按上述例外省略字段。控制端以"字段是否存在"判定，不要求版本号门槛。
+- 平台：六个主机探测标记均为 Linux 语义，Windows / macOS / \*BSD 上不输出、不得伪造；四个配置类标记与平台无关，**全平台输出**。因此非 Linux 平台的 `marks` 不再必然为 `[]`（例如启用了持久化的 Windows 节点返回 `["kstore"]`）。
+- 可用性：additive 可选字段。主机探测标记五端（`0.6.0-*`）与 PHP 两个完整副本（`0.6.0-php`、`0.6.0-php-cpanel-ai`）已实现；`netadmin`（15.17）自 0.6.8 起五端与 PHP 两个完整副本同步实现；配置类标记自 `0.6.4` 起由 py / js / java / java11 实现（`kmode3` 自 0.6.6 续批起四端同步；go 未实现 KMODE，只可能命中 `kstore`），PHP 四个副本无 KSTORE/KMODE 实现、不输出配置类标记；两个 emulator 副本按上述例外省略字段。控制端以"字段是否存在"判定，不要求版本号门槛。
 - 生命周期：进程级静态属性（P 级）——进程启动后首次 baseinfo 计算一次并写入快照，生命周期内不再重探；**不随 T 级 TTL 过期、也不随临时密钥轮换而重跑**（见「十六」）。配置类标记由启动期环境变量决定、进程内恒定，进 P 级快照无时效问题。
 
 ### 15.2 探测总则（准确优先、零子进程、零网络）
@@ -1460,8 +1599,8 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，请求
 
 ### 15.12 性能预算与实测
 
-- 设计目标：五标记冷态全量探测 ≤ 5 ms；热态（缓存命中）≤ 0.5 ms；相对 baseinfo 现有外网 IP 探测（多个 HTTPS 请求，几十至几百 ms）可忽略。配置类标记为 O(1) 常量读，不进入该预算。
-- 成本分项：`root` 1 次系统调用（java/php 需 1 次 `/proc/self/status` 读，可与 `fuse` 共用）；`kvm` 1 `stat` + 1 `open/close`；`fuse` 1 `stat` + 1 `open/close` + ≤4 次助手 `stat`；`pterodactyl` 1 次 `mountinfo` 读（实测 3–4 KB）+ 1–2 次 `environ` 读；`systemd` 4–5 次 `stat`（`/run/systemd/system`、两个控制通道、≤3 个 `systemctl` 候选路径）。全部为本地、可短路、无子进程。
+- 设计目标：六标记冷态全量探测 ≤ 5 ms；热态（缓存命中）≤ 0.5 ms；相对 baseinfo 现有外网 IP 探测（多个 HTTPS 请求，几十至几百 ms）可忽略。配置类标记为 O(1) 常量读，不进入该预算。
+- 成本分项：`root` 1 次系统调用（java/php 需 1 次 `/proc/self/status` 读，可与 `fuse` 共用）；`kvm` 1 `stat` + 1 `open/close`；`fuse` 1 `stat` + 1 `open/close` + ≤4 次助手 `stat`；`netadmin` 1 次 `/proc/self/status` 读（与 `root`/`fuse` 同文件）；`pterodactyl` 1 次 `mountinfo` 读（实测 3–4 KB）+ 1–2 次 `environ` 读；`systemd` 4–5 次 `stat`（`/run/systemd/system`、两个控制通道、≤3 个 `systemctl` 候选路径）。全部为本地、可短路、无子进程。
 - 实测（2026-10-22）：
   - root+KVM+systemd+fuse 主机（go 0.5.8）：`/proc/self/mountinfo` 3169 B、`/proc/1/environ` 93 B；Python 参考实现（root/kvm/pterodactyl/systemd 四项）200 次均值 **0.085 ms/次**（文件系统缓存热态）。
   - 翼龙容器（java 0.5.9，uid 998）：`/proc/self/mountinfo` 3649 B、`/proc/1/environ` 567 B；容器内无 python3，未跑同款基准，读取量同量级。
@@ -1472,7 +1611,7 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，请求
 - **additive**：不改变 baseinfo 既有字段、端点、认证链、签名与响应加密；旧控制端忽略新字段，新控制端必须容忍字段缺失。配置类标记（15.8–15.10）同样 additive：未启用持久化 / `KMODE=0` 的节点输出与 0.6.2 完全一致（非 Linux 为 `[]`），已启用节点仅在末尾多出对应布尔值。
 - **暴露面**：`marks` 与 baseinfo 其余字段同策略下发。当前 baseinfo 位于匿名白名单，实测两台真机未认证 `GET /api/baseinfo` 均返回 200 与全量字段（无 `session_key`），因此 `marks` 同样对未认证方可读。它只含能力布尔值，不含凭证、密钥、路径或地址，敏感度低于已暴露的 `os`/`kernel_version`/`ipv4`。配置类标记在此基础上多暴露三个**部署形态布尔**（持久化是否启用、启动模式 1/2）——不含路径、密钥与隧道域名，敏感度与既有能力布尔同档；已作为设计特性在 SECURITY-AUDIT 台账留档。若后续执行 SECURITY-AUDIT 的 M2 / B-3（匿名端点瘦身），`marks` 与 `os`/`kernel_version` 同档处理，不做字段级特殊裁剪，也不新增端点。
 - **已知漏报（预期，不算缺陷）**：五个主机探测标记在非 Linux 不输出（配置类标记不受此限，见 15.1 平台条款）；`/proc` 被 hidepid 或强隔离屏蔽；翼龙容器无读 `/proc/1/environ` 权限且未命中 `mountinfo`、兜底四条件不全；wings 自定义 `system.data` 且 hostname 非 UUID；go 端永不输出 `kmode1`/`kmode2`（未实现 KMODE）。
-- **已知误报边界（如实记录）**：`CapEff` 置位但 seccomp/LSM 另行拦截 `mount(2)` 时，`fuse` 仍会命中——本规范不做真实挂载（需实现 FUSE 守护进程，成本与副作用不可接受），接受该极窄误报；同理 `kvm` 在未启用严格模式时只保证"设备可打开"。
+- **已知误报边界（如实记录）**：`CapEff` 置位但 seccomp/LSM 另行拦截 `mount(2)` 时，`fuse` 仍会命中——本规范不做真实挂载（需实现 FUSE 守护进程，成本与副作用不可接受），接受该极窄误报；`netadmin` 同档：`CapEff` 第 12 位置位但 seccomp/LSM 另行拦截 netlink/接口创建时仍命中（不做真实建卡验证，见 15.17）；同理 `kvm` 在未启用严格模式时只保证"设备可打开"。
 - **误报防线**：弱特征必须四项同时满足；`kvm`/`fuse` 以"能打开设备"而非"路径存在"为准；`systemd` 三重条件；`root` 取 effective 而非 real。
 - **禁止用 `virtualization` 反推**：py 对 `/proc/cpuinfo` 中的 `KVM`/`QEMU` 字样返回 `QEMU`，go 的 `kvm` 表示"本机是虚拟机"，与"能运行 KVM"相反或无关。
 
@@ -1492,9 +1631,11 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，请求
 | 场景 | 期望 `marks` |
 |---|---|
 | 翼龙容器：998:998、无 `/dev/kvm`、无 `/dev/fuse`、无 systemd | `["pterodactyl"]` |
-| root + `/dev/kvm` 可读写 + systemd 运行 + `/dev/fuse` 可读写且有 `CAP_SYS_ADMIN` | `["root","kvm","systemd","fuse"]` |
-| Docker root 容器（默认 capability，无 `CAP_SYS_ADMIN`） | 不含 `fuse`（即使映射了 `/dev/fuse`）；无 `/dev/kvm` 时也不含 `kvm` |
+| root + `/dev/kvm` 可读写 + systemd 运行 + `/dev/fuse` 可读写且有 `CAP_SYS_ADMIN` | `["root","kvm","systemd","fuse","netadmin"]`（0.6.8 起：root 主机 `CapEff` 全量含 `CAP_NET_ADMIN`，第 12 位为 1） |
+| Docker root 容器（默认 capability，无 `CAP_SYS_ADMIN`、无 `CAP_NET_ADMIN`） | 不含 `fuse` 与 `netadmin`（即使映射了 `/dev/fuse`）；无 `/dev/kvm` 时也不含 `kvm` |
 | 非 root、不在 `kvm` 组 | 不含 `kvm` |
+| 非 root、未获 `CAP_NET_ADMIN`（常规用户进程，`CapEff` 常态 `0000000000000000`） | 不含 `netadmin` |
+| 非 root、经 ambient/file capabilities 获得 `CapEff` 第 12 位 | 含 `netadmin` |
 | 有 `systemctl` 但 `/run/systemd/system` 缺失 | 不含 `systemd` |
 | Windows / macOS 代理，未启用持久化、`KMODE=0` | `[]` |
 | Windows 代理，`KSTORE_KEY` 合法 + `KMODE=2` | `["kstore","kmode2"]`（go 端为 `["kstore"]`） |
@@ -1516,6 +1657,25 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，请求
 - **go 端未实现 KMODE**，go 永不输出 `kmode3`。
 
 实测（2026-11-16，Windows 10 实机）：py agent `KMODE=3 KHUB=http://127.0.0.1:18080 KNAME=demo1 KHUB_PORTS=7788` 启动并注册成功 → 未认证 `GET /api/baseinfo` → `marks` 含 `kmode3`；0.6.6 续批 java/java11 实机同拓扑（KHUB=http://127.0.0.1:18080，注册经 hub 成功）→ 经 hub 中继的 `GET /api/baseinfo` 响应 `marks` 含 `kmode3`（java 版本号 `0.6.5-java`、java11 `0.6.5-java11`）。取值矩阵（0/1/2/3/非法值）由离线单测覆盖（tests/py/test_marks.py / tests/js/test_marks.js）。
+
+### 15.17 `netadmin` —— 可创建/配置网络接口并重定向流量的前提（主机探测标记，0.6.8 起）
+
+目的：判断该环境是否具备创建/配置网络接口与重定向流量（组网/分流类任务）的能力前提。TUN/TAP 虚拟网卡创建、veth/bridge/dummy 接口创建、iptables/nftables 规则与路由表改写等操作的内核许可统一由 `CAP_NET_ADMIN` 把守，该 capability 是这类操作的最小充分判据；与 `fuse`（15.7，`CAP_SYS_ADMIN` 口径）互补，供控制端做任务路由与降级。
+
+判据（仅 Linux）：`/proc/self/status` 的 `CapEff` **第 12 位（CAP_NET_ADMIN）为 1**。
+
+实现：复用既有 `CapEff` 解析器，单次 `/proc/self/status` 限长读——py `_marks_cap_eff_bit(12)`、js `_capEffBit(12)`、go `marksCapEffBit(12)`、java/java11 `capEffBit(12)`、PHP 两个完整副本 `_marksCapEffBit(12)`；0.6.8 起五端 + PHP 两个完整副本同批实现，固定顺序插在 `fuse` 之后（15.1）。
+
+排除与边界：
+
+- 非 Linux 平台不报（主机探测标记平台条款，15.1）。
+- **不依据 `root` 推断**：容器可对 root 进程 drop `CAP_NET_ADMIN`（Docker 默认 capability 集不含它，需 `--cap-add NET_ADMIN` 显式授予），此类容器即使 euid 为 0 也如实不报；反之非 root 进程经 ambient/file capabilities 获得 effective 置位时如实报。
+- `CapBnd`/`CapPrm` 置位而 `CapEff` 未置位不报（15.2"只报确定命中"：effective 集才是当前可立即使用的口径，与 15.7 `fuse` 第 3 条一致）。
+- 漏报（预期，不算缺陷）：进程可经 user namespace 新建 netns 并在**该 netns 内**获得 `CAP_NET_ADMIN`，但当前 netns 的 `CapEff` 未置位时不报——标记只描述 agent 进程当前命名空间视角的事实（15.1）。
+- 误报边界与 `fuse` 同档（15.13）：`CapEff` 置位但 seccomp/LSM 另行拦截 netlink/接口创建时仍命中——本规范不做真实建卡验证（创建网络接口有持久副作用，成本与可回滚性都不可接受）。
+- 本标记不承诺 `CAP_NET_RAW`（原始套接字/packet socket，第 13 位）：需要表达时按 15.14 单独新增标记，不得复用本值；也不保证具体隧道/分流方案的外网可达性（那属 T 级网络探测与运行时验证的职责）。
+
+实测（2026-11-22，两台真机交叉验证）：本地源码 go 交叉编译静态二进制（`CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build`），经既有旧版 agent 的 exec 在两台机器各另起独立测试进程（`KPORT=27611`，setsid 脱离会话，不动在役 agent），测试进程内匿名 curl `127.0.0.1:27611/api/baseinfo` 取 marks，并与测试进程自身 `/proc/<pid>/status` 的 `CapEff` 逐台对账——① pidginhost（debian 13.7，uid 0 root，`CapEff=000001ffffffffff`）→ `marks` 命中 `["root","kvm","systemd","fuse","netadmin"]`，`netadmin` 位次在 `fuse` 之后，二次请求 P 级快照稳定；② anaconda（ubuntu 20.04 docker 容器，非特权用户 uid 2993416，`CapEff=0000000000000000`）→ `marks` 为 `[]`，不命中 `netadmin` 亦不命中其余主机标记。两台判读与 OS 级 `CapEff` 真相完全一致；测试进程与上传文件已清理（其中一台容器 PID 1 不回收子进程，死亡测试进程残留 zombie 态空壳，无端口/文件/资源占用，随容器生命周期消失，如实记录）。离线单测另覆盖置位/未置位/坏数据三态与固定顺序（tests/py/test_marks.py、tests/js/test_marks.js、go/utils/marks_test.go，夹具注入 `/proc` 根路径）。
 
 ## 十六、`/api/baseinfo` 字段分级缓存与快照语义
 
@@ -1549,7 +1709,7 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，请求
 | `kernel_version` | P | 进程生命周期 | 低（`uname`） | 进程内不变 |
 | `version` | P | 进程生命周期 | 常量 | 代理版本 |
 | `virtualization` | P | 进程生命周期 | 中（`/.dockerenv`、cgroup、mountinfo、cpuinfo） | 容器/虚拟化身份在进程内不变 |
-| `marks` | **P** | 进程生命周期 | 中（stat/open、mountinfo、environ） | 与第十五节一致：**进程全生命周期只探测一次** |
+| `marks` | **P** | 进程生命周期 | 中（stat/open、mountinfo、environ、/proc/self/status CapEff） | 与第十五节一致：**进程全生命周期只探测一次** |
 | `disk_total` | T | **30s** | 低（`statvfs`） | 卷扩容后 30 秒内可见 |
 | `mem_total` | T | **30s** | 低（`/proc/meminfo` 或 cgroup 限额文件） | 容器限额调整后 30 秒内可见 |
 | `swap_total` | T | **30s** | 低（`/proc/meminfo` 或 cgroup 文件） | 同上 |

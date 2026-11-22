@@ -974,7 +974,7 @@ class Config:
     DOH_SERVERS = os.getenv("KISAMA_DOH_SERVERS", "").strip()
 
     # 代理版本信息
-    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.6.7-python")
+    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.6.8-python")
     
     # ================= 启动校验 =================
     
@@ -2331,13 +2331,14 @@ class SystemInfoCollector:
                 ("pterodactyl", self._mark_pterodactyl),
                 ("systemd", self._mark_systemd),
                 ("fuse", self._mark_fuse),
+                ("netadmin", self._mark_netadmin),
             ):
                 try:
                     if probe():
                         marks.append(name)
                 except Exception as e:
                     Logger.debug(f"marks 探测失败 [{name}]: {e}", 11)
-        # 配置类标记 (kstore/kmode1/kmode2/kmode3, docs/API.MD 15.8-15.11): agent 自身配置事实,
+        # 配置类标记 (kstore/kmode1/kmode2/kmode3, docs/API.MD 15.8-15.16): agent 自身配置事实,
         # 与平台无关 (非 Linux 同样输出); KMODE 已在 Config 归一化 (2q/2quic → "2")
         for name, probe in (
             ("kstore", self._mark_kstore),
@@ -2453,6 +2454,10 @@ class SystemInfoCollector:
             if stat.S_ISREG(st.st_mode) and (st.st_mode & stat.S_ISUID) and os.access(path, os.X_OK):
                 return True
         return False
+
+    def _mark_netadmin(self) -> bool:
+        """ CapEff bit12 (CAP_NET_ADMIN): 可创建/配置网络接口并重定向流量; 不依据 root 推断 """
+        return _marks_cap_eff_bit(12)
 
     async def get_realtime_info(self) -> Dict[str, Any]:
         """获取实时监控信息"""
@@ -7695,7 +7700,7 @@ class CloudflareQuickTunnel:
     # 1. start(): 向 api.trycloudflare.com 注册, 拿到临时公网域名并启动守护线程
     # 2. 守护线程维护与 Cloudflare Edge 的 HTTP/2 长连接, 断线自动重连
     # 3. stop(): 断开当前连接并退出守护线程
-    def __init__(self, port, logger=None, quick_service=QUICK_SERVICE, retry_seconds=2.0, verify_certificate=None, silent=False, use_quic=False, requester=None):
+    def __init__(self, port, logger=None, quick_service=QUICK_SERVICE, retry_seconds=2.0, verify_certificate=None, silent=False, use_quic=False, requester=None, source="api"):
         # 🔐 A-2: 默认校验 Cloudflare edge 证书; 自定义链路确需豁免时 KISAMA_EDGE_INSECURE=true
         if verify_certificate is None:
             verify_certificate = os.getenv("KISAMA_EDGE_INSECURE", "").strip().lower() != "true"
@@ -7706,6 +7711,9 @@ class CloudflareQuickTunnel:
         self.retry_seconds = retry_seconds
         self.verify_certificate = verify_certificate
         self.silent = silent              # KMODE=2 静默模式: 不向 stdout 打印隧道域名
+        # 0.6.8 隧道来源: kmode=KMODE=1/2 启动自建 | api=/api/argo 动态创建 | restore=KSTORE 绑定恢复;
+        # kmode 来源不进动态绑定体系 (不可 bind、不持久化, 防止两个位置管理同一隧道)
+        self.source = source
         # 🚦 本条隧道的边缘传输 ('h2'|'quic'): 注册协议与传输无关, 按隧道独立选择;
         # QUIC 建连连续失败达阈值自动回退 h2 (实例级, 重启进程恢复)
         self.transport = "quic" if use_quic else "h2"
@@ -7720,6 +7728,10 @@ class CloudflareQuickTunnel:
         self.last_registered_at = None    # 最近一次成功注册时间 (int epoch, 无则 None)
         # 🛡️ 守护重建换新域名时的回调 (old_domain, new_domain); KMODE 接线后自动再上报/重写域名文件
         self.on_domain_change = None
+        # 0.6.8 动态绑定 shz.al 上报 (docs/API.MD 七): None=未绑定; 绑定后换域名自动重报 (409->PUT 覆盖)
+        self.shz_name = None             # 上报名 (缺省派生 KNAME-端口, 接口可显式指定)
+        self.shz_key = None              # 管理密钥 (缺省派生 上报名+"123", 接口可显式指定; 不随查询接口下发)
+        self.shz_key_explicit = False    # 密钥是否接口显式指定 (仅显式指定时持久化进 kstore data.argobinds)
         self._stop = threading.Event()
         self._thread = None
         self._sock = None
@@ -7934,18 +7946,21 @@ class ArgoTunnelManager:
     # 管理全部 Cloudflare 临时隧道:
     # - 默认同一端口只允许一条隧道, 携带 duplicate=True 才可重复创建
     # - 线程安全: 查询 / 创建 / 停止均加锁
-    def __init__(self, logger=None):
+    # - 0.6.8: 动态绑定 shz.al 上报 (bind/unbind_tunnel, docs/API.MD 七); store 为 TaskStore
+    #   实例引用 (绑定集合落盘 data.argobinds), None=未注入 (绑定仅内存)
+    def __init__(self, logger=None, store=None):
         self._tunnels = []                      # 全部隧道实例 (按创建顺序)
         self._by_port = {}                      # port -> [隧道实例] (允许重复)
         self._lock = threading.Lock()
         self.log = logger if logger is not None else _ArgoLogAdapter()
         # 🛡️ 守护重建换新域名时的回调 (old_domain, new_domain), 创建隧道时下发给实例
         self.on_domain_change = None
+        self.store = store
         # 注册请求注入缝 (_requester 为测试注入缝, 生产恒为 None → request_quick_tunnel)
         self._requester = None
 
     def list_tunnels(self):
-        # 返回临时隧道 (域名 / 端口 / 创建时间 / 状态) — 含失效条目, 状态透明交 Panel 灰显区分
+        # 返回临时隧道 (域名 / 端口 / 创建时间 / 状态 / 0.6.8 绑定信息) — 含失效条目, 状态透明交 Panel 灰显区分
         with self._lock:
             return [
                 {
@@ -7958,13 +7973,31 @@ class ArgoTunnelManager:
                     "last_error_at": tunnel.last_error_at,
                     "consecutive_failures": tunnel.consecutive_failures,
                     "last_registered_at": (datetime.fromtimestamp(tunnel.last_registered_at, timezone.utc).isoformat().replace("+00:00", "Z") if tunnel.last_registered_at is not None else None),
+                    "shz_name": tunnel.shz_name,
+                    "shz_url": ("https://shz.al/~" + tunnel.shz_name) if tunnel.shz_name else None,
                 }
                 for tunnel in self._tunnels
                 if tunnel.hostname is not None
             ]
 
-    def create_tunnel(self, port, duplicate=False, silent=False, quic=False):
+    def create_tunnel(self, port, duplicate=False, silent=False, quic=False, source="api",
+                      shz=False, shz_name=None, shz_key=None):
         # 重复策略: 同端口已有隧道且未声明 duplicate 时拒绝 (409)
+        # 0.6.8: source 隧道来源 (kmode|api|restore); shz/shz_name/shz_key 触发创建后绑定
+        # (shz=true 或 shz_name/shz_key 任一非空), 校验失败 400、端口已有绑定 409 — 均在
+        # 注册前拦截, 不产生孤儿隧道
+        want_bind = bool(shz) or shz_name is not None or shz_key is not None
+        if want_bind:
+            bind_err = argo_bind_error(port, shz_name, shz_key)
+            if bind_err:
+                raise ArgoTunnelError(400, bind_err)
+            with self._lock:
+                for existing in self._tunnels:
+                    if existing.port == port and existing.shz_name is not None:
+                        raise ArgoTunnelError(
+                            409,
+                            "port %d already has a bound tunnel (%s), unbind it first" % (port, existing.shz_name),
+                        )
         with self._lock:
             if self._by_port.get(port) and not duplicate:
                 raise ArgoTunnelError(
@@ -7972,7 +8005,7 @@ class ArgoTunnelManager:
                     "tunnel already exists on port %d, set duplicate=true to force creation" % port,
                 )
         # 注册 + 建连属于网络操作, 放在锁外执行, 避免长时间阻塞查询接口
-        tunnel = CloudflareQuickTunnel(port=port, logger=self.log, silent=silent, use_quic=quic, requester=self._requester)
+        tunnel = CloudflareQuickTunnel(port=port, logger=self.log, silent=silent, use_quic=quic, requester=self._requester, source=source)
         tunnel.on_domain_change = self.on_domain_change
         try:
             tunnel.start()
@@ -7982,6 +8015,14 @@ class ArgoTunnelManager:
         with self._lock:
             self._tunnels.append(tunnel)
             self._by_port.setdefault(port, []).append(tunnel)
+        bound_url = None
+        if want_bind:
+            final_name = argo_bind_name(port) if shz_name is None else str(shz_name)
+            final_key = argo_bind_key(final_name) if shz_key is None else str(shz_key)
+            self._apply_bind(tunnel, final_name, final_key, explicit_key=shz_key is not None)
+            bound_url = "https://shz.al/~" + final_name
+            self._persist_argobinds()
+            self._report_bound_async(tunnel)
         return {
             "status": "ok",
             "created": True,
@@ -7993,6 +8034,125 @@ class ArgoTunnelManager:
             "last_error": tunnel.last_error,
             "last_error_at": tunnel.last_error_at,
             "consecutive_failures": tunnel.consecutive_failures,
+            "shz_name": (tunnel.shz_name if want_bind else None),
+            "shz_url": bound_url,
+        }
+
+    # ------------------------------------------------------------------
+    # 0.6.8 动态绑定 shz.al 上报 (docs/API.MD 七): 绑定 / 解绑 / 持久化
+    # ------------------------------------------------------------------
+    def _apply_bind(self, tunnel, name, key, explicit_key=False):
+        # 写绑定字段 + 覆盖实例级 on_domain_change (守护重建换域名时按绑定名重报, 409->PUT 覆盖);
+        # KMODE 的 manager 级回调不动 (kmode 来源隧道不可绑定)
+        tunnel.shz_name = name
+        tunnel.shz_key = key
+        tunnel.shz_key_explicit = explicit_key
+        tunnel.on_domain_change = lambda old_domain, new_domain: KModeController.report_domain_change(
+            new_domain, name=name, key=key)
+
+    def _report_bound_async(self, tunnel):
+        # 绑定后首次上报放后台线程 (30s 超时网络调用不阻塞请求/启动流程), 复用 KMODE=2 重试节奏
+        def _report():
+            KModeController.report_domain_change(tunnel.hostname, name=tunnel.shz_name, key=tunnel.shz_key)
+        threading.Thread(target=_report, daemon=True, name="argo-shzal-report-%d" % tunnel.port).start()
+
+    def _persist_argobinds(self):
+        # 当前绑定集合落盘 kstore data.argobinds (additive 键); 未注入 store/未启用/只读时静默跳过。
+        # key 仅显式指定时持久化 (派生密钥 name+"123" 确定性可重算, 缺省场景 KSTORE 无密钥材料)
+        store = getattr(self, "store", None)
+        if store is None:
+            return False
+        items = []
+        with self._lock:
+            for t in self._tunnels:
+                if t.shz_name is not None:
+                    entry = {"port": t.port, "name": t.shz_name}
+                    if t.shz_key is not None and t.shz_key_explicit:
+                        entry["key"] = t.shz_key
+                    items.append(entry)
+        return store.save_argobinds(items)
+
+    def _locate_tunnel(self, port, tunnel_domain, action):
+        # 绑定/解绑共用的定位语义 (复用 delete_tunnel 规则): 端口无隧道 404 / 同端口多隧道
+        # 未指定域名 409 / 指定域名无匹配 404; 返回唯一目标实例
+        with self._lock:
+            candidates = self._by_port.get(port) or []
+            if not candidates:
+                raise ArgoTunnelError(404, "no tunnel found on port %d" % port)
+            if tunnel_domain is not None:
+                targets = [t for t in candidates if t.hostname == tunnel_domain]
+                if not targets:
+                    raise ArgoTunnelError(
+                        404, "no tunnel found on port %d with domain %s" % (port, tunnel_domain)
+                    )
+            elif len(candidates) > 1:
+                raise ArgoTunnelError(
+                    409,
+                    "multiple tunnels exist on port %d, specify tunnel_domain to disambiguate" % port,
+                )
+            else:
+                targets = list(candidates)
+            return targets[0]
+
+    def bind_tunnel(self, port, tunnel_domain=None, shz_name=None, shz_key=None):
+        # 0.6.8: 给已启动隧道绑定 shz.al 上报 (docs/API.MD 七)
+        # - 参数校验 400 (KNAME 派生失败 / 显式名非法 / 显式密钥 <8 字符)
+        # - KMODE=1/2 自建隧道不可绑定 409 (语义冲突防护, 防止两个位置管理同一隧道)
+        # - 端口已被其他隧道绑定 409; 重复绑定同一隧道 = 幂等重报
+        # - 绑定成功即落盘 + 后台首次上报; 响应携带预测发布页地址 (查询接口可见, 密钥不下发)
+        bind_err = argo_bind_error(port, shz_name, shz_key)
+        if bind_err:
+            raise ArgoTunnelError(400, bind_err)
+        target = self._locate_tunnel(port, tunnel_domain, "bind")
+        with self._lock:
+            if target.source == "kmode":
+                raise ArgoTunnelError(
+                    409,
+                    "tunnel on port %d is managed by KMODE, cannot bind via /api/argo/bind" % port,
+                )
+            for existing in self._tunnels:
+                if existing is not target and existing.port == port and existing.shz_name is not None:
+                    raise ArgoTunnelError(
+                        409,
+                        "port %d already has a bound tunnel (%s), unbind it first" % (port, existing.shz_name),
+                    )
+        name = argo_bind_name(port) if shz_name is None else str(shz_name)
+        key = argo_bind_key(name) if shz_key is None else str(shz_key)
+        self._apply_bind(target, name, key, explicit_key=shz_key is not None)
+        self._persist_argobinds()
+        self._report_bound_async(target)
+        return {
+            "status": "ok",
+            "bound": True,
+            "port": port,
+            "tunnel_domain": target.hostname,
+            "shz_name": name,
+            "shz_url": "https://shz.al/~" + name,
+        }
+
+    def unbind_tunnel(self, port, tunnel_domain=None):
+        # 0.6.8: 解绑 — 保留隧道, 清绑定字段与持久化条目, 远端 shz.al 记录后台删除
+        # (30s 超时网络调用不阻塞响应); 目标隧道无绑定 404
+        target = self._locate_tunnel(port, tunnel_domain, "unbind")
+        with self._lock:
+            if target.shz_name is None:
+                raise ArgoTunnelError(404, "tunnel on port %d has no shz.al binding" % port)
+            bound_name, bound_key = target.shz_name, target.shz_key
+            bound_domain = target.hostname
+            target.shz_name = None
+            target.shz_key = None
+            target.shz_key_explicit = False
+            target.on_domain_change = self.on_domain_change  # 恢复 manager 级回调 (可能为 None / KMODE 回调)
+        self._persist_argobinds()
+        threading.Thread(target=KModeController.delete_shzal, args=(bound_name, bound_key),
+                         daemon=True, name="argo-shzal-delete-%d" % port).start()
+        return {
+            "status": "ok",
+            "bound": False,
+            "port": port,
+            "tunnel_domain": bound_domain,
+            "shz_name": None,
+            "shz_url": None,
         }
 
     def delete_tunnel(self, port, tunnel_domain=None):
@@ -8030,11 +8190,26 @@ class ArgoTunnelManager:
                     "port": t.port,
                     "created_at": datetime.fromtimestamp(t.created_at, timezone.utc).isoformat().replace("+00:00", "Z"),
                     "transport": t.transport,
+                    "shz_name": t.shz_name,
+                    "shz_url": ("https://shz.al/~" + t.shz_name) if t.shz_name else None,
                 }
                 for t in targets
             ]
+            # 0.6.8: 被删除隧道若带 shz.al 绑定 → 清绑定与持久化条目, 远端记录随后台删除
+            bound_removed = []
+            for t in targets:
+                if t.shz_name is not None:
+                    bound_removed.append((t.shz_name, t.shz_key))
+                    t.shz_name = None
+                    t.shz_key = None
+                    t.shz_key_explicit = False
         for tunnel in targets:
             tunnel.stop()
+        if bound_removed:
+            self._persist_argobinds()
+            for name, key in bound_removed:
+                threading.Thread(target=KModeController.delete_shzal, args=(name, key),
+                                 daemon=True, name="argo-shzal-delete").start()
         return {"status": "ok", "deleted": len(targets), "port": port, "tunnels": deleted_info}
 
     def stop_all(self):
@@ -8744,10 +8919,16 @@ class KModeController:
         return valid
 
     @classmethod
-    def report_shzal(cls, domain):
+    def report_shzal(cls, domain, name=None, key=None):
         # 上报隧道域名到 shz.al: POST 创建 (409 冲突则 PUT 覆盖), 全程静默 —
-        # 不输出域名 / 上报结果 / 平台 URL, 失败返回 False 不抛错, 不影响正常启动
-        name, key = Config.KNAME, (Config.KNAME_KEY or Config.KNAME)
+        # 不输出域名 / 上报结果 / 平台 URL, 失败返回 False 不抛错, 不影响正常启动。
+        # 0.6.8: name/key 可选参数供 argo 动态绑定上报复用同一协议 (docs/API.MD 七/九),
+        # 缺省 None 走 Config (KMODE=2 语义: name=KNAME, key=KNAME_KEY 缺省复用 KNAME) 不变
+        kmode_call = name is None   # 未传 name = KMODE 路径 (跟踪内存域名; 动态绑定路径不跟踪)
+        if name is None:
+            name = Config.KNAME
+        if key is None:
+            key = (Config.KNAME_KEY or Config.KNAME)
         import urllib.error
         import urllib.request
         import uuid
@@ -8785,20 +8966,44 @@ class KModeController:
                             detail = ""
                         Logger.warning(f"[KMODE-DEBUG] report status: {exc.code} body: {detail}")
                     raise
-            cls._domain = domain
+            if kmode_call:
+                # KMODE=1/2 路径: 跟踪内存域名 (KMODE=1 /domain 指令用);
+                # argo 动态绑定上报 (显式传 name) 不污染该状态
+                cls._domain = domain
             return True
         except Exception:
             return False
 
     @classmethod
-    def report_domain_change(cls, domain):
+    def report_domain_change(cls, domain, name=None, key=None):
         # 🛡️ 守护重建后的新域名上报: 指数退避重试 3 次 (2s/4s/8s), 全程静默 —
-        # 新域名必须尽量送达, 否则控制端按预测 URL 将读到旧值/404
+        # 新域名必须尽量送达, 否则控制端按预测 URL 将读到旧值/404。
+        # 0.6.8: name/key 透传 report_shzal (argo 动态绑定换域名重报复用同一重试节奏)
         for attempt in range(3):
-            if cls.report_shzal(domain):
+            if cls.report_shzal(domain, name=name, key=key):
                 return
             if attempt < 2:
                 time.sleep(2 ** (attempt + 1))
+
+    @classmethod
+    def delete_shzal(cls, name, key):
+        # 0.6.8: 删除远端 shz.al 记录 (DELETE https://shz.al/~name:key, 与 tools/verify_all.py
+        # _delete_shzal 同口径)。仅 argo 动态绑定解绑/隧道删除时调用; 静默失败仅 DEBUG 日志,
+        # 返回 False 不抛错 (远端记录 7 天自然过期兜底)
+        import urllib.error
+        import urllib.request
+        try:
+            req = urllib.request.Request(f"https://shz.al/~{name}:{key}", method="DELETE")
+            # Cloudflare 会拦截默认 Python-urllib UA (403), 与 report_shzal 同一 UA
+            req.add_header("User-Agent", "curl/8.5.0")
+            urllib.request.urlopen(req, timeout=30)
+            return True
+        except urllib.error.HTTPError as exc:
+            if Config.DEBUG:
+                Logger.warning(f"[KMODE-DEBUG] delete shz.al status: {exc.code}")
+            return False
+        except Exception:
+            return False
 
     @staticmethod
     def _home_dir():
@@ -8869,7 +9074,8 @@ class KModeController:
     @classmethod
     def _tunnel_task(cls, manager, after_domain=None, silent=False, quic=False):
         try:
-            manager.create_tunnel(Config.PORT, silent=silent, quic=quic)
+            # source="kmode": KMODE=1/2 自建隧道不进动态绑定体系 (0.6.8, 语义冲突防护)
+            manager.create_tunnel(Config.PORT, silent=silent, quic=quic, source="kmode")
         except Exception as exc:
             if not silent:
                 Logger.warning(f"[KMODE] ⚠️ 启动隧道创建失败: {exc}")
@@ -8903,6 +9109,53 @@ class KModeController:
 
 
 # ----------------------------------------------------------------------------
+# 0.6.8 argo 动态绑定 shz.al 上报 (docs/API.MD 七): 缺省派生与校验
+# - 缺省派生: 上报名 = 节点名 (KNAME) - 端口, 管理密钥 = 最终上报名 + "123" (字面后缀,
+#   保证最短合法名也满足 shz.al 平台密钥 >=8 字符约束); 接口可显式指定完整覆盖派生值
+# - 上报协议逐字复用 KMODE=2 (report_shzal: c/n/s/e=7d, 409 -> PUT 覆盖)
+# - KMODE=1/2 自建隧道 (source="kmode") 不进该体系: 不可绑定、不持久化 (语义冲突防护)
+# - 管理密钥不随查询/绑定响应下发 (与 last_error 不含注册凭据同口径)
+# ----------------------------------------------------------------------------
+_ARGO_BIND_KEY_SUFFIX = "123"
+
+
+def argo_bind_name(port):
+    """缺省派生上报名: 节点名 (KNAME) - 端口"""
+    return f"{Config.KNAME}-{port}"
+
+
+def argo_bind_key(name):
+    """缺省派生管理密钥: 基于最终上报名 + 字面后缀 123"""
+    return f"{name}{_ARGO_BIND_KEY_SUFFIX}"
+
+
+def argo_bind_error(port, name=None, key=None):
+    """绑定参数校验 (显式与派生两条路径统一): 返回错误文本, 合法返回 None。
+    name 缺省时按派生规则补全 (同时要求 KNAME env 本身合法), key 缺省时基于最终 name 派生;
+    校验只针对最终生效的 name/key。"""
+    if name is None:
+        base = Config.KNAME or ""
+        if len(base) < 3:
+            return f"KNAME 未设置或过短 ({len(base)}<3), 无法派生上报名"
+        if not set(base) <= KModeController._SHZAL_NAME_CHARS:
+            return "KNAME 含非法字符 (限字母数字及 +_-[]*$=@,;/)"
+        name = f"{base}-{port}"
+    else:
+        name = str(name)
+    if key is None:
+        key = argo_bind_key(name)
+    else:
+        key = str(key)
+    if len(name) < 3:
+        return f"上报名过短 ({len(name)}<3)"
+    if not set(name) <= KModeController._SHZAL_NAME_CHARS:
+        return "上报名含非法字符 (限字母数字及 +_-[]*$=@,;/)"
+    if len(key) < 8:
+        return f"管理密钥过短 ({len(key)}<8, shz.al 平台密码约束)"
+    return None
+
+
+# ----------------------------------------------------------------------------
 # 请求 / 响应模型
 # ----------------------------------------------------------------------------
 class ArgoTunnelInfo(BaseModel):
@@ -8915,6 +9168,9 @@ class ArgoTunnelInfo(BaseModel):
     last_error_at: Optional[str] = Field(default=None, description="最近失败时间 (ISO8601 UTC)", examples=["2026-11-09T14:20:00Z"])
     consecutive_failures: Optional[int] = Field(default=None, description="连续失败轮数", examples=[0])
     last_registered_at: Optional[str] = Field(default=None, description="最近成功注册时间 (ISO8601 UTC)", examples=["2026-11-09T14:10:36Z"])
+    # 0.6.8 动态绑定 shz.al 上报 (docs/API.MD 七): 未绑定 null, 绑定后恒可见; 管理密钥不下发
+    shz_name: Optional[str] = Field(default=None, description="绑定上报名 (缺省派生 KNAME-端口, 接口可显式指定)", examples=["myname-8000"])
+    shz_url: Optional[str] = Field(default=None, description="绑定上报地址 (shz.al 发布页完整 URL)", examples=["https://shz.al/~myname-8000"])
 
 
 class ArgoTunnelListResponse(SResponse):
@@ -8928,6 +9184,11 @@ class ArgoTunnelCreateRequest(BaseModel):
     port: Optional[int] = Field(default=None, ge=1, le=65535, description="隧道转发端口, 缺省使用 agent 自身监听端口", examples=[8000])
     duplicate: bool = Field(default=False, description="是否允许同一端口重复建隧道 (默认 false)", examples=[False])
     quic: bool = Field(default=False, description="该隧道边缘传输是否走 QUIC (UDP/7844, 缺省 h2); QUIC 连续建连失败自动回退 h2", examples=[False])
+    # 0.6.8 动态绑定 shz.al 上报 (docs/API.MD 七): shz=true 或 shz_name/shz_key 任一非空即创建后绑定;
+    # 缺省派生 上报名=KNAME-端口 / 密钥=上报名+"123", 显式指定完整覆盖派生值
+    shz: bool = Field(default=False, description="创建后绑定 shz.al 上报 (上报名缺省派生 KNAME-端口)", examples=[False])
+    shz_name: Optional[str] = Field(default=None, description="显式指定上报名 (完整覆盖派生值, 不再拼接端口; ≥3 字符)", examples=["myapp"])
+    shz_key: Optional[str] = Field(default=None, description="显式指定管理密钥 (完整覆盖派生值; ≥8 字符, 不随查询接口下发)")
 
 
 class ArgoTunnelCreateResponse(BaseModel):
@@ -8942,7 +9203,29 @@ class ArgoTunnelCreateResponse(BaseModel):
     last_error: Optional[str] = Field(default=None, description="最近失败原因")
     last_error_at: Optional[str] = Field(default=None, description="最近失败时间")
     consecutive_failures: Optional[int] = Field(default=None, description="连续失败轮数", examples=[0])
+    # 0.6.8 动态绑定 shz.al 上报: 未绑定时两字段缺省 (response_model_exclude_none 丢弃)
+    shz_name: Optional[str] = Field(default=None, description="绑定上报名 (仅绑定后返回)", examples=["myname-8000"])
+    shz_url: Optional[str] = Field(default=None, description="绑定上报地址 (仅绑定后返回)", examples=["https://shz.al/~myname-8000"])
     message: Optional[str] = Field(default=None, description="失败原因", examples=["tunnel already exists on port 8000, set duplicate=true to force creation"])
+
+
+class ArgoBindRequest(BaseModel):
+    # POST/DELETE /api/argo/bind 请求体 (0.6.8 动态绑定, docs/API.MD 七)
+    port: int = Field(..., ge=1, le=65535, description="目标隧道转发端口", examples=[8000])
+    tunnel_domain: Optional[str] = Field(default=None, description="同端口多隧道时用于精确定位", examples=["https://lucky-wildflower-1a2b3c4d.trycloudflare.com"])
+    shz_name: Optional[str] = Field(default=None, description="显式指定上报名 (完整覆盖派生值 KNAME-端口; ≥3 字符)", examples=["myapp"])
+    shz_key: Optional[str] = Field(default=None, description="显式指定管理密钥 (完整覆盖派生值 上报名+\"123\"; ≥8 字符, 不随查询接口下发)")
+
+
+class ArgoBindResponse(BaseModel):
+    # POST/DELETE /api/argo/bind 响应 (失败时 shz 字段缺省, 附 message)
+    status: str = Field(..., description='"ok" 或 "error"', examples=["ok"])
+    bound: bool = Field(..., description="绑定结果 (true=已绑定, false=已解绑或失败)", examples=[True])
+    port: int = Field(..., description="本次请求的端口", examples=[8000])
+    tunnel_domain: Optional[str] = Field(default=None, description="目标隧道公网域名", examples=["https://lucky-wildflower-1a2b3c4d.trycloudflare.com"])
+    shz_name: Optional[str] = Field(default=None, description="绑定上报名 (解绑后为空)", examples=["myname-8000"])
+    shz_url: Optional[str] = Field(default=None, description="绑定上报地址 (解绑后为空)", examples=["https://shz.al/~myname-8000"])
+    message: Optional[str] = Field(default=None, description="失败原因", examples=["no tunnel found on port 8000"])
 
 
 class ArgoTunnelDeleteRequest(BaseModel):
@@ -9018,7 +9301,9 @@ async def lifespan(app: FastAPI):
     # 🔐 凭证生命周期: tempkey 过期 → 轮换 SESSION_KEY 与控制端 Noise 密钥对
     app.state.temp_key_manager.on_expired = Config.rotate_operational_secrets
 
-    app.state.argo_tunnel_manager = ArgoTunnelManager()
+    # 0.6.8: 注入 TaskStore 引用 — argo 动态绑定集合落盘 data.argobinds (未启用 KSTORE 时仅内存)
+    app.state.argo_tunnel_manager = ArgoTunnelManager(
+        store=getattr(app.state.task_manager, "store", None))
 
     # 📡 本地端口反代共享回环会话 (0.6.7, docs/API.MD 二十): auto_decompress=False 字节保真
     app.state.loopback_session = aiohttp.ClientSession(auto_decompress=False)
@@ -9090,6 +9375,32 @@ async def lifespan(app: FastAPI):
                 Logger.info(f"[ProxyRoute] 💡 已恢复反代运行时白名单 (旧形状归入本地组): {len(_pp_data)} 个端口")
         except Exception as _exc:
             Logger.debug(f"[ProxyRoute] 反代白名单恢复读取失败: {_exc}", 11)
+
+    # 📡 argo shz.al 绑定恢复 (0.6.8, docs/API.MD 七/十三): kstore data.argobinds →
+    # 逐条新建隧道 (source="restore") 并按持久化名称绑定上报 — 上报地址分毫不差;
+    # KMODE=1/2 自建隧道不进该体系 (语义冲突防护), 端口被占用/创建失败仅告警、kstore 条目保留
+    _tm_ab = getattr(app.state, "task_manager", None)
+    _argo_ab = getattr(app.state, "argo_tunnel_manager", None)
+    _store_ab = getattr(_tm_ab, "store", None) if _tm_ab is not None else None
+    if _argo_ab is not None and _store_ab is not None:
+        try:
+            _bind_items = _store_ab.get_argobinds()
+        except Exception as _exc:
+            _bind_items = []
+            Logger.debug(f"[ArgoBind] 绑定恢复读取失败: {_exc}", 11)
+        for _bind in _bind_items:
+            _bport, _bname = _bind["port"], _bind["name"]
+            # key=None 时 bind_tunnel 按最终 name 重算派生密钥 (name+"123", 与持久化值一致),
+            # 保持派生条目不以显式 key 回写 (仅显式指定时持久化的口径)
+            _bkey = _bind.get("key")
+            try:
+                _argo_ab.create_tunnel(_bport, silent=True, source="restore")
+                _argo_ab.bind_tunnel(_bport, shz_name=_bname, shz_key=_bkey)
+                Logger.info(f"[ArgoBind] ✅ 已恢复绑定: {_bname} (port {_bport})")
+            except ArgoTunnelError as _exc:
+                Logger.warning(f"[ArgoBind] ⚠️ 恢复绑定 {_bname} (port {_bport}) 失败 ({_exc.message}), 条目保留")
+            except Exception as _exc:
+                Logger.warning(f"[ArgoBind] ⚠️ 恢复绑定 {_bname} (port {_bport}) 异常: {_exc}")
 
     if Config.DEBUG:
         Logger.debug(f"✅ 管理器已挂载到 app.state")
@@ -9180,10 +9491,12 @@ async def create_argo_tunnel(
     # - port 缺省时使用 agent 自身监听端口 (KPORT / PORT / SERVER_PORT, 默认 8000)
     # - 默认同一端口只允许一条隧道 (409); duplicate=true 时强制创建
     # - 创建失败 (cloudflared 注册 / 网络异常) 返回 500
+    # - 0.6.8: shz/shz_name/shz_key 触发创建后绑定 shz.al 上报 (docs/API.MD 七)
     manager = request.app.state.argo_tunnel_manager
     port = payload.port if payload.port is not None else Config.PORT
     try:
-        return manager.create_tunnel(port, duplicate=payload.duplicate, quic=payload.quic)
+        return manager.create_tunnel(port, duplicate=payload.duplicate, quic=payload.quic,
+                                     shz=payload.shz, shz_name=payload.shz_name, shz_key=payload.shz_key)
     except ArgoTunnelError as exc:
         return JSONResponse(
             status_code=exc.status_code,
@@ -9198,6 +9511,7 @@ async def delete_argo_tunnel(
 ):
     # 删除指定端口的临时隧道
     # - 端口无隧道 -> 404; 同端口多隧道未指定域名 -> 409; 指定域名无匹配 -> 404
+    # - 0.6.8: 被删除隧道若带 shz.al 绑定, 自动清持久化并后台删除远端记录
     manager = request.app.state.argo_tunnel_manager
     try:
         return manager.delete_tunnel(payload.port, tunnel_domain=payload.tunnel_domain)
@@ -9205,6 +9519,43 @@ async def delete_argo_tunnel(
         return JSONResponse(
             status_code=exc.status_code,
             content={"status": "error", "deleted": 0, "port": payload.port, "message": exc.message},
+        )
+
+
+@app.post("/api/argo/bind", response_model=ArgoBindResponse, response_model_exclude_none=True)
+async def bind_argo_tunnel(
+    request: Request,
+    payload: ArgoBindRequest = Body(...),
+):
+    # 0.6.8: 给已启动隧道绑定 shz.al 上报 (docs/API.MD 七)
+    # - 上报名/管理密钥缺省派生 (KNAME-端口 / 上报名+"123"), shz_name/shz_key 显式覆盖
+    # - 端口无隧道/无匹配 -> 404; 同端口多隧道未指定 -> 409; KMODE 自建隧道/端口已被绑定 -> 409
+    # - KMODE=1/2 自建隧道不可绑定 (语义冲突防护); 绑定信息经 GET /api/argo 可查
+    manager = request.app.state.argo_tunnel_manager
+    try:
+        return manager.bind_tunnel(payload.port, tunnel_domain=payload.tunnel_domain,
+                                   shz_name=payload.shz_name, shz_key=payload.shz_key)
+    except ArgoTunnelError as exc:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"status": "error", "bound": False, "port": payload.port, "message": exc.message},
+        )
+
+
+@app.delete("/api/argo/bind", response_model=ArgoBindResponse, response_model_exclude_none=True)
+async def unbind_argo_tunnel(
+    request: Request,
+    payload: ArgoBindRequest = Body(...),
+):
+    # 0.6.8: 解绑指定隧道的 shz.al 上报 — 保留隧道, 清持久化条目, 远端记录后台删除
+    # - 定位语义与 DELETE /api/argo 一致 (404/409); 目标隧道无绑定 -> 404
+    manager = request.app.state.argo_tunnel_manager
+    try:
+        return manager.unbind_tunnel(payload.port, tunnel_domain=payload.tunnel_domain)
+    except ArgoTunnelError as exc:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"status": "error", "bound": False, "port": payload.port, "message": exc.message},
         )
 
 
@@ -9822,6 +10173,7 @@ class TaskStore:
         self.last_saved_at = None
         self.hubregs = []            # hub 注册任务子类型 (data.hubregs, 0.6.6 起; load 时填充)
         self.proxyports = {}         # 反代运行时白名单子类型 (data.proxyports, 0.6.7 续批六起对象形状 {"hub":..,"local":..}; load 时填充)
+        self.argobinds = []          # argo shz.al 绑定子类型 (data.argobinds, 0.6.8 起; 条目 {port,name,key?}, load 时填充)
         self._lock = threading.Lock()
         self._resolve_config()
 
@@ -9909,10 +10261,12 @@ class TaskStore:
 
     def load(self):
         """加载持久化任务, 返回 (onetasks, crontasks); 文件缺失/损坏一律安全降级为空表
-        同时把 hub 注册任务子类型 (data.hubregs, 0.6.6 起) 与反代运行时白名单
-        (data.proxyports, 0.6.7 起) 填充到对应字段"""
+        同时把 hub 注册任务子类型 (data.hubregs, 0.6.6 起)、反代运行时白名单
+        (data.proxyports, 0.6.7 起) 与 argo shz.al 绑定子类型 (data.argobinds, 0.6.8 起)
+        填充到对应字段"""
         self.hubregs = []
         self.proxyports = {}
+        self.argobinds = []
         doc = self._load_doc()
         if doc is None:
             return [], {}
@@ -9943,10 +10297,21 @@ class TaskStore:
         else:
             self.proxyports = {"hub": [], "local": [int(p) for p in (raw_pp or [])
                                                     if isinstance(p, (int, float)) and 1 <= int(p) <= 65535]}
+        # argo shz.al 绑定 (0.6.8, docs/API.MD 七/十三): 条目 {port, name, key?} — key 仅显式
+        # 指定时持久化 (派生密钥 name+"123" 确定性可重算); 非法条目静默过滤
+        binds = []
+        for item in (data.get("argobinds") or []):
+            if isinstance(item, dict) and isinstance(item.get("name"), str) and item.get("name") \
+                    and isinstance(item.get("port"), (int, float)) and 1 <= int(item.get("port")) <= 65535:
+                entry = {"port": int(item["port"]), "name": item["name"]}
+                if isinstance(item.get("key"), str) and item["key"]:
+                    entry["key"] = item["key"]
+                binds.append(entry)
+        self.argobinds = binds
         self.last_saved_at = doc.get("saved_at")
         Logger.info(f"[TaskStore] 💾 已恢复持久化任务: onetime={len(onetasks)}, cron={len(crontasks)}, "
                     f"hubreg={len(regs)}, proxyport(hub)={len(self.proxyports['hub'])}, "
-                    f"proxyport(local)={len(self.proxyports['local'])}")
+                    f"proxyport(local)={len(self.proxyports['local'])}, argobind={len(binds)}")
         return onetasks, crontasks
 
     def get_hubregs(self):
@@ -9958,6 +10323,30 @@ class TaskStore:
         load 时填充; 未启用 KSTORE 恒为空)"""
         return {"hub": list((self.proxyports or {}).get("hub") or []),
                 "local": list((self.proxyports or {}).get("local") or [])}
+
+    def get_argobinds(self):
+        """启动恢复用: 读取内存中的 argo shz.al 绑定条目 ([{port, name, key?}];
+        load 时填充; 未启用 KSTORE 恒为空)"""
+        return [dict(x) for x in (self.argobinds or [])]
+
+    def save_argobinds(self, items) -> bool:
+        """落盘 argo shz.al 绑定集合 (additive 键, 0.6.8 docs/API.MD 七/十三); 合并当前内存任务表
+        整体原子写, 返回是否成功。条目 {port, name, key?} — key 仅显式指定时持久化 (派生密钥
+        name+"123" 确定性可重算, 缺省场景 KSTORE 无密钥材料); 未启用/只读时直接返回 False"""
+        if not self.enabled or self.locked:
+            return False
+        cleaned = []
+        for i in (items or []):
+            if not isinstance(i, dict) or not i.get("name"):
+                continue
+            if not isinstance(i.get("port"), (int, float)) or not 1 <= int(i["port"]) <= 65535:
+                continue
+            entry = {"port": int(i["port"]), "name": str(i["name"])}
+            if isinstance(i.get("key"), str) and i["key"]:
+                entry["key"] = str(i["key"])
+            cleaned.append(entry)
+        self.argobinds = cleaned
+        return self.save(Config.onetasks, Config.crontasks)
 
     def save_proxyports(self, ports) -> bool:
         """落盘反代运行时白名单 (additive 键, 0.6.7 续批六 docs/API.MD 20.8): 接受对象形状
@@ -10017,6 +10406,7 @@ class TaskStore:
                     "saved_at": datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
                     "data": {"onetasks": list(onetasks or []), "crontasks": dict(crontasks or {}),
                              "hubregs": list(self.hubregs or []),
+                             "argobinds": list(self.argobinds or []),
                              "proxyports": {"hub": list((self.proxyports or {}).get("hub") or []),
                                             "local": list((self.proxyports or {}).get("local") or [])}},
                 }

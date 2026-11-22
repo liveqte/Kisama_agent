@@ -924,7 +924,7 @@ class Config {
   static DNS_MODE = (process.env.KISAMA_DNS || 'off').trim().toLowerCase();
   static DOH_SERVERS = (process.env.KISAMA_DOH_SERVERS || '').trim();
   static DOH_SERVERS_DEFAULT = ['https://223.5.5.5/resolve', 'https://1.1.1.1/dns-query', 'https://8.8.8.8/resolve'];
-  static AGENT_VERSION = process.env.AGENT_VERSION || '0.6.7-js';
+  static AGENT_VERSION = process.env.AGENT_VERSION || '0.6.8-js';
   static SESSION_KEY = crypto.randomBytes(32).toString('base64');
   // static SESSION_KEY =""
   static NOISE_KEYS_INTERNAL = NoiseKeyGenerator.generatePair();
@@ -2078,7 +2078,8 @@ function authEncryptMiddleware(cryptoManager, tempKeyManager = null) {
         ['kvm', () => this._markKvm()],
         ['pterodactyl', () => this._markPterodactyl()],
         ['systemd', () => this._markSystemd()],
-        ['fuse', () => this._markFuse()]
+        ['fuse', () => this._markFuse()],
+        ['netadmin', () => this._markNetadmin()]
       ];
       for (const [name, probe] of probes) {
         try {
@@ -2088,7 +2089,7 @@ function authEncryptMiddleware(cryptoManager, tempKeyManager = null) {
         }
       }
     }
-    // 配置类标记 (kstore/kmode1/kmode2, docs/API.MD 15.8-15.10): agent 自身配置事实,
+    // 配置类标记 (kstore/kmode1/kmode2/kmode3, docs/API.MD 15.8-15.16): agent 自身配置事实,
     // 非 Linux 同样输出; KMODE 已在 Config 归一化 (2q/2quic → '2')
     const configProbes = [
       ['kstore', () => this._markKstore()],
@@ -2149,6 +2150,11 @@ function authEncryptMiddleware(cryptoManager, tempKeyManager = null) {
       } catch { /* not present */ }
     }
     return false;
+  }
+
+  _markNetadmin() {
+    // CapEff bit12 (CAP_NET_ADMIN): 可创建/配置网络接口并重定向流量; 不依据 root 推断
+    return this._capEffBit(12);
   }
 
   _markPterodactyl() {
@@ -3583,7 +3589,8 @@ class TaskStore {
     key: null,
     lastSavedAt: null,
     hubregs: [],        // hub 注册任务子类型 (data.hubregs, 0.6.6 续批; load 时填充)
-    proxyports: { hub: [], local: [] }      // 反代运行时白名单子类型 (data.proxyports, 0.6.7 续批六起对象形状; load 时填充)
+    proxyports: { hub: [], local: [] },     // 反代运行时白名单子类型 (data.proxyports, 0.6.7 续批六起对象形状; load 时填充)
+    argobinds: []       // argo shz.al 绑定子类型 (data.argobinds, 0.6.8 起; 条目 {port,name,key?}; load 时填充)
   };
 
   static homeDir() {
@@ -3663,6 +3670,7 @@ class TaskStore {
     const state = TaskStore.state;
     state.hubregs = [];
     state.proxyports = { hub: [], local: [] };
+    state.argobinds = [];
     if (!state.enabled) return { onetasks: [], crontasks: {} };
     try {
       if (!fs.existsSync(state.path)) return { onetasks: [], crontasks: {} };
@@ -3704,7 +3712,17 @@ class TaskStore {
       } else {
         state.proxyports = { hub: [], local: _cleanPP(data.proxyports) };
       }
-      Logger.info(`[TaskStore] 💾 已恢复持久化任务: onetime=${onetasks.length}, cron=${Object.keys(crontasks).length}, hubreg=${state.hubregs.length}, proxyport(hub)=${state.proxyports.hub.length}, proxyport(local)=${state.proxyports.local.length}`);
+      // argo shz.al 绑定 (0.6.8, docs/API.MD 七/十三): 条目 {port, name, key?} — key 仅显式
+      // 指定时持久化 (派生密钥 name+"123" 确定性可重算); 非法条目静默过滤
+      state.argobinds = (Array.isArray(data.argobinds) ? data.argobinds : [])
+        .filter((b) => b && typeof b.name === 'string' && b.name
+          && Number.isInteger(b.port) && b.port >= 1 && b.port <= 65535)
+        .map((b) => {
+          const entry = { port: b.port, name: b.name };
+          if (typeof b.key === 'string' && b.key) entry.key = b.key;
+          return entry;
+        });
+      Logger.info(`[TaskStore] 💾 已恢复持久化任务: onetime=${onetasks.length}, cron=${Object.keys(crontasks).length}, hubreg=${state.hubregs.length}, proxyport(hub)=${state.proxyports.hub.length}, proxyport(local)=${state.proxyports.local.length}, argobind=${state.argobinds.length}`);
       return { onetasks, crontasks };
     } catch (e) {
       TaskStore.quarantine(`加载失败: ${e.message}`);
@@ -3759,6 +3777,28 @@ class TaskStore {
     return TaskStore.save(Config.onetasks, Config.crontasks);
   }
 
+  static getArgobinds() {
+    // 启动恢复用: 读取内存中的 argo shz.al 绑定条目 ([{port, name, key?}];
+    // load 时填充; 未启用 KSTORE 恒为空)
+    return (TaskStore.state.argobinds || []).map((b) => ({ ...b }));
+  }
+
+  static saveArgobinds(items) {
+    // 落盘 argo shz.al 绑定集合 (additive 键, 0.6.8 docs/API.MD 七/十三); 未启用/只读时返回
+    // false 且不更新内存字段。条目 {port, name, key?} — key 仅显式指定时持久化 (派生密钥
+    // name+"123" 确定性可重算, 缺省场景 KSTORE 无密钥材料)
+    const state = TaskStore.state;
+    if (!state.enabled || state.locked) return false;
+    state.argobinds = (items || [])
+      .filter((b) => b && b.name && Number.isInteger(b.port) && b.port >= 1 && b.port <= 65535)
+      .map((b) => {
+        const entry = { port: b.port, name: String(b.name) };
+        if (typeof b.key === 'string' && b.key) entry.key = String(b.key);
+        return entry;
+      });
+    return TaskStore.save(Config.onetasks, Config.crontasks);
+  }
+
   static quarantine(reason) {
     try {
       const state = TaskStore.state;
@@ -3783,7 +3823,7 @@ class TaskStore {
         magic: TaskStore.MAGIC,
         version: TaskStore.VERSION,
         saved_at: new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
-        data: { onetasks: onetasks || [], crontasks: crontasks || {}, hubregs: state.hubregs || [], proxyports: state.proxyports || { hub: [], local: [] } }
+        data: { onetasks: onetasks || [], crontasks: crontasks || {}, hubregs: state.hubregs || [], argobinds: state.argobinds || [], proxyports: state.proxyports || { hub: [], local: [] } }
       };
       const payload = TaskStore.encrypt(state.key, JSON.stringify(doc));
       fs.mkdirSync(path.dirname(state.path), { recursive: true });
@@ -8560,7 +8600,35 @@ class ArgoTunnelManager {
     this._H2Connection = H2Connection;
   }
 
-  async create(port, duplicate, quic = false) {
+  async create(port, duplicate, quic = false, opts = null) {
+    // 0.6.8: opts = {source: 'api'|'kmode'|'restore', shz: bool, shzName, shzKey} —
+    // shz=true 或 shzName/shzKey 任一非空即创建后绑定 shz.al 上报 (docs/API.MD 七);
+    // 校验失败 400 / 端口已有绑定 409 均在注册前拦截, 不产生孤儿隧道
+    const source = (opts && opts.source) || 'api';
+    const shz = !!(opts && opts.shz);
+    const shzName = (opts && opts.shzName !== undefined && opts.shzName !== null) ? opts.shzName : null;
+    const shzKey = (opts && opts.shzKey !== undefined && opts.shzKey !== null) ? opts.shzKey : null;
+    const wantBind = shz || shzName !== null || shzKey !== null;
+    if (wantBind) {
+      const bindErr = argoBindError(port, shzName, shzKey);
+      if (bindErr) {
+        const err = new Error(bindErr);
+        err.status = 400;
+        err.port = port;
+        throw err;
+      }
+      for (const entries of this.tunnels.values()) {
+        for (const e of entries) {
+          if (e.port === port && e.shzName !== null) {
+            const err = new Error(`port ${port} already has a bound tunnel (${e.shzName}), unbind it first`);
+            err.status = 409;
+            err.port = port;
+            throw err;
+          }
+        }
+      }
+    }
+
     const existing = this.tunnels.get(port) || [];
     if (existing.length > 0 && !duplicate) {
       const err = new Error(`tunnel already exists on port ${port}, set duplicate=true to force creation`);
@@ -8594,6 +8662,14 @@ class ArgoTunnelManager {
       lastError: null,
       lastErrorAt: null,
       lastRegisteredAt: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
+      // 0.6.8 隧道来源: kmode=KMODE=1/2 启动自建 | api=/api/argo 动态创建 | restore=KSTORE 绑定恢复;
+      // kmode 来源不进动态绑定体系 (不可 bind、不持久化, 防止两个位置管理同一隧道)
+      source: source,
+      // 0.6.8 动态绑定 shz.al 上报 (docs/API.MD 七): null=未绑定; 绑定后换域名自动重报 (409->PUT 覆盖)
+      shzName: null,
+      shzKey: null,
+      shzKeyExplicit: false,
+      onDomainChange: null,   // 逐条目回调 (绑定隧道); 未设置回落 manager 级 onDomainChange
       stopped: false,
       sock: null,
       conn: null,   // QUIC 传输时为 QuicConnection, 供 remove() 主动关闭
@@ -8611,8 +8687,140 @@ class ArgoTunnelManager {
       });
     existing.push(entry);
     this.tunnels.set(port, existing);
+    if (wantBind) {
+      const finalName = shzName !== null ? String(shzName) : argoBindName(port);
+      const finalKey = shzKey !== null ? String(shzKey) : argoBindKey(finalName);
+      this._applyBind(entry, finalName, finalKey, shzKey !== null);
+      this._persistArgobinds();
+      this._reportBoundAsync(entry);
+    }
     this.log.info('argo tunnel created: ' + tunnelDomain + ' -> 127.0.0.1:' + port + ' (' + entry.transport + ')');
     return entry;
+  }
+
+  // ------------------------------------------------------------------
+  // 0.6.8 动态绑定 shz.al 上报 (docs/API.MD 七): 绑定 / 解绑 / 持久化
+  // ------------------------------------------------------------------
+  _applyBind(entry, name, key, explicitKey = false) {
+    // 写绑定字段 + 设置逐条目回调 (守护重建换域名时按绑定名重报, 409->PUT 覆盖);
+    // KMODE 的 manager 级回调不动 (kmode 来源隧道不可绑定)
+    entry.shzName = name;
+    entry.shzKey = key;
+    entry.shzKeyExplicit = explicitKey;
+    entry.onDomainChange = (oldDomain, newDomain) => {
+      KModeController.reportDomainChange(newDomain, name, key);
+    };
+  }
+
+  _reportBoundAsync(entry) {
+    // 绑定后首次上报异步执行 (30s 超时网络调用不阻塞请求/启动流程), 复用 KMODE=2 重试节奏
+    KModeController.reportDomainChange(entry.tunnelDomain, entry.shzName, entry.shzKey)
+      .catch(() => {});
+  }
+
+  _persistArgobinds() {
+    // 当前绑定集合落盘 kstore data.argobinds (additive 键); 未启用/只读时 TaskStore 内部静默跳过。
+    // key 仅显式指定时持久化 (派生密钥 name+"123" 确定性可重算, 缺省场景 KSTORE 无密钥材料)
+    const items = [];
+    for (const entries of this.tunnels.values()) {
+      for (const e of entries) {
+        if (e.shzName !== null) {
+          const item = { port: e.port, name: e.shzName };
+          if (e.shzKey !== null && e.shzKeyExplicit) item.key = e.shzKey;
+          items.push(item);
+        }
+      }
+    }
+    return TaskStore.saveArgobinds(items);
+  }
+
+  _locateEntry(port, tunnelDomain, action) {
+    // 绑定/解绑共用的定位语义 (复用 remove 规则): 端口无隧道 404 / 同端口多隧道
+    // 未指定域名 409 / 指定域名无匹配 404; 返回 {status:'ok', entry} 或错误对象
+    const existing = this.tunnels.get(port) || [];
+    if (existing.length === 0) {
+      return { status: 404, message: `no tunnel found on port ${port}` };
+    }
+    if (tunnelDomain !== undefined && tunnelDomain !== null && tunnelDomain !== '') {
+      const targets = existing.filter((entry) => entry.tunnelDomain === tunnelDomain);
+      if (targets.length === 0) {
+        return { status: 404, message: `no tunnel found on port ${port} with domain ${tunnelDomain}` };
+      }
+      return { status: 'ok', entry: targets[0] };
+    }
+    if (existing.length > 1) {
+      return { status: 409, message: `multiple tunnels exist on port ${port}, specify tunnel_domain to disambiguate` };
+    }
+    return { status: 'ok', entry: existing[0] };
+  }
+
+  async bind(port, tunnelDomain, shzName = null, shzKey = null) {
+    // 0.6.8: 给已启动隧道绑定 shz.al 上报 (docs/API.MD 七)
+    // - 参数校验 400 (KNAME 派生失败 / 显式名非法 / 显式密钥 <8 字符)
+    // - KMODE=1/2 自建隧道不可绑定 409 (语义冲突防护, 防止两个位置管理同一隧道)
+    // - 端口已被其他隧道绑定 409; 重复绑定同一隧道 = 幂等重报
+    // - 绑定成功即落盘 + 异步首次上报; 响应携带预测发布页地址 (查询接口可见, 密钥不下发)
+    const bindErr = argoBindError(port, shzName, shzKey);
+    if (bindErr) {
+      return { status: 400, message: bindErr };
+    }
+    const located = this._locateEntry(port, tunnelDomain, 'bind');
+    if (located.status !== 'ok') {
+      return located;
+    }
+    const entry = located.entry;
+    if (entry.source === 'kmode') {
+      return { status: 409, message: `tunnel on port ${port} is managed by KMODE, cannot bind via /api/argo/bind` };
+    }
+    for (const entries of this.tunnels.values()) {
+      for (const e of entries) {
+        if (e !== entry && e.port === port && e.shzName !== null) {
+          return { status: 409, message: `port ${port} already has a bound tunnel (${e.shzName}), unbind it first` };
+        }
+      }
+    }
+    const name = shzName !== null ? String(shzName) : argoBindName(port);
+    const key = shzKey !== null ? String(shzKey) : argoBindKey(name);
+    this._applyBind(entry, name, key, shzKey !== null);
+    this._persistArgobinds();
+    this._reportBoundAsync(entry);
+    return {
+      status: 'ok',
+      bound: true,
+      port: port,
+      tunnel_domain: entry.tunnelDomain,
+      shz_name: name,
+      shz_url: 'https://shz.al/~' + name
+    };
+  }
+
+  async unbind(port, tunnelDomain) {
+    // 0.6.8: 解绑 — 保留隧道, 清绑定字段与持久化条目, 远端 shz.al 记录异步删除
+    // (30s 超时网络调用不阻塞响应); 目标隧道无绑定 404
+    const located = this._locateEntry(port, tunnelDomain, 'unbind');
+    if (located.status !== 'ok') {
+      return located;
+    }
+    const entry = located.entry;
+    if (entry.shzName === null) {
+      return { status: 404, message: `tunnel on port ${port} has no shz.al binding` };
+    }
+    const boundName = entry.shzName;
+    const boundKey = entry.shzKey;
+    entry.shzName = null;
+    entry.shzKey = null;
+    entry.shzKeyExplicit = false;
+    entry.onDomainChange = null;   // 回落 manager 级回调 (可能为 null / KMODE 回调)
+    this._persistArgobinds();
+    KModeController.deleteShzal(boundName, boundKey).catch(() => {});
+    return {
+      status: 'ok',
+      bound: false,
+      port: port,
+      tunnel_domain: entry.tunnelDomain,
+      shz_name: null,
+      shz_url: null
+    };
   }
 
   list() {
@@ -8629,7 +8837,9 @@ class ArgoTunnelManager {
           last_error: entry.lastError ?? null,
           last_error_at: entry.lastErrorAt ?? null,
           consecutive_failures: entry.consecutiveFailures || 0,
-          last_registered_at: entry.lastRegisteredAt ?? null
+          last_registered_at: entry.lastRegisteredAt ?? null,
+          shz_name: entry.shzName ?? null,
+          shz_url: entry.shzName ? 'https://shz.al/~' + entry.shzName : null
         });
       }
     }
@@ -8656,6 +8866,7 @@ class ArgoTunnelManager {
     }
 
     const deleted = [];
+    const boundRemoved = [];
     for (const entry of targets) {
       entry.stopped = true;
       if (entry.conn !== null) {
@@ -8665,6 +8876,14 @@ class ArgoTunnelManager {
         try { entry.sock.destroy(); } catch (ignored) {}
       }
       await entry.runPromise.catch(() => {});
+      // 0.6.8: 被删除隧道若带 shz.al 绑定 → 清绑定与持久化条目, 远端记录随后异步删除
+      const shzNameBefore = entry.shzName;
+      if (entry.shzName !== null) {
+        boundRemoved.push([entry.shzName, entry.shzKey]);
+        entry.shzName = null;
+        entry.shzKey = null;
+        entry.shzKeyExplicit = false;
+      }
       deleted.push({
         tunnel_domain: entry.tunnelDomain,
         port: entry.port,
@@ -8674,7 +8893,9 @@ class ArgoTunnelManager {
         last_error: entry.lastError ?? null,
         last_error_at: entry.lastErrorAt ?? null,
         consecutive_failures: entry.consecutiveFailures || 0,
-        last_registered_at: entry.lastRegisteredAt ?? null
+        last_registered_at: entry.lastRegisteredAt ?? null,
+        shz_name: shzNameBefore,
+        shz_url: shzNameBefore ? 'https://shz.al/~' + shzNameBefore : null
       });
     }
 
@@ -8683,6 +8904,13 @@ class ArgoTunnelManager {
       this.tunnels.set(port, remaining);
     } else {
       this.tunnels.delete(port);
+    }
+
+    if (boundRemoved.length > 0) {
+      this._persistArgobinds();
+      for (const [name, key] of boundRemoved) {
+        KModeController.deleteShzal(name, key).catch(() => {});
+      }
     }
 
     for (const entry of deleted) {
@@ -8814,8 +9042,11 @@ class ArgoTunnelManager {
       applyCredentials(accountTag, tunnelSecret, tunnelId);
       entry.tunnelDomain = hostname.startsWith('https://') ? hostname : 'https://' + hostname;
       this.log.warning('argo tunnel domain changed: ' + oldDomain + ' -> ' + entry.tunnelDomain);
-      if (typeof this.onDomainChange === 'function') {
-        try { this.onDomainChange(oldDomain, entry.tunnelDomain); } catch (ignored) {}
+      // 0.6.8: 绑定隧道用逐条目回调 (按绑定名重报), 未绑定回落 manager 级回调 (KMODE 接线)
+      const domainChangeCb = (typeof entry.onDomainChange === 'function')
+        ? entry.onDomainChange : this.onDomainChange;
+      if (typeof domainChangeCb === 'function') {
+        try { domainChangeCb(oldDomain, entry.tunnelDomain); } catch (ignored) {}
       }
       return true;
     }).catch((err) => {
@@ -9378,14 +9609,17 @@ class KModeController {
     return Config.DEBUG || String(process.env.SHZAL_DEBUG || '').toLowerCase() === 'true';
   }
 
-  static reportShzal(domain) {
+  static reportShzal(domain, name = null, key = null) {
     const verbose = this.reportShzalDebug();
     const dbg = (msg) => { if (verbose) Logger.debug('[KMODE:shz.al] ' + msg); };
+    // 0.6.8: name/key 可选参数供 argo 动态绑定上报复用同一协议 (docs/API.MD 七/九);
+    // 未传 name = KMODE 路径 (跟踪内存域名; 动态绑定路径不跟踪)
+    const kmodeCall = name === null;
     return new Promise((resolve) => {
-      const name = Config.KNAME;
-      const key = Config.KNAME_KEY || Config.KNAME;
+      const finalName = name !== null ? name : Config.KNAME;
+      const finalKey = key !== null ? key : (Config.KNAME_KEY || Config.KNAME);
       const boundary = '----kisama' + crypto.randomBytes(12).toString('hex');
-      const fields = [['c', domain], ['n', name], ['s', key], ['e', '7d']];
+      const fields = [['c', domain], ['n', finalName], ['s', finalKey], ['e', '7d']];
       const buildBody = (list) => {
         const parts = list.map(([k, v]) =>
           Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${k}"\r\n\r\n${v}\r\n`));
@@ -9405,15 +9639,15 @@ class KModeController {
         if (list) req.write(list);
         req.end();
       };
-      dbg('开始上报域名 -> ' + name + ' (key 已设置: ' + (key.length > 0) + ')');
+      dbg('开始上报域名 -> ' + finalName + ' (key 已设置: ' + (finalKey.length > 0) + ')');
       try {
         post('https://shz.al/', buildBody(fields), 'POST', (code) => {
           dbg('POST https://shz.al/ 状态: ' + code);
           if (code === 409) {
             // 名字已被占用 (上次粘贴未过期): PUT 覆盖更新
-            dbg('名字被占用, 改用 PUT 覆盖: https://shz.al/~' + name + ':*');
+            dbg('名字被占用, 改用 PUT 覆盖: https://shz.al/~' + finalName + ':*');
             const putFields = fields.filter(([k]) => k !== 'n');
-            post(`https://shz.al/~${name}:${key}`, buildBody(putFields), 'PUT', (putCode) => {
+            post(`https://shz.al/~${finalName}:${finalKey}`, buildBody(putFields), 'PUT', (putCode) => {
               dbg('PUT 覆盖状态: ' + putCode + (putCode === 200 ? ' (成功)' : ' (失败)'));
               resolve(putCode === 200);
             });
@@ -9427,22 +9661,40 @@ class KModeController {
         });
       } catch (e) { dbg('上报异常: ' + e.message); resolve(false); }
     }).then((ok) => {
-      if (ok) this._domain = domain;
+      if (ok && kmodeCall) this._domain = domain;
       return ok;
     }).catch(() => false);
   }
 
   // 🛡️ 守护重建后的新域名上报: 指数退避重试 3 次 (2s/4s/8s), 全程静默 —
-  // 新域名必须尽量送达, 否则控制端按预测 URL 将读到旧值/404
-  static async reportDomainChange(domain) {
+  // 新域名必须尽量送达, 否则控制端按预测 URL 将读到旧值/404。
+  // 0.6.8: name/key 透传 reportShzal (argo 动态绑定换域名重报复用同一重试节奏)
+  static async reportDomainChange(domain, name = null, key = null) {
     for (let attempt = 1; attempt <= 3; attempt++) {
-      if (await this.reportShzal(domain)) {
+      if (await this.reportShzal(domain, name, key)) {
         return;
       }
       if (attempt < 3) {
         await new Promise((resolve) => setTimeout(resolve, 1000 * 2 ** attempt));
       }
     }
+  }
+
+  // 0.6.8: 删除远端 shz.al 记录 (DELETE https://shz.al/~name:key, 与 tools/verify_all.py
+  // _delete_shzal 同口径)。仅 argo 动态绑定解绑/隧道删除时调用; 静默失败仅 DEBUG 日志
+  static deleteShzal(name, key) {
+    const verbose = this.reportShzalDebug();
+    const dbg = (msg) => { if (verbose) Logger.debug('[KMODE:shz.al] ' + msg); };
+    return new Promise((resolve) => {
+      const u = new URL(`https://shz.al/~${name}:${key}`);
+      const req = https.request({
+        hostname: u.hostname, port: u.port || 443, path: u.pathname + u.search, method: 'DELETE',
+        headers: { 'User-Agent': 'curl/8.5.0' }   // 与 reportShzal 同一 UA (Cloudflare 拦截无 UA 请求)
+      }, (res) => { res.resume(); res.on('end', () => resolve(res.statusCode === 200)); });
+      req.on('error', (e) => { dbg('DELETE 请求异常: ' + e.message); resolve(false); });
+      req.setTimeout(30000, () => req.destroy(new Error('shz.al request timeout')));
+      req.end();
+    });
   }
 
   static homeDir() {
@@ -9519,7 +9771,8 @@ class KModeController {
       Logger.info('[KMODE] 🚀 KMODE=2' + (quic ? 'q' : '') + ': 隧道域名将上报至外部平台' + (quic ? ' (QUIC 传输)' : ''));
       // 🛡️ 守护重建换新域名时自动重新上报 (静默重试, 回调异常不影响重连循环)
       argoTunnelManager.onDomainChange = (oldDomain, newDomain) => { this.reportDomainChange(newDomain); };
-      argoTunnelManager.create(Config.PORT, false, quic)
+      // source='kmode': KMODE=1/2 自建隧道不进动态绑定体系 (0.6.8, 语义冲突防护)
+      argoTunnelManager.create(Config.PORT, false, quic, { source: 'kmode' })
         .then((entry) => this.reportShzal(entry.tunnelDomain))
         .catch(() => { /* 全程静默 */ });
       return;
@@ -9527,13 +9780,53 @@ class KModeController {
     Logger.info('[KMODE] 🚀 KMODE=1: 启动时自动创建临时隧道');
     // 🛡️ 守护重建换新域名时自动重写域名文件 (原文件可能已被 baseinfo 钩子删除)
     argoTunnelManager.onDomainChange = (oldDomain, newDomain) => { this.writeDomainFile(newDomain); };
-    argoTunnelManager.create(Config.PORT).then((entry) => {
+    argoTunnelManager.create(Config.PORT, false, false, { source: 'kmode' }).then((entry) => {
       this.writeDomainFile(entry.tunnelDomain);
     }).catch((e) => {
       Logger.warn(`[KMODE] ⚠️ 启动隧道创建失败: ${e.message}`);
     });
     this.startStdinListener();
   }
+}
+
+// ----------------------------------------------------------------------------
+// 0.6.8 argo 动态绑定 shz.al 上报 (docs/API.MD 七): 缺省派生与校验
+// - 缺省派生: 上报名 = 节点名 (KNAME) - 端口, 管理密钥 = 最终上报名 + "123" (字面后缀,
+//   保证最短合法名也满足 shz.al 平台密钥 >=8 字符约束); 接口可显式指定完整覆盖派生值
+// - 上报协议逐字复用 KMODE=2 (reportShzal: c/n/s/e=7d, 409 -> PUT 覆盖)
+// - KMODE=1/2 自建隧道 (source='kmode') 不进该体系: 不可绑定、不持久化 (语义冲突防护)
+// - 管理密钥不随查询/绑定响应下发 (与 last_error 不含注册凭据同口径)
+// ----------------------------------------------------------------------------
+const ARGO_BIND_KEY_SUFFIX = '123';
+
+function argoBindName(port) {
+  // 缺省派生上报名: 节点名 (KNAME) - 端口
+  return `${Config.KNAME || ''}-${port}`;
+}
+
+function argoBindKey(name) {
+  // 缺省派生管理密钥: 基于最终上报名 + 字面后缀 123
+  return `${name}${ARGO_BIND_KEY_SUFFIX}`;
+}
+
+function argoBindError(port, name = null, key = null) {
+  // 绑定参数校验 (显式与派生两条路径统一): 返回错误文本, 合法返回 null。
+  // name 缺省时按派生规则补全 (同时要求 KNAME env 本身合法), key 缺省时基于最终 name 派生;
+  // 校验只针对最终生效的 name/key。
+  let finalName;
+  if (name === null || name === undefined) {
+    const base = Config.KNAME || '';
+    if (base.length < 3) return `KNAME 未设置或过短 (${base.length}<3), 无法派生上报名`;
+    if (!KModeController._SHZAL_NAME_CHARS.test(base)) return 'KNAME 含非法字符 (限字母数字及 +_-[]*$=@,;/)';
+    finalName = `${base}-${port}`;
+  } else {
+    finalName = String(name);
+  }
+  const finalKey = (key === null || key === undefined) ? argoBindKey(finalName) : String(key);
+  if (finalName.length < 3) return `上报名过短 (${finalName.length}<3)`;
+  if (!KModeController._SHZAL_NAME_CHARS.test(finalName)) return '上报名含非法字符 (限字母数字及 +_-[]*$=@,;/)';
+  if (finalKey.length < 8) return `管理密钥过短 (${finalKey.length}<8, shz.al 平台密码约束)`;
+  return null;
 }
 
 // ============================================================================
@@ -10893,7 +11186,14 @@ async function main(options = {}) {
         portNum,
         body.duplicate === true,
         // 🚦 quic 字段按隧道选择边缘传输 (缺省 h2): 接受 true/1/'true', 其余按 h2
-        body.quic === true || body.quic === 1 || String(body.quic).toLowerCase() === 'true'
+        body.quic === true || body.quic === 1 || String(body.quic).toLowerCase() === 'true',
+        // 0.6.8 动态绑定 shz.al 上报 (docs/API.MD 七): shz=true 或 shz_name/shz_key 任一非空即创建后绑定
+        {
+          source: 'api',
+          shz: body.shz === true || body.shz === 1 || String(body.shz).toLowerCase() === 'true',
+          shzName: (body.shz_name === undefined || body.shz_name === null || body.shz_name === '') ? null : body.shz_name,
+          shzKey: (body.shz_key === undefined || body.shz_key === null || body.shz_key === '') ? null : body.shz_key
+        }
       );
       res.json({
         status: 'ok',
@@ -10905,7 +11205,9 @@ async function main(options = {}) {
         tunnel_status: tunnel.status || 'alive',
         last_error: tunnel.lastError ?? null,
         last_error_at: tunnel.lastErrorAt ?? null,
-        consecutive_failures: tunnel.consecutiveFailures || 0
+        consecutive_failures: tunnel.consecutiveFailures || 0,
+        shz_name: tunnel.shzName ?? null,
+        shz_url: tunnel.shzName ? 'https://shz.al/~' + tunnel.shzName : null
       });
     } catch (e) {
       res.status(e.status || 500).json({
@@ -10943,6 +11245,73 @@ async function main(options = {}) {
       });
     } catch (e) {
       res.status(500).json({ status: 'error', deleted: 0, message: e.message });
+    }
+  });
+
+  // 0.6.8: 给已启动隧道绑定 shz.al 上报 (docs/API.MD 七) — 上报名/管理密钥缺省派生
+  // (KNAME-端口 / 上报名+"123"), shz_name/shz_key 显式覆盖; KMODE 自建隧道不可绑定
+  app.post('/api/argo/bind', async (req, res) => {
+    try {
+      const body = parseJsonBody(req.body);
+      const port = body.port;
+      const portNum = Number(port);
+      if (port === undefined || port === null || port === '' || !Number.isInteger(portNum) || portNum < 1 || portNum > 65535) {
+        return res.status(422).json({
+          status: 'error',
+          bound: false,
+          port: port ?? null,
+          message: 'port is required and must be an integer between 1 and 65535'
+        });
+      }
+      const result = await argoTunnelManager.bind(
+        portNum,
+        (body.tunnel_domain === undefined || body.tunnel_domain === null || body.tunnel_domain === '') ? null : body.tunnel_domain,
+        (body.shz_name === undefined || body.shz_name === null || body.shz_name === '') ? null : body.shz_name,
+        (body.shz_key === undefined || body.shz_key === null || body.shz_key === '') ? null : body.shz_key
+      );
+      if (result.status === 'ok') {
+        return res.json(result);
+      }
+      return res.status(result.status).json({
+        status: 'error',
+        bound: false,
+        port: portNum,
+        message: result.message
+      });
+    } catch (e) {
+      res.status(500).json({ status: 'error', bound: false, message: e.message });
+    }
+  });
+
+  // 0.6.8: 解绑指定隧道的 shz.al 上报 — 保留隧道, 清持久化条目, 远端记录异步删除
+  app.delete('/api/argo/bind', async (req, res) => {
+    try {
+      const body = parseJsonBody(req.body);
+      const port = body.port;
+      const portNum = Number(port);
+      if (port === undefined || port === null || port === '' || !Number.isInteger(portNum) || portNum < 1 || portNum > 65535) {
+        return res.status(422).json({
+          status: 'error',
+          bound: false,
+          port: port ?? null,
+          message: 'port is required and must be an integer between 1 and 65535'
+        });
+      }
+      const result = await argoTunnelManager.unbind(
+        portNum,
+        (body.tunnel_domain === undefined || body.tunnel_domain === null || body.tunnel_domain === '') ? null : body.tunnel_domain
+      );
+      if (result.status === 'ok') {
+        return res.json(result);
+      }
+      return res.status(result.status).json({
+        status: 'error',
+        bound: false,
+        port: portNum,
+        message: result.message
+      });
+    } catch (e) {
+      res.status(500).json({ status: 'error', bound: false, message: e.message });
     }
   });
 
@@ -11017,6 +11386,21 @@ async function main(options = {}) {
     if (Config.KMODE === '1' || (Config.KMODE === '2' && KModeController.knameValid())) {
       KModeController.activate(argoTunnelManager);
     }
+    // 📡 argo shz.al 绑定恢复 (0.6.8, docs/API.MD 七/十三): kstore data.argobinds →
+    // 逐条新建隧道 (source='restore') 并按持久化名称绑定上报 — 上报地址分毫不差;
+    // KMODE=1/2 自建隧道不进该体系 (语义冲突防护), 端口被占用/创建失败仅告警、kstore 条目保留
+    for (const bind of TaskStore.getArgobinds()) {
+      argoTunnelManager.create(bind.port, false, false, { source: 'restore' })
+        .then(() => argoTunnelManager.bind(bind.port, null, bind.name, bind.key ?? null))
+        .then((res) => {
+          if (res && res.status === 'ok') {
+            Logger.info(`[ArgoBind] ✅ 已恢复绑定: ${bind.name} (port ${bind.port})`);
+          } else {
+            Logger.warn(`[ArgoBind] ⚠️ 恢复绑定 ${bind.name} (port ${bind.port}) 失败 (${res && res.message}), 条目保留`);
+          }
+        })
+        .catch((e) => Logger.warn(`[ArgoBind] ⚠️ 恢复绑定 ${bind.name} (port ${bind.port}) 失败 (${e.message}), 条目保留`));
+    }
     // KMODE=3: kisama-hub 出站隧道启动 (server 就绪后, 回环目标可达)
     if (Config.KMODE === '3' && hubTunnelManager) {
       hubTunnelManager.start();
@@ -11059,4 +11443,4 @@ if (require.main === module||require.main?.filename?.includes('ts-node')) {
   main().catch(Logger.error);
 }
 
-module.exports = { main, loadCurves, Config, CryptoManager, SystemInfoCollector, CommandExecutor, FileManager, TaskManager, TaskStore, ArgoTunnelManager, argoBackoffSeconds, argoTruncateError, argoRetryBaseSeconds, argoRetryMaxSeconds, argoReregisterAfter, KModeController, HubTunnelManager, HubWSStream, HubRegisterError, HubTunnelRegistrar, hubKnameError, hubPublicUrlError, deriveHubWsUrl, filterLoopbackHeaders, hubBackoffSeconds, parseHubPorts, PROXY_STRIPPED_AUTH_HEADERS, makeRelayError, httpRequestRaw, httpRequestStream, relayLoopbackPrepare, filterProxyResponseHeaders, relayLoopbackHttp, proxyRuntimePorts, proxyEffectivePorts, proxySetRuntimePorts, proxyMergeRuntimePorts, proxyGroupsSnapshot, cleanPortList, PROXY_GROUP_HUB, PROXY_GROUP_LOCAL, PROXY_RUNTIME_PORTS, proxyWsRelayHandler, ZipArchiver, TempKeyManager, SecureDns, installDnsHook, patchDnsLookup, QuicConnection, QuicSession, QuicTlsClient, QuicKeys, QuicReader, quicInitialKeys, quicNextKeys, quicWriteVarint, quicReadVarint, quicDecodePacketNumber, quicApplyProtection, quicRemoveProtection, quicEncodeTransportParameters, quicDecodeTransportParameters, quicEncodeAck, quicRangesFromAck, hkdfExpandLabel, CapnpBuilder, capnpMessages, capnpWords, capnpStruct, capnpText, capnpStructList, capnpReturnResult, capnpConnectRequest, capnpConnectResponse, connectEdgeQuic, buildQuicRequest, verifyEdgeQuicCertificate, QUIC_DATA_STREAM_PREAMBLE, QUIC_SERVER_NAME, QUIC_ALPN, __ptySelector: { detectLinuxLibc, ptyCandidateOrder, probePtyModule, ensurePty, PTY_QWQO_VERSION, PTY_CLOSE_REASON, qwqoPlatformBinaryPath, selectPtyImplementation, getState: () => ({ ready: !!pty, reason: ptyUnavailableReason }) } };
+module.exports = { main, loadCurves, Config, CryptoManager, SystemInfoCollector, CommandExecutor, FileManager, TaskManager, TaskStore, ArgoTunnelManager, argoBackoffSeconds, argoTruncateError, argoRetryBaseSeconds, argoRetryMaxSeconds, argoReregisterAfter, argoBindName, argoBindKey, argoBindError, KModeController, HubTunnelManager, HubWSStream, HubRegisterError, HubTunnelRegistrar, hubKnameError, hubPublicUrlError, deriveHubWsUrl, filterLoopbackHeaders, hubBackoffSeconds, parseHubPorts, PROXY_STRIPPED_AUTH_HEADERS, makeRelayError, httpRequestRaw, httpRequestStream, relayLoopbackPrepare, filterProxyResponseHeaders, relayLoopbackHttp, proxyRuntimePorts, proxyEffectivePorts, proxySetRuntimePorts, proxyMergeRuntimePorts, proxyGroupsSnapshot, cleanPortList, PROXY_GROUP_HUB, PROXY_GROUP_LOCAL, PROXY_RUNTIME_PORTS, proxyWsRelayHandler, ZipArchiver, TempKeyManager, SecureDns, installDnsHook, patchDnsLookup, QuicConnection, QuicSession, QuicTlsClient, QuicKeys, QuicReader, quicInitialKeys, quicNextKeys, quicWriteVarint, quicReadVarint, quicDecodePacketNumber, quicApplyProtection, quicRemoveProtection, quicEncodeTransportParameters, quicDecodeTransportParameters, quicEncodeAck, quicRangesFromAck, hkdfExpandLabel, CapnpBuilder, capnpMessages, capnpWords, capnpStruct, capnpText, capnpStructList, capnpReturnResult, capnpConnectRequest, capnpConnectResponse, connectEdgeQuic, buildQuicRequest, verifyEdgeQuicCertificate, QUIC_DATA_STREAM_PREAMBLE, QUIC_SERVER_NAME, QUIC_ALPN, __ptySelector: { detectLinuxLibc, ptyCandidateOrder, probePtyModule, ensurePty, PTY_QWQO_VERSION, PTY_CLOSE_REASON, qwqoPlatformBinaryPath, selectPtyImplementation, getState: () => ({ ready: !!pty, reason: ptyUnavailableReason }) } };

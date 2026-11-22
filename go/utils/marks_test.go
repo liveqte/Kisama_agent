@@ -160,12 +160,49 @@ func TestMarksCapEffBit(t *testing.T) {
 	if !marksCapEffBit(21) {
 		t.Fatal("bit 21 should be set")
 	}
+	if !marksCapEffBit(12) {
+		t.Fatal("bit 12 should be set")
+	}
 	if marksCapEffBit(63) {
 		t.Fatal("bit 63 should be clear")
 	}
 	writeFile(t, filepath.Join(f.proc, "self", "status"), []byte("CapEff:\tnot-hex\n"))
 	if marksCapEffBit(21) {
 		t.Fatal("malformed CapEff must not hit")
+	}
+}
+
+// markNetadmin: CapEff bit 12 (CAP_NET_ADMIN), docs/API.MD section 15.17.
+func TestMarkNetadmin(t *testing.T) {
+	f := newMarksFixture(t)
+	status := filepath.Join(f.proc, "self", "status")
+	writeFile(t, status, []byte("Name:\tagent\nCapEff:\t0000000000001000\n"))
+	if !markNetadmin() {
+		t.Fatal("bit 12 set should hit")
+	}
+	writeFile(t, status, []byte("Name:\tagent\nCapEff:\t000001ffffffffff\n"))
+	if !markNetadmin() {
+		t.Fatal("full root set should hit")
+	}
+	writeFile(t, status, []byte("Name:\tagent\nCapEff:\t0000000000000000\n"))
+	if markNetadmin() {
+		t.Fatal("all-zero CapEff must not hit")
+	}
+	// Docker default capability set: no CAP_NET_ADMIN, even for root containers.
+	writeFile(t, status, []byte("Name:\tagent\nCapEff:\t00000000a80425fb\n"))
+	if markNetadmin() {
+		t.Fatal("docker default caps (no bit 12) must not hit")
+	}
+	// CAP_SYS_ADMIN (bit 21) alone must not imply bit 12.
+	writeFile(t, status, []byte("Name:\tagent\nCapEff:\t0000000000200000\n"))
+	if markNetadmin() {
+		t.Fatal("bit 21 only must not hit bit 12")
+	}
+	if err := os.Remove(status); err != nil {
+		t.Fatal(err)
+	}
+	if markNetadmin() {
+		t.Fatal("missing status file must not hit")
 	}
 }
 

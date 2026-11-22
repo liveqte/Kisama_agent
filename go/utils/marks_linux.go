@@ -30,10 +30,10 @@ const (
 
 var marksUUIDRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
-// detectMarksLinux probes all five marks in the fixed wire order. Each probe is
+// detectMarksLinux probes all six marks in the fixed wire order. Each probe is
 // isolated: a failure only drops that mark.
 func detectMarksLinux() []string {
-	marks := make([]string, 0, 5)
+	marks := make([]string, 0, 6)
 	if markRoot() {
 		marks = append(marks, "root")
 	}
@@ -48,6 +48,9 @@ func detectMarksLinux() []string {
 	}
 	if markFuse() {
 		marks = append(marks, "fuse")
+	}
+	if markNetadmin() {
+		marks = append(marks, "netadmin")
 	}
 	// Only names are logged; environ/mountinfo/passwd contents must never be logged.
 	logger.Debugf("marks detected: %s", strings.Join(marks, ","))
@@ -82,6 +85,12 @@ func markFuse() bool {
 		}
 	}
 	return false
+}
+
+// markNetadmin reports CapEff bit 12 (CAP_NET_ADMIN): the process can create
+// and configure network interfaces and redirect traffic. Never inferred from root.
+func markNetadmin() bool {
+	return marksCapEffBit(12)
 }
 
 func markPterodactyl() bool {

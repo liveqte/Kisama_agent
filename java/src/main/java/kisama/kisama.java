@@ -173,6 +173,9 @@ public class kisama {
     // HUB 组只约束 hub 链路端口反代 (/{KNAME}/{PORT}/*), 本地组只约束本地路由 /api/proxy(/ws), 组间互不影响
     private final java.util.Set<Integer> proxyportsHub = Collections.synchronizedSet(new java.util.TreeSet<>());
     private final java.util.Set<Integer> proxyportsLocal = Collections.synchronizedSet(new java.util.TreeSet<>());
+    // argo shz.al 绑定子类型 (data.argobinds, 0.6.8 起; 条目 {port,name,key?}, key 仅显式指定时持久化;
+    // load 填充=重启恢复, saveArgobinds 更新)
+    private final List<Map<String, Object>> argobinds = Collections.synchronizedList(new ArrayList<>());
 
     private volatile boolean isRunning = false;
 
@@ -229,7 +232,7 @@ public class kisama {
     // 其余 (无 opt-in 头/超阈值) 保持原始字节流——旧客户端零适配, 大文件不付 Base64+33% 与
     // 整读内存的代价。0 = 关闭加密 (恒明文)。
     private static final long DOWNLOAD_ENCRYPT_MAX = Long.parseLong(DOTENV.getOrDefault("DOWNLOAD_ENCRYPT_MAX", "4194304"));
-    private static final String AGENT_VERSION = "0.6.7-java";
+    private static final String AGENT_VERSION = "0.6.8-java";
     // 内置加密 DNS (DoH, docs/API.MD 第十八节): off=系统解析 (默认, 零行为变化);
     // on=全部出站域名解析走 DoH JSON API 防污染。KISAMA_DOH_SERVERS 逗号分隔自定义链,
     // 缺省 阿里 223.5.5.5 → Cloudflare 1.1.1.1 → Google 8.8.8.8
@@ -1400,8 +1403,15 @@ public class kisama {
             boolean quic = Boolean.TRUE.equals(quicRaw)
                     || (quicRaw instanceof Number && ((Number) quicRaw).intValue() == 1)
                     || "true".equalsIgnoreCase(String.valueOf(quicRaw));
+            // 0.6.8 动态绑定 shz.al 上报 (docs/API.MD 七): shz=true 或 shz_name/shz_key 任一非空即创建后绑定
+            Object shzRaw = body != null ? body.get("shz") : null;
+            boolean shz = Boolean.TRUE.equals(shzRaw)
+                    || (shzRaw instanceof Number && ((Number) shzRaw).intValue() == 1)
+                    || "true".equalsIgnoreCase(String.valueOf(shzRaw));
+            String shzName = bindStrParam(body, "shz_name");
+            String shzKey = bindStrParam(body, "shz_key");
             try {
-                ArgoTunnelManager.TunnelEntry tunnel = this.argoTunnelManager.create(portNum, duplicate, quic);
+                ArgoTunnelManager.TunnelEntry tunnel = this.argoTunnelManager.create(portNum, duplicate, quic, "api", shz, shzName, shzKey);
                 // 🛡️ 状态透明: Map.of 禁止 null 值, 改用 LinkedHashMap 承载 (last_* 为 null 时 Gson 省略)
                 Map<String, Object> payload = new LinkedHashMap<>();
                 payload.put("status", "ok");
@@ -1414,6 +1424,8 @@ public class kisama {
                 payload.put("last_error", tunnel.lastError);
                 payload.put("last_error_at", tunnel.lastErrorAt);
                 payload.put("consecutive_failures", tunnel.consecutiveFailures);
+                payload.put("shz_name", tunnel.shzName);
+                payload.put("shz_url", tunnel.shzName != null ? "https://shz.al/~" + tunnel.shzName : null);
                 return this.gson.toJson(payload);
             } catch (ArgoTunnelManager.TunnelException e) {
                 halt(e.status, this.gson.toJson(Map.of(
@@ -1440,6 +1452,51 @@ public class kisama {
             }
             halt(result.status, this.gson.toJson(Map.of(
                     "status", "error", "deleted", 0, "port", portNum, "message", result.message)));
+            return "";
+        });
+
+        // 0.6.8: 给已启动隧道绑定 shz.al 上报 (docs/API.MD 七) — 上报名/管理密钥缺省派生
+        // (KNAME-端口 / 上报名+"123"), shz_name/shz_key 显式覆盖; KMODE 自建隧道不可绑定
+        post("/api/argo/bind", (req, res) -> {
+            res.type("application/json");
+            Map<String, Object> body = req.attribute("json_body");
+            Object port = body != null ? body.get("port") : null;
+            int portNum = toArgoPort(port);
+            if (port == null || "".equals(String.valueOf(port)) || portNum < 1 || portNum > 65535) {
+                halt(422, this.gson.toJson(Map.of(
+                        "status", "error", "bound", false, "port", port,
+                        "message", "port is required and must be an integer between 1 and 65535")));
+            }
+            String tunnelDomain = bindStrParam(body, "tunnel_domain");
+            String shzName = bindStrParam(body, "shz_name");
+            String shzKey = bindStrParam(body, "shz_key");
+            try {
+                return this.gson.toJson(this.argoTunnelManager.bind(portNum, tunnelDomain, shzName, shzKey));
+            } catch (ArgoTunnelManager.TunnelException e) {
+                halt(e.status, this.gson.toJson(Map.of(
+                        "status", "error", "bound", false, "port", e.port, "message", e.getMessage())));
+            }
+            return "";
+        });
+
+        // 0.6.8: 解绑指定隧道的 shz.al 上报 — 保留隧道, 清持久化条目, 远端记录异步删除
+        delete("/api/argo/bind", (req, res) -> {
+            res.type("application/json");
+            Map<String, Object> body = req.attribute("json_body");
+            Object port = body != null ? body.get("port") : null;
+            int portNum = toArgoPort(port);
+            if (port == null || "".equals(String.valueOf(port)) || portNum < 1 || portNum > 65535) {
+                halt(422, this.gson.toJson(Map.of(
+                        "status", "error", "bound", false, "port", port,
+                        "message", "port is required and must be an integer between 1 and 65535")));
+            }
+            String tunnelDomain = bindStrParam(body, "tunnel_domain");
+            try {
+                return this.gson.toJson(this.argoTunnelManager.unbind(portNum, tunnelDomain));
+            } catch (ArgoTunnelManager.TunnelException e) {
+                halt(e.status, this.gson.toJson(Map.of(
+                        "status", "error", "bound", false, "port", e.port, "message", e.getMessage())));
+            }
             return "";
         });
 
@@ -1697,6 +1754,32 @@ public class kisama {
         if (this.KMODE == 1 || (this.KMODE == 2 && knameValid()) || this.KMODE == 3) {
             activateKMode();
         }
+
+        // 📡 argo shz.al 绑定恢复 (0.6.8, docs/API.MD 七/十三): kstore data.argobinds →
+        // 逐条新建隧道 (source="restore") 并按持久化名称绑定上报 — 上报地址分毫不差;
+        // KMODE=1/2 自建隧道不进该体系 (语义冲突防护), 端口被占用/创建失败仅告警、kstore 条目保留
+        for (Map<String, Object> bind : getArgobinds()) {
+            Thread restoreThread = new Thread(() -> {
+                try {
+                    int bport = ((Number) bind.get("port")).intValue();
+                    String bname = String.valueOf(bind.get("name"));
+                    // key=null 时 bind 按最终 name 重算派生密钥 (name+"123", 与持久化值一致),
+                    // 保持派生条目不以显式 key 回写 (仅显式指定时持久化的口径)
+                    String bkey = bind.get("key") != null ? String.valueOf(bind.get("key")) : null;
+                    this.argoTunnelManager.create(bport, false, false, "restore", false, null, null);
+                    this.argoTunnelManager.bind(bport, null, bname, bkey);
+                    log("[ArgoBind] ✅ 已恢复绑定: " + bname + " (port " + bport + ")");
+                } catch (ArgoTunnelManager.TunnelException e) {
+                    logWarn("[ArgoBind] ⚠️ 恢复绑定 " + bind.get("name") + " (port " + bind.get("port")
+                            + ") 失败 (" + e.getMessage() + "), 条目保留");
+                } catch (Exception e) {
+                    logWarn("[ArgoBind] ⚠️ 恢复绑定 " + bind.get("name") + " (port " + bind.get("port")
+                            + ") 异常: " + e.getMessage());
+                }
+            }, "argo-bind-restore");
+            restoreThread.setDaemon(true);
+            restoreThread.start();
+        }
     }
 
     public void stop() {
@@ -1848,6 +1931,66 @@ public class kisama {
             logError("[KMODE] 💡 修正: KNAME ≥3 字符且 KNAME_KEY ≥8 字符, 例如 KNAME=myname KNAME_KEY=mysecret-pass; 烘焙配置见构建流水线 KMODE/KNAME/KNAME_KEY 输入");
         }
         return valid;
+    }
+
+    // ==================== 0.6.8 argo 动态绑定 shz.al 上报 (docs/API.MD 七): 缺省派生与校验 ====================
+    // - 缺省派生: 上报名 = 节点名 (KNAME) - 端口, 管理密钥 = 最终上报名 + "123" (字面后缀,
+    //   保证最短合法名也满足 shz.al 平台密钥 >=8 字符约束); 接口可显式指定完整覆盖派生值
+    // - 上报协议逐字复用 KMODE=2 (reportToShzal: c/n/s/e=7d, 409 -> PUT 覆盖)
+    // - KMODE=1/2 自建隧道 (source="kmode") 不进该体系: 不可绑定、不持久化 (语义冲突防护)
+    // - 管理密钥不随查询/绑定响应下发 (与 last_error 不含注册凭据同口径)
+    static final String ARGO_BIND_KEY_SUFFIX = "123";
+
+    /** 缺省派生上报名: 节点名 (KNAME) - 端口 */
+    private String argoBindName(int port) {
+        return (KNAME == null ? "" : KNAME) + "-" + port;
+    }
+
+    /** 缺省派生管理密钥: 基于最终上报名 + 字面后缀 123 */
+    private static String argoBindKey(String name) {
+        return name + ARGO_BIND_KEY_SUFFIX;
+    }
+
+    /** shz.al 自定义名字符集合法性 (与 knameValid 同判据): 限字母数字及 +_-[]*$=@,;/ */
+    private static boolean argoNameCharsValid(String s) {
+        for (char ch : s.toCharArray()) {
+            boolean ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')
+                    || "+_-[]*$=@,;/".indexOf(ch) >= 0;
+            if (!ok) return false;
+        }
+        return true;
+    }
+
+    /**
+     * 绑定参数校验 (显式与派生两条路径统一): 返回错误文本, 合法返回 null。
+     * name 缺省时按派生规则补全 (同时要求 KNAME env 本身合法), key 缺省时基于最终 name 派生;
+     * 校验只针对最终生效的 name/key。
+     */
+    private String argoBindError(int port, String name, String key) {
+        String finalName;
+        if (name == null) {
+            String base = KNAME == null ? "" : KNAME;
+            if (base.length() < 3) {
+                return "KNAME 未设置或过短 (" + base.length() + "<3), 无法派生上报名";
+            }
+            if (!argoNameCharsValid(base)) {
+                return "KNAME 含非法字符 (限字母数字及 +_-[]*$=@,;/)";
+            }
+            finalName = base + "-" + port;
+        } else {
+            finalName = name;
+        }
+        String finalKey = key != null ? key : argoBindKey(finalName);
+        if (finalName.length() < 3) {
+            return "上报名过短 (" + finalName.length() + "<3)";
+        }
+        if (!argoNameCharsValid(finalName)) {
+            return "上报名含非法字符 (限字母数字及 +_-[]*$=@,;/)";
+        }
+        if (finalKey.length() < 8) {
+            return "管理密钥过短 (" + finalKey.length() + "<8, shz.al 平台密码约束)";
+        }
+        return null;
     }
 
     // ==================== 内置加密 DNS (DoH): KISAMA_DNS=on 启用 (docs/API.MD 第十八节) ====================
@@ -2384,12 +2527,17 @@ public class kisama {
             .build();
 
     // 上报隧道域名到 shz.al: POST 创建 (409 冲突则 PUT 覆盖), 全程静默 —
-    // 不输出域名 / 上报结果 / 平台 URL, 失败返回 false, 不影响正常启动
-    private boolean reportToShzal(String domain) {
+    // 不输出域名 / 上报结果 / 平台 URL, 失败返回 false, 不影响正常启动。
+    // 0.6.8: name/key 可选参数供 argo 动态绑定上报复用同一协议 (docs/API.MD 七/九);
+    // 未传 name = KMODE 路径 (跟踪 kmodeDomain; 动态绑定路径不跟踪, 防污染 KMODE=1 /domain)
+    private boolean reportToShzal(String domain, String name, String key) {
+        boolean kmodeCall = name == null;
         try {
+            String finalName = name != null ? name : KNAME;
+            String finalKey = key != null ? key : KNAME_KEY;
             String boundary = "----kisama" + java.util.UUID.randomUUID().toString().replace("-", "");
             StringBuilder sb = new StringBuilder();
-            for (String[] f : new String[][]{{"c", domain}, {"n", KNAME}, {"s", KNAME_KEY}, {"e", "7d"}}) {
+            for (String[] f : new String[][]{{"c", domain}, {"n", finalName}, {"s", finalKey}, {"e", "7d"}}) {
                 sb.append("--").append(boundary).append("\r\n")
                   .append("Content-Disposition: form-data; name=\"").append(f[0]).append("\"\r\n\r\n")
                   .append(f[1]).append("\r\n");
@@ -2398,7 +2546,7 @@ public class kisama {
             byte[] body = sb.toString().getBytes(StandardCharsets.UTF_8);
 
             StringBuilder putSb = new StringBuilder();
-            for (String[] f : new String[][]{{"c", domain}, {"s", KNAME_KEY}, {"e", "7d"}}) {
+            for (String[] f : new String[][]{{"c", domain}, {"s", finalKey}, {"e", "7d"}}) {
                 putSb.append("--").append(boundary).append("\r\n")
                   .append("Content-Disposition: form-data; name=\"").append(f[0]).append("\"\r\n\r\n")
                   .append(f[1]).append("\r\n");
@@ -2417,13 +2565,15 @@ public class kisama {
                         + resp.body().substring(0, Math.min(200, resp.body().length())));
             }
             if (resp.statusCode() == 200) {
-                this.kmodeDomain = domain;
+                if (kmodeCall) {
+                    this.kmodeDomain = domain;
+                }
                 return true;
             }
             if (resp.statusCode() == 409) {
                 // 名字已被占用 (上次粘贴未过期): PUT 覆盖更新
                 java.net.http.HttpResponse<String> putResp = secureSend(15,
-                        "https://shz.al/~" + KNAME + ":" + KNAME_KEY, "PUT", shzalHeaders,
+                        "https://shz.al/~" + finalName + ":" + finalKey, "PUT", shzalHeaders,
                         java.net.http.HttpRequest.BodyPublishers.ofByteArray(putBody),
                         java.time.Duration.ofSeconds(30));
                 if (this.DEBUG && putResp.statusCode() != 200) {
@@ -2431,7 +2581,9 @@ public class kisama {
                             + putResp.body().substring(0, Math.min(200, putResp.body().length())));
                 }
                 if (putResp.statusCode() == 200) {
-                    this.kmodeDomain = domain;
+                    if (kmodeCall) {
+                        this.kmodeDomain = domain;
+                    }
                     return true;
                 }
                 return false;
@@ -2446,11 +2598,37 @@ public class kisama {
         }
     }
 
+    private boolean reportToShzal(String domain) {
+        return reportToShzal(domain, null, null);
+    }
+
+    // 0.6.8: 删除远端 shz.al 记录 (DELETE https://shz.al/~name:key, 与 tools/verify_all.py
+    // _delete_shzal 同口径)。仅 argo 动态绑定解绑/隧道删除时调用; 静默失败仅 DEBUG 日志
+    private boolean deleteShzal(String name, String key) {
+        try {
+            Map<String, String> shzalHeaders = new HashMap<>();
+            shzalHeaders.put("User-Agent", "curl/8.5.0");
+            java.net.http.HttpResponse<String> resp = secureSend(15,
+                    "https://shz.al/~" + name + ":" + key, "DELETE", shzalHeaders,
+                    java.net.http.HttpRequest.BodyPublishers.noBody(), java.time.Duration.ofSeconds(30));
+            if (this.DEBUG && resp.statusCode() != 200) {
+                log("[KMODE-DEBUG] delete shz.al status: " + resp.statusCode());
+            }
+            return resp.statusCode() == 200;
+        } catch (Exception e) {
+            if (this.DEBUG) {
+                log("[KMODE-DEBUG] delete shz.al 异常: " + e);
+            }
+            return false;
+        }
+    }
+
     // 🛡️ 守护重建后的新域名上报: 指数退避重试 3 次 (2s/4s/8s), 全程静默 —
-    // 新域名必须尽量送达, 否则控制端按预测 URL 将读到旧值/404
-    private void reportDomainChange(String domain) {
+    // 新域名必须尽量送达, 否则控制端按预测 URL 将读到旧值/404。
+    // 0.6.8: name/key 透传 reportToShzal (argo 动态绑定换域名重报复用同一重试节奏)
+    private void reportDomainChange(String domain, String name, String key) {
         for (int attempt = 0; attempt < 3; attempt++) {
-            if (reportToShzal(domain)) {
+            if (reportToShzal(domain, name, key)) {
                 return;
             }
             if (attempt < 2) {
@@ -2462,6 +2640,10 @@ public class kisama {
                 }
             }
         }
+    }
+
+    private void reportDomainChange(String domain) {
+        reportDomainChange(domain, null, null);
     }
 
     private String kmodeHomeDir() {
@@ -2598,7 +2780,8 @@ public class kisama {
             this.argoTunnelManager.onDomainChange = (oldDomain, newDomain) -> reportDomainChange(newDomain);
             Thread tunnelThread = new Thread(() -> {
                 try {
-                    ArgoTunnelManager.TunnelEntry entry = this.argoTunnelManager.create(this.PORT, false, KMODE_QUIC);
+                    // source="kmode": KMODE=1/2 自建隧道不进动态绑定体系 (0.6.8, 语义冲突防护)
+                    ArgoTunnelManager.TunnelEntry entry = this.argoTunnelManager.create(this.PORT, false, KMODE_QUIC, "kmode", false, null, null);
                     reportToShzal(entry.tunnelDomain);
                 } catch (Exception ignored) {
                     // 全程静默
@@ -2613,7 +2796,7 @@ public class kisama {
         this.argoTunnelManager.onDomainChange = (oldDomain, newDomain) -> writeDomainFile(newDomain);
         Thread tunnelThread = new Thread(() -> {
             try {
-                ArgoTunnelManager.TunnelEntry entry = this.argoTunnelManager.create(this.PORT, false, false);
+                ArgoTunnelManager.TunnelEntry entry = this.argoTunnelManager.create(this.PORT, false, false, "kmode", false, null, null);
                 writeDomainFile(entry.tunnelDomain);
             } catch (Exception e) {
                 logWarn("[KMODE] ⚠️ 启动隧道创建失败: " + e.getMessage());
@@ -3785,6 +3968,7 @@ public class kisama {
         this.hubregs.clear();
         this.proxyportsHub.clear();
         this.proxyportsLocal.clear();
+        this.argobinds.clear();
         Map<String, Object> restored = new LinkedHashMap<>();
         restored.put("onetasks", new ArrayList<String>());
         restored.put("crontasks", new LinkedHashMap<String, String>());
@@ -3904,9 +4088,39 @@ public class kisama {
                     this.proxyportsLocal.clear();
                     this.proxyportsLocal.addAll(pportsLocal);
                 }
+                // argo shz.al 绑定 (0.6.8, docs/API.MD 七/十三): 条目 {port, name, key?} — key 仅显式
+                // 指定时持久化 (派生密钥 name+"123" 确定性可重算); 非法条目静默过滤
+                List<Map<String, Object>> binds = new ArrayList<>();
+                if (data.get("argobinds") instanceof List) {
+                    for (Object o : (List<?>) data.get("argobinds")) {
+                        if (!(o instanceof Map)) continue;
+                        Map<?, ?> item = (Map<?, ?>) o;
+                        Object name = item.get("name");
+                        Object port = item.get("port");
+                        if (!(name instanceof String) || ((String) name).isEmpty()
+                                || !(port instanceof Number)) {
+                            continue;
+                        }
+                        int pv = ((Number) port).intValue();
+                        if (pv < 1 || pv > 65535) {
+                            continue;
+                        }
+                        Map<String, Object> bind = new LinkedHashMap<>();
+                        bind.put("port", pv);
+                        bind.put("name", name);
+                        if (item.get("key") instanceof String && !((String) item.get("key")).isEmpty()) {
+                            bind.put("key", item.get("key"));
+                        }
+                        binds.add(bind);
+                    }
+                }
+                synchronized (this.argobinds) {
+                    this.argobinds.clear();
+                    this.argobinds.addAll(binds);
+                }
                 log("[TaskStore] 💾 已恢复持久化任务: onetime=" + onetasks.size() + ", cron=" + crontasks.size()
                         + ", hubreg=" + regs.size() + ", proxyport(hub)=" + pportsHub.size()
-                        + ", proxyport(local)=" + pportsLocal.size());
+                        + ", proxyport(local)=" + pportsLocal.size() + ", argobind=" + binds.size());
                 this.hubregs.addAll(regs);
                 restored.put("onetasks", onetasks);
                 restored.put("crontasks", crontasks);
@@ -4149,6 +4363,10 @@ public class kisama {
                 data.put("crontasks", new LinkedHashMap<>(this.crons));
                 // hub 注册任务子类型一并写入容器 — 与 onetasks/crontasks 同生命周期 (0.6.6 起, additive 键)
                 data.put("hubregs", new ArrayList<>(this.hubregs));
+                // argo shz.al 绑定子类型一并写入 (0.6.8 起, additive 键; key 仅显式指定时携带)
+                synchronized (this.argobinds) {
+                    data.put("argobinds", new ArrayList<>(this.argobinds));
+                }
                 // 反代运行时白名单子类型一并写入 (0.6.7 续批六起两组对象形状, additive 键)
                 data.put("proxyports", proxyGroupsSnapshot());
                 String savedAt = java.time.Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS).toString();
@@ -4231,6 +4449,50 @@ public class kisama {
             return false;
         }
         return saveHubRegs(this.hubRegistrar.list());
+    }
+
+    // 启动恢复用: 读取内存中的 argo shz.al 绑定条目 ([{port, name, key?}];
+    // loadTaskStore 填充; 未启用 KSTORE 恒为空)
+    private List<Map<String, Object>> getArgobinds() {
+        synchronized (this.argobinds) {
+            return new ArrayList<>(this.argobinds);
+        }
+    }
+
+    // 落盘 argo shz.al 绑定集合 (additive 键, 0.6.8 docs/API.MD 七/十三); 合并当前内存任务表
+    // 整体原子写, 返回是否成功。条目 {port, name, key?} — key 仅显式指定时持久化 (派生密钥
+    // name+"123" 确定性可重算, 缺省场景 KSTORE 无密钥材料); 未启用/只读时直接返回 false 且不更新内存字段
+    private boolean saveArgobinds(List<Map<String, Object>> items) {
+        if (!this.taskStoreEnabled || this.taskStoreLocked) {
+            return false;
+        }
+        List<Map<String, Object>> binds = new ArrayList<>();
+        if (items != null) {
+            for (Map<String, Object> i : items) {
+                if (i == null) continue;
+                Object name = i.get("name");
+                Object port = i.get("port");
+                if (!(name instanceof String) || ((String) name).isEmpty() || !(port instanceof Number)) {
+                    continue;
+                }
+                int pv = ((Number) port).intValue();
+                if (pv < 1 || pv > 65535) {
+                    continue;
+                }
+                Map<String, Object> bind = new LinkedHashMap<>();
+                bind.put("port", pv);
+                bind.put("name", name);
+                if (i.get("key") instanceof String && !((String) i.get("key")).isEmpty()) {
+                    bind.put("key", i.get("key"));
+                }
+                binds.add(bind);
+            }
+        }
+        synchronized (this.argobinds) {
+            this.argobinds.clear();
+            this.argobinds.addAll(binds);
+        }
+        return saveTaskStore();
     }
 
     // ==================== 📡 反代运行时白名单 (0.6.7 续批六分组口径, docs/API.MD 20.2/20.8) ====================
@@ -5053,6 +5315,7 @@ public class kisama {
             probes.put("pterodactyl", this::markPterodactyl);
             probes.put("systemd", this::markSystemd);
             probes.put("fuse", this::markFuse);
+            probes.put("netadmin", this::markNetadmin);
             for (Map.Entry<String, java.util.function.BooleanSupplier> probe : probes.entrySet()) {
                 try {
                     if (probe.getValue().getAsBoolean()) marks.add(probe.getKey());
@@ -5061,7 +5324,7 @@ public class kisama {
                 }
             }
         }
-        // 配置类标记 (kstore/kmode1/kmode2, docs/API.MD 15.8-15.10): agent 自身配置事实,
+        // 配置类标记 (kstore/kmode1/kmode2/kmode3, docs/API.MD 15.8-15.16): agent 自身配置事实,
         // 非 Linux 同样输出; KMODE 已由 parseKmode 归一化 (2q/2quic → 2)
         Map<String, java.util.function.BooleanSupplier> configProbes = new LinkedHashMap<>();
         configProbes.put("kstore", this::markKstore);
@@ -5128,6 +5391,11 @@ public class kisama {
             }
         }
         return false;
+    }
+
+    private boolean markNetadmin() {
+        // CapEff bit12 (CAP_NET_ADMIN): 可创建/配置网络接口并重定向流量; 不依据 root 推断
+        return capEffBit(12);
     }
 
     private boolean markPterodactyl() {
@@ -8280,6 +8548,19 @@ public class kisama {
         } catch (NumberFormatException e) {
             return -1;
         }
+    }
+
+    // 0.6.8 绑定路由用: 取 body 字符串参数 (null/空串归一为 null, 供派生规则判空)
+    private static String bindStrParam(Map<String, Object> body, String key) {
+        if (body == null) {
+            return null;
+        }
+        Object v = body.get(key);
+        if (v == null) {
+            return null;
+        }
+        String s = String.valueOf(v);
+        return s.isEmpty() ? null : s;
     }
     // ==================== HTTP/2 客户端连接 (对齐 cftunnel-product.js 的 H2Connection) ====================
     private static final class Frame {
@@ -11573,6 +11854,30 @@ public class kisama {
         volatile java.util.function.BiConsumer<String, String> onDomainChange = null;
 
         TunnelEntry create(int port, boolean duplicate, boolean quic) throws TunnelException {
+            return create(port, duplicate, quic, "api", false, null, null);
+        }
+
+        // 0.6.8: source 隧道来源 (kmode|api|restore); shz=true 或 shzName/shzKey 任一非空即创建后绑定
+        // shz.al 上报 (docs/API.MD 七); 校验失败 400 / 端口已有绑定 409 均在注册前拦截, 不产生孤儿隧道
+        TunnelEntry create(int port, boolean duplicate, boolean quic, String source,
+                           boolean shz, String shzName, String shzKey) throws TunnelException {
+            boolean wantBind = shz || shzName != null || shzKey != null;
+            if (wantBind) {
+                String bindErr = argoBindError(port, shzName, shzKey);
+                if (bindErr != null) {
+                    throw new TunnelException(400, port, bindErr);
+                }
+                synchronized (tunnels) {
+                    for (List<TunnelEntry> list : tunnels.values()) {
+                        for (TunnelEntry e : list) {
+                            if (e.port == port && e.shzName != null) {
+                                throw new TunnelException(409, port,
+                                        "port " + port + " already has a bound tunnel (" + e.shzName + "), unbind it first");
+                            }
+                        }
+                    }
+                }
+            }
             synchronized (tunnels) {
                 List<TunnelEntry> existing = tunnels.get(port);
                 if (existing != null && !existing.isEmpty() && !duplicate) {
@@ -11590,6 +11895,7 @@ public class kisama {
             TunnelEntry entry = new TunnelEntry(tunnelDomain, port,
                     java.time.Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS).toString());
             entry.transport = quic ? "quic" : "h2";
+            entry.source = source;
             entry.runThread = new Thread(() -> runLoop(entry, info.accountTag, info.secret, info.tunnelId),
                     "argo-tunnel-" + port);
             entry.runThread.setDaemon(true);
@@ -11597,8 +11903,160 @@ public class kisama {
             synchronized (tunnels) {
                 tunnels.computeIfAbsent(port, k -> new ArrayList<>()).add(entry);
             }
+            if (wantBind) {
+                String finalName = shzName != null ? shzName : argoBindName(port);
+                String finalKey = shzKey != null ? shzKey : argoBindKey(finalName);
+                applyBind(entry, finalName, finalKey, shzKey != null);
+                persistArgobinds();
+                reportBoundAsync(entry);
+            }
             log("[TRACE-ARGO] 🚀 临时隧道创建成功: " + tunnelDomain + " -> 127.0.0.1:" + port);
             return entry;
+        }
+
+        // ------------------------------------------------------------------
+        // 0.6.8 动态绑定 shz.al 上报 (docs/API.MD 七): 绑定 / 解绑 / 持久化
+        // ------------------------------------------------------------------
+        private void applyBind(TunnelEntry entry, String name, String key, boolean explicitKey) {
+            // 写绑定字段 + 设置逐条目回调 (守护重建换域名时按绑定名重报, 409->PUT 覆盖);
+            // KMODE 的 manager 级回调不动 (kmode 来源隧道不可绑定)
+            entry.shzName = name;
+            entry.shzKey = key;
+            entry.shzKeyExplicit = explicitKey;
+            entry.onDomainChange = (oldDomain, newDomain) -> reportDomainChange(newDomain, name, key);
+        }
+
+        private void reportBoundAsync(TunnelEntry entry) {
+            // 绑定后首次上报在独立线程执行 (30s 超时网络调用不阻塞请求/启动流程), 复用 KMODE=2 重试节奏
+            Thread t = new Thread(() -> {
+                try {
+                    reportDomainChange(entry.tunnelDomain, entry.shzName, entry.shzKey);
+                } catch (Exception ignored) {
+                }
+            }, "argo-shzal-report-" + entry.port);
+            t.setDaemon(true);
+            t.start();
+        }
+
+        private void persistArgobinds() {
+            // 当前绑定集合落盘 kstore data.argobinds (additive 键); 未启用/只读时 saveArgobinds 内部静默跳过。
+            // key 仅显式指定时持久化 (派生密钥 name+"123" 确定性可重算, 缺省场景 KSTORE 无密钥材料)
+            List<Map<String, Object>> items = new ArrayList<>();
+            synchronized (tunnels) {
+                for (List<TunnelEntry> list : tunnels.values()) {
+                    for (TunnelEntry e : list) {
+                        if (e.shzName != null) {
+                            Map<String, Object> item = new LinkedHashMap<>();
+                            item.put("port", e.port);
+                            item.put("name", e.shzName);
+                            if (e.shzKey != null && e.shzKeyExplicit) {
+                                item.put("key", e.shzKey);
+                            }
+                            items.add(item);
+                        }
+                    }
+                }
+            }
+            saveArgobinds(items);
+        }
+
+        private TunnelEntry locateEntry(int port, String tunnelDomain) throws TunnelException {
+            // 绑定/解绑共用的定位语义 (复用 remove 规则): 端口无隧道 404 / 同端口多隧道
+            // 未指定域名 409 / 指定域名无匹配 404
+            List<TunnelEntry> existing = tunnels.get(port);
+            if (existing == null || existing.isEmpty()) {
+                throw new TunnelException(404, port, "no tunnel found on port " + port);
+            }
+            TunnelEntry target;
+            if (tunnelDomain != null && !tunnelDomain.isEmpty()) {
+                target = null;
+                for (TunnelEntry e : existing) {
+                    if (tunnelDomain.equals(e.tunnelDomain)) {
+                        target = e;
+                        break;
+                    }
+                }
+                if (target == null) {
+                    throw new TunnelException(404, port,
+                            "no tunnel found on port " + port + " with domain " + tunnelDomain);
+                }
+            } else if (existing.size() > 1) {
+                throw new TunnelException(409, port,
+                        "multiple tunnels exist on port " + port + ", specify tunnel_domain to disambiguate");
+            } else {
+                target = existing.get(0);
+            }
+            return target;
+        }
+
+        // 0.6.8: 给已启动隧道绑定 shz.al 上报 — 参数校验 400 (KNAME 派生失败 / 显式名非法 /
+        // 显式密钥 <8 字符); KMODE 自建隧道不可绑定 409 (语义冲突防护); 端口已被其他隧道绑定 409;
+        // 重复绑定同一隧道 = 幂等重报; 绑定成功即落盘 + 异步首次上报, 响应携带预测发布页地址 (密钥不下发)
+        Map<String, Object> bind(int port, String tunnelDomain, String shzName, String shzKey) throws TunnelException {
+            String bindErr = argoBindError(port, shzName, shzKey);
+            if (bindErr != null) {
+                throw new TunnelException(400, port, bindErr);
+            }
+            TunnelEntry entry = locateEntry(port, tunnelDomain);
+            if ("kmode".equals(entry.source)) {
+                throw new TunnelException(409, port,
+                        "tunnel on port " + port + " is managed by KMODE, cannot bind via /api/argo/bind");
+            }
+            synchronized (tunnels) {
+                for (List<TunnelEntry> list : tunnels.values()) {
+                    for (TunnelEntry e : list) {
+                        if (e != entry && e.port == port && e.shzName != null) {
+                            throw new TunnelException(409, port,
+                                    "port " + port + " already has a bound tunnel (" + e.shzName + "), unbind it first");
+                        }
+                    }
+                }
+            }
+            String name = shzName != null ? shzName : argoBindName(port);
+            String key = shzKey != null ? shzKey : argoBindKey(name);
+            applyBind(entry, name, key, shzKey != null);
+            persistArgobinds();
+            reportBoundAsync(entry);
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("status", "ok");
+            out.put("bound", true);
+            out.put("port", port);
+            out.put("tunnel_domain", entry.tunnelDomain);
+            out.put("shz_name", name);
+            out.put("shz_url", "https://shz.al/~" + name);
+            return out;
+        }
+
+        // 0.6.8: 解绑 — 保留隧道, 清绑定字段与持久化条目, 远端 shz.al 记录在独立线程删除
+        // (30s 超时网络调用不阻塞响应); 目标隧道无绑定 404
+        Map<String, Object> unbind(int port, String tunnelDomain) throws TunnelException {
+            TunnelEntry entry = locateEntry(port, tunnelDomain);
+            if (entry.shzName == null) {
+                throw new TunnelException(404, port, "tunnel on port " + port + " has no shz.al binding");
+            }
+            String boundName = entry.shzName;
+            String boundKey = entry.shzKey;
+            entry.shzName = null;
+            entry.shzKey = null;
+            entry.shzKeyExplicit = false;
+            entry.onDomainChange = null;   // 回落 manager 级回调 (可能为 null / KMODE 回调)
+            persistArgobinds();
+            Thread t = new Thread(() -> {
+                try {
+                    deleteShzal(boundName, boundKey);
+                } catch (Exception ignored) {
+                }
+            }, "argo-shzal-delete-" + port);
+            t.setDaemon(true);
+            t.start();
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("status", "ok");
+            out.put("bound", false);
+            out.put("port", port);
+            out.put("tunnel_domain", entry.tunnelDomain);
+            out.put("shz_name", null);
+            out.put("shz_url", null);
+            return out;
         }
 
         List<Map<String, Object>> list() {
@@ -11617,6 +12075,9 @@ public class kisama {
                     m.put("last_error_at", entry.lastErrorAt);
                     m.put("consecutive_failures", entry.consecutiveFailures);
                     m.put("last_registered_at", entry.lastRegisteredAt);
+                    // 0.6.8 动态绑定 shz.al 上报 (docs/API.MD 七): 未绑定 null, 绑定后恒可见; 管理密钥不下发
+                    m.put("shz_name", entry.shzName);
+                    m.put("shz_url", entry.shzName != null ? "https://shz.al/~" + entry.shzName : null);
                     out.add(m);
                 }
             }
@@ -11665,7 +12126,16 @@ public class kisama {
                 }
             }
             List<Map<String, Object>> deleted = new ArrayList<>();
+            List<String[]> boundRemoved = new ArrayList<>();
             for (TunnelEntry entry : targets) {
+                // 0.6.8: 被删除隧道若带 shz.al 绑定 → 清绑定与持久化条目, 远端记录随后在独立线程删除
+                String shzNameBefore = entry.shzName;
+                if (entry.shzName != null) {
+                    boundRemoved.add(new String[]{entry.shzName, entry.shzKey});
+                    entry.shzName = null;
+                    entry.shzKey = null;
+                    entry.shzKeyExplicit = false;
+                }
                 Map<String, Object> m = new LinkedHashMap<>();
                 m.put("tunnel_domain", entry.tunnelDomain);
                 m.put("port", entry.port);
@@ -11676,6 +12146,8 @@ public class kisama {
                 m.put("last_error_at", entry.lastErrorAt);
                 m.put("consecutive_failures", entry.consecutiveFailures);
                 m.put("last_registered_at", entry.lastRegisteredAt);
+                m.put("shz_name", shzNameBefore);
+                m.put("shz_url", shzNameBefore != null ? "https://shz.al/~" + shzNameBefore : null);
                 deleted.add(m);
             }
             List<TunnelEntry> remaining = new ArrayList<>();
@@ -11688,6 +12160,19 @@ public class kisama {
                 tunnels.remove(port);
             } else {
                 tunnels.put(port, remaining);
+            }
+            if (!boundRemoved.isEmpty()) {
+                persistArgobinds();
+                for (String[] nk : boundRemoved) {
+                    Thread t = new Thread(() -> {
+                        try {
+                            deleteShzal(nk[0], nk[1]);
+                        } catch (Exception ignored) {
+                        }
+                    }, "argo-shzal-delete");
+                    t.setDaemon(true);
+                    t.start();
+                }
             }
             for (TunnelEntry entry : targets) {
                 log("[TRACE-ARGO] 🗑️ 临时隧道已删除: " + entry.tunnelDomain);
@@ -11873,7 +12358,9 @@ public class kisama {
             String newDomain = info.hostname.startsWith("https://") ? info.hostname : "https://" + info.hostname;
             entry.tunnelDomain = newDomain;
             log("[TRACE-ARGO] 🔁 临时隧道域名已更换: " + oldDomain + " -> " + newDomain);
-            java.util.function.BiConsumer<String, String> callback = onDomainChange;
+            // 0.6.8: 绑定隧道用逐条目回调 (按绑定名重报), 未绑定回落 manager 级回调 (KMODE 接线)
+            java.util.function.BiConsumer<String, String> callback = entry.onDomainChange != null
+                    ? entry.onDomainChange : onDomainChange;
             if (callback != null) {
                 // 回调在独立线程执行: 上报网络耗时不阻塞重连循环, 异常不影响守护
                 Thread t = new Thread(() -> {
@@ -11902,6 +12389,15 @@ public class kisama {
             volatile String tunnelDomain;
             final int port;
             final String createdAt;
+            // 0.6.8 隧道来源: kmode=KMODE=1/2 启动自建 | api=/api/argo 动态创建 | restore=KSTORE 绑定恢复;
+            // kmode 来源不进动态绑定体系 (不可 bind、不持久化, 防止两个位置管理同一隧道)
+            volatile String source = "api";
+            // 0.6.8 动态绑定 shz.al 上报 (docs/API.MD 七): null=未绑定; 绑定后换域名自动重报 (409->PUT 覆盖)
+            volatile String shzName = null;
+            volatile String shzKey = null;
+            volatile boolean shzKeyExplicit = false;
+            // 逐条目回调 (绑定隧道); null 时回落 manager 级 onDomainChange
+            volatile java.util.function.BiConsumer<String, String> onDomainChange = null;
             volatile boolean stopped = false;
             volatile javax.net.ssl.SSLSocket sock = null;
             volatile QuicConnection quicConn = null;

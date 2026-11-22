@@ -19,7 +19,7 @@ import agent  # noqa: E402
 
 
 class MarksProbeTest(unittest.TestCase):
-    """Five probes: hit / miss / unreadable / permission denied / malformed content."""
+    """Six probes: hit / miss / unreadable / permission denied / malformed content."""
 
     def setUp(self):
         self.base = Path(tempfile.mkdtemp(prefix="kisama_marks_"))
@@ -190,6 +190,7 @@ class MarksProbeTest(unittest.TestCase):
             "Name:\tagent\nCapEff:\t000001ffffffffff\n", encoding="utf-8"
         )
         self.assertTrue(agent._marks_cap_eff_bit(21))
+        self.assertTrue(agent._marks_cap_eff_bit(12))
         self.assertFalse(agent._marks_cap_eff_bit(63))
 
     def test_cap_eff_malformed_is_false(self):
@@ -197,6 +198,38 @@ class MarksProbeTest(unittest.TestCase):
         self.assertFalse(agent._marks_cap_eff_bit(21))
         (self.proc / "self" / "status").write_text("Name:\tagent\n", encoding="utf-8")
         self.assertFalse(agent._marks_cap_eff_bit(21))
+
+    # ---------- netadmin: CapEff bit12 (CAP_NET_ADMIN), docs/API.MD 15.17 ----------
+    def test_netadmin_hit_when_cap_eff_bit12_set(self):
+        (self.proc / "self" / "status").write_text(
+            "Name:\tagent\nCapEff:\t0000000000001000\n", encoding="utf-8"
+        )
+        self.assertTrue(self.collector._mark_netadmin())
+        # 全量 root 集: 第 12 位同样置位
+        (self.proc / "self" / "status").write_text(
+            "Name:\tagent\nCapEff:\t000001ffffffffff\n", encoding="utf-8"
+        )
+        self.assertTrue(self.collector._mark_netadmin())
+
+    def test_netadmin_miss_when_bit12_clear(self):
+        # 全零: 常规非特权用户进程
+        (self.proc / "self" / "status").write_text(
+            "Name:\tagent\nCapEff:\t0000000000000000\n", encoding="utf-8"
+        )
+        self.assertFalse(self.collector._mark_netadmin())
+        # Docker 默认 capability 集: 无 CAP_NET_ADMIN (bit12 为 0), 即使 root 也不报
+        (self.proc / "self" / "status").write_text(
+            "Name:\tagent\nCapEff:\t00000000a80425fb\n", encoding="utf-8"
+        )
+        self.assertFalse(self.collector._mark_netadmin())
+        # 仅 CAP_SYS_ADMIN (bit21) 置位不含 bit12: 不得张冠李戴
+        (self.proc / "self" / "status").write_text(
+            "Name:\tagent\nCapEff:\t0000000000200000\n", encoding="utf-8"
+        )
+        self.assertFalse(self.collector._mark_netadmin())
+
+    def test_netadmin_missing_status_file_is_false(self):
+        self.assertFalse(self.collector._mark_netadmin())
 
     def test_fuse_setuid_helper_path(self):
         fake_stat = mock.Mock(st_mode=stat.S_IFREG | stat.S_ISUID | 0o755)
@@ -214,11 +247,12 @@ class MarksProbeTest(unittest.TestCase):
              mock.patch.object(self.collector, "_mark_pterodactyl", return_value=True), \
              mock.patch.object(self.collector, "_mark_systemd", return_value=True), \
              mock.patch.object(self.collector, "_mark_fuse", return_value=False), \
+             mock.patch.object(self.collector, "_mark_netadmin", return_value=True), \
              mock.patch.object(self.collector, "_mark_kstore", return_value=False), \
              mock.patch.object(self.collector, "_mark_kmode1", return_value=False), \
              mock.patch.object(self.collector, "_mark_kmode2", return_value=False):
             self.assertEqual(self.collector._detect_marks(),
-                             ["root", "pterodactyl", "systemd"])
+                             ["root", "pterodactyl", "systemd", "netadmin"])
 
     def test_detect_marks_isolates_exceptions(self):
         with mock.patch.object(agent.platform, "system", return_value="Linux"), \
@@ -228,6 +262,7 @@ class MarksProbeTest(unittest.TestCase):
              mock.patch.object(self.collector, "_mark_pterodactyl", return_value=False), \
              mock.patch.object(self.collector, "_mark_systemd", return_value=False), \
              mock.patch.object(self.collector, "_mark_fuse", return_value=False), \
+             mock.patch.object(self.collector, "_mark_netadmin", return_value=False), \
              mock.patch.object(self.collector, "_mark_kstore", return_value=False), \
              mock.patch.object(self.collector, "_mark_kmode1", return_value=False), \
              mock.patch.object(self.collector, "_mark_kmode2", return_value=False):
@@ -301,6 +336,7 @@ class MarksProbeTest(unittest.TestCase):
              mock.patch.object(self.collector, "_mark_pterodactyl", return_value=False), \
              mock.patch.object(self.collector, "_mark_systemd", return_value=False), \
              mock.patch.object(self.collector, "_mark_fuse", return_value=False), \
+             mock.patch.object(self.collector, "_mark_netadmin", return_value=False), \
              mock.patch.object(self.collector, "_mark_kstore", return_value=True), \
              mock.patch.object(self.collector, "_mark_kmode1", return_value=False), \
              mock.patch.object(self.collector, "_mark_kmode2", return_value=False), \
@@ -315,6 +351,7 @@ class MarksProbeTest(unittest.TestCase):
              mock.patch.object(self.collector, "_mark_pterodactyl", return_value=False), \
              mock.patch.object(self.collector, "_mark_systemd", return_value=False), \
              mock.patch.object(self.collector, "_mark_fuse", return_value=False), \
+             mock.patch.object(self.collector, "_mark_netadmin", return_value=False), \
              mock.patch.object(self.collector, "_mark_kstore",
                                side_effect=RuntimeError("boom")), \
              mock.patch.object(self.collector, "_mark_kmode1", return_value=True), \

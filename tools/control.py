@@ -650,8 +650,8 @@ def test_baseinfo():
         marks_state = "marks: 缺省(跳过)"
         if "marks" in result:
             marks = result["marks"]
-            marks_order = ["root", "kvm", "pterodactyl", "systemd", "fuse",
-                           "kstore", "kmode1", "kmode2"]
+            marks_order = ["root", "kvm", "pterodactyl", "systemd", "fuse", "netadmin",
+                           "kstore", "kmode1", "kmode2", "kmode3"]
             marks_problem = None
             if not isinstance(marks, list):
                 marks_problem = f"marks 非数组: {type(marks).__name__}"
@@ -1766,6 +1766,52 @@ def proxy_route_check() -> bool:
         stop()
 
 
+def argo_bind(port: int, tunnel_domain: str = None, shz_name: str = None, shz_key: str = None):
+    """🔗 0.6.8 (docs/API.MD 七 §30): 给已启动隧道绑定 shz.al 上报。
+    上报名/管理密钥缺省派生 (KNAME-端口 / 上报名+"123"), shz_name/shz_key 显式覆盖。"""
+    payload = {"port": int(port)}
+    if tunnel_domain:
+        payload["tunnel_domain"] = tunnel_domain
+    if shz_name:
+        payload["shz_name"] = shz_name
+    if shz_key:
+        payload["shz_key"] = shz_key
+    result = _make_request("POST", "/api/argo/bind", params=payload, label="argo-bind", skip_print=True)
+    print(json.dumps(result, ensure_ascii=False, indent=2) if isinstance(result, dict) else result)
+    return isinstance(result, dict) and result.get("status") == "ok"
+
+
+def argo_unbind(port: int, tunnel_domain: str = None):
+    """🔓 0.6.8 (docs/API.MD 七 §31): 解绑隧道的 shz.al 上报 (保留隧道, 清持久化, 远端记录后台删除)。"""
+    payload = {"port": int(port)}
+    if tunnel_domain:
+        payload["tunnel_domain"] = tunnel_domain
+    result = _make_request("DELETE", "/api/argo/bind", params=payload, label="argo-unbind", skip_print=True)
+    print(json.dumps(result, ensure_ascii=False, indent=2) if isinstance(result, dict) else result)
+    return isinstance(result, dict) and result.get("status") == "ok"
+
+
+def argo_list():
+    """🔎 0.6.8 (docs/API.MD 七 §27): 查询临时隧道列表 (条目含 shz_name/shz_url 绑定信息)。"""
+    result = _make_request("GET", "/api/argo", label="argo-list", skip_print=True)
+    print(json.dumps(result, ensure_ascii=False, indent=2) if isinstance(result, dict) else result)
+    return isinstance(result, dict) and result.get("status") == "ok"
+
+
+def _parse_kv_args(argv, known_flags):
+    """简单 key=value 参数解析 (--flag value 形式), 返回 dict"""
+    out = {}
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token.startswith("--") and token[2:] in known_flags and i + 1 < len(argv):
+            out[token[2:]] = argv[i + 1]
+            i += 2
+        else:
+            i += 1
+    return out
+
+
 def tempkey_short_check() -> bool:
     """🔑 场景 8 (0.5.8, docs/API.MD 十四): tempkey format=short 短格式下发 + 短私钥端到端验收
 
@@ -2741,6 +2787,23 @@ def main():
             ok = proxy_route_check()
             print("PROXY_ROUTE_OK" if ok else "PROXY_ROUTE_FAILED")
             sys.exit(0 if ok else 1)
+        elif sys.argv[1] == "--argo-list":
+            # 🔎 0.6.8: 查询临时隧道列表 (含 shz_name/shz_url 绑定信息)
+            ok = argo_list()
+            sys.exit(0 if ok else 1)
+        elif sys.argv[1] == "--argo-bind" and len(sys.argv) > 2:
+            # 🔗 0.6.8: 绑定 shz.al 上报 (--argo-bind <port> [--tunnel-domain X] [--shz-name X] [--shz-key X])
+            opts = _parse_kv_args(sys.argv[2:], {"tunnel-domain", "shz-name", "shz-key"})
+            ok = argo_bind(int(sys.argv[2]), tunnel_domain=opts.get("tunnel-domain"),
+                           shz_name=opts.get("shz-name"), shz_key=opts.get("shz-key"))
+            print("ARGO_BIND_OK" if ok else "ARGO_BIND_FAILED")
+            sys.exit(0 if ok else 1)
+        elif sys.argv[1] == "--argo-unbind" and len(sys.argv) > 2:
+            # 🔓 0.6.8: 解绑 shz.al 上报 (--argo-unbind <port> [--tunnel-domain X])
+            opts = _parse_kv_args(sys.argv[2:], {"tunnel-domain"})
+            ok = argo_unbind(int(sys.argv[2]), tunnel_domain=opts.get("tunnel-domain"))
+            print("ARGO_UNBIND_OK" if ok else "ARGO_UNBIND_FAILED")
+            sys.exit(0 if ok else 1)
         elif sys.argv[1] in ["--status", "-s"]:
             _, ecies_sk = load_control_keys()
             fetch_status(ecies_sk=ecies_sk)
@@ -2931,6 +2994,13 @@ def _print_help():
   task_get_cron()                                        # 获取定时任务
   task_get_log_summary()                                 # 查看日志统计
   print_task_logs(task_get_onetime_log(5).get("logs"))  # 打印日志
+
+🔗 argo 隧道绑定 (0.6.8, docs/API.MD 七):
+  python control2.py --argo-list                                # 查询隧道列表 (含 shz_name/shz_url 绑定)
+  python control2.py --argo-bind 8080                           # 绑定 shz.al 上报 (缺省派生 KNAME-端口)
+  python control2.py --argo-bind 8080 --shz-name myapp --shz-key mysecret-key
+  python control2.py --argo-bind 8080 --tunnel-domain <域名>     # 同端口多隧道时精确定位
+  python control2.py --argo-unbind 8080                         # 解绑 (保留隧道, 远端记录后台删除)
 
 🔧 环境变量:
   PROXY_URL=http://proxy:8080    # 代理地址 (默认: http://localhost:9002)

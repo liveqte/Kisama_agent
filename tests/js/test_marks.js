@@ -137,9 +137,30 @@ function testCapEff(fx) {
   fs.writeFileSync(path.join(fx.roots.MARKS_PROC_ROOT, 'self', 'status'),
     'Name:\tagent\nCapEff:\t000001ffffffffff\n');
   assert.strictEqual(c._capEffBit(21), true);
+  assert.strictEqual(c._capEffBit(12), true);
   assert.strictEqual(c._capEffBit(63), false);
   fs.writeFileSync(path.join(fx.roots.MARKS_PROC_ROOT, 'self', 'status'), 'CapEff:\tzzz\n');
   assert.strictEqual(c._capEffBit(21), false);
+}
+
+// netadmin: CapEff bit12 (CAP_NET_ADMIN), docs/API.MD 15.17
+function testNetadmin(fx) {
+  const c = new SystemInfoCollector();
+  const status = path.join(fx.roots.MARKS_PROC_ROOT, 'self', 'status');
+  fs.writeFileSync(status, 'Name:\tagent\nCapEff:\t0000000000001000\n');
+  assert.strictEqual(c._markNetadmin(), true, 'bit12 set hits');
+  fs.writeFileSync(status, 'Name:\tagent\nCapEff:\t000001ffffffffff\n');
+  assert.strictEqual(c._markNetadmin(), true, 'full root set includes bit12');
+  fs.writeFileSync(status, 'Name:\tagent\nCapEff:\t0000000000000000\n');
+  assert.strictEqual(c._markNetadmin(), false, 'all-zero CapEff misses');
+  // Docker 默认 capability 集: 无 CAP_NET_ADMIN, root 容器也不报
+  fs.writeFileSync(status, 'Name:\tagent\nCapEff:\t00000000a80425fb\n');
+  assert.strictEqual(c._markNetadmin(), false, 'docker default caps (no bit12) misses');
+  // 仅 CAP_SYS_ADMIN (bit21) 置位不含 bit12: 不得张冠李戴
+  fs.writeFileSync(status, 'Name:\tagent\nCapEff:\t0000000000200000\n');
+  assert.strictEqual(c._markNetadmin(), false, 'bit21-only must not hit bit12');
+  fs.writeFileSync(status, 'Name:\tagent\n');
+  assert.strictEqual(c._markNetadmin(), false, 'missing CapEff line misses');
 }
 
 function testFuseSetuidHelper(fx) {
@@ -210,6 +231,7 @@ function testOrderAndNonLinux() {
     pterodactyl: SystemInfoCollector.prototype._markPterodactyl,
     systemd: SystemInfoCollector.prototype._markSystemd,
     fuse: SystemInfoCollector.prototype._markFuse,
+    netadmin: SystemInfoCollector.prototype._markNetadmin,
     kstore: SystemInfoCollector.prototype._markKstore,
     kmode1: SystemInfoCollector.prototype._markKmode1,
     kmode2: SystemInfoCollector.prototype._markKmode2,
@@ -220,16 +242,18 @@ function testOrderAndNonLinux() {
   SystemInfoCollector.prototype._markPterodactyl = () => true;
   SystemInfoCollector.prototype._markSystemd = () => true;
   SystemInfoCollector.prototype._markFuse = () => false;
+  SystemInfoCollector.prototype._markNetadmin = () => true;
   SystemInfoCollector.prototype._markKstore = () => true;
   SystemInfoCollector.prototype._markKmode1 = () => false;
   SystemInfoCollector.prototype._markKmode2 = () => true;
   try {
     Object.defineProperty(process, 'platform', { value: 'linux' });
-    // 配置类标记固定追加在主机探测标记末尾 (docs/API.MD 15.1)
-    assert.deepStrictEqual(c.detectMarks(), ['root', 'pterodactyl', 'systemd', 'kstore', 'kmode2']);
+    // 配置类标记固定追加在主机探测标记末尾; netadmin 插在主机组末尾 (fuse 之后, docs/API.MD 15.1/15.17)
+    assert.deepStrictEqual(c.detectMarks(),
+      ['root', 'pterodactyl', 'systemd', 'netadmin', 'kstore', 'kmode2']);
     SystemInfoCollector.prototype._markRoot = () => { throw new Error('boom'); };
     SystemInfoCollector.prototype._markKstore = () => { throw new Error('boom'); };
-    assert.deepStrictEqual(c.detectMarks(), ['pterodactyl', 'systemd', 'kmode2'],
+    assert.deepStrictEqual(c.detectMarks(), ['pterodactyl', 'systemd', 'netadmin', 'kmode2'],
       'one probe failure must not drop the others');
   } finally {
     Object.defineProperty(process, 'platform', desc);
@@ -238,6 +262,7 @@ function testOrderAndNonLinux() {
     SystemInfoCollector.prototype._markPterodactyl = saved.pterodactyl;
     SystemInfoCollector.prototype._markSystemd = saved.systemd;
     SystemInfoCollector.prototype._markFuse = saved.fuse;
+    SystemInfoCollector.prototype._markNetadmin = saved.netadmin;
     SystemInfoCollector.prototype._markKstore = saved.kstore;
     SystemInfoCollector.prototype._markKmode1 = saved.kmode1;
     SystemInfoCollector.prototype._markKmode2 = saved.kmode2;
@@ -259,6 +284,8 @@ async function main() {
   try { testSystemd(fx); } finally { fx.restore(); }
   fx = mkFixture();
   try { testCapEff(fx); } finally { fx.restore(); }
+  fx = mkFixture();
+  try { testNetadmin(fx); } finally { fx.restore(); }
   fx = mkFixture();
   try { testFuseSetuidHelper(fx); } finally { fx.restore(); }
   testConfigMarks();
