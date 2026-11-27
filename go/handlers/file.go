@@ -14,8 +14,10 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -45,8 +47,10 @@ func isPathInsideFileRoot(root, target string) bool {
 	}
 	probe := abs
 	for {
-		if _, err := os.Stat(probe); err == nil {
+		if _, err := os.Lstat(probe); err == nil {
 			break
+		} else if !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, syscall.ENOTDIR) {
+			return false
 		}
 		parent := filepath.Dir(probe)
 		if parent == probe {
@@ -138,6 +142,51 @@ func ListFiles(c *gin.Context) {
 	c.JSON(http.StatusOK, response)
 }
 
+var mountInfoPathEscapes = strings.NewReplacer(
+	`\040`, " ",
+	`\011`, "\t",
+	`\012`, "\n",
+	`\134`, `\`,
+)
+
+func mountReadOnlyFromMountInfo(target string, data []byte) *bool {
+	target = path.Clean(target)
+	if !path.IsAbs(target) {
+		return nil
+	}
+
+	bestLength := -1
+	var result *bool
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 6 {
+			continue
+		}
+		mountPoint := path.Clean(mountInfoPathEscapes.Replace(fields[4]))
+		if !path.IsAbs(mountPoint) {
+			continue
+		}
+		prefix := strings.TrimSuffix(mountPoint, "/") + "/"
+		if target != mountPoint && !strings.HasPrefix(target, prefix) {
+			continue
+		}
+		if len(mountPoint) <= bestLength {
+			continue
+		}
+
+		readOnly := false
+		for _, option := range strings.Split(fields[5], ",") {
+			if option == "ro" {
+				readOnly = true
+				break
+			}
+		}
+		result = &readOnly
+		bestLength = len(mountPoint)
+	}
+	return result
+}
+
 // QueryFileAuthority queries file permissions
 func QueryFileAuthority(c *gin.Context) {
 	cfg := config.Get()
@@ -146,6 +195,11 @@ func QueryFileAuthority(c *gin.Context) {
 	if err := c.BindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
 		return
+	}
+
+	var mountInfo []byte
+	if runtime.GOOS == "linux" {
+		mountInfo, _ = os.ReadFile("/proc/self/mountinfo")
 	}
 
 	var authorities []models.AuthorityInfo
@@ -170,14 +224,22 @@ func QueryFileAuthority(c *gin.Context) {
 		writable := mode&0200 != 0
 		executable := mode&0100 != 0
 
+		var mountReadOnly *bool
+		if len(mountInfo) > 0 {
+			if realPath, err := filepath.EvalSymlinks(absPath); err == nil {
+				mountReadOnly = mountReadOnlyFromMountInfo(filepath.ToSlash(realPath), mountInfo)
+			}
+		}
+
 		authority := models.AuthorityInfo{
-			Path:       path,
-			Mode:       mode.String(),
-			ModeOctal:  fmt.Sprintf("0o%o", mode.Perm()),
-			Type:       fileType,
-			Readable:   readable,
-			Writable:   writable,
-			Executable: executable,
+			Path:          path,
+			Mode:          mode.String(),
+			ModeOctal:     fmt.Sprintf("0o%o", mode.Perm()),
+			Type:          fileType,
+			Readable:      readable,
+			Writable:      writable,
+			Executable:    executable,
+			MountReadOnly: mountReadOnly,
 		}
 
 		authorities = append(authorities, authority)
@@ -317,7 +379,7 @@ func UploadFile(c *gin.Context) {
 	}
 
 	if err := os.MkdirAll(absDir, 0755); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create directory"})
+		respondFileError(c, http.StatusInternalServerError, "Failed to create directory", err)
 		return
 	}
 
@@ -351,21 +413,21 @@ func UploadFile(c *gin.Context) {
 		// 1. 创建隐藏的当前文件专属分块暂存目录：.upload_chunks/[filename]
 		chunkDir := filepath.Join(filepath.Dir(absPath), ".upload_chunks", filepath.Base(absPath))
 		if err := os.MkdirAll(chunkDir, 0755); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create chunk directory"})
+			respondFileError(c, http.StatusInternalServerError, "Failed to create chunk directory", err)
 			return
 		}
 
 		// 2. 将当前接收到的分片直接落盘暂存
 		chunkFile := filepath.Join(chunkDir, fmt.Sprintf("chunk_%d", chunkIndex))
 		if err := ioutil.WriteFile(chunkFile, content, 0644); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to write chunk file"})
+			respondFileError(c, http.StatusInternalServerError, "Failed to write chunk file", err)
 			return
 		}
 
 		// 3. 读取暂存目录，计算目前已到位的分片数量
 		files, err := ioutil.ReadDir(chunkDir)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to read chunk directory"})
+			respondFileError(c, http.StatusInternalServerError, "Failed to read chunk directory", err)
 			return
 		}
 
@@ -380,7 +442,7 @@ func UploadFile(c *gin.Context) {
 		if received == totalCount {
 			out, err := os.OpenFile(absPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to open target file for merging"})
+				respondFileError(c, http.StatusInternalServerError, "Failed to open target file for merging", err)
 				return
 			}
 
@@ -389,16 +451,19 @@ func UploadFile(c *gin.Context) {
 				partContent, err := ioutil.ReadFile(partPath)
 				if err != nil {
 					out.Close()
-					c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Missing chunk %d", i)})
+					respondFileError(c, http.StatusInternalServerError, fmt.Sprintf("Missing chunk %d", i), err)
 					return
 				}
 				if _, err := out.Write(partContent); err != nil {
 					out.Close()
-					c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to write merged content"})
+					respondFileError(c, http.StatusInternalServerError, "Failed to write merged content", err)
 					return
 				}
 			}
-			out.Close()
+			if err := out.Close(); err != nil {
+				respondFileError(c, http.StatusInternalServerError, "Failed to close merged file", err)
+				return
+			}
 
 			// 5. 释放暂存区垃圾
 			os.RemoveAll(chunkDir)
@@ -417,7 +482,7 @@ func UploadFile(c *gin.Context) {
 
 	// 🟢 降级兜底：非分块的传统小文件单包单次直传
 	if err := ioutil.WriteFile(absPath, content, 0644); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to write file"})
+		respondFileError(c, http.StatusInternalServerError, "Failed to write file", err)
 		return
 	}
 
@@ -469,6 +534,77 @@ func DeleteFiles(c *gin.Context) {
 	c.JSON(http.StatusOK, response)
 }
 
+func fileBatchStatus(total, success int) (string, string) {
+	if total > 0 && success == total {
+		return "ok", ""
+	}
+	if total == 0 {
+		return "error", "No operations requested"
+	}
+	if success == 0 {
+		return "error", fmt.Sprintf("All %d operations failed", total)
+	}
+	return "partial", fmt.Sprintf("%d of %d operations failed", total-success, total)
+}
+
+func ensureDestinationParent(target string) (status, message string) {
+	probe := filepath.Dir(target)
+	for {
+		info, err := os.Lstat(probe)
+		if err == nil {
+			if info.Mode()&os.ModeSymlink != 0 {
+				info, err = os.Stat(probe)
+				if err != nil {
+					return "denied", "destination parent is not a directory"
+				}
+			}
+			if !info.IsDir() {
+				return "denied", "destination parent is not a directory"
+			}
+			break
+		}
+		// Windows 的 ERROR_PATH_NOT_FOUND 同时匹配 ErrNotExist 与 ENOTDIR，必须先向上查找已有祖先。
+		if errors.Is(err, fs.ErrNotExist) {
+			parent := filepath.Dir(probe)
+			if parent == probe {
+				return "failed", err.Error()
+			}
+			probe = parent
+			continue
+		}
+		if errors.Is(err, syscall.ENOTDIR) {
+			return "denied", "destination parent is not a directory"
+		}
+		return "failed", err.Error()
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+		return "failed", err.Error()
+	}
+	return "", ""
+}
+
+func pathHasNonDirectoryAncestor(target string) bool {
+	for probe := target; ; probe = filepath.Dir(probe) {
+		info, err := os.Lstat(probe)
+		if err == nil {
+			if info.Mode()&os.ModeSymlink != 0 {
+				info, err = os.Stat(probe)
+				if err != nil {
+					return false
+				}
+			}
+			return !info.IsDir()
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			return false
+		}
+		parent := filepath.Dir(probe)
+		if parent == probe {
+			return false
+		}
+	}
+}
+
 // MoveFiles moves/renames files
 func MoveFiles(c *gin.Context) {
 	cfg := config.Get()
@@ -479,7 +615,7 @@ func MoveFiles(c *gin.Context) {
 		return
 	}
 
-	var results []models.FileMoveResult
+	results := make([]models.FileMoveResult, 0, len(req))
 	successCount := 0
 
 	for from, to := range req {
@@ -491,7 +627,22 @@ func MoveFiles(c *gin.Context) {
 				From:   from,
 				To:     to,
 				Status: "denied",
+				Error:  "path outside file root",
 			})
+			continue
+		}
+
+		if _, err := os.Lstat(absFrom); err != nil {
+			status, message := "failed", err.Error()
+			if errors.Is(err, fs.ErrNotExist) && !pathHasNonDirectoryAncestor(absFrom) {
+				status, message = "skipped", "source not found"
+			}
+			results = append(results, models.FileMoveResult{From: from, To: to, Status: status, Error: message})
+			continue
+		}
+
+		if status, message := ensureDestinationParent(absTo); status != "" {
+			results = append(results, models.FileMoveResult{From: from, To: to, Status: status, Error: message})
 			continue
 		}
 
@@ -500,6 +651,7 @@ func MoveFiles(c *gin.Context) {
 				From:   from,
 				To:     to,
 				Status: "failed",
+				Error:  err.Error(),
 			})
 		} else {
 			successCount++
@@ -511,8 +663,9 @@ func MoveFiles(c *gin.Context) {
 		}
 	}
 
+	status, message := fileBatchStatus(len(req), successCount)
 	response := models.FileMoveResponse{
-		BaseResponse: models.BaseResponse{Status: "ok"},
+		BaseResponse: models.BaseResponse{Status: status, Message: message},
 		Total:        len(req),
 		Success:      successCount,
 		Results:      results,
@@ -531,7 +684,7 @@ func CopyFiles(c *gin.Context) {
 		return
 	}
 
-	var results []models.FileMoveResult
+	results := make([]models.FileMoveResult, 0, len(req))
 	successCount := 0
 
 	for from, to := range req {
@@ -543,15 +696,31 @@ func CopyFiles(c *gin.Context) {
 				From:   from,
 				To:     to,
 				Status: "denied",
+				Error:  "path outside file root",
 			})
 			continue
 		}
 
-		if err := copyFile(absFrom, absTo); err != nil {
+		if _, err := os.Lstat(absFrom); err != nil {
+			status, message := "failed", err.Error()
+			if errors.Is(err, fs.ErrNotExist) && !pathHasNonDirectoryAncestor(absFrom) {
+				status, message = "skipped", "source not found"
+			}
+			results = append(results, models.FileMoveResult{From: from, To: to, Status: status, Error: message})
+			continue
+		}
+
+		if status, message := ensureDestinationParent(absTo); status != "" {
+			results = append(results, models.FileMoveResult{From: from, To: to, Status: status, Error: message})
+			continue
+		}
+
+		if err := copyPath(absFrom, absTo); err != nil {
 			results = append(results, models.FileMoveResult{
 				From:   from,
 				To:     to,
 				Status: "failed",
+				Error:  err.Error(),
 			})
 		} else {
 			successCount++
@@ -563,8 +732,9 @@ func CopyFiles(c *gin.Context) {
 		}
 	}
 
+	status, message := fileBatchStatus(len(req), successCount)
 	response := models.FileCopyResponse{
-		BaseResponse: models.BaseResponse{Status: "ok"},
+		BaseResponse: models.BaseResponse{Status: status, Message: message},
 		Total:        len(req),
 		Success:      successCount,
 		Results:      results,
@@ -590,7 +760,7 @@ func MkdirRecursive(c *gin.Context) {
 	}
 
 	if err := os.MkdirAll(absPath, 0755); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create directory"})
+		respondFileError(c, http.StatusInternalServerError, "Failed to create directory", err)
 		return
 	}
 
@@ -653,15 +823,16 @@ func ZipFile(c *gin.Context) {
 	}
 
 	if err := os.MkdirAll(filepath.Dir(absZip), 0755); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create directory"})
+		respondFileError(c, http.StatusInternalServerError, "Failed to create directory", err)
 		return
 	}
 
 	zipFile, err := os.Create(absZip) // os.Create 截断 = 覆盖重建
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to create zip"})
+		respondFileError(c, http.StatusInternalServerError, "Failed to create zip", err)
 		return
 	}
+	defer zipFile.Close()
 
 	w := zip.NewWriter(zipFile)
 	used := 0
@@ -669,53 +840,61 @@ func ZipFile(c *gin.Context) {
 	truncated := false
 	results := make([]models.FileZipItemResult, 0, len(req.Items))
 
-	addFile := func(absPath, name string) bool {
+	addFile := func(absPath, name string) (bool, error) {
 		if used >= zipMaxEntries {
-			return false
+			return false, nil
 		}
 		info, err := os.Stat(absPath)
-		if err != nil || info.IsDir() {
-			return true
+		if err != nil {
+			return true, err
+		}
+		if info.IsDir() {
+			return true, fmt.Errorf("is a directory")
 		}
 		fh, err := zip.FileInfoHeader(info)
 		if err != nil {
-			return true
+			return true, err
 		}
 		fh.Name = filepath.ToSlash(name)
 		fh.Method = zip.Deflate
 		fh.Modified = info.ModTime()
 		dst, err := w.CreateHeader(fh)
 		if err != nil {
-			return true
+			return true, err
 		}
 		src, err := os.Open(absPath)
 		if err != nil {
-			return true
+			return true, err
 		}
-		defer src.Close()
-		if _, err := io.Copy(dst, src); err != nil {
-			return true
+		_, copyErr := io.Copy(dst, src)
+		closeErr := src.Close()
+		if copyErr != nil {
+			return true, copyErr
+		}
+		if closeErr != nil {
+			return true, closeErr
 		}
 		used++
-		return true
+		return true, nil
 	}
-	addDirEntry := func(dirInfo os.FileInfo, name string) bool {
+	addDirEntry := func(dirInfo os.FileInfo, name string) (bool, error) {
 		if used >= zipMaxEntries {
-			return false
+			return false, nil
 		}
 		fh, err := zip.FileInfoHeader(dirInfo)
 		if err != nil {
-			return true
+			return true, err
 		}
 		fh.Name = filepath.ToSlash(name) + "/" // 目录条目带尾 / 保留空目录
 		fh.Modified = dirInfo.ModTime()
 		if _, err := w.CreateHeader(fh); err != nil {
-			return true
+			return true, err
 		}
 		used++
-		return true
+		return true, nil
 	}
 
+	failedItems := 0
 	for _, item := range req.Items {
 		if truncated {
 			results = append(results, models.FileZipItemResult{Item: item, Status: "skipped"})
@@ -723,19 +902,33 @@ func ZipFile(c *gin.Context) {
 		}
 		absItem := filepath.Join(cfg.FileRoot, item)
 		if !isPathInsideFileRoot(cfg.FileRoot, absItem) {
-			results = append(results, models.FileZipItemResult{Item: item, Status: "error"})
+			results = append(results, models.FileZipItemResult{Item: item, Status: "error", Error: "path outside file root"})
+			failedItems++
 			continue
 		}
 		info, err := os.Stat(absItem)
 		if err != nil {
-			results = append(results, models.FileZipItemResult{Item: item, Status: "not_found"})
+			result := models.FileZipItemResult{Item: item, Status: "error", Error: err.Error()}
+			if errors.Is(err, fs.ErrNotExist) {
+				result.Status = "not_found"
+				result.Error = ""
+			} else {
+				failedItems++
+			}
+			results = append(results, result)
 			continue
 		}
 		added := 0
 		if !info.IsDir() {
-			if !addFile(absItem, filepath.Base(item)) {
+			proceed, addErr := addFile(absItem, filepath.Base(item))
+			if !proceed {
 				truncated = true
 				results = append(results, models.FileZipItemResult{Item: item, Status: "skipped"})
+				continue
+			}
+			if addErr != nil {
+				results = append(results, models.FileZipItemResult{Item: item, Status: "error", Error: addErr.Error()})
+				failedItems++
 				continue
 			}
 			added = 1
@@ -746,45 +939,83 @@ func ZipFile(c *gin.Context) {
 				base = filepath.Base(item)
 			}
 			status := "ok"
+			wroteItem := false
+			var itemErr error
 			if item == "" || item == "." {
 				base = ""
 			}
 			walkErr := filepath.WalkDir(absItem, func(p string, d fs.DirEntry, werr error) error {
 				if werr != nil {
+					if itemErr == nil {
+						itemErr = werr
+					}
 					return nil // 单个不可读条目不中断
 				}
 				rel, rerr := filepath.Rel(absItem, p)
 				if rerr != nil {
+					if itemErr == nil {
+						itemErr = rerr
+					}
 					return nil
 				}
 				if rel == "." {
+					return nil
+				}
+				if d.Type()&os.ModeSymlink != 0 {
+					if itemErr == nil {
+						itemErr = fmt.Errorf("symbolic link not supported: %s", rel)
+					}
 					return nil
 				}
 				name := rel
 				if base != "" {
 					name = base + string(filepath.Separator) + rel
 				}
+				var proceed bool
+				var addErr error
 				if d.IsDir() {
 					dirInfo, ierr := d.Info()
 					if ierr != nil {
+						if itemErr == nil {
+							itemErr = ierr
+						}
 						return nil
 					}
-					if !addDirEntry(dirInfo, name) {
-						return errZipEntryLimit
+					proceed, addErr = addDirEntry(dirInfo, name)
+				} else {
+					proceed, addErr = addFile(p, name)
+					if addErr == nil && proceed {
+						added++
 					}
-					return nil
 				}
-				if !addFile(p, name) {
+				if addErr != nil && itemErr == nil {
+					itemErr = addErr
+				}
+				if !proceed {
 					return errZipEntryLimit
 				}
-				added++
+				if addErr == nil {
+					wroteItem = true
+				}
 				return nil
 			})
 			if walkErr == errZipEntryLimit {
 				status = "partial"
 				truncated = true
 			}
-			results = append(results, models.FileZipItemResult{Item: item, Status: status, Added: added})
+			if itemErr != nil {
+				if wroteItem {
+					status = "partial"
+				} else {
+					status = "error"
+				}
+				failedItems++
+			}
+			result := models.FileZipItemResult{Item: item, Status: status, Added: added}
+			if itemErr != nil {
+				result.Error = itemErr.Error()
+			}
+			results = append(results, result)
 			addedTotal += added
 			continue
 		}
@@ -793,25 +1024,39 @@ func ZipFile(c *gin.Context) {
 	}
 
 	if err := w.Close(); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to write zip"})
+		respondFileError(c, http.StatusInternalServerError, "Failed to write zip", err)
 		return
 	}
 	if err := zipFile.Close(); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to write zip"})
+		respondFileError(c, http.StatusInternalServerError, "Failed to write zip", err)
 		return
 	}
-	size := 0
-	if info, err := os.Stat(absZip); err == nil {
-		size = int(info.Size())
+	info, err := os.Stat(absZip)
+	if err != nil {
+		respondFileError(c, http.StatusInternalServerError, "Failed to stat zip", err)
+		return
 	}
+	size := int(info.Size())
 
-	c.JSON(http.StatusOK, gin.H{
-		"status":  "ok",
+	status, message := "ok", ""
+	if failedItems > 0 {
+		status = "partial"
+		message = fmt.Sprintf("%d of %d items failed", failedItems, len(req.Items))
+		if failedItems == len(req.Items) {
+			status = "error"
+		}
+	}
+	response := gin.H{
+		"status":  status,
 		"path":    relDisplay(cfg.FileRoot, absZip),
 		"entries": addedTotal,
 		"size":    size,
 		"results": results,
-	})
+	}
+	if message != "" {
+		response["message"] = message
+	}
+	c.JSON(http.StatusOK, response)
 }
 
 // UnzipFile 解压 zip 到指定目录 (0.5.4, docs/API.MD 12.1):
@@ -856,7 +1101,7 @@ func UnzipFile(c *gin.Context) {
 		return
 	}
 	if err := os.MkdirAll(absDest, 0755); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create directory"})
+		respondFileError(c, http.StatusInternalServerError, "Failed to create directory", err)
 		return
 	}
 
@@ -907,14 +1152,16 @@ func UnzipFile(c *gin.Context) {
 		cleaned := filepath.Clean(filepath.Join(absDest, f.Name))
 		relToDest, rerr := filepath.Rel(absDest, cleaned)
 		if rerr != nil || relToDest == ".." ||
-			strings.HasPrefix(relToDest, ".."+string(filepath.Separator)) || filepath.IsAbs(relToDest) {
+			strings.HasPrefix(relToDest, ".."+string(filepath.Separator)) || filepath.IsAbs(relToDest) ||
+			!isPathInsideFileRoot(cfg.FileRoot, cleaned) {
 			skipped++
 			continue
 		}
 		if f.FileInfo().IsDir() {
 			// 目录条目: 按归一化路径创建目录 (保留空目录并支撑后续文件写入)
 			if err := os.MkdirAll(cleaned, 0755); err != nil {
-				skipped++
+				respondFileError(c, http.StatusInternalServerError, "Failed to create extraction directory", err)
+				return
 			}
 			continue
 		}
@@ -926,27 +1173,37 @@ func UnzipFile(c *gin.Context) {
 		}
 		// 上游无目录条目的 zip 也能写入: 写文件前先确保父目录存在
 		if err := os.MkdirAll(filepath.Dir(cleaned), 0755); err != nil {
-			skipped++
-			continue
+			respondFileError(c, http.StatusInternalServerError, "Failed to create extraction directory", err)
+			return
 		}
 		rc, err := f.Open()
 		if err != nil {
-			skipped++
-			continue
+			respondFileError(c, http.StatusInternalServerError, "Failed to open zip entry", err)
+			return
 		}
 		out, err := os.OpenFile(cleaned, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 		if err != nil {
 			rc.Close()
-			skipped++
-			continue
+			respondFileError(c, http.StatusInternalServerError, "Failed to create extracted file", err)
+			return
 		}
-		n, cerr := io.Copy(out, rc)
+		remaining := zipMaxTotalBytes - totalBytes
+		n, cerr := io.Copy(out, io.LimitReader(rc, remaining+1))
+		if cerr == nil && n > remaining {
+			cerr = fmt.Errorf("zip entry exceeds total extraction limit")
+		}
 		closeErr := out.Close()
-		rc.Close()
-		if cerr != nil || closeErr != nil {
+		readCloseErr := rc.Close()
+		if cerr != nil || closeErr != nil || readCloseErr != nil {
 			os.Remove(cleaned)
-			skipped++
-			continue
+			if cerr != nil {
+				respondFileError(c, http.StatusInternalServerError, "Failed to write extracted file", cerr)
+			} else if closeErr != nil {
+				respondFileError(c, http.StatusInternalServerError, "Failed to close extracted file", closeErr)
+			} else {
+				respondFileError(c, http.StatusInternalServerError, "Failed to close zip entry", readCloseErr)
+			}
+			return
 		}
 		extracted++
 		totalBytes += n
@@ -955,6 +1212,11 @@ func UnzipFile(c *gin.Context) {
 		} else {
 			filesTruncated = true
 		}
+	}
+
+	if err := reader.Close(); err != nil {
+		respondFileError(c, http.StatusInternalServerError, "Failed to close zip archive", err)
+		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -970,13 +1232,92 @@ func UnzipFile(c *gin.Context) {
 
 // Helper functions
 
+func fileErrorReason(err error) string {
+	var pathErr *os.PathError
+	nonDirectoryAncestor := errors.As(err, &pathErr) && pathHasNonDirectoryAncestor(pathErr.Path)
+	switch {
+	case errors.Is(err, syscall.EROFS):
+		return "read_only_file_system"
+	case errors.Is(err, syscall.EACCES), errors.Is(err, syscall.EPERM):
+		return "permission_denied"
+	case runtime.GOOS != "windows" && errors.Is(err, syscall.ENOTDIR):
+		return "not_a_directory"
+	case errors.Is(err, syscall.EEXIST):
+		return "file_exists"
+	case nonDirectoryAncestor:
+		return "not_a_directory"
+	case errors.Is(err, syscall.ENOENT):
+		return "not_found"
+	case errors.Is(err, syscall.ENOSPC):
+		return "no_space"
+	default:
+		return "unknown"
+	}
+}
+
+func respondFileError(c *gin.Context, status int, message string, err error) {
+	c.JSON(status, gin.H{"status": "error", "error": message, "message": err.Error(), "reason": fileErrorReason(err)})
+}
+
+func respondRawFileError(c *gin.Context, status int, message string, err error) {
+	c.JSON(status, gin.H{"status": "error", "completed": false, "message": message, "reason": fileErrorReason(err)})
+}
+
 // isTextFile checks if content is text
 func isTextFile(content []byte) bool {
 	// Simple heuristic: check for null bytes
 	return !bytes.Contains(content, []byte{0})
 }
 
-// copyFile copies a file
+// copyPath copies a file or directory tree without following symbolic links.
+func copyPath(src, dst string) error {
+	info, err := os.Lstat(src)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		if info.Mode()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(src)
+			if err != nil {
+				return err
+			}
+			return os.Symlink(target, dst)
+		}
+		return copyFile(src, dst)
+	}
+
+	if isPathInsideFileRoot(src, dst) {
+		return fmt.Errorf("destination is inside source directory")
+	}
+
+	return filepath.WalkDir(src, func(current string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(src, current)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if entry.IsDir() {
+			return os.MkdirAll(target, 0755)
+		}
+		entryInfo, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if entryInfo.Mode()&os.ModeSymlink != 0 {
+			link, err := os.Readlink(current)
+			if err != nil {
+				return err
+			}
+			return os.Symlink(link, target)
+		}
+		return copyFile(current, target)
+	})
+}
+
+// copyFile copies a regular file.
 func copyFile(src, dst string) error {
 	content, err := ioutil.ReadFile(src)
 	if err != nil {
@@ -1019,7 +1360,7 @@ func UploadFileRaw(c *gin.Context) {
 	}
 
 	if err := os.MkdirAll(absDir, 0755); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "completed": false, "message": "Failed to create directory"})
+		respondRawFileError(c, http.StatusInternalServerError, "Failed to create directory", err)
 		return
 	}
 
@@ -1049,21 +1390,21 @@ func UploadFileRaw(c *gin.Context) {
 		// 创建当前文件专属的隐藏暂存分片目录
 		chunkDir := filepath.Join(filepath.Dir(absPath), ".upload_chunks", filepath.Base(absPath))
 		if err := os.MkdirAll(chunkDir, 0755); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "completed": false, "message": "Failed to create chunk directory"})
+			respondRawFileError(c, http.StatusInternalServerError, "Failed to create chunk directory", err)
 			return
 		}
 
 		// 分片落盘暂存
 		chunkFile := filepath.Join(chunkDir, fmt.Sprintf("chunk_%d", chunkID))
 		if err := ioutil.WriteFile(chunkFile, content, 0644); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "completed": false, "message": "Failed to write chunk"})
+			respondRawFileError(c, http.StatusInternalServerError, "Failed to write chunk", err)
 			return
 		}
 
 		// 统计当前已到位的分片数
 		files, err := ioutil.ReadDir(chunkDir)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "completed": false, "message": "Failed to read chunk directory"})
+			respondRawFileError(c, http.StatusInternalServerError, "Failed to read chunk directory", err)
 			return
 		}
 
@@ -1078,22 +1419,27 @@ func UploadFileRaw(c *gin.Context) {
 		if received == totalChunks {
 			out, err := os.OpenFile(absPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "completed": false, "message": "Failed to open target file"})
+				respondRawFileError(c, http.StatusInternalServerError, "Failed to open target file", err)
 				return
 			}
-			defer out.Close()
 
 			for i := 0; i < totalChunks; i++ {
 				partPath := filepath.Join(chunkDir, fmt.Sprintf("chunk_%d", i))
 				partContent, err := ioutil.ReadFile(partPath)
 				if err != nil {
-					c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "completed": false, "message": fmt.Sprintf("Missing chunk %d", i)})
+					out.Close()
+					respondRawFileError(c, http.StatusInternalServerError, fmt.Sprintf("Missing chunk %d", i), err)
 					return
 				}
 				if _, err := out.Write(partContent); err != nil {
-					c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "completed": false, "message": "Failed to merge chunk"})
+					out.Close()
+					respondRawFileError(c, http.StatusInternalServerError, "Failed to merge chunk", err)
 					return
 				}
+			}
+			if err := out.Close(); err != nil {
+				respondRawFileError(c, http.StatusInternalServerError, "Failed to close merged file", err)
+				return
 			}
 			os.RemoveAll(chunkDir) // 清理垃圾暂存区
 			os.Remove(filepath.Dir(chunkDir))
@@ -1121,7 +1467,7 @@ func UploadFileRaw(c *gin.Context) {
 
 	// 5. 降级兜底：非分块小文件单包直接落盘
 	if err := ioutil.WriteFile(absPath, content, 0644); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "completed": false, "message": "Failed to write file"})
+		respondRawFileError(c, http.StatusInternalServerError, "Failed to write file", err)
 		return
 	}
 

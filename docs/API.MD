@@ -106,6 +106,7 @@ agent 启动时自动读取**可执行文件同目录**（py/js 为脚本同目�
 
 ## 三、文件管理模块
 
+**路径边界**：本仓五端以 `FILE_ROOT` 为沙箱；对尚不存在的目标校验最深已存在祖先的 realpath。守卫使用 `lstat`/`NOFOLLOW_LINKS` 识别悬空符号链接，不得把它当作可覆盖的新文件或可跟随的父目录。目录复制与递归 ZIP 不跟随嵌套符号链接：复制原样保留链接，ZIP 将实际遇到的嵌套链接计为失败项；解压同时检查词法 zip-slip 与真实路径 containment。
 
 ### 4. 列出文件/目录
 路径：POST /api/file/list  
@@ -157,10 +158,19 @@ agent 启动时自动读取**可执行文件同目录**（py/js 为脚本同目�
 {
   "status": "ok",
   "files": [
-    { "path": "tmp/test.txt", "mode": "-rw-r--r--", "mode_octal": "0o644", "readable": true, "writable": true, "executable": false }
+    { "path": "tmp/test.txt", "mode": "-rw-r--r--", "mode_octal": "0o644", "readable": true, "writable": true, "executable": false, "mount_readonly": false }
   ]
 }
 ```
+
+**`writable` 与 `mount_readonly` 是两种不同判据**：
+
+- `writable` 保持既有 permission/access 语义，只反映权限位与进程访问检查，**不代表目标一定可写**；Linux 只读挂载上的 `0755` 目录仍可能返回 `writable:true`。
+- `mount_readonly` 是可选布尔字段，按 realpath 最长且路径边界正确的 `/proc/self/mountinfo` 挂载项判定：`true` 表示命中挂载选项含 `ro`；`false` 表示最长命中项含 `rw`。
+- `false` 也不保证写入成功（ACL、immutable、quota、容量、父目录状态等仍可拒绝）；控制端只能把 `true` 作为“确定不可写”的提前失败信号。
+- 非 Linux、mountinfo 读取失败或没有匹配挂载项时**省略字段**，不得臆造 `false`。PHP 本批未同步该字段，同样按缺失处理。
+- 本批五端（py/js/go/java/java11）实现；旧代理与 PHP 无此字段时，控制端继续执行既有写流程，以实际写结果为准。
+
 ### 6. 设置文件权限
 路径：PUT /api/file/authority  
 用途：批量修改文件/目录权限（支持八进制或符号模式）  
@@ -260,6 +270,15 @@ X-Total-Chunks: 1
   "message": "All chunks received. File merged successfully."
 }
 ```
+
+**写失败契约（本批五端统一）**：目录创建、分片写入、合并与关闭文件过程中出现的真实文件系统错误不得返回 `status:"ok"` 或 `completed:true`。失败响应带机器可读 `reason`，例如：
+
+```json
+{ "status": "error", "completed": false, "error": "Failed to create upload directory", "reason": "read_only_file_system" }
+```
+
+`reason` 稳定映射：`EROFS → read_only_file_system`、`EACCES/EPERM → permission_denied`、`ENOTDIR → not_a_directory`、`EEXIST → file_exists`、`ENOENT → not_found`、`ENOSPC → no_space`；无法归类为 `unknown`。`error`/`message` 保留可供排障的原始错误文本。控制端应先看 HTTP 状态与 `status/completed`，再按 `reason` 分流，不得把非成功响应当作上传完成。
+
 ### 9. 下载文件
 路径：POST /api/file/download  
 用途：下载代理端文件（二进制流）  
@@ -300,7 +319,7 @@ X-Total-Chunks: 1
 ```
 返回示例：
 ```
-{ "status": "ok", "total": 2, "success": 2, "results": [{ "from": "tmp/old.txt", "to": "archive/old.txt", "status": "ok" }] }
+{ "status": "ok", "total": 2, "success": 2, "results": [{ "from": "tmp/old.txt", "to": "archive/old.txt", "status": "ok" }, { "from": "tmp/logs", "to": "backup/logs", "status": "ok" }] }
 ```
 
 ### 11.1 批量复制
@@ -310,10 +329,17 @@ X-Total-Chunks: 1
 ```
 { "/tmp/old.txt": "/archive/old.txt", "/tmp/logs": "/backup/logs" }  
 ```
-返回示例：
-```
-{ "status": "ok", "total": 2, "success": 2, "results": [{ "from": "tmp/old.txt", "to": "archive/old.txt", "status": "ok" }] }
-```
+返回结构、外层状态与逐项语义与 §11 完全相同。
+
+**批量三态与逐项契约（本批五端统一）**：
+
+- `results[].status`：`ok` / `failed` / `denied` / `skipped`。只有 `ok` 计入 `success`。
+- 目标父目录不存在时自动递归创建；缺源：`skipped`，`error:"source not found"`；越界：`denied`，`error:"path outside file root"`；目标父路径存在但不是目录：`denied`，`error:"destination parent is not a directory"`；实际文件系统操作失败：`failed`，`error` 保留原始错误（含 `EROFS`/`EACCES`/`EXDEV` 等）。
+- `copy` 支持真实目录递归；嵌套符号链接原样复制而不跟随，目标位于源目录内部时拒绝。悬空符号链接目标本身按越界拒绝，不能用来在沙箱外创建文件。
+- 外层 `status`：非空且全部成功 → `ok`；部分成功 → `partial`；零成功 → `error`；空批次 → `error`。`message` 给出失败条数汇总，空批次为 `No operations requested`。
+- 逐项失败时 HTTP 仍为 **200**，兼容既有按 HTTP 码解析的客户端；**判定成功必须同时检查外层 `status=="ok"` 与每个 `results[].status=="ok"`**，不能只看 HTTP 200。
+- `results` 始终为数组（空批次为 `[]`）。`total` 为请求操作数，`success` 仅计 `ok` 项；`partial/error` 均表示本次批次未全部完成。
+- 旧代理可能没有 `results[].error`，或没有逐项 `results`；兼容控制端在无 `results` 时回退到外层状态，仅 `ok` 视为成功。新控制端发现 `partial/error` 必须报错并列出失败项。
 
 ### 12. 新建目录
 路径：POST /api/file/new
@@ -326,6 +352,7 @@ X-Total-Chunks: 1
 ```
 { "status": "ok", "path": "tmp/new/project/logs" }
 ```
+写失败时返回非成功 HTTP 状态与 `{"status":"error","error":"...","reason":"..."}`；`reason` 采用 §8 的稳定映射。只读挂载、权限不足、父级不是目录等真实错误不得因 `exist_ok`/递归创建短路而返回成功。
 
 ### 12.1 解压 ZIP 文件
 路径：POST /api/file/unzip
@@ -345,8 +372,8 @@ X-Total-Chunks: 1
 ```
 { "status": "ok", "path": "tmp/archive.zip", "dest": "tmp/extract", "extracted": 5, "skipped": 1, "files": ["tmp/extract/a.txt", "tmp/extract/sub/b.txt"], "files_truncated": false }
 ```
-字段说明：dest 为解压目标目录（显示相对路径，沙箱根显示为 `.`）；files 为解压出的路径（显示相对路径），最多返回 500 条，超出时 files_truncated=true；zip-slip 条目（归一化后逃出目标目录）不报错，计入 skipped；限额 20000 条目 / 512MB，超出部分计入 skipped。
-错误：400（path 缺失 / zip 文件不存在 / 非 zip 打不开 / 主机缺 zip 扩展）。
+字段说明：dest 为解压目标目录（显示相对路径，沙箱根显示为 `.`）；files 为解压出的路径（显示相对路径），最多返回 500 条，超出时 files_truncated=true；zip-slip 条目（归一化后逃出目标目录）或真实路径越界不报错，计入 skipped；限额 20000 条目 / 512MB，超出部分计入 skipped。512MB 上限按**实际写入字节数**累计，不以 ZIP 声明尺寸替代。
+错误：400（path 缺失 / zip 文件不存在 / 非 zip 打不开 / 主机缺 zip 扩展）。目录创建、entry 读取、目标创建、写入或关闭失败时返回 **500** + `reason`（§8 稳定映射），不得把这些真实写错误静默计入 `skipped`；复制/关闭失败会删除不完整目标文件。
 
 ### 12.2 压缩 ZIP 文件
 路径：POST /api/file/zip
@@ -365,8 +392,9 @@ X-Total-Chunks: 1
 ```
 { "status": "ok", "path": "tmp/out.zip", "entries": 12, "size": 34567, "results": [{ "item": "/tmp/a.txt", "status": "ok", "added": 1 }, { "item": "/tmp/ghost", "status": "not_found" }] }
 ```
-字段说明：entries 为写入 zip 的条目总数，size 为 zip 文件字节数；results 逐项回显请求中的 item 原始路径与压缩结果。条目数上限 20000。
-错误：400（path/items 缺失、items 非数组或为空、目标是目录、zip 创建失败、主机缺 zip 扩展）。
+字段说明：entries 为写入 zip 的条目总数，size 为 zip 文件字节数；results 逐项回显请求中的 item 原始路径与压缩结果，实际失败项带 `error`。条目数上限 20000。
+外层语义：所有请求项均完成且无实际失败 → `ok`；部分请求项实际失败 → `partial`；全部请求项实际失败 → `error`。`not_found` 等既有策略性跳过不计为实际失败，保持 ghost-item 兼容行为。任何 stat/open/read/write/close 错误都不得计为成功或无声跳过；递归遇到的嵌套符号链接不跟随，计为实际失败项。
+错误：400（path/items 缺失、items 非数组或为空、目标是目录、主机缺 zip 扩展）；zip 创建、写入或关闭失败返回 **500** + `reason`（§8 稳定映射）。
 
 ## 四、任务管理模块
 
@@ -1299,7 +1327,7 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，请求
 ```
 
 - `data` 信封为后续扩展预留，当前仅含任务定义；
-- **0.6.6 续批起 `data.hubregs`**：hub 注册任务子类型（kisama-hub 动态注册项，见「十九」19.9），元素 `{hub, kname, ports}`（ports 非法/越界值加载时过滤）；由 `POST/DELETE /api/hub` 自动落盘与删除，启动恢复流程自动重建注册。**additive 键**：`version` 保持 1，老版本 agent 回写容器会丢弃该键（混部期边界：老 agent 任务落盘会静默移除本端 hub 注册持久化，注册表内存态不受影响）——(补充于 19.9)。
+- **0.6.6 续批起 `data.hubregs`**：hub 注册任务子类型（kisama-hub 动态注册项，见「十九」19.9），元素 `{hub, kname, ports}`（ports 非法/越界值加载时过滤）；由 `POST/DELETE /api/hub` 自动落盘与删除，启动恢复流程自动重建注册。**0.6.8 起 `hub` 可保存 shz.al 原别名**，`resolved_hub` 只存在运行态快照、不落盘，重启后按 19.2.1 重新解析。**additive 键**：`version` 保持 1，老版本 agent 回写容器会丢弃该键（混部期边界：老 agent 任务落盘会静默移除本端 hub 注册持久化，注册表内存态不受影响）——(补充于 19.9)。
 - **0.6.8 起 `data.argobinds`**：argo shz.al 绑定子类型（`/api/argo` 动态隧道的 shz.al 上报绑定，见「七」§32），元素 `{port, name, key?}`——`key`（管理密钥）**仅接口显式指定时持久化**，缺省派生密钥（`name+"123"`）确定性可重算、不落盘（缺省场景 KSTORE 无密钥材料）；port/name 非法条目加载时过滤。由 `POST/DELETE /api/argo/bind` 与带绑定参数的 `POST /api/argo` 自动落盘，隧道删除/解绑自动移除，启动恢复流程自动重建隧道并按持久化名称上报。**additive 键**：`version` 保持 1，老版本 agent 回写容器会丢弃该键（同 hubregs 混部边界）。
 - **任务命令为 shell 字符串，多行脚本原样支持**（JSON 自动转义换行）；
 - 写盘时机：POST `/api/task/onetime`、POST `/api/task/cron`（含清空）成功后同步落盘；原子写（同目录 tmp 文件 + fsync + rename/replace）；
@@ -1314,10 +1342,10 @@ PHP 版本专属的特殊模式：代理端配置 `PLAIN_MODE=true` 后，请求
 5. 恢复出的启动任务**后台执行一次**（不阻塞 HTTP 就绪），结果写入既有 onetime 日志环形缓冲（重启后仍可经 `/api/task/log/onetime` 查证）；
 6. **0.6.8 起（argo 绑定子类型，四端统一）**：恢复 `data.argobinds` 绑定条目 → 逐条**新建隧道**（source=restore）并按持久化名称绑定 shz.al 上报（key 缺省时按最终 name 重算派生密钥）→ 上报地址分毫不差；恢复失败（端口被 KMODE 隧道占用 409、创建失败等）仅告警、条目保留；hubregs 恢复同理但为注册语义（见下）。
 
-### hub 注册任务子类型（0.6.6 续批起，Py/Js）
+### hub 注册任务子类型（0.6.6 续批起，Py/Js/Java/Java11）
 
-- KSTORE `data.hubregs` 持久化的是 **kisama-hub 动态注册项**（`POST /api/hub` 写入、`DELETE /api/hub` 移除，见「十九」19.9），元素为结构化对象 `{hub, kname, ports}`——**不是 shell 命令**，不进入 onetime/cron 执行流，与两者是并列的任务子类型。
-- **启动恢复**：agent 启动时在恢复流程中自动重建注册（逐项 `register`，不等待连接结果，失败项按指数退避自治重连；与 KMODE=3 静态项 KNAME 冲突时跳过恢复项并告警）。
+- KSTORE `data.hubregs` 持久化的是 **kisama-hub 动态注册项**（`POST /api/hub` 写入、`DELETE /api/hub` 移除，见「十九」19.9），元素为结构化对象 `{hub, kname, ports}`——**不是 shell 命令**，不进入 onetime/cron 执行流，与两者是并列的任务子类型。`hub` 保存归一化后的原配置；shz.al 别名连尾斜杠一并保留，不保存解析结果。
+- **启动恢复**：agent 启动时在恢复流程中自动重建注册（逐项 `register`，不等待连接结果，失败项按指数退避自治重连；与 KMODE=3 静态项 KNAME 冲突时跳过恢复项并告警）。别名项恢复后首次拨号前重新 GET，不读取任何旧的 `resolved_hub`。
 - **持久化随 KSTORE**：`KSTORE` 未启用时动态注册仅本进程内存活（重启即失，`POST` 响应 `persisted:false` 告知）；启用后重启自动恢复。
 - **混部边界**：老版本 agent（无 hubregs 解析）回写容器会丢弃该键（见「存储文件格式」）。
 
@@ -1870,9 +1898,9 @@ PHP 端（`kisamaphp` 四个副本）每次请求一个生命周期，§16.2 的
 
 ---
 
-## 十八、内置加密 DNS（DoH）：`KISAMA_DNS` 开关（五端统一，防 DNS 污染）
+## 十八、内置加密 DNS（DoH）：`KISAMA_DNS` 开关（Py/Js/Go/Java 已实现，Java11 未实现）
 
-> **一句话**：`KISAMA_DNS=on` 时 agent 全部出站域名解析改走内置 DoH（DNS over HTTPS JSON API），防御本地 DNS 污染/劫持；`off`（默认）不安装任何钩子、零行为变化。argo 隧道模块（快速隧道注册 + edge 长连接）、baseinfo 外网 IP 探测、KMODE=2 shz.al 上报、go 端 /kisamaproxy 上游转发全部覆盖；纯标准库零新依赖，证书校验零降级，无新增端点/监听面。
+> **一句话**：已实现端在 `KISAMA_DNS=on` 时把所覆盖的出站域名解析改走内置 DoH（DNS over HTTPS JSON API），防御本地 DNS 污染/劫持；`off`（默认）不安装任何钩子、零行为变化。覆盖 argo 隧道（快速隧道注册 + edge 长连接）、baseinfo 外网 IP 探测、KMODE=2 shz.al 上报、KMODE=3 Hub 连接（含 shz.al 别名 GET）与 Go 版 /kisamaproxy 上游转发；纯标准库零新依赖，证书校验零降级，无新增端点/监听面。**Java11 权威源码当前没有 DoH 子系统，本批不移植，也不声称覆盖。**
 
 ### 18.1 背景与覆盖矩阵
 
@@ -1880,23 +1908,25 @@ agent 为纯入站服务端（面板 → agent 是入站连接），DNS 污染�
 
 | 出站模块 | py | js | go | java | java11 | 覆盖方式 |
 |---|---|---|---|---|---|---|
-| baseinfo 外网 IP 探测（api.ipify.org 等） | ✅ | ✅ | ✅ | ✅ | ✅ | 全局钩子 / SecureSend |
-| argo 快速隧道注册（api.trycloudflare.com） | ✅ | ✅ | —（go 无 argo 模块） | ✅ | ✅ | 同上 |
-| argo edge 长连接（regionX.v2.argotunnel.com:7844，SNI=h2.cftunnel.com） | ✅ | ✅ | — | ✅ | ✅ | DoH 解析后按 IP 建连（逐 IP 尝试），SNI 与自研证书校验不变 |
-| KMODE=2 shz.al 上报 | ✅ | ✅ | —（go 无 KMODE） | ✅ | ✅ | SecureSend |
+| baseinfo 外网 IP 探测（api.ipify.org 等） | ✅ | ✅ | ✅ | ✅ | ❌ | 全局钩子 / SecureSend |
+| argo 快速隧道注册（api.trycloudflare.com） | ✅ | ✅ | —（go 无 argo 模块） | ✅ | ❌ | 同上 |
+| argo edge 长连接（regionX.v2.argotunnel.com:7844，SNI=h2.cftunnel.com） | ✅ | ✅ | — | ✅ | ❌ | DoH 解析后按 IP 建连（逐 IP 尝试），SNI 与自研证书校验不变 |
+| KMODE=2 shz.al 上报 | ✅ | ✅ | —（go 无 KMODE） | ✅ | ❌ | SecureSend |
+| KMODE=3 Hub 连接（含 shz.al 别名 GET） | ✅ | ✅ | —（go 无 KMODE） | ✅ | ❌ | 全局钩子 / SecureSend |
 | /kisamaproxy 上游转发 | —（py 无 proxy） | — | ✅ | — | — | Transport.DialContext 挂载 |
 
 - **py**：包装 `socket.getaddrinfo`（import 期安装），以「对 DoH 解析出的 IP 调原版 getaddrinfo」合成规范结果——覆盖 aiohttp/urllib/http.client/socket 全部进程内出站解析，完整保留 family/flags 语义；`gethostbyname` 等裸 API 不在钩子范围（本仓未使用）。
 - **js**：包装 `dns.lookup`（require 期安装），覆盖 http/https/tls/net 全部进程内出站解析（node 内置请求不经环境代理）；`dns.Resolver`（c-ares 线）不涉本仓出站路径。
 - **go**：`go/utils/dns.go` 提供 `SecureDialContext`，`fetchIP` 客户端与 `handlers.kisamaProxyTransport` 显式挂载；**未来新增出站域名连接（如 argo-go 移植）一律经 `utils.SecureDialContext` 挂载自动纳入**。
-- **java/java11**：`java.net.http.HttpClient` 无解析钩子，由 `secureSend` 改写连接（URI host → DoH 解析 IP，强制 HTTP/1.1 + 手工 `Host` 头保持原域名；`jdk.httpclient.allowRestrictedHeaders=host` 由静态块设置，仅放开本进程 Host 头设置许可）；edge 走 `SecureDns.resolve` 后按 IP 建连；proxyToOrigin 为回环地址不解析。
+- **java（17）**：`java.net.http.HttpClient` 无解析钩子，由 `secureSend` 改写连接（URI host → DoH 解析 IP，强制 HTTP/1.1 + 手工 `Host` 头保持原域名；`jdk.httpclient.allowRestrictedHeaders=host` 由静态块设置，仅放开本进程 Host 头设置许可）；edge 走 `SecureDns.resolve` 后按 IP 建连；proxyToOrigin 为回环地址不解析。0.6.8 的 shz.al Hub 别名 GET 复用该通道，15s 为覆盖解析与请求的总截止时间。
+- **java11**：当前权威源码无 `SecureDns` / `secureSend` / DoH 实现，所有出站仍走系统 DNS；`KISAMA_DNS` 不构成本端可用开关。0.6.8 仅实现 Hub 别名解析，使用现有 `HttpClient`、系统 DNS 与严格 TLS，未移植 DoH。
 - **php**：不在本仓（独立仓库），本期不涉及。
 
 ### 18.2 开关与变量
 
 | 变量 | 缺省 | 说明 |
 |---|---|---|
-| `KISAMA_DNS` | `off` | `off`=系统解析（零行为变化）；`on`=全部出站域名解析走 DoH |
+| `KISAMA_DNS` | `off` | `off`=系统解析（零行为变化）；`on`=已实现端（py/js/go/java）所覆盖的出站域名解析走 DoH；Java11 无此子系统 |
 | `KISAMA_DOH_SERVERS` | （空） | 逗号/空白分隔的 DoH JSON API 基地址链（去尾斜杠）；空/全非法回缺省链 |
 
 缺省服务器链（按序尝试；前一台网络级失败退避 60s 后换台，SERVFAIL 等服务端错误仅换台不退避）：
@@ -1925,7 +1955,7 @@ agent 为纯入站服务端（面板 → agent 是入站连接），DNS 污染�
 ### 18.5 验收与限制
 
 - 单测（全部 mock 网络层，不依赖外网）：`tests/py/test_secure_dns.py`（22 例）、`tests/js/test_secure_dns.js`（11 组）、`go/utils/dns_test.go`（14 个测试函数，含 httptest 假 DoH 与真实拨号链路）。
-- 已知限制：DoH 供应商被网络整体阻断时行为等价 off（全部回落系统解析）；php 端、js `dns.Resolver`、py `gethostbyname` 不在覆盖面（本仓出站路径均未使用）。
+- 已知限制：DoH 供应商被网络整体阻断时行为等价 off（全部回落系统解析）；php 端、Java11 端、js `dns.Resolver`、py `gethostbyname` 不在覆盖面（Java11 无 DoH 子系统；其余两项本仓出站路径均未使用）。
 
 ---
 
@@ -1953,8 +1983,8 @@ kisama-agent（内网，KMODE=3，回环分发到自身 /api 或 KHUB_PORTS 端�
 | 环境变量 | 缺省 | 说明 |
 | :--- | :--- | :--- |
 | `KMODE` | `0` | 设为 `3` 启用 kisama-hub 中继 |
-| `KHUB` | （空） | hub 基址，如 `https://hub.example.com`（尾斜杠剥除）；隧道 WS 地址自动推导（https→wss、http→ws、裸 host 按 ws，为字符串拼接、基址可含路径）；hub 启用路径前缀（19.3 `HUB_BASE_PATH`）时**必须带前缀**，如 `https://hub.example.com/hide1` |
-| `KHUB_PUBLIC_URL` | （空） | **公网基址覆盖值（可选，0.6.6 续批二）**：面板/客户端实际访问该 agent 中继地址的公网基址（可含路径前缀，如 `https://pub.example.com/hub`）。注册时经注册帧 `public_url` 字段上报，hub 拼 `/sub`、`/agents` 页与 ack `url` 时**优先用它**（优先级见 19.7）。**未配置时自动上报 KHUB 派生基址**（即 `KHUB` 本身——agent 知道 hub 公网地址的场景零配置）；本变量用于内网 KHUB 等派生值 ≠ 公网地址的部署。校验：`http(s)://` 开头、无空白、≤512 字符、尾斜杠剥除；非法值告警一次并回退 KHUB 派生基址 |
+| `KHUB` | （空） | hub 基址，如 `https://hub.example.com`（直连基址尾斜杠剥除、基址可含路径），或 shz.al 公开读值别名 `https://shz.al/~name`（0.6.8 起，契约见 19.2.1）；隧道 WS 地址自动推导（https→wss、http→ws、裸 host 按 ws，为字符串拼接）；hub 启用路径前缀（19.3 `HUB_BASE_PATH`）时可用根地址（hub 恒保留根 `/tunnel` 作为 agent 入口，KHUB 无需知道隐藏前缀）或带前缀地址（如 `https://hub.example.com/hide1`，兼容既有配置） |
+| `KHUB_PUBLIC_URL` | （空） | **公网基址覆盖值（可选，0.6.6 续批二）**：面板/客户端实际访问该 agent 中继地址的公网基址（可含路径前缀，如 `https://pub.example.com/hub`）。注册时经注册帧 `public_url` 字段上报，hub 拼 `/sub`、`/agents` 页与 ack `url` 时**优先用它**（优先级见 19.7；`HUB_BASE_PATH` 非空时须以 `/<前缀>` 结尾才生效）。**未配置时上报本轮实际使用的 Hub 基址**：直连即配置基址，别名即本轮 GET 解析出的真实基址，绝不把 shz.al 别名当作 `public_url`；本变量用于内网 KHUB 等派生值 ≠ 公网地址的部署。校验：`http(s)://` 开头、无空白、≤512 字符、尾斜杠剥除；非法值告警一次并回退本轮实际 Hub 基址 |
 | `KNAME` | （空） | hub 注册名，**单个 hub 内唯一**；校验规则独立于 shz.al（见 19.4），不要求 `KNAME_KEY` |
 | `KHUB_PORTS` | （空） | **HUB 组反代白名单 env 下限（0.6.7 续批六起归属 HUB 组）**（逗号分隔，如 `7788,9090`）；只约束 hub 链路端口反代 `/{KNAME}/{PORT}/*`，缺省空 = HUB 端口反代禁用，非法/越界条目静默忽略。聚合公式：HUB 组有效白名单 = `KHUB_PORTS` ∪ HUB 运行时列表（运行时经 20.8 API `scope=hub` 设置与 `POST /api/hub` 注册端口并入（19.9）并 KSTORE 持久化）；拒绝语义见 20.2（403 `port_not_allowed`、不发起连接） |
 | `KPROXY_PORTS` | （空） | **本地组反代白名单 env 下限（0.6.7 续批六新增）**（逗号分隔）；只约束本地反代路由（第二十节 `/api/proxy/{port}/*`、WS `/api/proxyws/{port}/{rest}`），缺省空 = 本地反代禁用，非法/越界条目静默忽略。聚合公式：本地组有效白名单 = `KPROXY_PORTS` ∪ 本地运行时列表（20.8）；**与 `KHUB_PORTS` 互不影响**（两组独立存储与校验，续批六拍板修订续批二"单一白名单口径"） |
@@ -1966,6 +1996,18 @@ kisama-agent（内网，KMODE=3，回环分发到自身 /api 或 KHUB_PORTS 端�
 
 - `KMODE=3` 但 `KHUB` 或 `KNAME` 缺失/非法时：告警并保持普通启动（本地服务照常，不建隧道）。
 - 注册成功后 baseinfo `marks` 追加 `kmode3`（见 15.16）。
+- 🏷️ **0.6.8 起 java/java11 支持宿主烘焙设置 Map**：10 参全量烘焙构造追加 `bakedSettings`（任意 KEY=VALUE），本表全部键（KHUB 家族与 `KISAMA_HUB_*`）可由宿主（如 Bukkit 插件）在构建期直接烘焙进产物、不依赖 `.env`/环境变量；优先级仍为 真实环境变量 > `.env` > 位置烘焙实参 > 烘焙设置 Map > 内置缺省（`resolveSetting`；KHUB 家族位置实参恒为 null、只走 Map 通道）。kisama_agent_jplugin 经可选输入 `KHUB_SETTINGS`（分号分隔 KEY=VALUE）注入。
+
+### 19.2.1 shz.al Hub 别名解析（0.6.8，Py/Js/Java/Java11）
+
+`KHUB` 与动态注册的 `hub` 都可使用 `https://shz.al/~name`：该 URL 是 shz.al 的公开读值入口，响应体才是真实 kisama-hub 基址。四端行为一致：
+
+- **别名识别与直连旁路**：仅 host 精确等于 `shz.al`、路径以 `/~` 开头的候选进入别名校验；名称 ≥3 字符，允许字母数字及 `+_-[]*$=@,;/`（尾斜杠是名称的一部分，配置归一化不得剥除）。`http://`、非 443 端口、query/fragment、userinfo、管理 URL `~name:key`、反斜杠、空白/控制字符等别名候选在 GET/WS 前拒绝并进入重连，绝不退化为直连或管理请求。普通 `http(s)://hub...` 不发起别名 GET，URL 推导规则不变。
+- **每次 attempt 重新解析**：解析位于每次连接入口最前面。别名 GET 失败时不创建 Hub WS；解析成功后的 WS 建连失败或注册失败也进入既有指数退避。下一轮必须重新 GET，**不得拿上一轮 `resolved_hub` 继续拨号**；最后成功值只保留在快照中用于展示。
+- **解析请求契约**：`GET` 原别名地址；头 `Accept: text/plain`、`User-Agent: curl/8.5.0`、`Accept-Encoding: identity`；严格 TLS、禁止跟随重定向、15s 总超时；响应体最多 4096 字节（读取 4097 用于判超限）。Java17 经既有 `secureSend`，因此 `KISAMA_DNS=on` 时沿用 DoH；Java11 无 DoH，使用系统 DNS（见第十八节）。
+- **响应契约**：仅接受 HTTP 200、`text/plain`（可带 charset）、无 `Content-Encoding` 或 `identity`，UTF-8 严格解码。trim 后必须恰为一个绝对 `http://` 或 `https://` Hub 基址，≤512 字符；允许路径前缀，尾部斜杠剥除；拒绝空体、HTML、多 URL、内部空白/控制字符、反斜杠、userinfo、query/fragment、非法 host、空端口及非法/越界端口。
+- **注册公网基址**：合法 `KHUB_PUBLIC_URL` 始终优先且自身不解析；未配置时使用**本轮解析出的真实 Hub 基址**。`hub` 与 KSTORE 保存原配置（别名仍是别名），`resolved_hub` 保存最后成功解析值，`url` / `public_url` 展示优先级为「显式覆盖 > 最后成功解析值 > 原配置」。
+- **信任边界**：shz.al paste 内容决定 agent 的出站 Hub 目的地，允许 HTTP(S) 内网/回环地址；严格 TLS 只约束 shz.al GET，不约束解析结果。该取舍与缓解见 `docs/SECURITY-AUDIT.md` F20/B-17。
 
 ### 19.3 hub 端点清单
 
@@ -1977,19 +2019,19 @@ kisama-agent（内网，KMODE=3，回环分发到自身 /api 或 KHUB_PORTS 端�
 | `GET /sub` | 订阅：text/plain，每行一条 `kisama://node?domain=<enc>&name=<enc>`（见 19.7） |
 | `GET /sub?format=json` | 面板批量导入格式 `NodeConfigExport {version, exportedAt, nodes:[...]}`（面板「导入配置」直接消费） |
 | `GET /health` | 健康检查 `{status, hub_version, agents}` |
-| `WS /tunnel` | agent 注册与隧道（唯一 agent 入口，见 19.5） |
+| `WS /tunnel` | agent 注册与隧道（唯一 agent 入口，见 19.5）；**根路径恒开放**，前缀模式下另有 `/<前缀>/tunnel` 兼容带前缀 KHUB |
 | `ANY /{KNAME}/api/*` | API 中继 → agent 自身 `/api/*` |
 | `GET /{KNAME}/api/ws/*` | 终端 WS 中继（帧级多路复用，见 19.6） |
 | `ANY /{KNAME}/{PORT}/*` | 端口反代 → agent 回环 `127.0.0.1:{PORT}`（`PORT` 须 1-65535） |
 
-hub 环境变量：`HUB_PORT`(8080)、`HUB_MAX_AGENTS`(256)、`HUB_RELAY_TIMEOUT`(30s)、`HUB_MAX_BODY`(64MB)、`HUB_HEARTBEAT_TIMEOUT`(60s)、`HUB_WS_IDLE_TIMEOUT`(600s)、`HUB_PUBLIC_URL`（可选，订阅 domain 与 ack url 的公网基址，不含路径前缀；缺省按 `X-Forwarded-Proto` + Host 推导，生产 TLS 反代后建议显式设置）、`HUB_BASE_PATH`（可选，路由前缀如 `hide1` → 上表全部路由挂 `/hide1/` 下，根路径与其余未挂前缀路径 404 隐藏、`/hide1` 自动重定向 `/hide1/`；前缀段限字母/数字/连字符/下划线，非法回退根路径；此时 agent 的 `KHUB` 与订阅/面板 domain 均须带前缀——四端 KHUB→WS 地址为字符串拼接天然携带前缀，agent 端零改动；隐藏属轻微混淆非认证，代理/枚举仍可发现）。hub 全部响应（含中继，上游同名头剥除后统一裁定）带 CORS 头 `Access-Control-Allow-Origin: *` 等（0.6.6 批次，语义对齐 kpng/kisamaproxy；带 `Origin` 的 OPTIONS 预检由 hub 本地 204 应答，无 `Origin` 的 OPTIONS 照旧透传）。
+hub 环境变量：`HUB_PORT`(8080)、`HUB_MAX_AGENTS`(256)、`HUB_RELAY_TIMEOUT`(30s)、`HUB_MAX_BODY`(64MB)、`HUB_HEARTBEAT_TIMEOUT`(60s)、`HUB_WS_IDLE_TIMEOUT`(600s)、`HUB_PUBLIC_URL`（可选，订阅 domain 与 ack url 的公网基址，不含路径前缀；缺省按 `X-Forwarded-Proto` + Host 推导，生产 TLS 反代后建议显式设置）、`HUB_BASE_PATH`（可选，路由前缀如 `hide1` → 上表除根 `/tunnel` 外全部路由挂 `/hide1/` 下，根路径其余未挂前缀路径 404 隐藏、`/hide1` 自动重定向 `/hide1/`；前缀段限字母/数字/连字符/下划线，非法回退根路径；此时 agent 的 `KHUB` 可用根地址（根 `/tunnel` 恒开放）或带前缀——四端 KHUB→WS 地址为字符串拼接，两种形态天然支持，agent 端零改动；订阅/面板 domain 仍带前缀——根地址接入的 agent 缺省上报 `public_url` 不含前缀时 hub 回落自身推导（见 19.7）；隐藏属轻微混淆非认证，代理/枚举仍可发现）。hub 全部响应（含中继，上游同名头剥除后统一裁定）带 CORS 头 `Access-Control-Allow-Origin: *` 等（0.6.6 批次，语义对齐 kpng/kisamaproxy；带 `Origin` 的 OPTIONS 预检由 hub 本地 204 应答，无 `Origin` 的 OPTIONS 照旧透传）。
 
 ### 19.4 KNAME 规则与注册抢占
 
 - **格式**：`^[a-z0-9][a-z0-9-]{1,62}$`（输入小写归一化，2-63 字符，首位字母或数字）。
 - **保留名**（与 hub 自有路由冲突，注册即拒）：`api`、`agents`、`health`、`tunnel`、`static`、`sub`、`favicon.ico`。
 - **抢占规则**：槽位空闲（旧连接已断并注销）才可注册；活跃连接在位时返回 `name_taken`，**不发生替换**（杜绝抢名战争）。进程重启后旧 WS 已死可自然重占。hub 重启后注册表清空，agent 自动重连重注册（注册表纯内存，无持久化）。
-- **注册帧**（WS /tunnel 首帧）：`{"t":"register","v":1,"kname":"...","version":"0.6.5-python","ports":[7788]}`，可选字段 `public_url`（公网基址，0.6.6 续批起；**0.6.6 续批二起缺省自动上报**——`KHUB_PUBLIC_URL` 合法配置值优先，未配置取 KHUB 派生基址（`KHUB` 本身）；hub 校验同 agent 端——`http(s)://` 开头、无空白、≤512 字符、尾斜杠剥除，非法即拒 `invalid_public_url`，旧版 agent 不携带时回落 hub 推导）；应答 `{"t":"ack","ok":true,"kname":"...","url":"https://<host>/<kname>"}`（`url` 按 19.7 优先级拼装，agent 上报了 `public_url` 时即为其修正值）或 `{"t":"ack","ok":false,"code":"invalid_name"|"name_taken"|"full"|"invalid_version"|"invalid_frame"|"invalid_public_url","message":"..."}`。
+- **注册帧**（WS /tunnel 首帧）：`{"t":"register","v":1,"kname":"...","version":"0.6.8-python","ports":[7788],"public_url":"https://hub.example.com"}`。**0.6.8 起四端恒发送 `public_url`**：合法 `KHUB_PUBLIC_URL` 优先，未配置时直连取配置基址、shz.al 别名取本轮解析出的真实 Hub 基址（19.2.1）；hub 校验同 agent 端——`http(s)://` 开头、无空白、≤512 字符、尾斜杠剥除，非法即拒 `invalid_public_url`。旧版 agent 不携带该字段时仍回落 hub 推导。应答 `{"t":"ack","ok":true,"kname":"...","url":"https://<host>/<kname>"}`（`url` 按 19.7 优先级拼装，agent 上报了 `public_url` 且其值以 `/<前缀>` 结尾时即为其修正值，否则回落 hub 推导）或 `{"t":"ack","ok":false,"code":"invalid_name"|"name_taken"|"full"|"invalid_version"|"invalid_frame"|"invalid_public_url","message":"..."}`。
 - **心跳**：agent 每 20s 发 `{"t":"ping"}`，hub 回 `{"t":"pong"}`；hub 读空闲超时 `HUB_HEARTBEAT_TIMEOUT`（60s，任何帧重置），超时断开并注销。
 
 ### 19.5 HTTP 中继 envelope（req/res/err）
@@ -2017,7 +2059,8 @@ hub 环境变量：`HUB_PORT`(8080)、`HUB_MAX_AGENTS`(256)、`HUB_RELAY_TIMEOUT
 ### 19.7 订阅与连接串契约（对齐 kisama-panel share-link.ts）
 
 - hub 生成的链接形态：`kisama://node?domain=<enc>&name=<enc>`；值编码严格对齐面板 `encodeURIComponent` 语义（`+` 必须转 `%2B`，解析侧不做 `+`→空格）；可选字段为空不写。
-- **domain 基址来源三级优先级（0.6.6 续批起；0.6.6 续批二起 public_url 缺省自动上报）**：该 agent 注册时上报的 `public_url`（注册帧字段，`KHUB_PUBLIC_URL` 覆盖值优先、缺省取 KHUB 派生基址——agent 已声明其实际基址，无需 hub 侧配置）> hub 全局 `HUB_PUBLIC_URL` > 请求推导（`X-Forwarded-Proto` + Host，或 TLS 判定 https）。`/sub`（文本与 `?format=json` 的 `domain`）、`/agents` 页与 `/api/agents` 的 `url`、注册 ack 的 `url` 四处统一按此优先级拼装（`{基址}/{KNAME}`）；`/api/agents` 条目 additive 增加 `public_url` 字段（非空才输出，标示该条目 url 来源）。未上报任何值时行为与 0.6.6 首批完全一致。
+- **domain 基址来源三级优先级（0.6.6 续批起；0.6.8 起别名缺省上报真实解析基址）**：该 agent 注册时上报的 `public_url`（注册帧字段，合法 `KHUB_PUBLIC_URL` 覆盖值优先；未配置时直连取配置基址、shz.al 别名取本轮解析出的真实 Hub 基址，别名 URL 自身绝不上报）> hub 全局 `HUB_PUBLIC_URL` > 请求推导（`X-Forwarded-Proto` + Host，或 TLS 判定 https）。`/sub`（文本与 `?format=json` 的 `domain`）、`/agents` 页与 `/api/agents` 的 `url`、注册 ack 的 `url` 四处统一按此优先级拼装（`{基址}/{KNAME}`）；`/api/agents` 条目 additive 增加 `public_url` 字段（上报值实际生效时才输出，标示该条目 url 来源）。旧版 agent 未上报任何值时行为与 0.6.6 首批完全一致。
+- **`HUB_BASE_PATH` 非空时的前缀约束**：上报值须以 `/<前缀>` 结尾才直接采用；否则视为 agent 只知道 hub 根地址（根 `/tunnel` 接入时缺省上报 KHUB 即此形态），回落 `HUB_PUBLIC_URL` / 请求推导并由 hub 统一补前缀，保证 `/sub`、`/agents` 页与 ack `url` 始终带前缀（避免面板拿到缺前缀的坏链接）。
 - **不带任何私钥字段**：连接串里的 `ecdsaprikey`/`eciesprikey` 是**面板侧私钥**，hub 不可能持有；面板导入后节点级缺省由其全局密钥兜底（`node.key || globalConfig.key`）。
 - 面板节点 URL 配置为 `https://hub/{KNAME}`：面板 `getSignPath` 对任意前缀取最后一个 `/api/` 锚点签名，签名 PATH 即 agent 实际分发的路径——**签名口径 = 剥离 KNAME 前缀后的本地路径**，面板与 `tools/control.py`（相对路径签名）均零改动兼容。
 - 面板现状**没有订阅 URL 定时拉取器**：`/sub` 文本可逐条复制进 NodeForm 粘贴导入，`/sub?format=json` 可经面板「导入配置」批量导入；订阅 URL 自动拉取为 kisama-panel 侧后续改动预留。
@@ -2033,8 +2076,10 @@ hub 环境变量：`HUB_PORT`(8080)、`HUB_MAX_AGENTS`(256)、`HUB_RELAY_TIMEOUT
   "tunnel": {
     "tunnel_status": "alive",          // alive | reconnecting | failed（对齐 /api/argo 三态惯例）
     "hub": "https://hub.example.com",
+    "resolved_hub": "https://hub.example.com",
     "kname": "demo1",
     "url": "https://hub.example.com/demo1",
+    "public_url": "https://hub.example.com",
     "ports": [7788],
     "consecutive_failures": 0,
     "last_error": null,
@@ -2047,17 +2092,21 @@ hub 环境变量：`HUB_PORT`(8080)、`HUB_MAX_AGENTS`(256)、`HUB_RELAY_TIMEOUT
 
 **0.6.6 续批 additive 扩展**：响应新增 `registrations` 数组（注册表全量，元素在 snapshot 基础上含 `source: "startup"|"dynamic"`）；`tunnel` 字段保留（KMODE=3 静态实例快照，无则 null）；`enabled` 语义更新为"注册表非空"。非 KMODE=3 且无动态注册时返回 `{"status":"ok","enabled":false,"registrations":[],"tunnel":null}`。
 
+**0.6.8 别名可观测性（additive）**：每个 snapshot 新增 `resolved_hub` 与 `public_url`。`hub` 始终保留原配置（别名为原 shz.al URL）；`resolved_hub` 在直连时等于配置基址，别名首次成功解析前为 `null`，之后保留最后一次成功值——**它只用于展示，不是拨号缓存**。`url` 与 `public_url` 按「显式 `KHUB_PUBLIC_URL` > 最后成功解析值 > 原配置」派生，因此首次解析前别名快照可能暂时显示原别名；注册帧只发送本轮实际使用的真实基址。四端均显式输出 `resolved_hub: null`（Java/Java11 的 `/api/hub` 使用专用序列化器，不改变其他接口省略 null 的既有行为）。
+
 **0.6.6 续批新增 `POST/DELETE /api/hub`（动态注册，见 19.9）**——注册项持久化于 kstore `data.hubregs`（第十三节），agent 重启自动恢复。
 
 ### 19.9 动态注册 API（POST/DELETE /api/hub，0.6.6 续批，Py/Js/Java/Java11）
 
-运行时动态指挥 agent 注册/注销到 kisama-hub，**不依赖 KMODE=3 启动配置**。三条路由均走验签（非白名单）。注册项持久化于 kstore `data.hubregs`（第十三节"hub 注册任务子类型"），agent 重启自动恢复。
+运行时动态指挥 agent 注册/注销到 kisama-hub，**不依赖 KMODE=3 启动配置**。三条路由均走验签（非白名单）。注册项持久化于 kstore `data.hubregs`（第十三节"hub 注册任务子类型"），agent 重启自动恢复。动态项与 KMODE=3 启动项共用同一管理器，因此 `hub` 同样支持 `https://shz.al/~name`，完整解析/重试契约见 19.2.1。
 
 **`POST /api/hub`** — 动态注册：
 
 ```json
 { "hub": "https://hub.example.com", "kname": "myhost", "ports": [7788] }
 ```
+
+别名形态示例：`{ "hub": "https://shz.al/~myhub", "kname": "myhost", "ports": [] }`。`data.hubregs` 只保存原 `hub` 配置（包括原别名），不保存 `resolved_hub`；重启后重新 GET 解析，解析结果变化不影响持久化条目身份。
 
 - 同步等待注册结果（15s 超时）；成功 → `200 {"status":"ok","persisted":<bool>,"registration":{...snapshot, "source":"dynamic"}}`（`persisted=false` 表示 KSTORE 未启用，注册仅本进程内存活）；
 - `KNAME` 非法/保留名 → `422 {"code":"invalid_name",...}`；hub 基址非 http(s) → `422 {"code":"invalid_hub"}`；本 agent 已有同名注册 → `409 {"code":"name_taken"}`（kname 唯一键）；hub 侧 name_taken/full → `409`——以上**均不保留注册项**；
@@ -2087,9 +2136,11 @@ hub 环境变量：`HUB_PORT`(8080)、`HUB_MAX_AGENTS`(256)、`HUB_RELAY_TIMEOUT
 | 端口反代 WS 透传（ws_open.port，19.6） | ✅ | ✅ | ❌ | ✅ | ✅ |
 | marks `kmode3` | ✅ | ✅ | ❌ | ✅ | ✅ |
 | `GET /api/hub` | ✅ | ✅ | ❌ | ✅ | ✅ |
-| public_url 上报（缺省 KHUB 派生，KHUB_PUBLIC_URL 覆盖；19.4/19.7，0.6.6 续批二） | ✅ | ✅ | ❌ | ✅ | ✅ |
+| public_url 上报（显式覆盖 > 本轮真实 Hub 基址；19.4/19.7，0.6.8 起四端恒发送） | ✅ | ✅ | ❌ | ✅ | ✅ |
+| shz.al Hub 别名解析（启动/动态注册，每次 attempt 重新 GET；19.2.1） | ✅ | ✅ | ❌ | ✅ | ✅ |
+| `resolved_hub` 快照（首次解析前 null，之后保留最后成功值） | ✅ | ✅ | ❌ | ✅ | ✅ |
 
-遗留（后续批次）：go 的 KMODE=3 实现（需先补 KMODE/KNAME/KHUB/KHUB_PORTS 配置基建）；php 端无 WS 客户端、不做 hub 接入；面板订阅 URL 自动拉取（kisama-panel 侧）。
+遗留（后续批次）：go 的 KMODE=3 实现（需先补 KMODE/KNAME/KHUB/KHUB_PORTS 配置基建）；php 端无 WS 客户端、不做 hub 接入；面板订阅 URL 自动拉取（kisama-panel 侧）；Java11 DoH 子系统（当前别名解析使用系统 DNS，见第十八节，本批未移植）。
 
 ## 二十、本地端口反代路由 `/api/proxy/{port}/*`（0.6.7 起，Py/Js/Java/Java11）
 

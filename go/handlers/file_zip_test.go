@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -283,5 +284,131 @@ func TestUnzipFileHandlerNotAZip(t *testing.T) {
 	code, _ := doZipJSON(t, r, "POST", "/api/file/unzip", map[string]any{"path": "fake.zip"})
 	if code != http.StatusBadRequest {
 		t.Fatalf("非 zip 应 400, got %d", code)
+	}
+}
+
+func TestZipWriteErrorsExposeReason(t *testing.T) {
+	r := setupZipTest(t)
+	makeZipTree(t)
+	code, resp := doZipJSON(t, r, "POST", "/api/file/zip", map[string]any{
+		"path": "out.zip", "items": []string{"src/a.txt"},
+	})
+	if code != http.StatusOK {
+		t.Fatalf("预备 zip 失败: %d %v", code, resp)
+	}
+	root := config.Get().FileRoot
+	if err := os.WriteFile(filepath.Join(root, "blocker"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	code, resp = doZipJSON(t, r, "POST", "/api/file/zip", map[string]any{
+		"path": "blocker/out.zip", "items": []string{"src/a.txt"},
+	})
+	if code != http.StatusInternalServerError || resp["reason"] == "" {
+		t.Fatalf("zip 写失败响应=%d %v", code, resp)
+	}
+	if runtime.GOOS != "windows" && resp["reason"] != "not_a_directory" {
+		t.Fatalf("zip reason=%v", resp["reason"])
+	}
+
+	code, resp = doZipJSON(t, r, "POST", "/api/file/unzip", map[string]any{
+		"path": "out.zip", "dest_path": "blocker/dest",
+	})
+	if code != http.StatusInternalServerError || resp["reason"] == "" {
+		t.Fatalf("unzip 写失败响应=%d %v", code, resp)
+	}
+	if runtime.GOOS != "windows" && resp["reason"] != "not_a_directory" {
+		t.Fatalf("unzip reason=%v", resp["reason"])
+	}
+}
+
+func TestZipFileHandlerRejectsNestedSymlink(t *testing.T) {
+	r := setupZipTest(t)
+	makeZipTree(t)
+	root := config.Get().FileRoot
+	outside := filepath.Join(t.TempDir(), "outside.txt")
+	if err := os.WriteFile(outside, []byte("SECRET"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "src", "link.txt")); err != nil {
+		t.Skipf("host denied symlink creation: %v", err)
+	}
+
+	code, resp := doZipJSON(t, r, http.MethodPost, "/api/file/zip", map[string]any{
+		"path": "out.zip", "items": []string{"src"},
+	})
+	if code != http.StatusOK || resp["status"] != "error" {
+		t.Fatalf("嵌套链接应计为实际失败: %d %v", code, resp)
+	}
+	result := resp["results"].([]any)[0].(map[string]any)
+	if !strings.Contains(result["error"].(string), "symbolic link not supported") {
+		t.Fatalf("嵌套链接错误=%v", result)
+	}
+	zr, err := zip.OpenReader(filepath.Join(root, "out.zip"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer zr.Close()
+	for _, entry := range zr.File {
+		if strings.HasSuffix(entry.Name, "link.txt") {
+			t.Fatalf("不得打包链接目标: %v", zr.File)
+		}
+	}
+}
+
+func TestUnzipFileHandlerRejectsSymlinkParentEscape(t *testing.T) {
+	r := setupZipTest(t)
+	root := config.Get().FileRoot
+	outside := t.TempDir()
+	dest := filepath.Join(root, "dest")
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(dest, "link")); err != nil {
+		t.Skipf("host denied symlink creation: %v", err)
+	}
+	zipPath := filepath.Join(root, "evil.zip")
+	f, err := os.Create(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(f)
+	entry, err := zw.Create("link/evil.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := entry.Write([]byte("evil")); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	code, resp := doZipJSON(t, r, http.MethodPost, "/api/file/unzip", map[string]any{
+		"path": "evil.zip", "dest_path": "dest",
+	})
+	if code != http.StatusOK || resp["skipped"] != float64(1) {
+		t.Fatalf("链接父路径条目应跳过: %d %v", code, resp)
+	}
+	if _, err := os.Stat(filepath.Join(outside, "evil.txt")); !os.IsNotExist(err) {
+		t.Fatalf("不得通过链接父路径写出沙箱: %v", err)
+	}
+}
+
+func TestZipFileHandlerReportsDeniedItem(t *testing.T) {
+	r := setupZipTest(t)
+	makeZipTree(t)
+	code, resp := doZipJSON(t, r, "POST", "/api/file/zip", map[string]any{
+		"path": "out.zip", "items": []string{"../outside.txt"},
+	})
+	if code != http.StatusOK || resp["status"] != "error" {
+		t.Fatalf("越界项不得报成功: %d %v", code, resp)
+	}
+	result := resp["results"].([]any)[0].(map[string]any)
+	if result["status"] != "error" || result["error"] != "path outside file root" {
+		t.Fatalf("越界项错误=%v", result)
 	}
 }

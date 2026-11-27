@@ -4,9 +4,12 @@
 # ============================================================================
 import os
 import sys
+import errno
+import posixpath
 import json
 import time
 import re
+import unicodedata
 import base64
 import hashlib
 import hmac
@@ -337,6 +340,7 @@ class AuthorityInfo(BaseModel):
     readable: bool
     writable: bool
     executable: bool
+    mount_readonly: Optional[bool] = None
 
 class AuthorityQueryResponse(SResponse):
     files: List[AuthorityInfo]
@@ -430,6 +434,7 @@ class FileMoveResult(BaseModel):
     from_field: str = Field(..., alias="from") # 使用 alias 兼容 Python 关键字 from
     to: str
     status: str
+    error: Optional[str] = None
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -437,6 +442,7 @@ class FileMoveResponse(BaseModel):
     status: str
     total: int
     success: int
+    message: Optional[str] = None
     results: List[Dict[str, str]] # 或者使用 FileMoveResult
 
 # --- 新建目录 ---
@@ -457,6 +463,8 @@ class FileZipItemResult(BaseModel):
     item: str
     status: str
     added: int = 0
+    error: Optional[str] = None
+    reason: Optional[str] = None
 
 class FileZipResponse(BaseModel):
     status: str
@@ -710,6 +718,26 @@ class NoiseKeyGenerator:
 # ============================================================================
 # ⚙️ 全局配置类
 # ============================================================================
+def is_shzal_hub_alias(url):
+    raw = (url or "").strip()
+    lexical = raw.replace("\t", "").replace("\r", "").replace("\n", "")
+    match = re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:(.*)$", lexical, re.DOTALL)
+    if not match:
+        return False
+    rest = match.group(1)
+    if rest.startswith("//"):
+        rest = rest[2:]
+    authority_match = re.match(r"([^/?#\\]*)(.*)$", rest, re.DOTALL)
+    if not authority_match:
+        return False
+    authority, tail = authority_match.groups()
+    host_port = authority.rsplit("@", 1)[-1]
+    host = host_port.split(":", 1)[0].strip().lower()
+    if host != "shz.al":
+        return False
+    return tail.startswith("/~") or ("\\" in tail and "/~" in tail)
+
+
 class Config:
     """
     配置中心 - 支持多级配置源
@@ -948,10 +976,11 @@ class Config:
     # KPROXY_PORTS=本地组反代白名单 env 下限 (0.6.7 续批六分组口径), 只约束本地路由
     # /api/proxy/{port} 与 /api/proxyws/{port}; 两组互不影响 (docs/API.MD 20.2);
     # 重试/心跳/限额与 argo 同风格 env 可调
-    KHUB = os.getenv("KHUB", "").strip().rstrip("/")
+    KHUB = os.getenv("KHUB", "").strip()
+    KHUB = KHUB if is_shzal_hub_alias(KHUB) else KHUB.rstrip("/")
     # KHUB_PUBLIC_URL=hub 对面板/客户端暴露的公网基址覆盖值 (可选, 0.6.6 续批二): 注册时经 public_url 字段
-    # 上报给 hub, hub 拼订阅/页面/ack url 时优先用它; 未配置时缺省自动上报 KHUB 派生基址, 本变量
-    # 用于内网 KHUB 等派生值 ≠ 公网地址的部署; 非法值告警并回退 KHUB 派生
+    # 上报给 hub, hub 拼订阅/页面/ack url 时优先用它; 未配置时缺省自动上报本轮实际 Hub 基址, 本变量
+    # 用于内网 KHUB 等派生值 ≠ 公网地址的部署; 非法值告警并回退本轮实际 Hub 基址
     KHUB_PUBLIC_URL = os.getenv("KHUB_PUBLIC_URL", "").strip().rstrip("/")
     KHUB_PORTS = tuple(sorted({
         int(p.strip()) for p in os.getenv("KHUB_PORTS", "").split(",")
@@ -974,7 +1003,7 @@ class Config:
     DOH_SERVERS = os.getenv("KISAMA_DOH_SERVERS", "").strip()
 
     # 代理版本信息
-    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.6.8-python")
+    AGENT_VERSION = os.getenv("AGENT_VERSION", "0.6.9-python")
     
     # ================= 启动校验 =================
     
@@ -2899,6 +2928,57 @@ from fastapi import HTTPException, status, UploadFile
 from croniter import croniter
 
 
+_FILE_ERROR_REASONS = {
+    errno.EROFS: "read_only_file_system",
+    errno.EACCES: "permission_denied",
+    errno.EPERM: "permission_denied",
+    errno.ENOTDIR: "not_a_directory",
+    errno.EEXIST: "file_exists",
+    errno.ENOENT: "not_found",
+    errno.ENOSPC: "no_space",
+}
+
+
+def _file_error_reason(error) -> str:
+    """把文件系统 errno 映射为稳定的跨端错误语义。"""
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        reason = _FILE_ERROR_REASONS.get(getattr(error, "errno", None))
+        if reason:
+            return reason
+        error = error.__cause__ or error.__context__
+    return "unknown"
+
+
+def _file_batch_result(total: int, success: int, results: List[Dict[str, str]]) -> dict:
+    if total > 0 and success == total:
+        status, message = "ok", ""
+    elif total == 0:
+        status, message = "error", "No operations requested"
+    elif success == 0:
+        status, message = "error", f"All {total} operations failed"
+    else:
+        status, message = "partial", f"{total - success} of {total} operations failed"
+    result = {"status": status, "total": total, "success": success}
+    if message:
+        result["message"] = message
+    result["results"] = results
+    return result
+
+
+class FileOperationError(HTTPException):
+    """文件写入失败; 独立异常处理器保留 errno 语义, 不改变其他 HTTPException。"""
+
+    def __init__(self, message: str, error: Exception, status_code: int = 500):
+        super().__init__(status_code=status_code, detail=message)
+        self.reason = _file_error_reason(error)
+
+
+class _ZipSourceReadError(Exception):
+    pass
+
+
 class FileManager:
     """
     文件管理器 - 封装所有文件/目录操作
@@ -2954,6 +3034,16 @@ class FileManager:
                 detail=f"Access denied: '{user_path}' outside root '{self.root}'"
             )
         return target
+
+    def _validate_parent_directory(self, target: Path):
+        """父链中间存在普通文件时显式映射 ENOTDIR (Windows 否则可能报 ENOENT)。"""
+        parent = target.parent
+        while parent != self.root and not parent.exists() and parent.parent != parent:
+            parent = parent.parent
+        if parent.exists() and not parent.is_dir():
+            raise NotADirectoryError(
+                errno.ENOTDIR, "Parent path is not a directory", str(parent)
+            )
     
     def _format_info(self, path: Path) -> dict:
         """格式化文件信息"""
@@ -2996,8 +3086,54 @@ class FileManager:
         self._audit("list", base_path, "ok", {"count": len(files)})
         return {"status": "ok", "count": len(files), "files": files}
     
+    @staticmethod
+    def _mount_readonly_from_mountinfo(target: str, data: Union[bytes, str]) -> Optional[bool]:
+        """从可注入的 mountinfo 数据中取 realpath 的最长边界匹配挂载项。"""
+        target = posixpath.normpath(target or "")
+        if not posixpath.isabs(target):
+            return None
+        try:
+            if isinstance(data, bytes):
+                text = data.decode("utf-8", errors="surrogateescape")
+            elif isinstance(data, str):
+                text = data
+            else:
+                return None
+        except UnicodeError:
+            return None
+
+        escapes = {"040": " ", "011": "\t", "012": "\n", "134": "\\"}
+        best_length = -1
+        result = None
+        for line in text.splitlines():
+            fields = line.split()
+            if len(fields) < 6:
+                continue
+            mount_point = posixpath.normpath(re.sub(
+                r"\\(040|011|012|134)",
+                lambda match: escapes[match.group(1)],
+                fields[4],
+            ))
+            if not posixpath.isabs(mount_point):
+                continue
+            if target != mount_point and not target.startswith(mount_point.rstrip("/") + "/"):
+                continue
+            if len(mount_point) <= best_length:
+                continue
+            result = "ro" in fields[5].split(",")
+            best_length = len(mount_point)
+        return result
+
     def get_authority(self, paths: List[str]) -> dict:
-        """批量查询文件权限"""
+        """批量查询文件权限; writable 保留 os.access 语义, 只读挂载单独表达。"""
+        mount_info = None
+        if sys.platform.startswith("linux"):
+            try:
+                with open("/proc/self/mountinfo", "rb") as mount_file:
+                    mount_info = mount_file.read()
+            except OSError:
+                pass
+
         results = []
         for p in paths:
             try:
@@ -3006,7 +3142,7 @@ class FileManager:
                     results.append({"path": p, "error": "Not found"})
                     continue
                 info = self._format_info(target)
-                results.append({
+                entry = {
                     "path": info["path"],
                     "name": info["name"],
                     "mode": info.get("mode"),
@@ -3015,7 +3151,13 @@ class FileManager:
                     "readable": os.access(target, os.R_OK),
                     "writable": os.access(target, os.W_OK),
                     "executable": os.access(target, os.X_OK)
-                })
+                }
+                if mount_info is not None:
+                    real_path = os.path.realpath(target)
+                    mount_readonly = self._mount_readonly_from_mountinfo(real_path, mount_info)
+                    if mount_readonly is not None:
+                        entry["mount_readonly"] = mount_readonly
+                results.append(entry)
             except HTTPException as e:
                 results.append({"path": p, "error": str(e.detail)})
             except Exception as e:
@@ -3076,6 +3218,7 @@ class FileManager:
             raise HTTPException(413, f"File too large: use chunked upload")
         
         try:
+            self._validate_parent_directory(target)
             target.parent.mkdir(parents=True, exist_ok=True)
             
             if chunk_id is not None and total_chunks is not None:
@@ -3128,10 +3271,8 @@ class FileManager:
                 self._audit("upload", str(target), "ok", {"size": len(file_content)})
                 return {"status": "ok", "path": str(target.relative_to(self.root))}
                 
-        except PermissionError:
-            raise HTTPException(403, "Permission denied")
         except Exception as e:
-            raise HTTPException(500, f"Upload failed: {e}")
+            raise FileOperationError(f"Upload failed: {e}", e) from e
     
     def download_file(self, file_path: str) -> tuple:
         """准备下载: 返回 (Path, MIME类型, 大小)"""
@@ -3183,8 +3324,7 @@ class FileManager:
     def move_paths(self, move_map: Dict[str, str]) -> dict:
         """
         批量移动/重命名文件/目录
-        :param move_map: {"src_path1": "dst_path1", "src_path2": "dst_path2", ...}
-        :return: {"status": "ok", "results": [{"from": "...", "to": "...", "status": "ok/error"}]}
+        :return: status = ok/partial/error; 逐项 status = ok/skipped/denied/failed
         """
         results = []
         
@@ -3194,13 +3334,13 @@ class FileManager:
                 dst_path = self._safe_path(dst)
                 
                 if not src_path.exists():
-                    results.append({"from": src, "to": dst, "status": "error", "error": "Source not found"})
+                    results.append({"from": src, "to": dst, "status": "skipped", "error": "source not found"})
                     continue
                 if dst_path.exists():
-                    results.append({"from": src, "to": dst, "status": "error", "error": "Destination exists"})
+                    results.append({"from": src, "to": dst, "status": "failed", "error": "Destination exists"})
                     continue
                 
-                # 确保目标父目录存在
+                self._validate_parent_directory(dst_path)
                 dst_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(src_path), str(dst_path))
                 
@@ -3212,26 +3352,30 @@ class FileManager:
                 self._audit("move_batch", f"{src} -> {dst}", "ok")
                 
             except HTTPException as e:
-                results.append({"from": src, "to": dst, "status": "error", "error": str(e.detail)})
+                results.append({
+                    "from": src, "to": dst,
+                    "status": "denied" if e.status_code == 403 else "failed",
+                    "error": "path outside file root" if e.status_code == 403 else str(e.detail),
+                })
+            except NotADirectoryError:
+                results.append({
+                    "from": src, "to": dst, "status": "denied",
+                    "error": "destination parent is not a directory",
+                })
             except Exception as e:
-                results.append({"from": src, "to": dst, "status": "error", "error": str(e)})
+                results.append({"from": src, "to": dst, "status": "failed", "error": str(e)})
         
         success_count = sum(1 for r in results if r["status"] == "ok")
+        total = len(move_map)
         self._audit("move_batch", str(list(move_map.keys())), "completed", 
-                   {"total": len(move_map), "success": success_count})
+                   {"total": total, "success": success_count})
         
-        return {
-            "status": "ok" if success_count > 0 else "failed",
-            "total": len(move_map),
-            "success": success_count,
-            "results": results
-        }
+        return _file_batch_result(total, success_count, results)
     # 在 FileManager 类中添加:
     def copy_paths(self, copy_map: Dict[str, str]) -> dict:
         """
         批量复制文件/目录
-        :param copy_map: {"src_path1": "dst_path1", "src_path2": "dst_path2", ...}
-        :return: {"status": "ok", "results": [{"from": "...", "to": "...", "status": "ok/error"}]}
+        :return: status = ok/partial/error; 逐项 status = ok/skipped/denied/failed
         """
         results = []
         
@@ -3241,26 +3385,35 @@ class FileManager:
                 dst_path = self._safe_path(dst)
                 
                 if not src_path.exists():
-                    results.append({"from": src, "to": dst, "status": "error", "error": "Source not found"})
+                    results.append({"from": src, "to": dst, "status": "skipped", "error": "source not found"})
                     continue
                 
                 # 如果目标是目录，则复制到该目录下 (保持原文件名)
                 if dst_path.is_dir():
                     dst_path = dst_path / src_path.name
                 
-                # 目标已存在则跳过 (与 move_paths 保持一致的保守策略)
                 if dst_path.exists():
-                    results.append({"from": src, "to": dst, "status": "error", "error": "Destination exists"})
+                    results.append({"from": src, "to": dst, "status": "failed", "error": "Destination exists"})
                     continue
                 
-                # 确保目标父目录存在
+                self._validate_parent_directory(dst_path)
                 dst_path.parent.mkdir(parents=True, exist_ok=True)
                 
-                # 执行复制: 文件用 copy2 (保留元数据), 目录用 copytree
+                # 执行复制: 文件用 copy2 (保留元数据), 目录用 copytree 且不跟随嵌套符号链接。
                 if src_path.is_file():
                     shutil.copy2(str(src_path), str(dst_path))
                 else:
-                    shutil.copytree(str(src_path), str(dst_path))
+                    try:
+                        dst_path.relative_to(src_path)
+                    except ValueError:
+                        pass
+                    else:
+                        results.append({
+                            "from": src, "to": dst, "status": "failed",
+                            "error": "destination is inside source directory",
+                        })
+                        continue
+                    shutil.copytree(str(src_path), str(dst_path), symlinks=True)
                 
                 results.append({
                     "from": str(src_path.relative_to(self.root)),
@@ -3270,20 +3423,25 @@ class FileManager:
                 self._audit("copy_batch", f"{src} -> {dst}", "ok")
                 
             except HTTPException as e:
-                results.append({"from": src, "to": dst, "status": "error", "error": str(e.detail)})
+                results.append({
+                    "from": src, "to": dst,
+                    "status": "denied" if e.status_code == 403 else "failed",
+                    "error": "path outside file root" if e.status_code == 403 else str(e.detail),
+                })
+            except NotADirectoryError:
+                results.append({
+                    "from": src, "to": dst, "status": "denied",
+                    "error": "destination parent is not a directory",
+                })
             except Exception as e:
-                results.append({"from": src, "to": dst, "status": "error", "error": str(e)})
+                results.append({"from": src, "to": dst, "status": "failed", "error": str(e)})
         
         success_count = sum(1 for r in results if r["status"] == "ok")
+        total = len(copy_map)
         self._audit("copy_batch", str(list(copy_map.keys())), "completed", 
-                   {"total": len(copy_map), "success": success_count})
+                   {"total": total, "success": success_count})
         
-        return {
-            "status": "ok" if success_count > 0 else "failed",
-            "total": len(copy_map),
-            "success": success_count,
-            "results": results
-        }
+        return _file_batch_result(total, success_count, results)
 
     def _parse_mode(self, mode_str: str) -> int:
         """
@@ -3378,11 +3536,12 @@ class FileManager:
             raise HTTPException(409, f"Exists: {dir_path}")
         
         try:
+            self._validate_parent_directory(target)
             target.mkdir(parents=True)
             self._audit("mkdir", str(target), "ok")
             return {"status": "ok", "path": str(target.relative_to(self.root))}
         except Exception as e:
-            raise HTTPException(500, f"Mkdir failed: {e}")
+            raise FileOperationError(f"Mkdir failed: {e}", e) from e
     
     # ================= ZIP 压缩/解压 (0.5.4, docs/API.MD 12.1/12.2) =================
     
@@ -3414,6 +3573,7 @@ class FileManager:
         added_total = 0
         truncated = False  # 超过条目上限后, 余下 item 整体跳过
         try:
+            self._validate_parent_directory(target)
             target.parent.mkdir(parents=True, exist_ok=True)
             if target.exists():
                 target.unlink()
@@ -3421,13 +3581,34 @@ class FileManager:
                 entry_count = 0
                 
                 def add_entry(write_fn) -> bool:
-                    """写入单条目; 超上限返回 False"""
+                    """写入单条目; 超上限返回 False, 真实写错误上抛 500。"""
                     nonlocal entry_count
                     if entry_count >= self.ZIP_MAX_ENTRIES:
                         return False
-                    write_fn()
+                    try:
+                        write_fn()
+                    except (FileOperationError, _ZipSourceReadError):
+                        raise
+                    except Exception as e:
+                        raise FileOperationError(f"Zip failed: {e}", e) from e
                     entry_count += 1
                     return True
+
+                def add_file(path: Path, arcname: str) -> bool:
+                    if entry_count >= self.ZIP_MAX_ENTRIES:
+                        return False
+                    with path.open("rb") as source:
+                        def write_source():
+                            with zf.open(arcname, "w") as target:
+                                while True:
+                                    try:
+                                        chunk = source.read(1024 * 1024)
+                                    except Exception as e:
+                                        raise _ZipSourceReadError(str(e)) from e
+                                    if not chunk:
+                                        break
+                                    target.write(chunk)
+                        return add_entry(write_source)
                 
                 for item in items:
                     if truncated:
@@ -3441,7 +3622,7 @@ class FileManager:
                         top_name = PurePosixPath(item.replace("\\", "/").strip("/")).name or "item"
                         added = 0
                         if src.is_file():
-                            if not add_entry(lambda s=src, n=top_name: zf.write(s, n)):
+                            if not add_file(src, top_name):
                                 truncated = True
                                 results.append({"item": item, "status": "skipped", "added": 0})
                                 continue
@@ -3450,14 +3631,17 @@ class FileManager:
                             base = "" if flat else top_name
                             partial = False
                             # 按路径深度排序保证父目录条目先于子内容; 目录本身也写入 (带尾 /) 保留空目录
-                            for p in sorted(src.rglob("*"), key=lambda x: len(x.parts)):
-                                arc = "/".join([base] + list(p.relative_to(src).parts))
+                            paths = sorted(src.rglob("*"), key=lambda x: len(x.parts))
+                            if any(p.is_symlink() for p in paths):
+                                raise OSError("symbolic link not supported in recursive zip")
+                            for p in paths:
+                                arc = "/".join(([base] if base else []) + list(p.relative_to(src).parts))
                                 if p.is_dir():
                                     if not add_entry(lambda a=arc: zf.writestr(zipfile.ZipInfo(a + "/"), b"")):
                                         partial = True
                                         break
                                 else:
-                                    if not add_entry(lambda s=p, a=arc: zf.write(s, a)):
+                                    if not add_file(p, arc):
                                         partial = True
                                         break
                                     added += 1
@@ -3467,27 +3651,48 @@ class FileManager:
                                 results.append({"item": item, "status": "partial", "added": added})
                                 continue
                         else:
-                            results.append({"item": item, "status": "error", "added": 0})
+                            results.append({
+                                "item": item, "status": "error", "added": 0,
+                                "error": "Unsupported file type", "reason": "unknown",
+                            })
                             continue
                         added_total += added
                         results.append({"item": item, "status": "ok", "added": added})
                         self._audit("zip", item, "ok")
-                    except HTTPException:
-                        results.append({"item": item, "status": "error", "added": 0})
-                    except Exception:
-                        results.append({"item": item, "status": "error", "added": 0})
+                    except FileOperationError:
+                        raise
+                    except HTTPException as e:
+                        results.append({
+                            "item": item, "status": "error", "added": 0,
+                            "error": "path outside file root" if e.status_code == 403 else str(e.detail),
+                            "reason": _file_error_reason(e),
+                        })
+                    except Exception as e:
+                        results.append({
+                            "item": item, "status": "error", "added": 0,
+                            "error": str(e), "reason": _file_error_reason(e),
+                        })
+            size = target.stat().st_size
         except HTTPException:
             raise
         except Exception as e:
-            raise HTTPException(400, f"Zip failed: {e}")
-        
-        return {
-            "status": "ok",
+            raise FileOperationError(f"Zip failed: {e}", e) from e
+
+        failed_items = sum(1 for result in results if result["status"] == "error")
+        successful_items = sum(1 for result in results if result["status"] in ("ok", "partial"))
+        batch_status = "ok"
+        if failed_items:
+            batch_status = "partial" if successful_items else "error"
+        response = {
+            "status": batch_status,
             "path": self._display_path(target),
             "entries": added_total,
-            "size": target.stat().st_size if target.exists() else 0,
+            "size": size,
             "results": results,
         }
+        if failed_items:
+            response["message"] = f"{failed_items} of {len(results)} items failed"
+        return response
     
     def unzip_archive(self, zip_path: str, dest_path: Optional[str] = None,
                       overwrite: bool = True, entries: Optional[List[str]] = None) -> dict:
@@ -3508,7 +3713,6 @@ class FileManager:
                 raise HTTPException(400, f"Destination is a file: {dest_path}")
         else:
             dest = target.parent
-        dest.mkdir(parents=True, exist_ok=True)
         
         filters = [e for e in (entries or []) if e] if entries else None
         dest_real = dest.resolve()
@@ -3518,6 +3722,8 @@ class FileManager:
         files_truncated = False
         total_bytes = 0
         try:
+            self._validate_parent_directory(dest)
+            dest.mkdir(parents=True, exist_ok=True)
             with zipfile.ZipFile(target) as zf:
                 for info in zf.infolist():
                     if info.filename.endswith("/"):
@@ -3531,6 +3737,9 @@ class FileManager:
                         if name not in filters and base not in filters:
                             skipped += 1
                             continue
+                    if info.flag_bits & 0x1:
+                        skipped += 1
+                        continue
                     out = (dest / info.filename).resolve()
                     try:
                         out.relative_to(dest_real)
@@ -3543,25 +3752,47 @@ class FileManager:
                     if total_bytes + info.file_size > self.ZIP_MAX_TOTAL_BYTES:
                         skipped += 1
                         continue
+                    out_opened = False
                     try:
+                        self._validate_parent_directory(out)
                         out.parent.mkdir(parents=True, exist_ok=True)
-                        with zf.open(info) as src_fh, open(out, "wb") as dst_fh:
-                            shutil.copyfileobj(src_fh, dst_fh)
+                        with zf.open(info) as src_fh:
+                            dst_fh = open(out, "wb")
+                            out_opened = True
+                            with dst_fh:
+                                remaining = self.ZIP_MAX_TOTAL_BYTES - total_bytes
+                                written = 0
+                                while True:
+                                    chunk = src_fh.read(min(1024 * 1024, remaining + 1))
+                                    if not chunk:
+                                        break
+                                    if len(chunk) > remaining:
+                                        raise OSError("zip entry exceeds total extraction limit")
+                                    dst_fh.write(chunk)
+                                    written += len(chunk)
+                                    remaining -= len(chunk)
                         extracted += 1
-                        total_bytes += info.file_size
+                        total_bytes += written
                         if len(files) < self.ZIP_MAX_LISTED_FILES:
                             files.append(self._display_path(out))
                         else:
                             files_truncated = True
                         self._audit("unzip", info.filename, "ok")
                     except Exception as e:
-                        skipped += 1
+                        if out_opened:
+                            try:
+                                out.unlink()
+                            except OSError:
+                                pass
+                        raise FileOperationError(f"Unzip failed: {e}", e) from e
+        except FileOperationError:
+            raise
         except zipfile.BadZipFile:
             raise HTTPException(400, f"Not a zip file: {zip_path}")
         except HTTPException:
             raise
         except Exception as e:
-            raise HTTPException(400, f"Unzip failed: {e}")
+            raise FileOperationError(f"Unzip failed: {e}", e) from e
         
         return {
             "status": "ok",
@@ -8258,7 +8489,7 @@ _HUB_PUBLIC_URL_RE = re.compile(r"^https?://\S+$")
 
 def hub_public_url_error(url):
     """agent 上报公网基址校验 (与 hub 端 ValidatePublicURL 同源契约); 返回错误文本, 合法返回 None
-    空值 = 未配置 (合法缺省, 条目回落 hub 侧推导)。scheme 白名单 http/https, 上限 512 字符,
+    空值 = 未配置 (合法缺省, 注册时使用本轮实际 Hub 基址)。scheme 白名单 http/https, 上限 512 字符,
     尾部斜杠在 Config 解析时已剥离——非法值 agent 端不上报 (hub 端同规则硬拒绝作纵深)。"""
     normalized = (url or "").strip().rstrip("/")
     if not normalized:
@@ -8268,6 +8499,145 @@ def hub_public_url_error(url):
     if not _HUB_PUBLIC_URL_RE.match(normalized):
         return "public_url %r 非法: 必须以 http:// 或 https:// 开头且无空白字符" % normalized
     return None
+
+
+_SHZAL_HUB_ALIAS_HOST = "shz.al"
+_SHZAL_HUB_ALIAS_NAME_RE = re.compile(r"^[A-Za-z0-9+_\-*$=@,;/\[\]]+$")
+_HUB_HOST_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+
+
+def normalize_hub_url(url):
+    """别名尾斜杠属于名称的一部分; 仅直连 Hub 剥除尾部斜杠。"""
+    raw = (url or "").strip()
+    return raw if is_shzal_hub_alias(raw) else raw.rstrip("/")
+
+
+def shzal_hub_alias_error(url):
+    """shz.al Hub 别名入口校验; 非别名形态返回 None, 形态正确但非法返回错误文本。"""
+    if not is_shzal_hub_alias(url):
+        return None
+    raw = (url or "").strip()
+    if "\\" in raw:
+        return "shz.al Hub 别名不得包含反斜杠"
+    if any(ch.isspace() or unicodedata.category(ch) == "Cc" for ch in raw):
+        return "shz.al Hub 别名含空白或控制字符"
+    if "?" in raw or "#" in raw:
+        return "shz.al Hub 别名不得包含 query 或 fragment"
+    match = re.fullmatch(r"([A-Za-z][A-Za-z0-9+.-]*)://([^/?#]+)(/[^?#]*)", raw)
+    if not match:
+        return "shz.al Hub 别名非法"
+    scheme, authority, path = match.groups()
+    if scheme.lower() != "https":
+        return "shz.al Hub 别名必须使用 https://"
+    if "@" in authority:
+        return "shz.al Hub 别名不得包含 userinfo"
+    if ":" in authority:
+        host, port_text = authority.split(":", 1)
+        if host.lower() != _SHZAL_HUB_ALIAS_HOST or not re.fullmatch(r"[0-9]+", port_text):
+            return "shz.al Hub 别名非法"
+        if len(port_text) > 5 or int(port_text) != 443:
+            return "shz.al Hub 别名端口必须为 443"
+    elif authority.lower() != _SHZAL_HUB_ALIAS_HOST:
+        return "shz.al Hub 别名非法"
+    if not path.startswith("/~"):
+        return "shz.al Hub 别名非法"
+    name = path[2:]
+    if len(name) < 3:
+        return "shz.al Hub 别名名称过短"
+    if not _SHZAL_HUB_ALIAS_NAME_RE.fullmatch(name):
+        return "shz.al Hub 别名名称含非法字符"
+    return None
+
+
+def validate_resolved_hub_url(value):
+    """校验 shz.al 响应体中的唯一 Hub 基址, 返回去尾斜杠后的 URL。"""
+    raw = (value or "").strip()
+    if not raw:
+        raise ValueError("shz.al 响应体为空")
+    if len(raw) > 512:
+        raise ValueError("shz.al 响应中的 Hub 地址超过 512 字符")
+    if not raw.startswith(("http://", "https://")):
+        raise ValueError("shz.al 响应中的 Hub 地址必须以 http:// 或 https:// 开头")
+    if "\\" in raw or any(ch.isspace() or unicodedata.category(ch) == "Cc" for ch in raw):
+        raise ValueError("shz.al 响应中的 Hub 地址含空白或控制字符")
+    try:
+        parts = urlsplit(raw)
+        host = parts.hostname or ""
+        port = parts.port
+    except ValueError as exc:
+        raise ValueError("shz.al 响应中的 Hub 地址非法") from exc
+    if parts.scheme not in ("http", "https") or not host:
+        raise ValueError("shz.al 响应中的 Hub 地址缺少合法 scheme 或 host")
+    if parts.username is not None or parts.password is not None:
+        raise ValueError("shz.al 响应中的 Hub 地址不得包含 userinfo")
+    if "?" in raw or "#" in raw:
+        raise ValueError("shz.al 响应中的 Hub 地址不得包含 query 或 fragment")
+    if parts.netloc.endswith(":"):
+        raise ValueError("shz.al 响应中的 Hub 地址端口为空")
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("shz.al 响应中的 Hub 地址端口越界")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        if len(host) > 253 or not all(_HUB_HOST_LABEL_RE.fullmatch(label) for label in host.split(".")):
+            raise ValueError("shz.al 响应中的 Hub 地址 host 非法")
+    return raw.rstrip("/")
+
+
+def _hub_alias_response_headers(headers):
+    normalized = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
+    content_type = normalized.get("content-type", "").split(";", 1)[0].strip().lower()
+    content_encoding = normalized.get("content-encoding", "").strip().lower()
+    if content_type != "text/plain":
+        raise ConnectionError("shz.al 别名响应不是 text/plain")
+    if content_encoding not in ("", "identity"):
+        raise ConnectionError("shz.al 别名响应不得压缩")
+
+
+async def resolve_shzal_hub_url(session, alias, request_fn=None):
+    """GET shz.al 公开别名并严格校验响应体; 每次调用都重新获取。"""
+    alias_error = shzal_hub_alias_error(alias)
+    if alias_error:
+        raise ConnectionError(alias_error)
+    headers = {"Accept": "text/plain", "User-Agent": "curl/8.5.0", "Accept-Encoding": "identity"}
+    try:
+        if request_fn is not None:
+            status, response_headers, body = await request_fn(session, "GET", alias, headers, None)
+        else:
+            async with session.get(alias, headers=headers, allow_redirects=False, auto_decompress=False,
+                                   timeout=aiohttp.ClientTimeout(total=15)) as response:
+                status = response.status
+                response_headers = dict(response.headers)
+                chunks = []
+                size = 0
+                while size <= 4096:
+                    chunk = await response.content.read(4097 - size)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    size += len(chunk)
+                    if size > 4096:
+                        raise ConnectionError("shz.al 别名响应超过 4096 字节")
+                body = b"".join(chunks)
+    except asyncio.CancelledError:
+        raise
+    except ConnectionError:
+        raise
+    except Exception as exc:
+        raise ConnectionError("shz.al 别名解析失败: %s" % str(exc)[:200]) from exc
+    if status != 200:
+        raise ConnectionError("shz.al 别名解析失败: HTTP %s" % status)
+    _hub_alias_response_headers(response_headers)
+    if len(body) > 4096:
+        raise ConnectionError("shz.al 别名响应超过 4096 字节")
+    try:
+        text = body.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ConnectionError("shz.al 别名响应不是合法 UTF-8") from exc
+    try:
+        return validate_resolved_hub_url(text)
+    except ValueError as exc:
+        raise ConnectionError(str(exc)) from exc
 
 
 def derive_hub_ws_url(hub_url):
@@ -8398,22 +8768,23 @@ class HubTunnelManager:
     """
 
     def __init__(self, hub_url, kname, port, ports=None, source="startup"):
-        self.hub_url = (hub_url or "").strip().rstrip("/")
+        self.hub_url = normalize_hub_url(hub_url)
         self.kname = (kname or "").strip().lower()
         self.port = int(port)
         self.ports = list(ports or [])
         self.source = source             # startup (KMODE=3 静态) | dynamic (POST /api/hub 动态)
         self.log = Logger  # KModeController 同款全局日志器 (INFO/WARNING 非 DEBUG 静默)
         # KHUB_PUBLIC_URL 公网基址覆盖值 (可选): 注册时上报 public_url, hub 拼订阅/页面/ack url 优先用
-        # (0.6.6 续批二起缺省自动上报 KHUB 派生基址; 此变量用于内网 KHUB 等派生值 ≠ 公网地址的部署)
+        # 未配置时自动上报本轮实际 Hub 基址：直连为配置基址，别名为本轮解析出的真实基址
         _pub_err = hub_public_url_error(Config.KHUB_PUBLIC_URL)
         if _pub_err:
-            self.log.warning("[KMODE3] ⚠️ KHUB_PUBLIC_URL %s, 回退 KHUB 派生基址上报" % _pub_err)
+            self.log.warning(f"[KMODE3] ⚠️ KHUB_PUBLIC_URL {_pub_err}, 回退本轮实际 Hub 基址上报")
             self.public_url = None
         else:
             self.public_url = (Config.KHUB_PUBLIC_URL or "").strip().rstrip("/") or None
-        # 中继地址: 上报基址 = 覆盖值 || KHUB 派生 (与注册帧 public_url 字段一致)
-        self.relay_url = "%s/%s" % (self.public_url or self.hub_url, self.kname)
+        # 中继地址: 上报基址 = 覆盖值 || 本轮解析基址 (与注册帧 public_url 字段一致)
+        self.resolved_hub = None if is_shzal_hub_alias(self.hub_url) else self.hub_url
+        self.relay_url = "%s/%s" % (self.public_url or self.resolved_hub or self.hub_url, self.kname)
         # 🛡️ 状态透明: 三态 + 失败原因, 供 GET /api/hub 暴露给 Panel
         self.status = "reconnecting"      # alive | reconnecting | failed
         self.last_error = None            # 最近一次异常消息 (截断 300 字)
@@ -8447,9 +8818,10 @@ class HubTunnelManager:
             "tunnel_status": self.status,   # alive | reconnecting | failed
             "source": self.source,          # startup | dynamic
             "hub": self.hub_url,
+            "resolved_hub": self.resolved_hub,
             "kname": self.kname,
             "url": self.relay_url,
-            "public_url": self.public_url or self.hub_url,  # 注册帧实际上报基址 (KHUB_PUBLIC_URL 覆盖值 || KHUB 派生)
+            "public_url": self.public_url or self.resolved_hub or self.hub_url,
             "ports": sorted(self.ports),
             "consecutive_failures": self.consecutive_failures,
             "last_error": self.last_error,
@@ -8559,15 +8931,23 @@ class HubTunnelManager:
             await asyncio.sleep(min(0.25, max(0.0, deadline - time.time())))
 
     async def _connect_once(self, session):
+        alias_error = shzal_hub_alias_error(self.hub_url)
+        if alias_error:
+            raise ConnectionError(alias_error)
+        effective_hub = self.hub_url
+        if is_shzal_hub_alias(self.hub_url):
+            effective_hub = await resolve_shzal_hub_url(session, self.hub_url, self._request)
+        self.resolved_hub = effective_hub
+        self.relay_url = "%s/%s" % (self.public_url or effective_hub, self.kname)
         # timeout=None 关闭 aiohttp 默认 10s receive 超时 (心跳间隔 20s 会被它切断),
         # 断线判定交由应用层 20s 心跳 + hub 侧 60s 读 deadline
         ws_factory = self._ws_factory or (lambda s, url: s.ws_connect(url, autoping=True, timeout=None))
-        async with ws_factory(session, derive_hub_ws_url(self.hub_url)) as ws:
+        async with ws_factory(session, derive_hub_ws_url(effective_hub)) as ws:
             reg = {
                 "t": "register", "v": 1, "kname": self.kname,
                 "version": Config.AGENT_VERSION, "ports": sorted(self.ports),
             }
-            reg["public_url"] = self.public_url or self.hub_url  # 公网基址: 覆盖值优先, 缺省 KHUB 派生 (0.6.6 续批二起恒携带)
+            reg["public_url"] = self.public_url or effective_hub
             await self._send(ws, reg)
             ack_msg = await ws.receive(timeout=15)
             if ack_msg.type != aiohttp.WSMsgType.TEXT:
@@ -8580,7 +8960,7 @@ class HubTunnelManager:
             self.consecutive_failures = 0
             self.last_error = None
             self.last_connected_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-            self.log.info(f"[KMODE3] ✅ 已连接 hub {self.hub_url} (注册名 {self.kname}, 中继地址 {self.relay_url})")
+            self.log.info(f"[KMODE3] ✅ 已连接 hub {self.resolved_hub} (注册名 {self.kname}, 中继地址 {self.relay_url})")
             await self._pump(session, ws)
 
     async def _send(self, ws, payload):
@@ -8824,8 +9204,9 @@ class HubTunnelRegistrar:
         HubRegisterError.code (invalid_name/name_taken/full, 注册项不保留)
         本地 KNAME 冲突 (同 registrar 内) 同 name_taken 语义"""
         name_err = hub_kname_error(kname)
+        norm_hub = normalize_hub_url(hub_url)
         if name_err:
-            snap = {"kname": (kname or "").strip().lower(), "hub": (hub_url or "").strip().rstrip("/"),
+            snap = {"kname": (kname or "").strip().lower(), "hub": norm_hub,
                     "source": source, "tunnel_status": "failed", "ports": sorted(ports or [])}
             return snap, "invalid_name", name_err
         norm_kname = kname.strip().lower()
@@ -8833,7 +9214,7 @@ class HubTunnelRegistrar:
             if norm_kname in self._items:
                 existing = self._items[norm_kname]
                 return existing.snapshot(), "name_taken", "KNAME 已在本 agent 注册表中 (kname 唯一)"
-        manager = HubTunnelManager(hub_url, kname, Config.PORT, ports=ports, source=source)
+        manager = HubTunnelManager(norm_hub, kname, Config.PORT, ports=ports, source=source)
         manager.start()
         ok, err = manager.wait_connected(wait_timeout)
         if ok:
@@ -9598,7 +9979,7 @@ async def register_hub(request: Request, payload: HubRegisterRequest = Body(...)
     registrar = getattr(request.app.state, "hub_registrar", None)
     if registrar is None:
         return JSONResponse(status_code=500, content={"status": "error", "persisted": False, "message": "hub registrar 未初始化"})
-    hub_url = (payload.hub or "").strip().rstrip("/")
+    hub_url = normalize_hub_url(payload.hub)
     if not hub_url.lower().startswith(("http://", "https://")):
         return JSONResponse(status_code=422, content={"status": "error", "code": "invalid_hub", "message": "hub 必须以 http:// 或 https:// 开头"})
     snap, code, msg = registrar.register(hub_url, payload.kname, ports=payload.ports or [],
@@ -10957,7 +11338,7 @@ async def file_list(
 
 
 # --- POST /api/file/authority : 批量查询权限 ---
-@app.post("/api/file/authority", response_model=AuthorityQueryResponse)
+@app.post("/api/file/authority", response_model=AuthorityQueryResponse, response_model_exclude_none=True)
 async def file_authority(
     request: Request,
     body: AuthorityQueryRequest = Body(...)
@@ -11187,21 +11568,18 @@ async def file_delete(
 
 
 # --- PUT /api/file : 批量移动/重命名 ---
-@app.put("/api/file", response_model=FileMoveResponse)
+@app.put("/api/file", response_model=FileMoveResponse, response_model_exclude_none=True)
 async def file_move(
     request: Request,
     # 修正：直接接收 Dict[str, str] 作为整个 Body，不再寻找 "move_map" 键
     move_map: Dict[str, str] = Body(..., examples={ "/tmp/old.txt": "/archive/old.txt" })
 ):
-    if not move_map:
-        return JSONResponse(status_code=400, content={"error": "At least one src->dst pair required"})
-    
     fm = request.app.state.file_manager
     # 执行逻辑
     result = fm.move_paths(move_map) 
     return result
     
-@app.post("/api/file/cp", response_model=FileMoveResponse)
+@app.post("/api/file/cp", response_model=FileMoveResponse, response_model_exclude_none=True)
 async def file_copy(
     request: Request,
     # 直接接收字典映射作为整个请求体
@@ -11216,9 +11594,6 @@ async def file_copy(
     - 如果目标路径已存在，该条目会标记为错误并跳过
     - 文件复制保留元数据 (mtime, mode 等)
     """
-    if not copy_map:
-        return JSONResponse(status_code=400, content={"error": "At least one src->dst pair required"})
-    
     fm = request.app.state.file_manager
     # 调用 FileManager 的 copy_paths 方法
     result = fm.copy_paths(copy_map) 
@@ -11240,7 +11615,7 @@ async def file_mkdir(
 
 
 # --- POST /api/file/zip : 压缩 ZIP 文件 (0.5.4) ---
-@app.post("/api/file/zip", response_model=FileZipResponse)
+@app.post("/api/file/zip", response_model=FileZipResponse, response_model_exclude_none=True)
 async def file_zip(
     request: Request,
     body: FileZipRequest = Body(...)
@@ -11470,6 +11845,21 @@ async def terminal_websocket(websocket: WebSocket, path: str, request_id: str = 
                                 incognito_requested=(incognito == '1'))
 
 # 全局异常处理
+@app.exception_handler(FileOperationError)
+async def file_operation_exception_handler(request: Request, exc: FileOperationError):
+    """文件写错误保留 status/reason; fileraw 额外明确 completed=false。"""
+    message = str(exc.detail)
+    content = {
+        "status": "error",
+        "error": message,
+        "message": message,
+        "reason": exc.reason,
+    }
+    if request.url.path == "/api/fileraw":
+        content["completed"] = False
+    return JSONResponse(status_code=exc.status_code, content=content)
+
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     """统一处理认证失败等异常；响应加密由 AuthEncryptMiddleware 统一执行(单一加密点)"""

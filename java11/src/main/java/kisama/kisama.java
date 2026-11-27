@@ -11,20 +11,28 @@ import javax.crypto.spec.SecretKeySpec;
 import java.io.*;
 import java.lang.management.ManagementFactory;
 import java.math.BigInteger;
+import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AccessDeniedException;
+import java.nio.file.FileAlreadyExistsException;
+import java.nio.file.FileSystemLoopException;
+import java.nio.file.FileVisitOption;
+import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
+import java.nio.file.NoSuchFileException;
+import java.nio.file.NotDirectoryException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.security.*;
 import java.security.spec.X509EncodedKeySpec;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.stream.Collectors;
-import java.util.stream.Stream;
 import java.util.zip.*;
 import org.bouncycastle.jce.ECNamedCurveTable;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
@@ -35,6 +43,8 @@ import org.bouncycastle.math.ec.ECPoint;
 import org.eclipse.jetty.websocket.api.Session;
 import org.eclipse.jetty.websocket.api.annotations.*;
 import java.nio.ByteBuffer;
+import java.nio.channels.Channels;
+import java.nio.channels.FileChannel;
 import com.pty4j.PtyProcess;
 import com.pty4j.PtyProcessBuilder;
 
@@ -42,6 +52,7 @@ public class kisama {
 
     // ==================== 实例配置与状态 (原 static 变量改造) ====================
     private final Gson gson = new Gson();
+    private final Gson hubGson = new com.google.gson.GsonBuilder().serializeNulls().create();
     private final boolean DEBUG;
     private final String HOST;
     private final int PORT;
@@ -59,8 +70,9 @@ public class kisama {
     // 行为参数 env 可调 (KISAMA_HUB_*), 存毫秒便于统一比较; 不进烘焙构造 (决策: 避免插件仓同步负担)
     private final String KHUB;
     // KHUB_PUBLIC_URL=hub 对面板/客户端暴露的公网基址覆盖值 (可选, 0.6.6 续批二): 注册时经
-    // public_url 字段上报, hub 拼订阅/页面/ack url 时优先用它; 未配置时缺省自动上报 KHUB 派生
-    // 基址, 本变量用于内网 KHUB 等派生值 ≠ 公网地址的部署; 非法值告警并回退 KHUB 派生 (hubPublicUrlError 判定)
+    // public_url 字段上报, hub 拼订阅/页面/ack url 时优先用它; 未配置时自动上报本轮实际 Hub 基址
+    //（直连为配置基址，别名为本轮解析出的真实基址），本变量用于内网 KHUB 等派生值 ≠ 公网地址的部署
+    // 非法值告警并回退本轮实际 Hub 基址（hubPublicUrlError 判定）
     private final String KHUB_PUBLIC_URL;
     private final java.util.Set<Integer> KHUB_PORTS;
     private final java.util.Set<Integer> KPROXY_PORTS;
@@ -167,6 +179,8 @@ public class kisama {
     // 宿主烘焙 KSTORE/KSTORE_KEY (9 参构造注入; null=未提供, initTaskStore 经 resolveSetting 走统一优先级)
     private final String BAKED_KSTORE;
     private final String BAKED_KSTORE_KEY;
+    // 宿主烘焙设置 Map (10 参构造注入; 任意 KEY=VALUE——KHUB 家族等未设位置实参的键经 resolveSetting 走 Map 通道)
+    private final java.util.Map<String, String> BAKED_SETTINGS;
     // hub 注册任务子类型 (data.hubregs, 0.6.6 起; additive 键, 老版本回写会丢弃 — load 填充/saveHubRegs 更新)
     private final List<Map<String, Object>> hubregs = Collections.synchronizedList(new ArrayList<>());
     // 反代运行时白名单子类型 (data.proxyports, 0.6.7 续批六起两组对象形状; load 填充=重启恢复, saveProxyports 更新):
@@ -232,7 +246,7 @@ public class kisama {
     // 其余 (无 opt-in 头/超阈值) 保持原始字节流——旧客户端零适配, 大文件不付 Base64+33% 与
     // 整读内存的代价。0 = 关闭加密 (恒明文)。
     private static final long DOWNLOAD_ENCRYPT_MAX = Long.parseLong(DOTENV.getOrDefault("DOWNLOAD_ENCRYPT_MAX", "4194304"));
-    private static final String AGENT_VERSION = "0.6.8-java11";
+    private static final String AGENT_VERSION = "0.6.9-java11";
 
     // baseinfo 三组快照 (docs/API.MD 十六): P 级进程内只建一次; T-local 30s; T-net 3600s.
     // 快照只含系统字段, 凭证在路由层按请求装配, 轮换不再清空
@@ -271,7 +285,7 @@ public class kisama {
         // 域名文件路径, 缺省 $HOME/domain.txt, 支持 $HOME / ~ 前缀
         this.KPATH = DOTENV.getOrDefault("KPATH", "");
         // KMODE=3 kisama-hub 中继 (docs/API.MD 十九): 纯 DOTENV 解析 (无参/独立运行无烘焙通道)
-        this.KHUB = trimHubUrl(DOTENV.get("KHUB"));
+        this.KHUB = normalizeHubUrl(DOTENV.get("KHUB"));
         this.KHUB_PUBLIC_URL = trimHubUrl(DOTENV.get("KHUB_PUBLIC_URL"));
         this.KHUB_PORTS = parseHubPorts(DOTENV.get("KHUB_PORTS"));
         this.KPROXY_PORTS = parseHubPorts(DOTENV.get("KPROXY_PORTS"));
@@ -284,9 +298,10 @@ public class kisama {
         this.KEYS_DIR = DOTENV.getOrDefault("KEYS_DIR", "./keys");
         this.ECDSA_PUBLIC_KEY_B64 = getKeyWithFallback("ECDSA_PUBKEY", "agent_ecdsa_pub.pem", "YOUR_HARDCODED_ECDSA_PUBLIC_KEY_HERE");
         this.ECIES_PUBLIC_KEY_B64 = getKeyWithFallback("ECIES_PUBKEY", "agent_ecies_pub.b64", "YOUR_HARDCODED_ECIES_PUBLIC_KEY_HERE");
-        // 宿主烘焙 KSTORE 通道仅由 9 参构造注入; 无参/独立运行保持纯 DOTENV 解析
+        // 宿主烘焙通道 (位置实参/设置 Map) 仅由带参构造注入; 无参/独立运行保持纯 DOTENV 解析
         this.BAKED_KSTORE = null;
         this.BAKED_KSTORE_KEY = null;
+        this.BAKED_SETTINGS = java.util.Map.of();
     }
 
     // 2. 有参构造函数（重载）：允许外部模块直接覆盖核心 3 要素，其余继续走默认初始化
@@ -308,8 +323,21 @@ public class kisama {
     public kisama(int port, String ecdsaPublicKeyB64, String eciesPublicKeyB64,
                   String bakedKmode, String bakedKpath, String bakedKname, String bakedKnameKey,
                   String bakedKstore, String bakedKstoreKey) {
+        this(port, ecdsaPublicKeyB64, eciesPublicKeyB64, bakedKmode, bakedKpath, bakedKname, bakedKnameKey,
+                bakedKstore, bakedKstoreKey, java.util.Map.of());
+    }
+
+    // 5. 全量烘焙构造 + 设置 Map：在 9 参基础上追加 bakedSettings (任意 KEY=VALUE)——KHUB 家族等未设位置
+    //    实参的键经 resolveSetting 走 Map 通道 (0.6.8 起 Owner 拍板纳入, 原"KHUB 家族不进烘焙构造"决策撤销)。
+    //    优先级: 真实环境变量 > .env > 位置烘焙实参 > 烘焙设置 Map > 内置缺省; null/空串视为未提供。
+    //    Map 由宿主 (kisama_agent_jplugin setup.sh) 构建期生成 java.util.Map.of/ofEntries 字面量。
+    public kisama(int port, String ecdsaPublicKeyB64, String eciesPublicKeyB64,
+                  String bakedKmode, String bakedKpath, String bakedKname, String bakedKnameKey,
+                  String bakedKstore, String bakedKstoreKey, java.util.Map<String, String> bakedSettings) {
         // 门控先行 (同无参构造): 后续阶段若引入 log() 调用也受 LOG_LEVEL 约束, 依赖字段缺省值 0 属误用
         this.logLevel = resolveLogLevel();
+        // 烘焙设置 Map 先于首个 resolveSetting 调用装配 (KPORT 解析即走该链), 包装为不可变视图
+        this.BAKED_SETTINGS = bakedSettings == null ? java.util.Map.of() : java.util.Collections.unmodifiableMap(bakedSettings);
         // 覆盖指定的三个必要参数; PORT 同样走 resolveSetting (宿主烘焙值可被真实 env / .env 的 KPORT 覆盖, 与 KMODE 家族一致)
         this.PORT = Integer.parseInt(resolveSetting("KPORT", String.valueOf(port), "8000"));
         this.ECDSA_PUBLIC_KEY_B64 = ecdsaPublicKeyB64;
@@ -326,9 +354,9 @@ public class kisama {
         this.KNAME = kname2;
         this.KNAME_KEY = knameKey2.isEmpty() ? kname2 : knameKey2;
         this.KPATH = resolveSetting("KPATH", bakedKpath, "");
-        // KMODE=3 kisama-hub 中继 (docs/API.MD 十九): resolveSetting 统一优先级 (真实 env > .env > 内置缺省);
-        // 决策: KHUB 家族不进烘焙构造, 避免插件仓同步负担
-        this.KHUB = trimHubUrl(resolveSetting("KHUB", null, ""));
+        // KMODE=3 kisama-hub 中继 (docs/API.MD 十九): resolveSetting 统一优先级 (真实 env > .env > 位置烘焙实参 > 烘焙设置 Map > 内置缺省);
+        // 0.6.8 起 Owner 拍板: KHUB 家族经烘焙设置 Map 通道纳入烘焙 (原"不进烘焙构造"决策撤销), 位置实参保持 null
+        this.KHUB = normalizeHubUrl(resolveSetting("KHUB", null, ""));
         this.KHUB_PUBLIC_URL = trimHubUrl(resolveSetting("KHUB_PUBLIC_URL", null, ""));
         this.KHUB_PORTS = parseHubPorts(resolveSetting("KHUB_PORTS", null, ""));
         this.KPROXY_PORTS = parseHubPorts(resolveSetting("KPROXY_PORTS", null, ""));
@@ -343,11 +371,14 @@ public class kisama {
         this.BAKED_KSTORE_KEY = bakedKstoreKey;
     }
 
-    // 生效值 = DOTENV(环境变量 ∪ .env) 命中则用它, 否则用烘焙值, 再否则用内置缺省
-    private static String resolveSetting(String key, String baked, String fallback) {
+    // 生效值 = DOTENV(环境变量 ∪ .env) 命中则用它, 否则用位置烘焙实参, 再否则用烘焙设置 Map, 最后用内置缺省。
+    // 优先级: 真实环境变量 > .env > 位置烘焙实参 > 烘焙设置 Map > 内置缺省 (实例方法: 读本实例的 BAKED_SETTINGS)
+    private String resolveSetting(String key, String baked, String fallback) {
         String fromEnv = DOTENV.get(key);
         if (fromEnv != null) return fromEnv;
         if (baked != null && !baked.isEmpty()) return baked;
+        String fromMap = this.BAKED_SETTINGS.get(key);
+        if (fromMap != null && !fromMap.isEmpty()) return fromMap;
         return fallback;
     }
 
@@ -820,6 +851,7 @@ public class kisama {
         post("/api/file/authority", (req, res) -> {
             Map<String, Object> body = req.attribute("json_body");
             List<String> paths = (List<String>) (body != null ? body.getOrDefault("paths", new ArrayList<>()) : new ArrayList<>());
+            String mountInfo = readLinuxMountInfo();
             List<Map<String, Object>> results = new ArrayList<>();
             for (String p : paths) {
                 try {
@@ -833,6 +865,14 @@ public class kisama {
                     info.put("readable", f.canRead());
                     info.put("writable", f.canWrite());
                     info.put("executable", f.canExecute());
+                    if (mountInfo != null && !mountInfo.isEmpty()) {
+                        try {
+                            Boolean readOnly = mountReadOnlyFromMountInfo(f.toPath().toRealPath().toString(), mountInfo);
+                            if (readOnly != null) info.put("mount_readonly", readOnly);
+                        } catch (Exception ignored) {
+                            // realpath 不可用时不臆造 mount_readonly
+                        }
+                    }
                     results.add(info);
                 } catch (Exception ignored) {
                 }
@@ -889,6 +929,7 @@ public class kisama {
         });
 
         post("/api/file", (req, res) -> {
+            res.type("application/json");
             Map<String, Object> body = req.attribute("json_body");
             String path = Objects.toString(body.getOrDefault("path", "."));
             String filename = Objects.toString(body.getOrDefault("filename", "upload.bin"));
@@ -896,12 +937,16 @@ public class kisama {
             byte[] data = Base64.getDecoder().decode(content);
             Path dir = Paths.get(this.FILE_ROOT).resolve(path).normalize();
             if (!isPathInsideFileRoot(dir)) halt(403);
-            Files.createDirectories(dir);
             Path target = dir.resolve(filename);
             // 🔐 A-1: filename 可能携带 ../ 或绝对路径, 拼接后必须复查
             if (!isPathInsideFileRoot(target)) halt(403);
-            Files.write(target, data);
-            res.type("application/json");
+            try {
+                Files.createDirectories(dir);
+                Files.write(target, data);
+            } catch (Exception ex) {
+                res.status(500);
+                return this.gson.toJson(fileErrorResponse("Failed to upload file", ex));
+            }
             return this.gson.toJson(Map.of("status", "ok", "path", Paths.get(path).resolve(filename).toString()));
         });
         // ============================================================================
@@ -938,8 +983,6 @@ public class kisama {
                 res.status(403);
                 return this.gson.toJson(Map.of("status", "error", "completed", false, "message", "Access denied"));
             }
-            Files.createDirectories(dirPath);
-
             Path targetPath = dirPath.resolve(fileName).toAbsolutePath().normalize();
             if (!isPathInsideFileRoot(targetPath)) {
                 res.status(403);
@@ -954,8 +997,11 @@ public class kisama {
 
             String relPath = Paths.get(filePath).resolve(fileName).toString();
 
-            // 4. 自适应分块暂存与绝对强顺序重组引擎
-            if (totalChunks > 0) {
+            try {
+                Files.createDirectories(dirPath);
+
+                // 4. 自适应分块暂存与绝对强顺序重组引擎
+                if (totalChunks > 0) {
                 // 建立当前文件专属的隐藏暂存分片目录：.upload_chunks/[filename]
                 Path parentChunkDir = dirPath.resolve(".upload_chunks"); // 外层暂存根目录
                 Path chunkDir = parentChunkDir.resolve(fileName);        // 当前文件子目录
@@ -1027,6 +1073,11 @@ public class kisama {
                     "message", "File uploaded successfully."
                 ));
             }
+            } catch (Exception ex) {
+                res.status(500);
+                return this.gson.toJson(
+                        rawFileErrorResponse("Failed to upload file", ex));
+            }
         });
         post("/api/file/download", (req, res) -> {
             Map<String, Object> body = req.attribute("json_body");
@@ -1096,32 +1147,10 @@ public class kisama {
             }
             List<Map<String, Object>> results = new ArrayList<>();
             for (Map.Entry<String, String> e : moveMap.entrySet()) {
-                Path src = Paths.get(this.FILE_ROOT).resolve(e.getKey()).normalize();
-                Path dst = Paths.get(this.FILE_ROOT).resolve(e.getValue()).normalize();
-                if (!isPathInsideFileRoot(src) || !isPathInsideFileRoot(dst)) {
-                    Map<String, Object> r0 = new HashMap<>();
-                    r0.put("from", e.getKey());
-                    r0.put("to", e.getValue());
-                    r0.put("status", "error");
-                    r0.put("message", "Access denied");
-                    results.add(r0);
-                    continue;
-                }
-                Map<String, Object> r = new HashMap<>();
-                r.put("from", e.getKey());
-                r.put("to", e.getValue());
-                try {
-                    Files.createDirectories(dst.getParent());
-                    Files.move(src, dst);
-                    r.put("status", "ok");
-                } catch (Exception ex) {
-                    r.put("status", "error");
-                    r.put("message", ex.getMessage());
-                }
-                results.add(r);
+                results.add(fileBatchEntry(e.getKey(), e.getValue(), false));
             }
             res.type("application/json");
-            return this.gson.toJson(Map.of("status", "ok", "total", results.size(), "success", results.size(), "results", results));
+            return this.gson.toJson(fileBatchResponse(results));
         });
 
         post("/api/file/cp", (req, res) -> {
@@ -1134,44 +1163,25 @@ public class kisama {
             }
             List<Map<String, Object>> results = new ArrayList<>();
             for (Map.Entry<String, String> e : copyMap.entrySet()) {
-                Path src = Paths.get(this.FILE_ROOT).resolve(e.getKey()).normalize();
-                Path dst = Paths.get(this.FILE_ROOT).resolve(e.getValue()).normalize();
-                if (!isPathInsideFileRoot(src) || !isPathInsideFileRoot(dst)) {
-                    Map<String, Object> r0 = new HashMap<>();
-                    r0.put("from", e.getKey());
-                    r0.put("to", e.getValue());
-                    r0.put("status", "error");
-                    r0.put("message", "Access denied");
-                    results.add(r0);
-                    continue;
-                }
-                Map<String, Object> r = new HashMap<>();
-                r.put("from", e.getKey());
-                r.put("to", e.getValue());
-                try {
-                    if (Files.isDirectory(src)) {
-                    } else {
-                        Files.createDirectories(dst.getParent());
-                        Files.copy(src, dst);
-                    }
-                    r.put("status", "ok");
-                } catch (Exception ex) {
-                    r.put("status", "error");
-                    r.put("message", ex.getMessage());
-                }
-                results.add(r);
+                results.add(fileBatchEntry(e.getKey(), e.getValue(), true));
             }
             res.type("application/json");
-            return this.gson.toJson(Map.of("status", "ok", "total", results.size(), "success", results.size(), "results", results));
+            return this.gson.toJson(fileBatchResponse(results));
         });
 
         Object fileNewHandler = (Route) (req, res) -> {
+            res.type("application/json");
             Map<String, Object> body = req.attribute("json_body");
             String p = Objects.toString(body != null ? body.getOrDefault("path", body.getOrDefault("dir", " ")) : " ");
             Path full = Paths.get(this.FILE_ROOT).resolve(p).normalize();
             if (!isPathInsideFileRoot(full)) halt(403);
-            Files.createDirectories(full);
-            res.type("application/json");
+            try {
+                Files.createDirectories(full);
+            } catch (Exception ex) {
+                res.status(500);
+                return this.gson.toJson(
+                        fileErrorResponse("Failed to create directory", ex));
+            }
             return this.gson.toJson(Map.of("status", "ok", "path", p));
         };
         post("/api/file/new", (Route) fileNewHandler);
@@ -1476,7 +1486,7 @@ public class kisama {
             List<Map<String, Object>> registrations = this.hubRegistrar.list();
             HubTunnelManager staticMgr = this.hubStaticKname != null ? this.hubRegistrar.get(this.hubStaticKname) : null;
             if (staticMgr == null && registrations.isEmpty()) {
-                return this.gson.toJson(Map.of(
+                return this.hubGson.toJson(Map.of(
                         "status", "ok", "enabled", false,
                         "message", "无 hub 注册 (KMODE=3 或 POST /api/hub 动态注册)"));
             }
@@ -1488,13 +1498,13 @@ public class kisama {
                 payload.put("tunnel", staticMgr.snapshot());
             }
             payload.put("registrations", registrations);
-            return this.gson.toJson(payload);
+            return this.hubGson.toJson(payload);
         });
 
         post("/api/hub", (req, res) -> {
             res.type("application/json");
             Map<String, Object> body = req.attribute("json_body");
-            String hub = trimHubUrl(body != null && body.get("hub") != null ? String.valueOf(body.get("hub")) : "");
+            String hub = normalizeHubUrl(body != null && body.get("hub") != null ? String.valueOf(body.get("hub")) : "");
             String kname = body != null && body.get("kname") != null ? String.valueOf(body.get("kname")) : "";
             List<Integer> ports = new ArrayList<>();
             if (body != null && body.get("ports") instanceof List) {
@@ -1507,7 +1517,7 @@ public class kisama {
             }
             String hubLower = hub.toLowerCase(Locale.ROOT);
             if (!hubLower.startsWith("http://") && !hubLower.startsWith("https://")) {
-                halt(422, this.gson.toJson(Map.of(
+                halt(422, this.hubGson.toJson(Map.of(
                         "status", "error", "persisted", false, "code", "invalid_hub",
                         "message", "hub 必须以 http:// 或 https:// 开头")));
             }
@@ -1526,16 +1536,16 @@ public class kisama {
             }
             if (rr.code == null) {
                 boolean persisted = persistHubRegs();
-                return this.gson.toJson(Map.of("status", "ok", "persisted", persisted, "registration", rr.snapshot));
+                return this.hubGson.toJson(Map.of("status", "ok", "persisted", persisted, "registration", rr.snapshot));
             }
             if ("unreachable".equals(rr.code)) {
                 // 网络类失败: 注册项保留继续退避 (意图落盘), 状态后查 GET /api/hub
                 boolean persisted = persistHubRegs();
-                halt(500, this.gson.toJson(Map.of("status", "error", "persisted", persisted,
+                halt(500, this.hubGson.toJson(Map.of("status", "error", "persisted", persisted,
                         "code", rr.code, "message", rr.message == null ? "" : rr.message, "registration", rr.snapshot)));
             }
             int httpCode = ("name_taken".equals(rr.code) || "full".equals(rr.code)) ? 409 : 422;
-            halt(httpCode, this.gson.toJson(Map.of("status", "error", "persisted", false,
+            halt(httpCode, this.hubGson.toJson(Map.of("status", "error", "persisted", false,
                     "code", rr.code, "message", rr.message == null ? "" : rr.message, "registration", rr.snapshot)));
             return "";
         });
@@ -1545,15 +1555,15 @@ public class kisama {
             Map<String, Object> body = req.attribute("json_body");
             String kname = body != null && body.get("kname") != null ? String.valueOf(body.get("kname")) : "";
             if (kname.trim().isEmpty()) {
-                halt(422, this.gson.toJson(Map.of("status", "error", "message", "kname is required")));
+                halt(422, this.hubGson.toJson(Map.of("status", "error", "message", "kname is required")));
             }
             // 注销一条注册 (stop 隧道 + 移出注册表 + 落盘同步删除); 未注册 → 404
             Map<String, Object> snap = this.hubRegistrar.unregister(kname);
             if (snap == null) {
-                halt(404, this.gson.toJson(Map.of("status", "error", "message", "KNAME " + kname + " 未注册")));
+                halt(404, this.hubGson.toJson(Map.of("status", "error", "message", "KNAME " + kname + " 未注册")));
             }
             boolean persisted = persistHubRegs();
-            return this.gson.toJson(Map.of("status", "ok", "persisted", persisted, "removed", snap));
+            return this.hubGson.toJson(Map.of("status", "ok", "persisted", persisted, "removed", snap));
         });
 
         // 📡 反代白名单配置 (0.6.7 续批六分组口径, docs/API.MD 20.8): 验签管理端点 (before 过滤器
@@ -2294,13 +2304,309 @@ public class kisama {
         final CompletableFuture<Void> done = new CompletableFuture<>();
     }
 
-    /** KHUB 基址归一 (trim + 剥尾部斜杠) */
+    private static String trimHubUrlInput(String raw) {
+        return raw == null ? "" : raw.strip();
+    }
+
+    /** 直连 Hub 与解析响应归一 (trim + 剥尾部斜杠) */
     private static String trimHubUrl(String raw) {
-        String u = raw == null ? "" : raw.trim();
+        String u = trimHubUrlInput(raw);
         while (u.endsWith("/")) {
             u = u.substring(0, u.length() - 1);
         }
         return u;
+    }
+
+    /** 别名尾斜杠属于合法名称的一部分, 原配置必须保留 */
+    private static String normalizeHubUrl(String raw) {
+        String u = trimHubUrlInput(raw);
+        return isShzalHubAlias(u) ? u : trimHubUrl(u);
+    }
+
+    private static final String SHZAL_HUB_ALIAS_HOST = "shz.al";
+    private static final int SHZAL_HUB_ALIAS_MAX_BYTES = 4096;
+    private static final int SHZAL_HUB_RESOLVED_MAX_CHARS = 512;
+    private static final java.util.regex.Pattern SHZAL_HUB_SCHEME_RE =
+            java.util.regex.Pattern.compile("^[A-Za-z][A-Za-z0-9+.-]*$");
+    private static final java.util.regex.Pattern SHZAL_HUB_ALIAS_NAME_RE =
+            java.util.regex.Pattern.compile("^[A-Za-z0-9+_\\-*$=@,;/\\[\\]]+$");
+    private static final java.util.regex.Pattern HUB_HOST_LABEL_RE =
+            java.util.regex.Pattern.compile("^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$");
+
+    /** shz.al + /~ 形态识别; 普通 Hub 保持直连旁路 */
+    private static boolean isShzalHubAlias(String raw) {
+        String value = trimHubUrlInput(raw);
+        String lexical = value.replace("\t", "").replace("\r", "").replace("\n", "");
+        int colon = lexical.indexOf(':');
+        if (colon <= 0 || !SHZAL_HUB_SCHEME_RE.matcher(lexical.substring(0, colon)).matches()) {
+            return false;
+        }
+        String rest = lexical.substring(colon + 1);
+        if (rest.startsWith("//")) rest = rest.substring(2);
+        int end = 0;
+        while (end < rest.length() && "/?#\\".indexOf(rest.charAt(end)) < 0) end++;
+        String authority = rest.substring(0, end);
+        String tail = rest.substring(end);
+        String hostPort = authority.substring(authority.lastIndexOf('@') + 1);
+        int hostEnd = hostPort.indexOf(':');
+        String host = (hostEnd < 0 ? hostPort : hostPort.substring(0, hostEnd)).trim();
+        if (!SHZAL_HUB_ALIAS_HOST.equalsIgnoreCase(host)) return false;
+        return tail.startsWith("/~") || (tail.indexOf('\\') >= 0 && rest.contains("/~"));
+    }
+
+    /** 契约允许名称含裸 [] 但 JDK URI 不允许; 仅编码这两个字符, 保持路径语义 */
+    private static String shzalAliasRequestUrl(String raw) {
+        return trimHubUrlInput(raw).replace("[", "%5B").replace("]", "%5D");
+    }
+
+    /** URI.getPort 对越界端口会返回 -1, 因此按原始 authority 单独校验 */
+    private static boolean validHubAuthorityPort(java.net.URI uri) {
+        String authority = uri.getRawAuthority();
+        if (authority == null) return false;
+        String hostPort = authority.substring(authority.lastIndexOf('@') + 1);
+        String portText = null;
+        if (hostPort.startsWith("[")) {
+            int end = hostPort.indexOf(']');
+            if (end < 0) return false;
+            if (end + 1 < hostPort.length()) {
+                if (hostPort.charAt(end + 1) != ':') return false;
+                portText = hostPort.substring(end + 2);
+            }
+        } else {
+            int colon = hostPort.lastIndexOf(':');
+            if (colon >= 0) portText = hostPort.substring(colon + 1);
+        }
+        if (portText == null) return true;
+        if (portText.isEmpty()) return false;
+        try {
+            int port = Integer.parseInt(portText);
+            return port >= 1 && port <= 65535;
+        } catch (NumberFormatException e) {
+            return false;
+        }
+    }
+
+    /** shz.al Hub 别名入口校验; 非别名形态返回 null, 别名形态非法时返回错误文本 */
+    private static String shzalHubAliasError(String raw) {
+        if (!isShzalHubAlias(raw)) return null;
+        String normalized = trimHubUrlInput(raw);
+        if (normalized.indexOf('\\') >= 0) {
+            return "shz.al Hub 别名不得包含反斜杠";
+        }
+        try {
+            java.net.URI uri = new java.net.URI(shzalAliasRequestUrl(normalized));
+            if (uri.getHost() == null || !SHZAL_HUB_ALIAS_HOST.equalsIgnoreCase(uri.getHost())) {
+                return "shz.al Hub 别名非法";
+            }
+            if (!"https".equalsIgnoreCase(uri.getScheme())) {
+                return "shz.al Hub 别名必须使用 https://";
+            }
+            if (uri.getRawUserInfo() != null) {
+                return "shz.al Hub 别名不得包含 userinfo";
+            }
+            if (uri.getRawQuery() != null || uri.getRawFragment() != null) {
+                return "shz.al Hub 别名不得包含 query 或 fragment";
+            }
+            if (!validHubAuthorityPort(uri) || (uri.getPort() != -1 && uri.getPort() != 443)) {
+                return "shz.al Hub 别名端口必须为 443";
+            }
+            int pathStart = normalized.indexOf('/', normalized.indexOf("://") + 3);
+            String name = pathStart >= 0 ? normalized.substring(pathStart + 2) : "";
+            if (name.length() < 3) {
+                return "shz.al Hub 别名名称过短";
+            }
+            if (!SHZAL_HUB_ALIAS_NAME_RE.matcher(name).matches()) {
+                return "shz.al Hub 别名名称含非法字符";
+            }
+            return null;
+        } catch (Exception e) {
+            return "shz.al Hub 别名非法";
+        }
+    }
+
+    /** 响应 URL host 校验: IPv4/IPv6 字面量或合法 DNS 标签, 不做名称解析 */
+    private static boolean validResolvedHubHost(String host) {
+        if (host == null || host.isEmpty()) return false;
+        String h = host;
+        if (h.startsWith("[") && h.endsWith("]")) {
+            h = h.substring(1, h.length() - 1);
+        }
+        if (h.contains(":")) {
+            try {
+                // 含冒号只可能走 IPv6 字面量解析, 不触发 DNS 查询
+                java.net.InetAddress.getByName(h);
+                return true;
+            } catch (Exception e) {
+                return false;
+            }
+        }
+        if (h.matches("(\\d{1,3}\\.){3}\\d{1,3}")) {
+            for (String octet : h.split("\\.", -1)) {
+                if ((octet.length() > 1 && octet.startsWith("0"))
+                        || Integer.parseInt(octet) > 255) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        if (h.length() > 253) return false;
+        for (String label : h.split("\\.", -1)) {
+            if (!HUB_HOST_LABEL_RE.matcher(label).matches()) return false;
+        }
+        return true;
+    }
+
+    /** 校验 shz.al 响应体中的唯一绝对 Hub 基址, 返回去尾斜杠后的 URL */
+    private static String validateResolvedHubUrl(String value) throws IOException {
+        String raw = value == null ? "" : value.strip();
+        if (raw.isEmpty()) {
+            throw new IOException("shz.al 响应体为空");
+        }
+        if (raw.length() > SHZAL_HUB_RESOLVED_MAX_CHARS) {
+            throw new IOException("shz.al 响应中的 Hub 地址超过 512 字符");
+        }
+        if (!raw.startsWith("http://") && !raw.startsWith("https://")) {
+            throw new IOException("shz.al 响应中的 Hub 地址必须以 http:// 或 https:// 开头");
+        }
+        if (raw.indexOf('\\') >= 0) {
+            throw new IOException("shz.al 响应中的 Hub 地址不得包含反斜杠");
+        }
+        for (int i = 0; i < raw.length(); i++) {
+            char ch = raw.charAt(i);
+            if (Character.isWhitespace(ch) || Character.isSpaceChar(ch) || Character.isISOControl(ch)) {
+                throw new IOException("shz.al 响应中的 Hub 地址含空白或控制字符");
+            }
+        }
+        try {
+            java.net.URI uri = new java.net.URI(raw);
+            String host = uri.getHost();
+            if (!("http".equals(uri.getScheme()) || "https".equals(uri.getScheme()))
+                    || !validResolvedHubHost(host)) {
+                throw new IOException("shz.al 响应中的 Hub 地址缺少合法 scheme 或 host");
+            }
+            if (uri.getRawUserInfo() != null) {
+                throw new IOException("shz.al 响应中的 Hub 地址不得包含 userinfo");
+            }
+            if (uri.getRawQuery() != null || uri.getRawFragment() != null) {
+                throw new IOException("shz.al 响应中的 Hub 地址不得包含 query 或 fragment");
+            }
+            if (!validHubAuthorityPort(uri)) {
+                throw new IOException("shz.al 响应中的 Hub 地址端口为空、非法或越界");
+            }
+        } catch (java.net.URISyntaxException e) {
+            throw new IOException("shz.al 响应中的 Hub 地址非法", e);
+        }
+        return trimHubUrl(raw);
+    }
+
+    /** 别名响应只接受 200 + text/plain (可带 charset 等参数) + 无压缩或 identity */
+    private static void validateHubAliasResponseHeaders(java.net.http.HttpResponse<byte[]> response) throws IOException {
+        java.util.List<String> contentTypes = response.headers().allValues("content-type");
+        if (contentTypes.size() != 1) {
+            throw new IOException("shz.al 别名响应不是 text/plain");
+        }
+        String contentType = contentTypes.get(0);
+        int semicolon = contentType.indexOf(';');
+        String mediaType = (semicolon < 0 ? contentType : contentType.substring(0, semicolon)).trim();
+        if (!"text/plain".equalsIgnoreCase(mediaType)) {
+            throw new IOException("shz.al 别名响应不是 text/plain");
+        }
+        java.util.List<String> encodings = response.headers().allValues("content-encoding");
+        if (!encodings.isEmpty() && (encodings.size() != 1
+                || !"identity".equalsIgnoreCase(encodings.get(0).trim()))) {
+            throw new IOException("shz.al 别名响应不得压缩");
+        }
+    }
+
+    /** 限量 BodySubscriber: 第 4097 字节到达即 cancel 并异常完成, 缓冲始终不超过上限 */
+    private static java.net.http.HttpResponse.BodySubscriber<byte[]> limitedBodySubscriber(int maxBytes) {
+        return new java.net.http.HttpResponse.BodySubscriber<byte[]>() {
+            private final ByteArrayOutputStream buffer = new ByteArrayOutputStream(Math.min(maxBytes, 8192));
+            private final CompletableFuture<byte[]> result = new CompletableFuture<>();
+            private java.util.concurrent.Flow.Subscription subscription;
+
+            @Override
+            public void onSubscribe(java.util.concurrent.Flow.Subscription subscription) {
+                this.subscription = subscription;
+                subscription.request(Long.MAX_VALUE);
+            }
+
+            @Override
+            public void onNext(java.util.List<java.nio.ByteBuffer> items) {
+                if (result.isDone()) return;
+                for (java.nio.ByteBuffer item : items) {
+                    int remaining = item.remaining();
+                    if (remaining > maxBytes - buffer.size()) {
+                        IOException error = new IOException("response body exceeds " + maxBytes + " bytes");
+                        try {
+                            if (subscription != null) subscription.cancel();
+                        } finally {
+                            result.completeExceptionally(error);
+                        }
+                        return;
+                    }
+                    byte[] chunk = new byte[remaining];
+                    item.get(chunk);
+                    buffer.write(chunk, 0, remaining);
+                }
+            }
+
+            @Override
+            public void onError(Throwable throwable) {
+                result.completeExceptionally(throwable);
+            }
+
+            @Override
+            public void onComplete() {
+                result.complete(buffer.toByteArray());
+            }
+
+            @Override
+            public CompletionStage<byte[]> getBody() {
+                return result;
+            }
+        };
+    }
+
+    /** GET 公开别名并严格校验响应; Java11 使用系统 DNS/默认严格 TLS, 不移植 DoH 子系统 */
+    private static String resolveShzalHubUrl(String alias) throws Exception {
+        String aliasError = shzalHubAliasError(alias);
+        if (aliasError != null) {
+            throw new IOException(aliasError);
+        }
+        java.net.http.HttpClient client = java.net.http.HttpClient.newBuilder()
+                .connectTimeout(java.time.Duration.ofSeconds(15))
+                .followRedirects(java.net.http.HttpClient.Redirect.NEVER)
+                .build();
+        java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
+                .uri(new java.net.URI(shzalAliasRequestUrl(alias)))
+                .timeout(java.time.Duration.ofSeconds(15))
+                .header("Accept", "text/plain")
+                .header("User-Agent", "curl/8.5.0")
+                .header("Accept-Encoding", "identity")
+                .GET()
+                .build();
+        java.net.http.HttpResponse<byte[]> response = client.send(request,
+                responseInfo -> limitedBodySubscriber(SHZAL_HUB_ALIAS_MAX_BYTES));
+        if (response.statusCode() != 200) {
+            throw new IOException("shz.al 别名解析失败: HTTP " + response.statusCode());
+        }
+        validateHubAliasResponseHeaders(response);
+        byte[] body = response.body();
+        if (body == null) body = new byte[0];
+        if (body.length > SHZAL_HUB_ALIAS_MAX_BYTES) {
+            throw new IOException("shz.al 别名响应超过 4096 字节");
+        }
+        String text;
+        try {
+            java.nio.charset.CharsetDecoder decoder = StandardCharsets.UTF_8.newDecoder()
+                    .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT);
+            text = decoder.decode(java.nio.ByteBuffer.wrap(body)).toString();
+        } catch (java.nio.charset.CharacterCodingException e) {
+            throw new IOException("shz.al 别名响应不是合法 UTF-8", e);
+        }
+        return validateResolvedHubUrl(text);
     }
 
     /** KHUB_PORTS/KPROXY_PORTS 白名单解析 (逗号分隔; 非法/越界条目忽略, 缺省空=端口反代禁用) */
@@ -2400,7 +2706,7 @@ public class kisama {
             java.util.regex.Pattern.compile("^https?://\\S+$");
 
     /** agent 上报公网基址校验 (与 hub 端 ValidatePublicURL 同源契约); 返回错误文本, 合法返回 null
-     * 空值 = 未配置 (合法缺省, 条目回落 hub 侧推导)。scheme 白名单 http/https (该值会成为
+     * 空值 = 未配置 (合法缺省, 注册时使用本轮实际 Hub 基址)。scheme 白名单 http/https (该值会成为
      * hub /agents 页 href, 拒绝 javascript: 等危险 scheme), 上限 512 字符, 尾部斜杠已剥离 */
     private static String hubPublicUrlError(String url) {
         String normalized = trimHubUrl(url);
@@ -2418,7 +2724,7 @@ public class kisama {
 
     /** KHUB 基址 → 隧道 WS 地址 (https→wss, http→ws, 裸 host 按 ws) */
     private static String deriveHubWsUrl(String hubUrl) {
-        String url = trimHubUrl(hubUrl);
+        String url = normalizeHubUrl(hubUrl);
         if (url.startsWith("https://")) return "wss://" + url.substring("https://".length()) + "/tunnel";
         if (url.startsWith("http://")) return "ws://" + url.substring("http://".length()) + "/tunnel";
         return "ws://" + url + "/tunnel";
@@ -2609,8 +2915,9 @@ public class kisama {
         final int port;
         final java.util.Set<Integer> ports;   // 注册 ports 快照 (注册帧上报/页面展示)
         final String source;                  // startup | dynamic
-        final String publicUrl;               // KHUB_PUBLIC_URL 修正值 (null=未配置, 条目按 hub 推导)
-        final String relayUrl;
+        final String publicUrl;               // KHUB_PUBLIC_URL 修正值 (null=未配置, 上报本轮真实 Hub 基址)
+        volatile String resolvedHubUrl;       // 直连=hubUrl; 别名首次成功前 null, 之后保留最后成功值
+        volatile String relayUrl;             // 上报基址 + /KNAME, 随本轮解析成功更新
         // 🛡️ 状态透明: 三态 + 失败原因, 供 GET /api/hub 暴露给 Panel
         volatile String status = "reconnecting";   // alive | reconnecting | failed
         volatile String lastError = null;
@@ -2640,7 +2947,7 @@ public class kisama {
         Thread thread = null;
 
         HubTunnelManager(String hubUrl, String kname, int port, List<Integer> ports, String source) {
-            this.hubUrl = trimHubUrl(hubUrl);
+            this.hubUrl = normalizeHubUrl(hubUrl);
             this.kname = kname == null ? "" : kname.trim().toLowerCase(Locale.ROOT);
             this.port = port;
             java.util.Set<Integer> ps = new java.util.TreeSet<>();
@@ -2651,17 +2958,20 @@ public class kisama {
             }
             this.ports = ps;
             this.source = source;
-            // KHUB_PUBLIC_URL 公网基址覆盖值 (可选): 注册时上报 public_url, hub 拼订阅/页面/ack url 优先用;
-            // 0.6.6 续批二起缺省自动上报 KHUB 派生基址, 此变量用于内网 KHUB 等派生值 ≠ 公网地址的部署
-            String pubErr = hubPublicUrlError(KHUB_PUBLIC_URL);
+            // KHUB_PUBLIC_URL 公网基址覆盖值 (可选): 注册时上报 public_url, hub 拼订阅/页面/ack url 优先用
+            // 未配置时自动上报本轮实际 Hub 基址（直连为配置基址，别名为本轮解析出的真实基址）
+            String configuredPublicUrl = trimHubUrl(KHUB_PUBLIC_URL);
+            String pubErr = hubPublicUrlError(configuredPublicUrl);
             if (pubErr != null) {
-                logWarn("[KMODE3] ⚠️ KHUB_PUBLIC_URL " + pubErr + ", 回退 KHUB 派生基址上报");
+                logWarn("[KMODE3] ⚠️ KHUB_PUBLIC_URL " + pubErr + ", 回退本轮实际 Hub 基址上报");
                 this.publicUrl = null;
             } else {
-                this.publicUrl = KHUB_PUBLIC_URL == null || KHUB_PUBLIC_URL.isEmpty() ? null : KHUB_PUBLIC_URL;
+                this.publicUrl = configuredPublicUrl.isEmpty() ? null : configuredPublicUrl;
             }
-            // 中继地址: 上报基址 = 覆盖值 || KHUB 派生 (与注册帧 public_url 字段一致)
-            this.relayUrl = (this.publicUrl != null ? this.publicUrl : this.hubUrl) + "/" + this.kname;
+            // 中继地址: 上报基址 = 显式 publicUrl || 本轮解析基址 || 原 KHUB (与注册帧一致)
+            this.resolvedHubUrl = isShzalHubAlias(this.hubUrl) ? null : this.hubUrl;
+            this.relayUrl = (this.publicUrl != null ? this.publicUrl
+                    : this.resolvedHubUrl != null ? this.resolvedHubUrl : this.hubUrl) + "/" + this.kname;
             this.pingIntervalMs = Math.max(5000L, KISAMA_HUB_PING_INTERVAL_MS);
             this.retryBaseMs = Math.max(500L, KISAMA_HUB_RETRY_BASE_MS);
             this.retryMaxMs = Math.max(this.retryBaseMs, KISAMA_HUB_RETRY_MAX_MS);
@@ -2686,13 +2996,17 @@ public class kisama {
 
         // ---- 状态快照 (GET /api/hub) ----
         Map<String, Object> snapshot() {
+            String resolvedHub = this.resolvedHubUrl;
+            String effectivePublicUrl = this.publicUrl != null ? this.publicUrl
+                    : resolvedHub != null ? resolvedHub : this.hubUrl;
             Map<String, Object> m = new LinkedHashMap<>();
             m.put("tunnel_status", status);
             m.put("source", source);
             m.put("hub", hubUrl);
+            m.put("resolved_hub", resolvedHub);
             m.put("kname", kname);
-            m.put("url", relayUrl);
-            m.put("public_url", publicUrl != null ? publicUrl : hubUrl);   // 注册帧实际上报基址 (覆盖值 || KHUB 派生)
+            m.put("url", effectivePublicUrl + "/" + kname);
+            m.put("public_url", effectivePublicUrl);   // 显式 publicUrl || 最后成功解析值 || 原 KHUB
             m.put("ports", new ArrayList<>(ports));
             m.put("consecutive_failures", consecutiveFailures);
             m.put("last_error", lastError);
@@ -2794,6 +3108,17 @@ public class kisama {
         }
 
         private void connectOnce() throws Exception {
+            String aliasError = shzalHubAliasError(this.hubUrl);
+            if (aliasError != null) {
+                throw new IOException(aliasError);
+            }
+            String effectiveHubUrl = this.hubUrl;
+            if (isShzalHubAlias(this.hubUrl)) {
+                effectiveHubUrl = resolveShzalHubUrl(this.hubUrl);
+            }
+            // 仅在本次解析完全成功后才更新; 失败时保留旧值供状态展示, 但绝不用于本轮拨号
+            this.resolvedHubUrl = effectiveHubUrl;
+            this.relayUrl = (this.publicUrl != null ? this.publicUrl : effectiveHubUrl) + "/" + this.kname;
             final HubConnectState st = new HubConnectState();
             final StringBuilder textBuf = new StringBuilder();   // 分片聚合 (ws_data 大帧可能跨多个 onText 回调)
             java.net.http.WebSocket.Listener listener = new java.net.http.WebSocket.Listener() {
@@ -2852,7 +3177,7 @@ public class kisama {
             };
             java.net.http.WebSocket w = this.http.newWebSocketBuilder()
                     .connectTimeout(java.time.Duration.ofSeconds(10))
-                    .buildAsync(java.net.URI.create(deriveHubWsUrl(this.hubUrl)), listener)
+                    .buildAsync(java.net.URI.create(deriveHubWsUrl(effectiveHubUrl)), listener)
                     .get(15, TimeUnit.SECONDS);
             this.hubWs = w;
             try {
@@ -2862,9 +3187,7 @@ public class kisama {
                 reg.put("kname", this.kname);
                 reg.put("version", AGENT_VERSION);
                 reg.put("ports", new ArrayList<>(this.ports));
-                if (this.publicUrl != null) {
-                    reg.put("public_url", this.publicUrl != null ? this.publicUrl : this.hubUrl);   // 公网基址: 覆盖值优先, 缺省 KHUB 派生 (0.6.6 续批二起恒携带)
-                }
+                reg.put("public_url", this.publicUrl != null ? this.publicUrl : effectiveHubUrl);
                 sendHubFrame(reg);
                 if (!st.ackLatch.await(15, TimeUnit.SECONDS)) {
                     throw new IOException("hub 注册应答超时");
@@ -2877,7 +3200,7 @@ public class kisama {
                 this.consecutiveFailures = 0;
                 this.lastError = null;
                 this.lastConnectedAt = java.time.Instant.now().toString();
-                log("[KMODE3] ✅ 已连接 hub " + this.hubUrl + " (注册名 " + this.kname + ", 中继地址 " + this.relayUrl + ")");
+                log("[KMODE3] ✅ 已连接 hub " + effectiveHubUrl + " (注册名 " + this.kname + ", 中继地址 " + this.relayUrl + ")");
                 final java.net.http.WebSocket connWs = w;
                 java.util.concurrent.ScheduledFuture<?> pingTask = this.pingExecutor.scheduleAtFixedRate(() -> {
                     if (!stopped.get() && hubWs == connWs) {
@@ -3264,7 +3587,7 @@ public class kisama {
         HubRegisterResult register(String hubUrl, String kname, List<Integer> ports, String source, long waitTimeoutMs) {
             String nameErr = hubKnameError(kname);
             String normKname = kname == null ? "" : kname.trim().toLowerCase(Locale.ROOT);
-            String normHub = trimHubUrl(hubUrl);
+            String normHub = normalizeHubUrl(hubUrl);
             if (nameErr != null) {
                 Map<String, Object> snap = new LinkedHashMap<>();
                 snap.put("tunnel_status", "failed");
@@ -3284,7 +3607,7 @@ public class kisama {
                 snap.put("tunnel_status", "failed");
                 return new HubRegisterResult(snap, "name_taken", "KNAME 已在本 agent 注册表中 (kname 唯一)");
             }
-            HubTunnelManager manager = new HubTunnelManager(hubUrl, kname, PORT, ports, source);
+            HubTunnelManager manager = new HubTunnelManager(normHub, kname, PORT, ports, source);
             manager.start();
             Exception err = manager.waitConnected(waitTimeoutMs);
             if (err == null) {
@@ -3967,15 +4290,281 @@ public class kisama {
             Path rootReal = Paths.get(this.FILE_ROOT).toAbsolutePath().toRealPath();
             Path abs = p.toAbsolutePath().normalize();
             Path probe = abs;
-            while (!Files.exists(probe)) {
+            // NOFOLLOW 让悬空链接也作为已存在祖先参与 realpath 校验, 避免后续写入跟随链接逃逸。
+            while (!Files.exists(probe, LinkOption.NOFOLLOW_LINKS)) {
                 Path parent = probe.getParent();
                 if (parent == null) return false;
                 probe = parent;
             }
-            return probe.toRealPath().startsWith(rootReal);
+            Path cleanedReal = probe.toRealPath().resolve(probe.relativize(abs)).normalize();
+            return cleanedReal.startsWith(rootReal);
         } catch (Exception e) {
             return false;
         }
+    }
+
+    // ========== File API 契约辅助 (G-1/G-2/G-3) ==========
+
+    private static String fileExceptionMessage(Throwable ex) {
+        String message = ex.getMessage();
+        return message == null || message.isEmpty() ? ex.toString() : message;
+    }
+
+    private static Map<String, Object> fileBatchItem(String from, String to, String status, String error) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("from", from);
+        result.put("to", to);
+        result.put("status", status);
+        if (error != null) {
+            result.put("error", error);
+            result.put("message", error); // 旧调用方 message 兼容
+        }
+        return result;
+    }
+
+    // 非空全成功=ok; 部分成功=partial; 空批次或零成功=error。HTTP 状态由路由保持 200。
+    static Map<String, Object> fileBatchResponse(List<Map<String, Object>> results) {
+        int total = results.size();
+        int success = 0;
+        for (Map<String, Object> result : results) {
+            if ("ok".equals(result.get("status"))) success++;
+        }
+        String status;
+        String message = "";
+        if (total > 0 && success == total) {
+            status = "ok";
+        } else if (total == 0) {
+            status = "error";
+            message = "No operations requested";
+        } else if (success == 0) {
+            status = "error";
+            message = "All " + total + " operations failed";
+        } else {
+            status = "partial";
+            message = (total - success) + " of " + total + " operations failed";
+        }
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("status", status);
+        response.put("total", total);
+        response.put("success", success);
+        response.put("results", results);
+        if (!message.isEmpty()) response.put("message", message);
+        return response;
+    }
+
+    // 与 Go errnoName 对齐: 同时识别异常类型与平台错误文本, 并检查 cause 链。
+    static String fileErrorReason(Throwable error) {
+        if (error == null) return "unknown";
+        boolean permission = false, notDirectory = false, exists = false, notFound = false, noSpace = false;
+        StringBuilder messages = new StringBuilder();
+        for (Throwable cause = error; cause != null; cause = cause.getCause()) {
+            permission |= cause instanceof AccessDeniedException || cause instanceof SecurityException;
+            notDirectory |= cause instanceof NotDirectoryException;
+            exists |= cause instanceof FileAlreadyExistsException;
+            notFound |= cause instanceof NoSuchFileException;
+            String message = cause.getMessage();
+            if (message != null) messages.append(message).append('\n');
+        }
+        String text = messages.toString().toLowerCase(Locale.ROOT);
+        noSpace = text.contains("no space left") || text.contains("enospc");
+        if (text.contains("read-only file system")) return "read_only_file_system";
+        if (permission || text.contains("permission denied")) return "permission_denied";
+        if (notDirectory || text.contains("not a directory")) return "not_a_directory";
+        if (exists || text.contains("file exists")) return "file_exists";
+        if (notFound || text.contains("no such file")) return "not_found";
+        if (noSpace) return "no_space";
+        return "unknown";
+    }
+
+    private static Map<String, Object> fileErrorResponse(String message, Throwable error) {
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("status", "error");
+        response.put("error", message);
+        response.put("message", message);
+        response.put("reason", fileErrorReason(error));
+        return response;
+    }
+
+    private static Map<String, Object> rawFileErrorResponse(String message, Throwable error) {
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("status", "error");
+        response.put("completed", false);
+        response.put("error", message);
+        response.put("message", message);
+        response.put("reason", fileErrorReason(error));
+        return response;
+    }
+
+    private Map<String, Object> fileBatchEntry(String from, String to, boolean copy) {
+        Path src;
+        Path dst;
+        try {
+            src = Paths.get(this.FILE_ROOT).toAbsolutePath().resolve(from).normalize();
+            dst = Paths.get(this.FILE_ROOT).toAbsolutePath().resolve(to).normalize();
+        } catch (Exception ex) {
+            return fileBatchItem(from, to, "failed", fileExceptionMessage(ex));
+        }
+        if (!isPathInsideFileRoot(src) || !isPathInsideFileRoot(dst)) {
+            return fileBatchItem(from, to, "denied", "path outside file root");
+        }
+        try {
+            // NOFOLLOW_LINKS 与 Go os.Lstat 对齐: 悬空链接也算存在, 由实际操作报告失败。
+            Files.readAttributes(src, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+        } catch (NoSuchFileException ex) {
+            return fileBatchItem(from, to, "skipped", "source not found");
+        } catch (Exception ex) {
+            return fileBatchItem(from, to, "failed", fileExceptionMessage(ex));
+        }
+
+        Path parent = dst.getParent();
+        if (parent != null) {
+            try {
+                Path existing = parent;
+                while (!Files.exists(existing, LinkOption.NOFOLLOW_LINKS)) {
+                    Path next = existing.getParent();
+                    if (next == null) return fileBatchItem(from, to, "failed", "destination parent does not exist");
+                    existing = next;
+                }
+                BasicFileAttributes attrs = Files.readAttributes(existing, BasicFileAttributes.class);
+                if (!attrs.isDirectory()) {
+                    return fileBatchItem(from, to, "denied", "destination parent is not a directory");
+                }
+                Files.createDirectories(parent);
+            } catch (NoSuchFileException ex) {
+                return fileBatchItem(from, to, "denied", "destination parent is not a directory");
+            } catch (Exception ex) {
+                return fileBatchItem(from, to, "failed", fileExceptionMessage(ex));
+            }
+        }
+
+        try {
+            if (copy) {
+                if (Files.isDirectory(src, LinkOption.NOFOLLOW_LINKS)) {
+                    if (isDestinationWithinSource(src, dst)) {
+                        throw new IOException("destination is inside source directory");
+                    }
+                    copyDirectoryTree(src, dst);
+                } else {
+                    Files.copy(src, dst, LinkOption.NOFOLLOW_LINKS);
+                }
+            } else {
+                Files.move(src, dst);
+            }
+            return fileBatchItem(from, to, "ok", null);
+        } catch (Exception ex) {
+            return fileBatchItem(from, to, "failed", fileExceptionMessage(ex));
+        }
+    }
+
+    // 防止把目录复制到自身 (含经 symlink 解析后落入自身) 造成无界递归。
+    private static boolean isDestinationWithinSource(Path src, Path dst) {
+        Path source = src.toAbsolutePath().normalize();
+        Path destination = dst.toAbsolutePath().normalize();
+        if (destination.startsWith(source)) return true;
+        try {
+            Path sourceReal = source.toRealPath();
+            Path probe = destination;
+            while (!Files.exists(probe, LinkOption.NOFOLLOW_LINKS)) {
+                Path next = probe.getParent();
+                if (next == null) return false;
+                probe = next;
+            }
+            return probe.toRealPath().startsWith(sourceReal);
+        } catch (IOException ex) {
+            return false;
+        }
+    }
+
+    private static void copyDirectoryTree(Path src, Path dst) throws IOException {
+        Files.walkFileTree(src, new SimpleFileVisitor<Path>() {
+            @Override
+            public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) throws IOException {
+                Files.createDirectories(dst.resolve(src.relativize(dir)));
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                // 不跟随目录树内的符号链接, 避免越出 FILE_ROOT 读取链接目标。
+                Files.copy(file, dst.resolve(src.relativize(file)), LinkOption.NOFOLLOW_LINKS);
+                return FileVisitResult.CONTINUE;
+            }
+        });
+    }
+
+    private static String readLinuxMountInfo() {
+        if (!System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("linux")) return null;
+        try {
+            return new String(Files.readAllBytes(Paths.get("/proc/self/mountinfo")), StandardCharsets.UTF_8);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private static String decodeMountInfoField(String value) {
+        StringBuilder decoded = new StringBuilder(value.length());
+        for (int i = 0; i < value.length(); i++) {
+            char ch = value.charAt(i);
+            if (ch == '\\' && i + 3 < value.length()) {
+                String escaped = value.substring(i + 1, i + 4);
+                if (escaped.equals("040")) decoded.append(' ');
+                else if (escaped.equals("011")) decoded.append('\t');
+                else if (escaped.equals("012")) decoded.append('\n');
+                else if (escaped.equals("134")) decoded.append('\\');
+                else {
+                    decoded.append(ch);
+                    continue;
+                }
+                i += 3;
+            } else {
+                decoded.append(ch);
+            }
+        }
+        return decoded.toString();
+    }
+
+    // mountinfo 使用 POSIX 路径; 在 Windows 测试环境下也不能按宿主 Path 规则解析反斜杠。
+    private static String normalizeMountPath(String path) {
+        if (path == null || !path.startsWith("/")) return null;
+        Deque<String> parts = new ArrayDeque<>();
+        for (String part : path.split("/")) {
+            if (part.isEmpty() || part.equals(".")) continue;
+            if (part.equals("..")) {
+                if (!parts.isEmpty()) parts.removeLast();
+            } else {
+                parts.addLast(part);
+            }
+        }
+        return parts.isEmpty() ? "/" : "/" + String.join("/", parts);
+    }
+
+    // target 必须已 toRealPath; 返回 null 表示未知, false 表示命中 rw 挂载。
+    static Boolean mountReadOnlyFromMountInfo(String target, String mountInfo) {
+        String normalizedTarget = normalizeMountPath(target);
+        if (normalizedTarget == null || mountInfo == null || mountInfo.isEmpty()) return null;
+        int bestLength = -1;
+        Boolean result = null;
+        for (String line : mountInfo.split("\\r?\\n")) {
+            String trimmed = line.trim();
+            if (trimmed.isEmpty()) continue;
+            String[] fields = trimmed.split("\\s+");
+            if (fields.length < 6) continue;
+            String mountPoint = normalizeMountPath(decodeMountInfoField(fields[4]));
+            if (mountPoint == null) continue;
+            String prefix = mountPoint.equals("/") ? "/" : mountPoint + "/";
+            if (!normalizedTarget.equals(mountPoint) && !normalizedTarget.startsWith(prefix)) continue;
+            if (mountPoint.length() <= bestLength) continue;
+            boolean readOnly = false;
+            for (String option : fields[5].split(",")) {
+                if (option.equals("ro")) {
+                    readOnly = true;
+                    break;
+                }
+            }
+            result = readOnly;
+            bestLength = mountPoint.length();
+        }
+        return result;
     }
 
     // ========== File ZIP/Unzip (0.5.4, docs/API.MD 12.1/12.2) ==========
@@ -3996,37 +4585,94 @@ public class kisama {
     }
 
     private Map<String, Object> zipItemRes(String item, String status, int added) {
+        return zipItemRes(item, status, added, null);
+    }
+
+    private Map<String, Object> zipItemRes(String item, String status, int added, String error) {
         Map<String, Object> r = new LinkedHashMap<>();
         r.put("item", item);
         r.put("status", status);
         r.put("added", added);
+        if ("error".equals(status) && (error == null || error.isEmpty())) error = "Unknown zip error";
+        if (error != null) r.put("error", error);
         return r;
     }
 
-    private boolean zipPutFile(ZipOutputStream zos, Path file, String entryName) {
-        try {
-            ZipEntry entry = new ZipEntry(entryName.replace('\\', '/'));
-            entry.setTime(Files.getLastModifiedTime(file).toMillis());
-            zos.putNextEntry(entry);
-            Files.copy(file, zos);
-            zos.closeEntry();
-            return true;
-        } catch (IOException e) {
-            return false;
+    private Map<String, Object> zipItemError(String item, Throwable error, int added) {
+        Map<String, Object> result = zipItemRes(item, "error", added, fileExceptionMessage(error));
+        result.put("reason", fileErrorReason(error));
+        return result;
+    }
+
+    private static final class ZipSourceReadException extends IOException {
+        ZipSourceReadException(IOException cause) {
+            super(cause.getMessage(), cause);
         }
     }
 
-    private void zipPutDir(ZipOutputStream zos, Path dir, String entryName) {
+    private void zipPutFile(ZipOutputStream zos, Path file, String entryName) throws IOException {
+        zipPutFile(zos, file, entryName, false);
+    }
+
+    private void zipPutFile(ZipOutputStream zos, Path file, String entryName, boolean noFollow) throws IOException {
+        ZipEntry entry = new ZipEntry(entryName.replace('\\', '/'));
+        InputStream source = null;
+        IOException failure = null;
         try {
-            ZipEntry entry = new ZipEntry(entryName.replace('\\', '/') + "/"); // 目录条目带尾 / 保留空目录
+            try {
+                if (noFollow) {
+                    BasicFileAttributes attrs = Files.readAttributes(file, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+                    if (attrs.isSymbolicLink()) throw new IOException("symbolic link not supported: " + file);
+                }
+                source = Files.newInputStream(file);
+            } catch (IOException ex) {
+                throw new ZipSourceReadException(ex);
+            }
+            try {
+                entry.setTime(Files.getLastModifiedTime(file).toMillis());
+            } catch (IOException ex) {
+                throw new ZipSourceReadException(ex);
+            }
+            zos.putNextEntry(entry);
+            byte[] buffer = new byte[64 * 1024];
+            while (true) {
+                int read;
+                try {
+                    read = source.read(buffer);
+                } catch (IOException ex) {
+                    throw new ZipSourceReadException(ex);
+                }
+                if (read < 0) break;
+                zos.write(buffer, 0, read);
+            }
+            zos.closeEntry();
+        } catch (IOException ex) {
+            failure = ex;
+            throw ex;
+        } finally {
+            if (source != null) {
+                try {
+                    source.close();
+                } catch (IOException ex) {
+                    if (failure != null) failure.addSuppressed(ex);
+                    else throw new ZipSourceReadException(ex);
+                }
+            }
+        }
+    }
+
+    private void zipPutDir(ZipOutputStream zos, Path dir, String entryName) throws IOException {
+        ZipEntry entry = new ZipEntry(entryName.replace('\\', '/') + "/"); // 目录条目带尾 / 保留空目录
+        try {
             entry.setTime(Files.getLastModifiedTime(dir).toMillis());
-            zos.putNextEntry(entry);
-            zos.closeEntry();
-        } catch (IOException ignored) {
+        } catch (IOException ex) {
+            throw new ZipSourceReadException(ex);
         }
+        zos.putNextEntry(entry);
+        zos.closeEntry();
     }
 
-    // 压缩 ZIP: 父目录自动创建、已存在时覆盖重建 (等价 zip -r)、单项失败不中断 (docs/API.MD 12.2)
+    // 压缩 ZIP: 父目录自动创建、已存在时覆盖重建 (等价 zip -r); 源读取失败逐项记录, 归档写入失败整体返回 500。
     private String fileZipImpl(Map<String, Object> body) {
         if (body == null || body.get("path") == null || body.get("path").toString().isBlank()) {
             halt(400, this.gson.toJson(Map.of("status", "error", "message", "path required")));
@@ -4040,14 +4686,21 @@ public class kisama {
 
         Path zipPath = Paths.get(this.FILE_ROOT).resolve(Objects.toString(body.get("path"))).normalize();
         if (!isPathInsideFileRoot(zipPath)) halt(403);
-        if (Files.exists(zipPath) && Files.isDirectory(zipPath)) {
+        BasicFileAttributes targetAttrs = null;
+        try {
+            targetAttrs = Files.readAttributes(zipPath, BasicFileAttributes.class);
+        } catch (NoSuchFileException ignored) {
+        } catch (IOException e) {
+            halt(500, this.gson.toJson(fileErrorResponse("Failed to create zip", e)));
+        }
+        if (targetAttrs != null && targetAttrs.isDirectory()) {
             halt(400, this.gson.toJson(Map.of("status", "error", "message", "Target is a directory")));
         }
         try {
             if (zipPath.getParent() != null) Files.createDirectories(zipPath.getParent());
             Files.deleteIfExists(zipPath);
-        } catch (IOException e) {
-            halt(400, this.gson.toJson(Map.of("status", "error", "message", "Failed to create zip")));
+        } catch (Exception e) {
+            halt(500, this.gson.toJson(fileErrorResponse("Failed to create zip", e)));
         }
 
         List<Map<String, Object>> results = new ArrayList<>();
@@ -4062,96 +4715,396 @@ public class kisama {
                     results.add(zipItemRes(item, "skipped", 0));
                     continue;
                 }
-                Path src = Paths.get(this.FILE_ROOT).resolve(item).normalize();
-                if (!isPathInsideFileRoot(src)) {
-                    results.add(zipItemRes(item, "error", 0));
+                Path src;
+                try {
+                    src = Paths.get(this.FILE_ROOT).resolve(item).normalize();
+                } catch (Exception ex) {
+                    results.add(zipItemError(item, ex, 0));
                     continue;
                 }
-                if (!Files.exists(src)) {
+                if (!isPathInsideFileRoot(src)) {
+                    results.add(zipItemRes(item, "error", 0, "path outside file root"));
+                    continue;
+                }
+                BasicFileAttributes attrs;
+                try {
+                    attrs = Files.readAttributes(src, BasicFileAttributes.class);
+                } catch (NoSuchFileException ex) {
                     results.add(zipItemRes(item, "not_found", 0));
                     continue;
+                } catch (Exception ex) {
+                    results.add(zipItemError(item, ex, 0));
+                    continue;
                 }
+
                 int[] added = {0};
-                if (Files.isRegularFile(src)) {
-                    if (used.get() >= ZIP_MAX_ENTRIES || !zipPutFile(zos, src, src.getFileName().toString())) {
+                if (attrs.isRegularFile()) {
+                    if (used.get() >= ZIP_MAX_ENTRIES) {
                         truncated = true;
                         results.add(zipItemRes(item, "skipped", 0));
                         continue;
                     }
+                    try {
+                        zipPutFile(zos, src, src.getFileName().toString());
+                    } catch (ZipSourceReadException ex) {
+                        results.add(zipItemError(item, ex, 0));
+                        continue;
+                    }
                     used.incrementAndGet();
                     added[0] = 1;
-                } else if (Files.isDirectory(src)) {
-                    // 目录递归打包; 非 flat 时条目名带顶层目录名前缀; 目录条目 (带尾 /) 保留空目录
-                    String base = flat ? "" : src.getFileName().toString();
-                    String status = "ok";
-                    try (Stream<Path> walkStream = Files.walk(src)) {
-                        for (Path p : walkStream.sorted().collect(Collectors.toList())) {
-                            if (p.equals(src)) continue;
-                            String rel = src.relativize(p).toString();
-                            String name = base.isEmpty() ? rel : base + "/" + rel;
-                            if (Files.isDirectory(p)) {
-                                if (used.get() >= ZIP_MAX_ENTRIES) {
-                                    status = "partial";
-                                    truncated = true;
-                                    break;
+                } else if (attrs.isDirectory()) {
+                    // NOFOLLOW_LINKS: 嵌套符号链接只记录真实失败, 绝不打开链接目标。
+                    String base = flat || src.getFileName() == null ? "" : src.getFileName().toString();
+                    IOException[] itemError = {null};
+                    boolean[] itemTruncated = {false};
+                    // 空 FileVisitOption 集合即 walkFileTree 的 NOFOLLOW_LINKS 等价行为。
+                    Files.walkFileTree(src, EnumSet.noneOf(FileVisitOption.class), Integer.MAX_VALUE,
+                            new SimpleFileVisitor<Path>() {
+                                @Override
+                                public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes dirAttrs) throws IOException {
+                                    if (dir.equals(src)) return FileVisitResult.CONTINUE;
+                                    if (used.get() >= ZIP_MAX_ENTRIES) {
+                                        itemTruncated[0] = true;
+                                        return FileVisitResult.TERMINATE;
+                                    }
+                                    String rel = src.relativize(dir).toString();
+                                    String name = base.isEmpty() ? rel : base + "/" + rel;
+                                    try {
+                                        zipPutDir(zos, dir, name);
+                                    } catch (ZipSourceReadException ex) {
+                                        if (itemError[0] == null) itemError[0] = ex;
+                                        return FileVisitResult.CONTINUE;
+                                    }
+                                    used.incrementAndGet();
+                                    return FileVisitResult.CONTINUE;
                                 }
-                                zipPutDir(zos, p, name);
-                                used.incrementAndGet();
-                            } else if (Files.isRegularFile(p)) {
-                                if (used.get() >= ZIP_MAX_ENTRIES) {
-                                    status = "partial";
-                                    truncated = true;
-                                    break;
-                                }
-                                if (zipPutFile(zos, p, name)) {
+
+                                @Override
+                                public FileVisitResult visitFile(Path file, BasicFileAttributes fileAttrs) throws IOException {
+                                    if (used.get() >= ZIP_MAX_ENTRIES) {
+                                        itemTruncated[0] = true;
+                                        return FileVisitResult.TERMINATE;
+                                    }
+                                    String rel = src.relativize(file).toString();
+                                    if (fileAttrs.isSymbolicLink()) {
+                                        if (itemError[0] == null) itemError[0] = new IOException("symbolic link not supported: " + rel);
+                                        return FileVisitResult.CONTINUE;
+                                    }
+                                    if (!fileAttrs.isRegularFile()) {
+                                        if (itemError[0] == null) itemError[0] = new IOException("Unsupported file type: " + rel);
+                                        return FileVisitResult.CONTINUE;
+                                    }
+                                    String name = base.isEmpty() ? rel : base + "/" + rel;
+                                    try {
+                                        zipPutFile(zos, file, name, true);
+                                    } catch (ZipSourceReadException ex) {
+                                        if (itemError[0] == null) itemError[0] = ex;
+                                        return FileVisitResult.CONTINUE;
+                                    }
                                     used.incrementAndGet();
                                     added[0]++;
+                                    return FileVisitResult.CONTINUE;
                                 }
-                            }
-                        }
-                    } catch (IOException ignored) {
-                        // 单个不可读条目不中断
-                    }
-                    results.add(zipItemRes(item, status, added[0]));
+
+                                @Override
+                                public FileVisitResult visitFileFailed(Path file, IOException exc) throws IOException {
+                                    if (itemError[0] == null) itemError[0] = exc;
+                                    return FileVisitResult.CONTINUE;
+                                }
+                            });
                     addedTotal += added[0];
+                    if (itemTruncated[0]) truncated = true;
+                    if (itemError[0] != null) {
+                        results.add(zipItemError(item, itemError[0], added[0]));
+                    } else {
+                        results.add(zipItemRes(item, itemTruncated[0] ? "partial" : "ok", added[0]));
+                    }
                     continue;
                 } else {
-                    results.add(zipItemRes(item, "error", 0));
+                    results.add(zipItemRes(item, "error", 0, "Unsupported file type"));
                     continue;
                 }
                 addedTotal += added[0];
                 results.add(zipItemRes(item, "ok", added[0]));
             }
-        } catch (IOException e) {
-            halt(400, this.gson.toJson(Map.of("status", "error", "message", "Zip failed: " + e.getMessage())));
+        } catch (Exception e) {
+            halt(500, this.gson.toJson(fileErrorResponse("Failed to create zip", e)));
         }
 
-        long size = 0;
+        long size;
         try {
             size = Files.size(zipPath);
-        } catch (IOException ignored) {
+        } catch (IOException e) {
+            halt(500, this.gson.toJson(fileErrorResponse("Failed to stat zip", e)));
+            return "";
         }
+
+        int successfulItems = 0, failedItems = 0;
+        for (Map<String, Object> result : results) {
+            if ("ok".equals(result.get("status")) || "partial".equals(result.get("status"))) successfulItems++;
+            if ("error".equals(result.get("status"))) failedItems++;
+        }
+        String status = "ok";
+        if (results.isEmpty()) status = "error";
+        else if (failedItems > 0) status = successfulItems > 0 ? "partial" : "error";
+
         Map<String, Object> resp = new LinkedHashMap<>();
-        resp.put("status", "ok");
+        resp.put("status", status);
         resp.put("path", relDisplay(zipPath));
         resp.put("entries", addedTotal);
         resp.put("size", size);
         resp.put("results", results);
+        if (failedItems > 0) resp.put("message", failedItems + " of " + results.size() + " items failed");
         return this.gson.toJson(resp);
     }
 
-    // 解压 ZIP: 缺省解压到 zip 所在目录; 防 zip-slip (逃出目标目录的条目计入 skipped 不报错);
-    // 限额 20000 条目 / 512MB, 超出部分计入 skipped (docs/API.MD 12.1)
+    private static final int ZIP_LOCAL_HEADER_SIG = 0x04034b50;
+    private static final int ZIP_CENTRAL_HEADER_SIG = 0x02014b50;
+    private static final int ZIP64_EOCD_SIG = 0x06064b50;
+    private static final int ZIP64_LOCATOR_SIG = 0x07064b50;
+    private static final int ZIP_EOCD_SIG = 0x06054b50;
+    private static final Charset ZIP_CP437 = Charset.forName("IBM437");
+
+    private static final class ZipCentralEntry {
+        String name;
+        int flags;
+        int method;
+        long crc;
+        long compressedSize;
+        long uncompressedSize;
+        long localOffset;
+    }
+
+    private static final class LimitedInputStream extends FilterInputStream {
+        private long remaining;
+
+        LimitedInputStream(InputStream in, long limit) {
+            super(in);
+            this.remaining = limit;
+        }
+
+        long remaining() {
+            return remaining;
+        }
+
+        @Override
+        public int read() throws IOException {
+            if (remaining == 0) return -1;
+            int value = super.read();
+            if (value < 0) throw new EOFException("unexpected end of zip entry");
+            remaining--;
+            return value;
+        }
+
+        @Override
+        public int read(byte[] bytes, int offset, int length) throws IOException {
+            if (length == 0) return 0;
+            if (remaining == 0) return -1;
+            int read = super.read(bytes, offset, (int) Math.min(length, remaining));
+            if (read < 0) throw new EOFException("unexpected end of zip entry");
+            remaining -= read;
+            return read;
+        }
+    }
+
+    // FileChannel 由解压外层统一关闭; 每个条目的 Inflater 仍可独立释放。
+    private static final class NonClosingInputStream extends FilterInputStream {
+        NonClosingInputStream(InputStream in) {
+            super(in);
+        }
+
+        @Override
+        public void close() {
+        }
+    }
+
+    private static int zipU16(byte[] bytes, int offset) {
+        return (bytes[offset] & 0xff) | ((bytes[offset + 1] & 0xff) << 8);
+    }
+
+    private static long zipU32(byte[] bytes, int offset) {
+        return (zipU16(bytes, offset) & 0xffffffffL) | ((zipU16(bytes, offset + 2) & 0xffffffffL) << 16);
+    }
+
+    private static long zipU64(byte[] bytes, int offset) {
+        return zipU32(bytes, offset) | (zipU32(bytes, offset + 4) << 32);
+    }
+
+    private static byte[] readFully(FileChannel channel, long offset, int length) throws IOException {
+        if (offset < 0 || length < 0 || offset > channel.size() - length) throw new EOFException("unexpected end of zip file");
+        ByteBuffer buffer = ByteBuffer.allocate(length);
+        channel.position(offset);
+        while (buffer.hasRemaining()) {
+            if (channel.read(buffer) < 0) throw new EOFException("unexpected end of zip file");
+        }
+        return buffer.array();
+    }
+
+    // Java 11 的 ZipFile 会在打开阶段拒绝含加密条目的归档, 因此直接读取中央目录元数据,
+    // 以便随机跳过加密条目并继续处理同一归档内的普通条目。
+    private static List<ZipCentralEntry> readZipCentralDirectory(Path zipPath) throws IOException {
+        try (FileChannel channel = FileChannel.open(zipPath, StandardOpenOption.READ)) {
+            long fileSize = channel.size();
+            if (fileSize < 22) throw new ZipException("Not a zip file");
+            int tailLength = (int) Math.min(fileSize, 22L + 65535);
+            byte[] tail = readFully(channel, fileSize - tailLength, tailLength);
+            int eocdIndex = -1;
+            for (int i = tailLength - 22; i >= 0; i--) {
+                if (zipU32(tail, i) == ZIP_EOCD_SIG && i + 22L + zipU16(tail, i + 20) == tailLength) {
+                    eocdIndex = i;
+                    break;
+                }
+            }
+            if (eocdIndex < 0) throw new ZipException("Not a zip file");
+            long eocdOffset = fileSize - tailLength + eocdIndex;
+            if (zipU16(tail, eocdIndex + 4) != 0 || zipU16(tail, eocdIndex + 6) != 0) {
+                throw new ZipException("multi-disk zip archives are not supported");
+            }
+
+            long entryCount = zipU16(tail, eocdIndex + 10);
+            long centralSize = zipU32(tail, eocdIndex + 12);
+            long centralOffset = zipU32(tail, eocdIndex + 16);
+            long centralEnd = eocdOffset;
+            boolean zip64 = entryCount == 0xffff || centralSize == 0xffffffffL || centralOffset == 0xffffffffL
+                    || zipU16(tail, eocdIndex + 8) == 0xffff;
+            if (zip64) {
+                if (eocdOffset < 20) throw new ZipException("invalid zip64 locator");
+                byte[] locator = readFully(channel, eocdOffset - 20, 20);
+                if (zipU32(locator, 0) != ZIP64_LOCATOR_SIG || zipU32(locator, 4) != 0 || zipU32(locator, 16) != 1) {
+                    throw new ZipException("invalid zip64 locator");
+                }
+                long zip64Offset = zipU64(locator, 8);
+                byte[] zip64Eocd = readFully(channel, zip64Offset, 56);
+                if (zipU32(zip64Eocd, 0) != ZIP64_EOCD_SIG || zipU64(zip64Eocd, 4) < 44
+                        || zipU32(zip64Eocd, 16) != 0 || zipU32(zip64Eocd, 20) != 0) {
+                    throw new ZipException("invalid zip64 directory");
+                }
+                entryCount = zipU64(zip64Eocd, 32);
+                centralSize = zipU64(zip64Eocd, 40);
+                centralOffset = zipU64(zip64Eocd, 48);
+                centralEnd = zip64Offset;
+            } else if (zipU16(tail, eocdIndex + 8) != entryCount) {
+                throw new ZipException("multi-disk zip archives are not supported");
+            }
+            if (entryCount > Integer.MAX_VALUE) throw new ZipException("too many zip entries");
+            if (centralOffset < 0 || centralSize < 0 || centralOffset > fileSize || centralSize > fileSize - centralOffset) {
+                throw new ZipException("invalid central directory");
+            }
+
+            // 兼容带前缀数据的自解压 ZIP: 优先使用 EOCD 记录偏移, 失败时用中央目录实际终点回推。
+            if (entryCount > 0 && centralOffset + 4 <= fileSize
+                    && zipU32(readFully(channel, centralOffset, 4), 0) != ZIP_CENTRAL_HEADER_SIG) {
+                long inferred = centralEnd - centralSize;
+                if (inferred >= 0 && inferred + 4 <= fileSize
+                        && zipU32(readFully(channel, inferred, 4), 0) == ZIP_CENTRAL_HEADER_SIG) {
+                    centralOffset = inferred;
+                }
+            }
+            long directoryEnd = centralOffset + centralSize;
+            if (directoryEnd < centralOffset || directoryEnd > fileSize) throw new ZipException("invalid central directory");
+
+            List<ZipCentralEntry> entries = new ArrayList<>();
+            long position = centralOffset;
+            for (long index = 0; index < entryCount; index++) {
+                if (directoryEnd - position < 46) throw new ZipException("truncated central directory");
+                byte[] header = readFully(channel, position, 46);
+                if (zipU32(header, 0) != ZIP_CENTRAL_HEADER_SIG) throw new ZipException("invalid central directory header");
+                int nameLength = zipU16(header, 28);
+                int extraLength = zipU16(header, 30);
+                int commentLength = zipU16(header, 32);
+                int variableDataLength = nameLength + extraLength + commentLength;
+                long variableLength = 46L + variableDataLength;
+                if (variableLength > directoryEnd - position) throw new ZipException("truncated central directory entry");
+                byte[] variable = readFully(channel, position + 46, variableDataLength);
+                byte[] nameBytes = Arrays.copyOfRange(variable, 0, nameLength);
+                byte[] extra = Arrays.copyOfRange(variable, nameLength, nameLength + extraLength);
+
+                ZipCentralEntry entry = new ZipCentralEntry();
+                entry.flags = zipU16(header, 8);
+                entry.method = zipU16(header, 10);
+                entry.crc = zipU32(header, 16);
+                entry.compressedSize = zipU32(header, 20);
+                entry.uncompressedSize = zipU32(header, 24);
+                entry.localOffset = zipU32(header, 42);
+                entry.name = new String(nameBytes, (entry.flags & 0x800) != 0 ? StandardCharsets.UTF_8 : ZIP_CP437);
+
+                boolean needSize = entry.uncompressedSize == 0xffffffffL;
+                boolean needCompressed = entry.compressedSize == 0xffffffffL;
+                boolean needOffset = entry.localOffset == 0xffffffffL;
+                if (needSize || needCompressed || needOffset) {
+                    for (int extraPosition = 0; extraPosition + 4 <= extra.length; ) {
+                        int id = zipU16(extra, extraPosition);
+                        int dataLength = zipU16(extra, extraPosition + 2);
+                        if (extraPosition + 4L + dataLength > extra.length) throw new ZipException("invalid zip64 extra field");
+                        if (id == 0x0001) {
+                            int dataPosition = extraPosition + 4;
+                            int dataEnd = dataPosition + dataLength;
+                            if (needSize) {
+                                if (dataPosition + 8 > dataEnd) throw new ZipException("invalid zip64 extra field");
+                                entry.uncompressedSize = zipU64(extra, dataPosition);
+                                dataPosition += 8;
+                            }
+                            if (needCompressed) {
+                                if (dataPosition + 8 > dataEnd) throw new ZipException("invalid zip64 extra field");
+                                entry.compressedSize = zipU64(extra, dataPosition);
+                                dataPosition += 8;
+                            }
+                            if (needOffset) {
+                                if (dataPosition + 8 > dataEnd) throw new ZipException("invalid zip64 extra field");
+                                entry.localOffset = zipU64(extra, dataPosition);
+                            }
+                            break;
+                        }
+                        extraPosition += 4 + dataLength;
+                    }
+                    if ((needSize && entry.uncompressedSize == 0xffffffffL)
+                            || (needCompressed && entry.compressedSize == 0xffffffffL)
+                            || (needOffset && entry.localOffset == 0xffffffffL)) {
+                        throw new ZipException("missing zip64 extra field");
+                    }
+                }
+                if (entry.compressedSize < 0 || entry.uncompressedSize < 0 || entry.localOffset < 0) {
+                    throw new ZipException("invalid zip64 entry size");
+                }
+                entries.add(entry);
+                position += variableLength;
+            }
+            return entries;
+        }
+    }
+
+    // 目标不存在时解析最深已存在祖先的真实路径, 并补齐缺失尾段; 悬空/循环链接不可作为安全祖先。
+    private static boolean isRealPathInsideFileRoot(Path target, Path rootReal) throws IOException {
+        Path absolute = target.toAbsolutePath().normalize();
+        Path probe = absolute;
+        while (!Files.exists(probe, LinkOption.NOFOLLOW_LINKS)) {
+            Path parent = probe.getParent();
+            if (parent == null) return false;
+            probe = parent;
+        }
+        Path cleanedReal = probe.toRealPath().resolve(probe.relativize(absolute)).normalize();
+        return cleanedReal.startsWith(rootReal);
+    }
+
+    // 解压 ZIP: 缺省解压到 zip 所在目录; 词法 zip-slip 与真实路径越界计入 skipped;
+    // 限额按实际写出字节执行, 任何条目读取/创建/写入/关闭失败均返回 500 并清理不完整目标。
     private String fileUnzipImpl(Map<String, Object> body) {
         if (body == null || body.get("path") == null || body.get("path").toString().isBlank()) {
             halt(400, this.gson.toJson(Map.of("status", "error", "message", "path required")));
         }
         Path zipPath = Paths.get(this.FILE_ROOT).resolve(Objects.toString(body.get("path"))).normalize();
         if (!isPathInsideFileRoot(zipPath)) halt(403);
-        if (!Files.exists(zipPath)) {
+        BasicFileAttributes zipAttrs;
+        try {
+            zipAttrs = Files.readAttributes(zipPath, BasicFileAttributes.class);
+        } catch (NoSuchFileException ex) {
             halt(400, this.gson.toJson(Map.of("status", "error", "message", "Zip not found")));
+            return "";
+        } catch (IOException ex) {
+            halt(500, this.gson.toJson(fileErrorResponse("Failed to read zip", ex)));
+            return "";
         }
-        if (Files.isDirectory(zipPath)) {
+        if (zipAttrs.isDirectory()) {
             halt(400, this.gson.toJson(Map.of("status", "error", "message", "Path is a directory")));
         }
 
@@ -4160,7 +5113,15 @@ public class kisama {
         if (destObj != null && !destObj.toString().isBlank()) {
             dest = Paths.get(this.FILE_ROOT).resolve(destObj.toString()).normalize();
             if (!isPathInsideFileRoot(dest)) halt(403);
-            if (Files.exists(dest) && !Files.isDirectory(dest)) {
+            BasicFileAttributes destAttrs = null;
+            try {
+                destAttrs = Files.readAttributes(dest, BasicFileAttributes.class);
+            } catch (NoSuchFileException ignored) {
+            } catch (IOException ex) {
+                halt(500, this.gson.toJson(fileErrorResponse("Failed to create directory", ex)));
+                return "";
+            }
+            if (destAttrs != null && !destAttrs.isDirectory()) {
                 halt(400, this.gson.toJson(Map.of("status", "error", "message", "Destination is a file")));
             }
         } else {
@@ -4168,8 +5129,9 @@ public class kisama {
         }
         try {
             Files.createDirectories(dest);
-        } catch (IOException e) {
-            halt(400, this.gson.toJson(Map.of("status", "error", "message", "Failed to create directory")));
+        } catch (Exception e) {
+            halt(500, this.gson.toJson(fileErrorResponse("Failed to create directory", e)));
+            return "";
         }
 
         boolean overwrite = !Boolean.FALSE.equals(body.get("overwrite"));
@@ -4186,16 +5148,26 @@ public class kisama {
         List<String> files = new ArrayList<>();
         boolean filesTruncated = false;
 
-        try (ZipFile zf = new ZipFile(zipPath.toFile())) {
-            Enumeration<? extends ZipEntry> en = zf.entries();
-            while (en.hasMoreElements()) {
-                ZipEntry entry = en.nextElement();
-                if (entry.isDirectory()) continue; // 目录条目: 按需由父级 createDirectories 创建
+        List<ZipCentralEntry> entries;
+        try {
+            entries = readZipCentralDirectory(zipPath);
+        } catch (ZipException ze) {
+            halt(400, this.gson.toJson(Map.of("status", "error", "message", "Not a zip file")));
+            return "";
+        } catch (IOException ioe) {
+            halt(500, this.gson.toJson(fileErrorResponse("Failed to open zip", ioe)));
+            return "";
+        }
+
+        try (FileChannel channel = FileChannel.open(zipPath, StandardOpenOption.READ)) {
+            Path rootReal = Paths.get(this.FILE_ROOT).toAbsolutePath().toRealPath();
+            for (ZipCentralEntry entry : entries) {
+                String name = entry.name.replace('\\', '/');
+                if (name.endsWith("/")) continue; // 目录条目: 按需由父级 createDirectories 创建
                 if (extracted + skipped >= ZIP_MAX_ENTRIES || totalBytes >= ZIP_MAX_TOTAL_BYTES) {
                     skipped++;
                     continue;
                 }
-                String name = entry.getName().replace('\\', '/');
                 if (!filters.isEmpty()) {
                     String base = name.contains("/") ? name.substring(name.lastIndexOf('/') + 1) : name;
                     if (!filters.contains(name) && !filters.contains(base)) {
@@ -4203,44 +5175,117 @@ public class kisama {
                         continue;
                     }
                 }
-                if (entry.getMethod() != ZipEntry.STORED && entry.getMethod() != ZipEntry.DEFLATED) {
+                if ((entry.flags & 0x1) != 0) {
                     skipped++;
                     continue;
                 }
-                long size = entry.getSize();
-                if (size < 0 || totalBytes + size > ZIP_MAX_TOTAL_BYTES) {
+
+                byte[] localHeader;
+                try {
+                    localHeader = readFully(channel, entry.localOffset, 30);
+                } catch (IOException ex) {
+                    throw new IOException("Failed to read zip entry '" + name + "'", ex);
+                }
+                if (zipU32(localHeader, 0) != ZIP_LOCAL_HEADER_SIG) {
+                    throw new IOException("Failed to read zip entry '" + name + "': invalid local header");
+                }
+                if ((zipU16(localHeader, 6) & 0x1) != 0) {
                     skipped++;
                     continue;
                 }
-                Path out = dest.resolve(entry.getName()).normalize();
-                // zip-slip: 归一化后必须仍在目标目录内
+                if (zipU16(localHeader, 8) != entry.method) {
+                    throw new IOException("Failed to read zip entry '" + name + "': compression method mismatch");
+                }
+                if (entry.method != ZipEntry.STORED && entry.method != ZipEntry.DEFLATED) {
+                    throw new IOException("Failed to read zip entry '" + name + "': unsupported compression method " + entry.method);
+                }
+                long declaredSize = entry.uncompressedSize;
+                if (declaredSize >= 0 && declaredSize > ZIP_MAX_TOTAL_BYTES - totalBytes) {
+                    skipped++;
+                    continue;
+                }
+                long dataOffset = entry.localOffset + 30L + zipU16(localHeader, 26) + zipU16(localHeader, 28);
+                if (dataOffset < entry.localOffset || dataOffset > channel.size()) {
+                    throw new IOException("Failed to read zip entry '" + name + "': invalid data offset");
+                }
+                Path out = dest.resolve(name).normalize();
+                // 词法 zip-slip: 归一化后必须仍位于目标目录内。
                 if (!out.startsWith(dest) || out.equals(dest)) {
                     skipped++;
                     continue;
                 }
-                if (!overwrite && Files.exists(out)) {
+                try {
+                    if (!isRealPathInsideFileRoot(out, rootReal)) {
+                        skipped++;
+                        continue;
+                    }
+                } catch (NoSuchFileException | FileSystemLoopException ex) {
                     skipped++;
                     continue;
                 }
-                try (InputStream in = zf.getInputStream(entry)) {
-                    Files.createDirectories(out.getParent());
-                    Files.copy(in, out, StandardCopyOption.REPLACE_EXISTING);
-                } catch (Exception e) {
+                if (!overwrite && Files.exists(out, LinkOption.NOFOLLOW_LINKS)) {
                     skipped++;
                     continue;
+                }
+
+                channel.position(dataOffset);
+                LimitedInputStream limited = new LimitedInputStream(
+                        new NonClosingInputStream(Channels.newInputStream(channel)), entry.compressedSize);
+                Inflater inflater = entry.method == ZipEntry.DEFLATED ? new Inflater(true) : null;
+                InputStream in = inflater == null ? limited : new InflaterInputStream(limited, inflater);
+                CRC32 crc = new CRC32();
+                boolean targetExisted = Files.exists(out, LinkOption.NOFOLLOW_LINKS);
+                boolean outputOpened = false;
+                long written = 0;
+                try (in) {
+                    Files.createDirectories(out.getParent());
+                    if (!overwrite && Files.exists(out, LinkOption.NOFOLLOW_LINKS)) {
+                        targetExisted = true;
+                        skipped++;
+                        continue;
+                    }
+                    try (OutputStream output = Files.newOutputStream(out,
+                            StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
+                        outputOpened = true;
+                        long remaining = ZIP_MAX_TOTAL_BYTES - totalBytes;
+                        byte[] buffer = new byte[64 * 1024];
+                        while (true) {
+                            int read = in.read(buffer);
+                            if (read < 0) break;
+                            if ((long) read > remaining) {
+                                throw new IOException("zip entry exceeds total extraction limit");
+                            }
+                            output.write(buffer, 0, read);
+                            crc.update(buffer, 0, read);
+                            written += read;
+                            remaining -= read;
+                        }
+                    }
+                    if (crc.getValue() != entry.crc) throw new IOException("zip entry CRC mismatch");
+                    if (declaredSize >= 0 && written != declaredSize) throw new IOException("zip entry size mismatch");
+                } catch (Exception e) {
+                    if (outputOpened || !targetExisted) {
+                        try {
+                            Files.deleteIfExists(out);
+                        } catch (Exception ignored) {
+                            // 保留原始读取/写入/关闭错误。
+                        }
+                    }
+                    throw new IOException("Failed to extract zip entry '" + name + "'", e);
+                } finally {
+                    if (inflater != null) inflater.end();
                 }
                 extracted++;
-                totalBytes += size;
+                totalBytes += written;
                 if (files.size() < ZIP_MAX_LISTED_FILES) {
                     files.add(relDisplay(out));
                 } else {
                     filesTruncated = true;
                 }
             }
-        } catch (ZipException ze) {
-            halt(400, this.gson.toJson(Map.of("status", "error", "message", "Not a zip file")));
-        } catch (IOException ioe) {
-            halt(400, this.gson.toJson(Map.of("status", "error", "message", "Unzip failed: " + ioe.getMessage())));
+        } catch (Exception ioe) {
+            halt(500, this.gson.toJson(fileErrorResponse("Failed to extract zip entry", ioe)));
+            return "";
         }
 
         Map<String, Object> resp = new LinkedHashMap<>();

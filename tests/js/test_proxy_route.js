@@ -311,12 +311,14 @@ async function main() {
     const srv = app.listen(0, '127.0.0.1');
     await new Promise((r) => srv.once('listening', r));
     const agentPort = srv.address().port;
+    let activeClient = null;
 
     try {
       // 1) 白名单拒绝 → close 1008
       proxySetRuntimePorts('local', []);
       const rejectCode = await new Promise((resolve, reject) => {
         const c = new WsClient(`ws://127.0.0.1:${agentPort}/api/proxyws/${upstreamPort}/echo`);
+        activeClient = c;
         c.on('close', (code) => resolve(code));
         c.on('error', (e) => reject(e));
       });
@@ -326,6 +328,7 @@ async function main() {
       proxySetRuntimePorts('local', [upstreamPort]);
       await new Promise((resolve, reject) => {
         const c = new WsClient(`ws://127.0.0.1:${agentPort}/api/proxyws/${upstreamPort}/echo?u=1`);
+        activeClient = c;
         let stage = 'text';
         c.on('error', reject);
         c.on('message', (data, isBinary) => {
@@ -342,6 +345,7 @@ async function main() {
         c.on('open', () => c.send('hello'));
       });
     } finally {
+      if (activeClient) activeClient.terminate();
       proxySetRuntimePorts('local', []);
       wss.close();
       srv.close();

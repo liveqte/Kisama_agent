@@ -17,7 +17,8 @@
 
 const assert = require('assert');
 const http = require('http');
-const { HubTunnelManager, HubWSStream, HubTunnelRegistrar, HubRegisterError, hubKnameError, hubPublicUrlError, deriveHubWsUrl, filterLoopbackHeaders, hubBackoffSeconds, parseHubPorts, Config, proxySetRuntimePorts, proxyEffectivePorts } = require('../../js/agent.js');
+const { execFileSync } = require('child_process');
+const { HubTunnelManager, HubWSStream, HubTunnelRegistrar, HubRegisterError, hubKnameError, hubPublicUrlError, isShzalHubAlias, shzalHubAliasError, validateResolvedHubUrl, resolveShzalHubUrl, deriveHubWsUrl, filterLoopbackHeaders, hubBackoffSeconds, parseHubPorts, Config, proxySetRuntimePorts, proxyEffectivePorts, httpRequestRaw } = require('../../js/agent.js');
 
 let failed = 0;
 async function test(name, fn) {
@@ -47,6 +48,39 @@ function makeManager(opts = {}) {
   );
   mgr.logs = logs;
   return mgr;
+}
+
+function fakeHubWs() {
+  const sent = [];
+  const handlers = {};
+  let markReady;
+  const ready = new Promise((resolve) => { markReady = resolve; });
+  const ws = {
+    readyState: 1, OPEN: 1,
+    on: (ev, cb) => { (handlers[ev] = handlers[ev] || []).push(cb); },
+    send: (d) => sent.push(JSON.parse(d)),
+    ping: () => {}, close: () => {}, terminate: () => {}
+  };
+  return { ws, sent, handlers, ready, created: markReady };
+}
+
+function aliasReply(value = 'https://hub.test', options = {}) {
+  return {
+    status: options.status === undefined ? 200 : options.status,
+    headers: options.headers === undefined ? { 'Content-Type': 'text/plain; charset=utf-8' } : options.headers,
+    body: options.body === undefined ? Buffer.from(value) : options.body
+  };
+}
+
+async function registerAndClose(mgr, harness) {
+  const done = mgr._connectOnce().catch((err) => err);
+  await harness.ready;
+  harness.handlers.open.forEach((cb) => cb());
+  harness.handlers.close.forEach((cb) => cb(1000, 'test'));
+  const err = await done;
+  assert.ok(err instanceof Error, 'unacked close must reject');
+  assert.strictEqual(harness.sent.length, 1);
+  return harness.sent[0];
 }
 
 async function main() {
@@ -100,13 +134,229 @@ async function main() {
   await test('snapshot 字段齐全', () => {
     const mgr = makeManager();
     const snap = mgr.snapshot();
-    for (const key of ['tunnel_status', 'hub', 'kname', 'url', 'public_url', 'ports', 'consecutive_failures', 'last_error', 'last_error_at', 'last_connected_at', 'relay_count']) {
+    for (const key of ['tunnel_status', 'source', 'hub', 'resolved_hub', 'kname', 'url', 'public_url', 'ports', 'consecutive_failures', 'last_error', 'last_error_at', 'last_connected_at', 'relay_count']) {
       assert.ok(key in snap, key);
     }
     assert.strictEqual(snap.kname, 'demo1');
     assert.deepStrictEqual(snap.ports, [7788, 8080]);
+    assert.strictEqual(snap.hub, 'http://hub.test');
+    assert.strictEqual(snap.resolved_hub, 'http://hub.test');
     assert.strictEqual(snap.url, 'http://hub.test/demo1');
     assert.strictEqual(snap.public_url, 'http://hub.test');  // 缺省自动上报 KHUB 派生基址 (0.6.6 续批二)
+  });
+
+  console.log('== shz.al Hub 别名解析 ==');
+
+  await test('别名形态与入口校验', () => {
+    for (const raw of ['https://shz.al/~alias', 'https://shz.al/~alias/',
+                       'HTTPS://SHZ.AL/~a+b_c-1[]*$=@,;/', 'https://shz.al:443/~name']) {
+      assert.strictEqual(isShzalHubAlias(raw), true, raw);
+      assert.strictEqual(shzalHubAliasError(raw), null, raw);
+    }
+    for (const raw of ['https://shz.al.evil/~alias', 'https://other.test/~alias', 'https://shz.al/path']) {
+      assert.strictEqual(isShzalHubAlias(raw), false, raw);
+      assert.strictEqual(shzalHubAliasError(raw), null, raw);
+    }
+    for (const raw of ['http://shz.al/~alias', 'ftp://shz.al/~alias', 'ws://shz.al/~alias',
+                       'https://shz.al/~ab', 'https://shz.al/~',
+                       'https://shz.al/~alias:key', 'https://shz.al/~ali%20as',
+                       'https://@shz.al/~alias', 'https://shz.al:8443/~alias',
+                       'https://shz.al:65536/~alias', 'https://shz.al:bad/~alias',
+                       'https://shz.al:999999999999999999999999/~alias',
+                       'https://shz.al:/~alias', 'https://shz.al/~alias\\path',
+                       'https://shz.al\\@evil.test/~alias', 'https:shz.al/~alias',
+                       'https://shz.al/~abc/./def', 'https://shz.al/~al\tias',
+                       'https://shz.al/~al\nrias', 'https://shz.al /~alias',
+                       'https://shz.al/~alias\x00',
+                       'https://shz.al/~alias?x=1', 'https://shz.al/~alias?',
+                       'https://shz.al/~alias#frag', 'https://shz.al/~alias#']) {
+      assert.strictEqual(isShzalHubAlias(raw), true, raw);
+      assert.notStrictEqual(shzalHubAliasError(raw), null, raw);
+    }
+  });
+
+  await test('KHUB 环境入口与 merge 保留别名尾斜杠', () => {
+    const alias = 'https://shz.al/~alias/';
+    const agentPath = require.resolve('../../js/agent.js');
+    const output = execFileSync(process.execPath, ['-e', `process.stdout.write(require(${JSON.stringify(agentPath)}).Config.KHUB)`], {
+      env: { ...process.env, KHUB: alias }, encoding: 'utf8'
+    });
+    assert.strictEqual(output, alias);
+    const saved = Config.KHUB;
+    try {
+      Config.merge({ KHUB: alias });
+      assert.strictEqual(Config.KHUB, alias);
+      Config.merge({ KHUB: 'https://hub.test///' });
+      assert.strictEqual(Config.KHUB, 'https://hub.test');
+    } finally {
+      Config.KHUB = saved;
+    }
+  });
+
+  await test('解析响应 URL 校验与尾斜杠归一', () => {
+    const valid = new Map([
+      ['https://hub.test', 'https://hub.test'],
+      [' https://hub.test/prefix/// \n', 'https://hub.test/prefix'],
+      ['http://127.0.0.1:8080/base/', 'http://127.0.0.1:8080/base'],
+      ['https://[::1]:9443/hub', 'https://[::1]:9443/hub']
+    ]);
+    for (const [raw, want] of valid) assert.strictEqual(validateResolvedHubUrl(raw), want, raw);
+    for (const raw of ['', '<html>hub</html>', 'https://one.test\nhttps://two.test',
+                       'ftp://hub.test', 'HTTPS://hub.test', 'https://hub.test/a b',
+                       'https://hub.test/a\\b', 'https://hub.test/a\x00b',
+                       'https://hub.test/a\x85b', 'https://@hub.test', 'https://user@hub.test',
+                       'https://hub.test?x=1', 'https://hub.test?', 'https://hub.test#x',
+                       'https://hub.test#', 'https://hub.test:', 'https://hub.test:0',
+                       'https://hub.test:65536', 'https://hub.test:bad', 'https://bad_host.test',
+                       'https://hub..test', 'https://hub.test/' + 'a'.repeat(600)]) {
+      assert.throws(() => validateResolvedHubUrl(raw), undefined, raw);
+    }
+  });
+
+  await test('别名 GET 请求契约与路径前缀', async () => {
+    const calls = [];
+    const request = async (method, url, headers, body) => {
+      calls.push({ method, url, headers, body });
+      return aliasReply(' https://real.test/hub/ \n');
+    };
+    assert.strictEqual(await resolveShzalHubUrl('https://shz.al/~alias', request), 'https://real.test/hub');
+    assert.deepStrictEqual(calls, [{ method: 'GET', url: 'https://shz.al/~alias',
+      headers: { Accept: 'text/plain', 'User-Agent': 'curl/8.5.0', 'Accept-Encoding': 'identity' }, body: null }]);
+  });
+
+  await test('别名响应拒绝矩阵', async () => {
+    const cases = [
+      aliasReply('https://hub.test', { status: 301 }), aliasReply('https://hub.test', { status: 404 }),
+      aliasReply('https://hub.test', { headers: { 'Content-Type': 'text/html' } }),
+      aliasReply('https://hub.test', { headers: {} }),
+      aliasReply('https://hub.test', { headers: { 'Content-Type': 'text/plain', 'Content-Encoding': 'gzip' } }),
+      aliasReply('', {}), aliasReply('<html>hub</html>'),
+      aliasReply('https://one.test\nhttps://two.test'),
+      aliasReply('', { body: Buffer.from([0xff]) }), aliasReply('', { body: Buffer.alloc(4097) })
+    ];
+    for (let i = 0; i < cases.length; i++) {
+      await assert.rejects(resolveShzalHubUrl('https://shz.al/~alias', async () => cases[i]), undefined, `case ${i}`);
+    }
+  });
+
+  await test('4096/4097 字节边界', async () => {
+    const url = Buffer.from('https://hub.test');
+    const padded = Buffer.concat([url, Buffer.alloc(4096 - url.length, 0x20)]);
+    assert.strictEqual(await resolveShzalHubUrl('https://shz.al/~alias', async () => aliasReply('', { body: padded })), url.toString());
+    await assert.rejects(resolveShzalHubUrl('https://shz.al/~alias', async () => aliasReply('', { body: Buffer.concat([padded, Buffer.from('x')]) })), /4096/);
+  });
+
+  await test('管理 URL 在 GET 前拒绝', async () => {
+    let called = false;
+    await assert.rejects(resolveShzalHubUrl('https://shz.al/~alias:key', async () => {
+      called = true;
+      return aliasReply();
+    }), /别名/);
+    assert.strictEqual(called, false);
+  });
+
+  await test('直连 Hub 旁路别名 GET', async () => {
+    const mgr = makeManager();
+    const harness = fakeHubWs();
+    let gets = 0;
+    let dialed = null;
+    mgr._request = async () => { gets += 1; return aliasReply(); };
+    mgr._wsFactory = (url) => { dialed = url; harness.created(); return harness.ws; };
+    const reg = await registerAndClose(mgr, harness);
+    assert.strictEqual(gets, 0);
+    assert.strictEqual(dialed, 'ws://hub.test/tunnel');
+    assert.strictEqual(reg.public_url, 'http://hub.test');
+    assert.strictEqual(mgr.snapshot().resolved_hub, 'http://hub.test');
+  });
+
+  await test('别名快照与注册帧使用真实 Hub', async () => {
+    const alias = 'https://shz.al/~alias/';
+    const mgr = makeManager({ hubUrl: alias });
+    const initial = mgr.snapshot();
+    assert.strictEqual(initial.hub, alias);
+    assert.strictEqual(initial.resolved_hub, null);
+    assert.strictEqual(initial.url, alias + '/demo1');
+    const harness = fakeHubWs();
+    let dialed = null;
+    mgr._request = async () => aliasReply('https://real.test/hub/');
+    mgr._wsFactory = (url) => { dialed = url; harness.created(); return harness.ws; };
+    const reg = await registerAndClose(mgr, harness);
+    const snap = mgr.snapshot();
+    assert.strictEqual(dialed, 'wss://real.test/hub/tunnel');
+    assert.strictEqual(reg.public_url, 'https://real.test/hub');
+    assert.strictEqual(snap.hub, alias);
+    assert.strictEqual(snap.resolved_hub, 'https://real.test/hub');
+    assert.strictEqual(snap.public_url, 'https://real.test/hub');
+    assert.strictEqual(snap.url, 'https://real.test/hub/demo1');
+  });
+
+  await test('KHUB_PUBLIC_URL 优先但仍解析拨号地址', async () => {
+    const saved = Config.KHUB_PUBLIC_URL;
+    Config.KHUB_PUBLIC_URL = 'https://public.test/gw';
+    try {
+      const mgr = makeManager({ hubUrl: 'https://shz.al/~alias' });
+      const harness = fakeHubWs();
+      let gets = 0;
+      mgr._request = async () => { gets += 1; return aliasReply('https://real.test/hub'); };
+      mgr._wsFactory = () => { harness.created(); return harness.ws; };
+      const reg = await registerAndClose(mgr, harness);
+      assert.strictEqual(gets, 1);
+      assert.strictEqual(reg.public_url, 'https://public.test/gw');
+      assert.strictEqual(mgr.snapshot().resolved_hub, 'https://real.test/hub');
+      assert.strictEqual(mgr.snapshot().url, 'https://public.test/gw/demo1');
+    } finally {
+      Config.KHUB_PUBLIC_URL = saved;
+    }
+  });
+
+  await test('每次 attempt 重新 GET 并从失败恢复', async () => {
+    const mgr = makeManager({ hubUrl: 'https://shz.al/~alias' });
+    const values = ['http://127.0.0.1:1', 'https://real.test/hub'];
+    const gets = [];
+    const dialed = [];
+    const harness = fakeHubWs();
+    mgr._request = async (method, url) => { gets.push(url); return aliasReply(values[gets.length - 1]); };
+    mgr._wsFactory = (url) => {
+      dialed.push(url);
+      if (dialed.length === 1) throw new Error('dial refused');
+      harness.created();
+      return harness.ws;
+    };
+    await assert.rejects(mgr._connectOnce(), /dial refused/);
+    const reg = await registerAndClose(mgr, harness);
+    assert.deepStrictEqual(gets, ['https://shz.al/~alias', 'https://shz.al/~alias']);
+    assert.deepStrictEqual(dialed, ['ws://127.0.0.1:1/tunnel', 'wss://real.test/hub/tunnel']);
+    assert.strictEqual(reg.public_url, 'https://real.test/hub');
+  });
+
+  await test('刷新失败不得用旧解析值拨号', async () => {
+    const mgr = makeManager({ hubUrl: 'https://shz.al/~alias' });
+    const harness = fakeHubWs();
+    let gets = 0;
+    const dialed = [];
+    mgr._request = async () => {
+      gets += 1;
+      if (gets === 1) return aliasReply('https://last.test/hub');
+      throw new Error('alias unreachable');
+    };
+    mgr._wsFactory = (url) => { dialed.push(url); harness.created(); return harness.ws; };
+    await registerAndClose(mgr, harness);
+    await assert.rejects(mgr._connectOnce(), /alias unreachable/);
+    assert.strictEqual(gets, 2);
+    assert.deepStrictEqual(dialed, ['wss://last.test/hub/tunnel']);
+    assert.strictEqual(mgr.snapshot().resolved_hub, 'https://last.test/hub');
+  });
+
+  await test('非法别名不 GET 不拨号', async () => {
+    for (const alias of ['https://shz.al/~alias:key', 'https://shz.al\\@evil.test/~alias',
+                         'https:shz.al/~alias', 'https://shz.al/~al\tias']) {
+      const mgr = makeManager({ hubUrl: alias });
+      let called = false;
+      mgr._request = async () => { called = true; return aliasReply(); };
+      mgr._wsFactory = () => { called = true; return fakeHubWs().ws; };
+      await assert.rejects(mgr._connectOnce(), /别名/, alias);
+      assert.strictEqual(called, false, alias);
+    }
   });
 
   console.log('== KHUB_PUBLIC_URL 公网基址修正值 (0.6.6 续批) ==');
@@ -155,22 +405,16 @@ async function main() {
     Config.KHUB_PUBLIC_URL = 'https://pub.test/hub';
     try {
       const mgr = makeManager();
-      const sent = [];
-      const handlers = {};
-      const fakeWs = {
-        readyState: 1, OPEN: 1,
-        on: (ev, cb) => { (handlers[ev] = handlers[ev] || []).push(cb); },
-        send: (d) => sent.push(JSON.parse(d)),
-        ping: () => {}, close: () => {}, terminate: () => {}
-      };
-      mgr._wsFactory = () => fakeWs;
+      const harness = fakeHubWs();
+      mgr._wsFactory = () => { harness.created(); return harness.ws; };
       const done = mgr._connectOnce().catch(() => {});
-      handlers.open.forEach((cb) => cb());          // 触发注册帧发送
-      assert.strictEqual(sent.length, 1);
-      assert.strictEqual(sent[0].t, 'register');
-      assert.strictEqual(sent[0].kname, 'demo1');
-      assert.strictEqual(sent[0].public_url, 'https://pub.test/hub');
-      handlers.close.forEach((cb) => cb(1000, 'test'));  // 收尾 (未 ack → reject → 已捕获)
+      await harness.ready;
+      harness.handlers.open.forEach((cb) => cb());          // 触发注册帧发送
+      assert.strictEqual(harness.sent.length, 1);
+      assert.strictEqual(harness.sent[0].t, 'register');
+      assert.strictEqual(harness.sent[0].kname, 'demo1');
+      assert.strictEqual(harness.sent[0].public_url, 'https://pub.test/hub');
+      harness.handlers.close.forEach((cb) => cb(1000, 'test'));  // 收尾 (未 ack → reject → 已捕获)
       await done;
     } finally {
       Config.KHUB_PUBLIC_URL = saved;
@@ -179,20 +423,14 @@ async function main() {
 
   await test('注册帧缺省携带 KHUB 派生 public_url (0.6.6 续批二)', async () => {
     const mgr = makeManager();  // KHUB_PUBLIC_URL 未配置
-    const sent = [];
-    const handlers = {};
-    const fakeWs = {
-      readyState: 1, OPEN: 1,
-      on: (ev, cb) => { (handlers[ev] = handlers[ev] || []).push(cb); },
-      send: (d) => sent.push(JSON.parse(d)),
-      ping: () => {}, close: () => {}, terminate: () => {}
-    };
-    mgr._wsFactory = () => fakeWs;
+    const harness = fakeHubWs();
+    mgr._wsFactory = () => { harness.created(); return harness.ws; };
     const done = mgr._connectOnce().catch(() => {});
-    handlers.open.forEach((cb) => cb());
-    assert.strictEqual(sent.length, 1);
-    assert.strictEqual(sent[0].public_url, 'http://hub.test');
-    handlers.close.forEach((cb) => cb(1000, 'test'));
+    await harness.ready;
+    harness.handlers.open.forEach((cb) => cb());
+    assert.strictEqual(harness.sent.length, 1);
+    assert.strictEqual(harness.sent[0].public_url, 'http://hub.test');
+    harness.handlers.close.forEach((cb) => cb(1000, 'test'));
     await done;
   });
 
@@ -302,6 +540,45 @@ async function main() {
     }
   });
 
+  console.log('== httpRequestRaw 限流/总超时/禁重定向 ==');
+
+  await test('4096 边界、15s 总超时缝与不跟随重定向', async () => {
+    const sockets = new Set();
+    let redirected = 0;
+    const server = http.createServer((req, res) => {
+      if (req.url === '/hold') return;
+      if (req.url === '/alias') {
+        res.writeHead(302, { Location: '/target' });
+        return res.end();
+      }
+      if (req.url === '/target') redirected += 1;
+      const size = req.url === '/large' ? 4097 : 4096;
+      res.end(Buffer.alloc(size));
+    });
+    server.on('connection', (socket) => {
+      sockets.add(socket);
+      socket.on('close', () => sockets.delete(socket));
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const base = `http://127.0.0.1:${server.address().port}`;
+      const exact = await httpRequestRaw('GET', base + '/exact', {}, null, 5000, 4096);
+      assert.strictEqual(exact.body.length, 4096);
+      await assert.rejects(httpRequestRaw('GET', base + '/large', {}, null, 5000, 4096, {
+        tooLargeError: new Error('alias body too large')
+      }), /alias body too large/);
+      const redirect = await httpRequestRaw('GET', base + '/alias', {}, null, 5000, 4096);
+      assert.strictEqual(redirect.status, 302);
+      assert.strictEqual(redirected, 0);
+      await assert.rejects(httpRequestRaw('GET', base + '/hold', {}, null, 5000, 4096, {
+        totalTimeoutMs: 50, timeoutError: new Error('alias total deadline')
+      }), /alias total deadline/);
+    } finally {
+      for (const socket of sockets) socket.destroy();
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+
   console.log('== 终端 WS 流 ==');
 
   await test('HubWSStream 拨号失败 → ws_ack ok:false', async () => {
@@ -400,6 +677,21 @@ async function main() {
     assert.strictEqual(snapshot.source, 'dynamic');
     assert.strictEqual(registrar.list().length, 1);
     assert.ok(registrar.get('demo1').started);
+  });
+
+  await test('Registrar 保留 shz.al 别名尾斜杠', async () => {
+    const alias = 'https://shz.al/~alias/';
+    let received = null;
+    const registrar = new HubTunnelRegistrar({ info(){}, warn(){}, warning(){}, error(){}, debug(){} });
+    registrar._managerFactory = (hubUrl, kname, port, ports, logger, source) => {
+      received = hubUrl;
+      return { start(){}, stop(){}, waitConnected: async () => ({ ok: true, err: null }),
+               snapshot: () => ({ tunnel_status: 'alive', source, hub: hubUrl, kname: kname.toLowerCase(), ports: [] }) };
+    };
+    const { snapshot, code } = await registrar.register(alias, 'demo1', [], 'dynamic', 100);
+    assert.strictEqual(code, null);
+    assert.strictEqual(received, alias);
+    assert.strictEqual(snapshot.hub, alias);
   });
 
   await test('Registrar 同 kname 冲突 409 语义', async () => {

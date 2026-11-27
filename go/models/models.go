@@ -6,7 +6,8 @@ import "time"
 
 // BaseResponse is the base response structure
 type BaseResponse struct {
-	Status string `json:"status"`
+	Status  string `json:"status"`
+	Message string `json:"message,omitempty"`
 }
 
 // CountResponse response with count
@@ -154,14 +155,15 @@ type FileInfo struct {
 
 // AuthorityInfo represents file authority information
 type AuthorityInfo struct {
-	Path       string `json:"path"`
-	Name       string `json:"name,omitempty"`
-	Mode       string `json:"mode"`
-	ModeOctal  string `json:"mode_octal"`
-	Type       string `json:"type,omitempty"`
-	Readable   bool   `json:"readable"`
-	Writable   bool   `json:"writable"`
-	Executable bool   `json:"executable"`
+	Path          string `json:"path"`
+	Name          string `json:"name,omitempty"`
+	Mode          string `json:"mode"`
+	ModeOctal     string `json:"mode_octal"`
+	Type          string `json:"type,omitempty"`
+	Readable      bool   `json:"readable"`
+	Writable      bool   `json:"writable"`
+	Executable    bool   `json:"executable"`
+	MountReadOnly *bool  `json:"mount_readonly,omitempty"`
 }
 
 // FileListRequest represents a file list request
@@ -253,11 +255,12 @@ type FileDeleteResponse struct {
 // FileMoveRequest represents a file move request (map from -> to)
 type FileMoveRequest map[string]string
 
-// FileMoveResult represents a single move result
+// FileMoveResult represents a single move/copy result
 type FileMoveResult struct {
 	From   string `json:"from"`
 	To     string `json:"to"`
-	Status string `json:"status"`
+	Status string `json:"status"` // ok / failed / skipped / denied
+	Error  string `json:"error,omitempty"`
 }
 
 // FileMoveResponse represents a file move response
@@ -295,6 +298,7 @@ type FileZipItemResult struct {
 	Item   string `json:"item"`
 	Status string `json:"status"` // ok / not_found / partial / skipped / error
 	Added  int    `json:"added"`
+	Error  string `json:"error,omitempty"`
 }
 
 // FileUnzipRequest represents an unzip request

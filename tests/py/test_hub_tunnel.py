@@ -14,6 +14,8 @@
 """
 
 import asyncio
+import os
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -60,9 +62,9 @@ class _FakeWsCm:
         return False
 
 
-def _make_manager(ports=None, retry_base=2.0, retry_max=60.0):
+def _make_manager(ports=None, retry_base=2.0, retry_max=60.0, hub_url="http://hub.test"):
     mgr = agent.HubTunnelManager(
-        hub_url="http://hub.test", kname="Demo1", port=58000,
+        hub_url=hub_url, kname="Demo1", port=58000,
         ports=ports if ports is not None else [7788, 8080],
     )
     # 测试线程不启动 (不调 start), 直接操作协程方法
@@ -117,17 +119,354 @@ class FilterLoopbackHeadersTest(unittest.TestCase):
         self.assertEqual(agent.filter_loopback_headers({}), {})
 
 
+class ShzalHubAliasValidationTest(unittest.TestCase):
+    def test_alias_shapes(self):
+        for raw in ("https://shz.al/~alias", "https://shz.al/~alias/",
+                    "HTTPS://SHZ.AL/~a+b_c-1[]*$=@,;/", "https://shz.al:443/~name"):
+            self.assertTrue(agent.is_shzal_hub_alias(raw), raw)
+            self.assertIsNone(agent.shzal_hub_alias_error(raw), raw)
+        for raw in ("https://shz.al.evil/~alias", "https://other.test/~alias",
+                    "https://shz.al/path"):
+            self.assertFalse(agent.is_shzal_hub_alias(raw), raw)
+            self.assertIsNone(agent.shzal_hub_alias_error(raw), raw)
+
+    def test_invalid_alias_rejected_before_request(self):
+        invalid = ("http://shz.al/~alias", "ftp://shz.al/~alias", "ws://shz.al/~alias",
+                   "https://shz.al/~ab", "https://shz.al/~",
+                   "https://shz.al/~alias:key", "https://shz.al/~ali%20as",
+                   "https://user@shz.al/~alias", "https://shz.al:8443/~alias",
+                   "https://shz.al:65536/~alias", "https://shz.al:/~alias",
+                   "https://shz.al:999999999999999999999999/~alias",
+                   "https://shz.al/~alias\\path", "https://shz.al\\@evil.test/~alias",
+                   "https:shz.al/~alias", "https://shz.al/~abc/./def",
+                   "https://shz.al/~al\tias", "https://shz.al/~al\nrias",
+                   "https://shz.al /~alias", "https://shz.al/~alias\x00",
+                   "https://shz.al/~alias?x=1", "https://shz.al/~alias?",
+                   "https://shz.al/~alias#frag", "https://shz.al/~alias#")
+        for raw in invalid:
+            with self.subTest(raw=raw):
+                self.assertTrue(agent.is_shzal_hub_alias(raw), raw)
+                self.assertIsNotNone(agent.shzal_hub_alias_error(raw))
+
+    def test_config_and_normalization_preserve_alias_trailing_slash(self):
+        alias = "https://shz.al/~alias/"
+        self.assertEqual(agent.normalize_hub_url(alias), alias)
+        self.assertEqual(agent.normalize_hub_url("https://hub.test///"), "https://hub.test")
+        env = dict(os.environ, KHUB=alias)
+        output = subprocess.check_output(
+            [sys.executable, "-c", "import agent; print(agent.Config.KHUB)"],
+            cwd=ROOT / "py", env=env, text=True,
+        )
+        self.assertEqual(output.strip(), alias)
+
+    def test_resolved_url_validation(self):
+        valid = {
+            "https://hub.test": "https://hub.test",
+            " https://hub.test/prefix/// \n": "https://hub.test/prefix",
+            "http://127.0.0.1:8080/base/": "http://127.0.0.1:8080/base",
+            "https://[::1]:9443/hub": "https://[::1]:9443/hub",
+        }
+        for raw, want in valid.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(agent.validate_resolved_hub_url(raw), want)
+        invalid = ("", "<html>hub</html>", "https://one.test\nhttps://two.test",
+                   "ftp://hub.test", "HTTPS://hub.test", "https://hub.test/a b",
+                   "https://hub.test/a\\b", "https://hub.test/a\x00b",
+                   "https://hub.test/a\x85b", "https://user@hub.test",
+                   "https://hub.test?x=1", "https://hub.test?", "https://hub.test#x",
+                   "https://hub.test#", "https://hub.test:", "https://hub.test:0",
+                   "https://hub.test:65536", "https://hub.test:bad",
+                   "https://bad_host.test", "https://hub..test",
+                   "https://hub.test/" + "a" * 600)
+        for raw in invalid:
+            with self.subTest(raw=raw):
+                with self.assertRaises(ValueError):
+                    agent.validate_resolved_hub_url(raw)
+
+
+def _alias_reply(value="https://hub.test", status=200, headers=None, body=None):
+    if headers is None:
+        headers = {"Content-Type": "text/plain; charset=utf-8"}
+    return status, headers, value.encode("utf-8") if body is None else body
+
+
+class ShzalHubResolverTest(unittest.TestCase):
+    def test_request_contract_and_path_prefix(self):
+        async def run():
+            mgr = _make_manager(hub_url="https://shz.al/~alias")
+            calls = []
+            session = object()
+
+            async def request(current_session, method, url, headers, body):
+                calls.append((current_session, method, url, headers, body))
+                return _alias_reply(" https://real.test/hub/ \n")
+
+            mgr._request = request
+            self.assertEqual(await agent.resolve_shzal_hub_url(session, mgr.hub_url, request),
+                             "https://real.test/hub")
+            self.assertEqual(calls, [(session, "GET", "https://shz.al/~alias",
+                                      {"Accept": "text/plain", "User-Agent": "curl/8.5.0",
+                                       "Accept-Encoding": "identity"}, None)])
+        asyncio.run(run())
+
+    def test_response_rejection_matrix(self):
+        cases = (
+            _alias_reply(status=301), _alias_reply(status=404),
+            _alias_reply(headers={"Content-Type": "text/html"}),
+            _alias_reply(headers={}),
+            _alias_reply(headers={"Content-Type": "text/plain", "Content-Encoding": "gzip"}),
+            _alias_reply(body=b""), _alias_reply(body=b"<html>hub</html>"),
+            _alias_reply(body=b"https://one.test\nhttps://two.test"),
+            _alias_reply(body=b"https://hub.test/\xff"),
+            _alias_reply(body=b"x" * 4097),
+        )
+
+        async def run():
+            for index, response in enumerate(cases):
+                with self.subTest(index=index):
+                    async def request(session, method, url, headers, body, response=response):
+                        return response
+                    with self.assertRaises(ConnectionError):
+                        await agent.resolve_shzal_hub_url(object(), "https://shz.al/~alias", request)
+        asyncio.run(run())
+
+    def test_4096_byte_boundary(self):
+        url = b"https://hub.test"
+        padded = url + b" " * (4096 - len(url))
+
+        async def run():
+            async def request(session, method, alias, headers, body):
+                return _alias_reply(body=padded)
+            self.assertEqual(await agent.resolve_shzal_hub_url(object(), "https://shz.al/~alias", request),
+                             url.decode())
+        asyncio.run(run())
+
+    def test_production_session_options_and_bounded_read(self):
+        url = "https://hub.test"
+        captured = {}
+
+        class _Content:
+            def __init__(self):
+                self.body = b"x" * 4097
+                self.reads = []
+
+            async def read(self, size):
+                self.reads.append(size)
+                out, self.body = self.body[:size], self.body[size:]
+                return out
+
+        class _Response:
+            status = 200
+            headers = {"Content-Type": "text/plain"}
+
+            def __init__(self):
+                self.content = _Content()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+        response = _Response()
+
+        class _Session:
+            def get(self, alias, **kwargs):
+                captured.update(alias=alias, kwargs=kwargs)
+                return response
+
+        async def run():
+            with self.assertRaisesRegex(ConnectionError, "4096"):
+                await agent.resolve_shzal_hub_url(_Session(), "https://shz.al/~alias")
+        asyncio.run(run())
+        self.assertEqual(captured["alias"], "https://shz.al/~alias")
+        self.assertIs(captured["kwargs"]["allow_redirects"], False)
+        self.assertIs(captured["kwargs"]["auto_decompress"], False)
+        self.assertEqual(captured["kwargs"]["headers"]["Accept-Encoding"], "identity")
+        self.assertEqual(captured["kwargs"]["timeout"].total, 15)
+        self.assertEqual(response.content.reads, [4097])
+
+    def test_management_url_never_requests(self):
+        async def run():
+            async def request(*args):
+                self.fail("management URL must not be requested")
+            with self.assertRaises(ConnectionError):
+                await agent.resolve_shzal_hub_url(object(), "https://shz.al/~alias:key", request)
+        asyncio.run(run())
+
+
+class ShzalHubManagerTest(unittest.TestCase):
+    def test_direct_hub_bypasses_alias_request(self):
+        async def run():
+            mgr = _make_manager()
+            requests = []
+            ws_urls = []
+
+            async def request(*args):
+                requests.append(args)
+                return _alias_reply()
+
+            def factory(session, url):
+                ws_urls.append(url)
+                return _FakeWsCm(_FakeWS())
+
+            mgr._request = request
+            mgr._ws_factory = factory
+            with self.assertRaises(ConnectionError):
+                await mgr._connect_once(None)
+            self.assertEqual(requests, [])
+            self.assertEqual(ws_urls, ["ws://hub.test/tunnel"])
+            self.assertEqual(mgr.snapshot()["resolved_hub"], "http://hub.test")
+        asyncio.run(run())
+
+    def test_alias_snapshot_and_registration_use_resolved_hub(self):
+        async def run():
+            mgr = _make_manager(hub_url="https://shz.al/~alias")
+            initial = mgr.snapshot()
+            self.assertEqual(initial["hub"], "https://shz.al/~alias")
+            self.assertIsNone(initial["resolved_hub"])
+            self.assertEqual(initial["url"], "https://shz.al/~alias/demo1")
+            ws_urls = []
+            ws = _FakeWS()
+
+            async def request(*args):
+                return _alias_reply("https://real.test/hub/")
+
+            def factory(session, url):
+                ws_urls.append(url)
+                return _FakeWsCm(ws)
+
+            mgr._request = request
+            mgr._ws_factory = factory
+            with self.assertRaises(ConnectionError):
+                await mgr._connect_once(None)
+            snap = mgr.snapshot()
+            self.assertEqual(ws_urls, ["wss://real.test/hub/tunnel"])
+            self.assertEqual(ws.sent[0]["public_url"], "https://real.test/hub")
+            self.assertEqual(snap["hub"], "https://shz.al/~alias")
+            self.assertEqual(snap["resolved_hub"], "https://real.test/hub")
+            self.assertEqual(snap["public_url"], "https://real.test/hub")
+            self.assertEqual(snap["url"], "https://real.test/hub/demo1")
+        asyncio.run(run())
+
+    def test_public_url_override_does_not_skip_dial_resolution(self):
+        async def run():
+            with mock.patch.object(agent.Config, "KHUB_PUBLIC_URL", "https://public.test/gw"):
+                mgr = _make_manager(hub_url="https://shz.al/~alias")
+            requests = []
+            ws = _FakeWS()
+
+            async def request(*args):
+                requests.append(args)
+                return _alias_reply("https://real.test/hub")
+
+            mgr._request = request
+            mgr._ws_factory = lambda session, url: _FakeWsCm(ws)
+            with self.assertRaises(ConnectionError):
+                await mgr._connect_once(None)
+            self.assertEqual(len(requests), 1)
+            self.assertEqual(ws.sent[0]["public_url"], "https://public.test/gw")
+            self.assertEqual(mgr.snapshot()["resolved_hub"], "https://real.test/hub")
+            self.assertEqual(mgr.snapshot()["url"], "https://public.test/gw/demo1")
+        asyncio.run(run())
+
+    def test_every_attempt_gets_alias_again_and_recovers(self):
+        async def run():
+            mgr = _make_manager(hub_url="https://shz.al/~alias", retry_base=0.5)
+            values = ["http://127.0.0.1:1", "https://real.test/hub"]
+            gets = []
+            ws_urls = []
+            ws = _FakeWS()
+
+            async def request(*args):
+                gets.append(args)
+                return _alias_reply(values[len(gets) - 1])
+
+            class _FailCM:
+                async def __aenter__(self):
+                    raise ConnectionError("dial refused")
+
+                async def __aexit__(self, *exc):
+                    return False
+
+            def factory(session, url):
+                ws_urls.append(url)
+                return _FailCM() if len(ws_urls) == 1 else _FakeWsCm(ws)
+
+            mgr._request = request
+            mgr._ws_factory = factory
+            with self.assertRaises(ConnectionError):
+                await mgr._connect_once(None)
+            with self.assertRaises(ConnectionError):
+                await mgr._connect_once(None)
+            self.assertEqual(len(gets), 2)
+            self.assertEqual(ws_urls, ["ws://127.0.0.1:1/tunnel", "wss://real.test/hub/tunnel"])
+            self.assertEqual(ws.sent[0]["public_url"], "https://real.test/hub")
+        asyncio.run(run())
+
+    def test_failed_refresh_never_dials_last_resolved_hub(self):
+        async def run():
+            mgr = _make_manager(hub_url="https://shz.al/~alias")
+            gets = []
+            ws_urls = []
+
+            async def request(*args):
+                gets.append(args)
+                if len(gets) == 1:
+                    return _alias_reply("https://last.test/hub")
+                raise OSError("alias unreachable")
+
+            def factory(session, url):
+                ws_urls.append(url)
+                return _FakeWsCm(_FakeWS())
+
+            mgr._request = request
+            mgr._ws_factory = factory
+            with self.assertRaises(ConnectionError):
+                await mgr._connect_once(None)
+            with self.assertRaises(ConnectionError):
+                await mgr._connect_once(None)
+            self.assertEqual(len(gets), 2)
+            self.assertEqual(ws_urls, ["wss://last.test/hub/tunnel"])
+            self.assertEqual(mgr.snapshot()["resolved_hub"], "https://last.test/hub")
+        asyncio.run(run())
+
+    def test_invalid_alias_never_gets_or_dials(self):
+        async def run():
+            for alias in ("https://shz.al/~alias:key", "https://shz.al\\@evil.test/~alias",
+                          "https:shz.al/~alias", "https://shz.al/~al\tias"):
+                with self.subTest(alias=alias):
+                    mgr = _make_manager(hub_url=alias)
+                    calls = []
+
+                    async def request(*args):
+                        calls.append(args)
+                        return _alias_reply()
+
+                    def factory(*args):
+                        calls.append(args)
+                        return _FakeWsCm(_FakeWS())
+
+                    mgr._request = request
+                    mgr._ws_factory = factory
+                    with self.assertRaises(ConnectionError):
+                        await mgr._connect_once(None)
+                    self.assertEqual(calls, [])
+        asyncio.run(run())
+
+
 class HubTunnelManagerSnapshotTest(unittest.TestCase):
     def test_snapshot_fields(self):
         mgr = _make_manager(ports=[9090, 7788])
         snap = mgr.snapshot()
-        for key in ("tunnel_status", "hub", "kname", "url", "public_url", "ports",
+        for key in ("tunnel_status", "source", "hub", "resolved_hub", "kname", "url", "public_url", "ports",
                     "consecutive_failures", "last_error", "last_error_at",
                     "last_connected_at", "relay_count"):
             self.assertIn(key, snap, key)
         self.assertEqual(snap["kname"], "demo1")
         self.assertEqual(snap["ports"], [7788, 9090])  # 排序输出
         self.assertEqual(snap["hub"], "http://hub.test")
+        self.assertEqual(snap["resolved_hub"], "http://hub.test")
         self.assertEqual(snap["url"], "http://hub.test/demo1")
         self.assertEqual(snap["public_url"], "http://hub.test")  # 缺省自动上报 KHUB 派生基址 (0.6.6 续批二)
         self.assertIn(snap["tunnel_status"], ("alive", "reconnecting", "failed"))
@@ -473,6 +812,13 @@ class HubTunnelRegistrarTest(unittest.TestCase):
         self.assertEqual(snap["source"], "dynamic")
         self.assertEqual(len(self.registrar.list()), 1)
         self.assertEqual(self.registrar.list()[0]["ports"], [7788])
+
+    def test_register_preserves_alias_trailing_slash(self):
+        alias = "https://shz.al/~alias/"
+        snap, code, msg = self.registrar.register(alias, "demo1", ports=[], source="dynamic")
+        self.assertIsNone(code)
+        self.assertEqual(_FakeHubManager.instances[0].hub_url, alias)
+        self.assertEqual(snap["hub"], alias)
 
     def test_register_duplicate_kname_conflict(self):
         self.registrar.register("https://hub.test", "demo1", ports=[])

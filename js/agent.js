@@ -559,7 +559,7 @@ const HUB_PUBLIC_URL_RE = /^https?:\/\/\S+$/;
 
 function hubPublicUrlError(url) {
   // agent 上报公网基址校验 (与 hub 端 ValidatePublicURL 同源契约); 返回错误文本, 合法返回 null
-  // 空值 = 未配置 (合法缺省, 条目回落 hub 侧推导)。scheme 白名单 http/https (该值会成为
+  // 空值 = 未配置 (合法缺省, 注册时使用本轮实际 Hub 基址)。scheme 白名单 http/https (该值会成为
   // hub /agents 页 href, 拒绝 javascript: 等危险 scheme), 上限 512 字符, 尾部斜杠已剥离
   const normalized = (url || '').trim().replace(/\/+$/, '');
   if (!normalized) return null;
@@ -720,32 +720,60 @@ function makeRelayError(code, message) {
   return err;
 }
 
-function httpRequestRaw(method, url, headers, body, timeoutMs, maxBody) {
+function httpRequestRaw(method, url, headers, body, timeoutMs, maxBody, options = {}) {
   // 回环 http://127.0.0.1:{port} 原始请求 (node http/https, 字节保真: 不解压、不改写);
   // 响应边收边计数, 超 maxBody 立即中断 (超限提前止损, 语义与 0.6.6 _httpRequest 一致)
   return new Promise((resolve, reject) => {
     let u;
     try { u = new URL(url); } catch (err) { return reject(err); }
     const mod = u.protocol === 'https:' ? https : http;
+    let settled = false;
+    let deadlineTimer = null;
+    const resolveOnce = (value) => {
+      if (settled) return;
+      settled = true;
+      if (deadlineTimer) clearTimeout(deadlineTimer);
+      resolve(value);
+    };
+    const rejectOnce = (err) => {
+      if (settled) return;
+      settled = true;
+      if (deadlineTimer) clearTimeout(deadlineTimer);
+      reject(err);
+    };
     const req = mod.request(u, { method, headers }, (res) => {
       const chunks = [];
       let size = 0;
       let tooLarge = false;
       res.on('data', (c) => {
+        if (tooLarge || settled) return;
         size += c.length;
-        if (size > maxBody + 1) { tooLarge = true; res.destroy(); return; }
+        if (size > maxBody) {
+          tooLarge = true;
+          rejectOnce(options.tooLargeError || makeRelayError('body_too_large', 'response body exceeds KISAMA_HUB_MAX_BODY'));
+          res.destroy();
+          return;
+        }
         chunks.push(c);
       });
       res.on('end', () => {
-        if (tooLarge) {
-          return reject(makeRelayError('body_too_large', 'response body exceeds KISAMA_HUB_MAX_BODY'));
-        }
-        resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) });
+        if (tooLarge || settled) return;
+        resolveOnce({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) });
       });
-      res.on('error', reject);
+      res.on('error', rejectOnce);
     });
-    req.setTimeout(timeoutMs, () => req.destroy(new Error('loopback request timeout')));
-    req.on('error', reject);
+    if (options.totalTimeoutMs) {
+      deadlineTimer = setTimeout(() => {
+        rejectOnce(options.timeoutError || new Error('loopback request timeout'));
+        req.destroy();
+      }, options.totalTimeoutMs);
+      if (deadlineTimer.unref) deadlineTimer.unref();
+    }
+    req.setTimeout(timeoutMs, () => {
+      rejectOnce(options.timeoutError || new Error('loopback request timeout'));
+      req.destroy();
+    });
+    req.on('error', rejectOnce);
     if (body && body.length) req.write(body);
     req.end();
   });
@@ -820,6 +848,132 @@ async function relayLoopbackHttp(opts) {
     throw makeRelayError('body_too_large', `响应体超过 KISAMA_HUB_MAX_BODY (${maxBody} 字节)`);
   }
   return { status, headers: respHeaders, body: respBody };
+}
+
+function hubRawAuthority(value) {
+  const raw = String(value || '').trim();
+  const schemeEnd = raw.indexOf('://');
+  return schemeEnd < 0 ? '' : raw.slice(schemeEnd + 3).split('/')[0];
+}
+
+function isShzalHubAlias(value) {
+  const raw = String(value || '').trim();
+  const lexical = raw.replace(/[\t\r\n]/g, '');
+  const match = lexical.match(/^[A-Za-z][A-Za-z0-9+.-]*:([\s\S]*)$/);
+  if (!match) return false;
+  let rest = match[1];
+  if (rest.startsWith('//')) rest = rest.slice(2);
+  const authorityMatch = rest.match(/^([^/?#\\]*)([\s\S]*)$/);
+  if (!authorityMatch) return false;
+  const authority = authorityMatch[1];
+  const tail = authorityMatch[2];
+  const hostPort = authority.slice(authority.lastIndexOf('@') + 1);
+  const host = hostPort.split(':', 1)[0].trim().toLowerCase();
+  if (host !== 'shz.al') return false;
+  return tail.startsWith('/~') || (tail.includes('\\') && rest.includes('/~'));
+}
+
+function normalizeHubUrl(value) {
+  const raw = String(value || '').trim();
+  return isShzalHubAlias(raw) ? raw : raw.replace(/\/+$/, '');
+}
+
+function shzalHubAliasError(value) {
+  if (!isShzalHubAlias(value)) return null;
+  const raw = String(value || '').trim();
+  if (raw.includes('\\')) return 'shz.al Hub 别名不得包含反斜杠';
+  if (/[\s\u0000-\u001f\u007f-\u009f]/.test(raw)) return 'shz.al Hub 别名含空白或控制字符';
+  if (raw.includes('?') || raw.includes('#')) return 'shz.al Hub 别名不得包含 query 或 fragment';
+  const match = raw.match(/^([A-Za-z][A-Za-z0-9+.-]*):\/\/([^/?#]+)(\/[^?#]*)$/);
+  if (!match) return 'shz.al Hub 别名非法';
+  const scheme = match[1].toLowerCase();
+  const authority = match[2];
+  const path = match[3];
+  if (scheme !== 'https') return 'shz.al Hub 别名必须使用 https://';
+  if (authority.includes('@')) return 'shz.al Hub 别名不得包含 userinfo';
+  if (authority.includes(':')) {
+    const separator = authority.indexOf(':');
+    const host = authority.slice(0, separator).toLowerCase();
+    const portText = authority.slice(separator + 1);
+    if (host !== 'shz.al' || !/^[0-9]+$/.test(portText)) return 'shz.al Hub 别名非法';
+    if (portText.length > 5 || Number(portText) !== 443) return 'shz.al Hub 别名端口必须为 443';
+  } else if (authority.toLowerCase() !== 'shz.al') {
+    return 'shz.al Hub 别名非法';
+  }
+  if (!path.startsWith('/~')) return 'shz.al Hub 别名非法';
+  const name = path.slice(2);
+  if (name.length < 3) return 'shz.al Hub 别名名称过短';
+  if (!/^[A-Za-z0-9+_\-*$=@,;/\[\]]+$/.test(name)) return 'shz.al Hub 别名名称含非法字符';
+  return null;
+}
+
+function validateResolvedHubUrl(value) {
+  const raw = String(value == null ? '' : value).trim();
+  if (!raw) throw new Error('shz.al 响应体为空');
+  if (raw.length > 512) throw new Error('shz.al 响应中的 Hub 地址超过 512 字符');
+  if (!/^https?:\/\//.test(raw)) throw new Error('shz.al 响应中的 Hub 地址必须以 http:// 或 https:// 开头');
+  if (raw.includes('\\') || /[\s\u0000-\u001f\u007f-\u009f]/.test(raw)) {
+    throw new Error('shz.al 响应中的 Hub 地址含空白或控制字符');
+  }
+  if (raw.includes('?') || raw.includes('#')) throw new Error('shz.al 响应中的 Hub 地址不得包含 query 或 fragment');
+  let parsed;
+  try { parsed = new URL(raw); } catch (err) { throw new Error('shz.al 响应中的 Hub 地址非法'); }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error('shz.al 响应中的 Hub 地址缺少合法 scheme 或 host');
+  }
+  const authority = hubRawAuthority(raw);
+  if (authority.includes('@')) throw new Error('shz.al 响应中的 Hub 地址不得包含 userinfo');
+  if (authority.endsWith(':')) throw new Error('shz.al 响应中的 Hub 地址端口为空');
+  if (parsed.port && (Number(parsed.port) < 1 || Number(parsed.port) > 65535)) {
+    throw new Error('shz.al 响应中的 Hub 地址端口越界');
+  }
+  let host;
+  if (authority.startsWith('[')) {
+    const end = authority.indexOf(']');
+    host = end < 0 ? '' : authority.slice(1, end);
+    if (net.isIP(host) !== 6) throw new Error('shz.al 响应中的 Hub 地址 host 非法');
+  } else {
+    host = authority.split(':', 1)[0];
+    if (!net.isIP(host) && (host.length > 253 || !host.split('.').every((label) =>
+      /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(label)))) {
+      throw new Error('shz.al 响应中的 Hub 地址 host 非法');
+    }
+  }
+  return raw.replace(/\/+$/, '');
+}
+
+function shzalHubResponseHeaders(headers) {
+  const normalized = {};
+  for (const [key, value] of Object.entries(headers || {})) normalized[String(key).toLowerCase()] = String(value);
+  const contentType = String(normalized['content-type'] || '').split(';', 1)[0].trim().toLowerCase();
+  const contentEncoding = String(normalized['content-encoding'] || '').trim().toLowerCase();
+  if (contentType !== 'text/plain') throw new Error('shz.al 别名响应不是 text/plain');
+  if (contentEncoding && contentEncoding !== 'identity') throw new Error('shz.al 别名响应不得压缩');
+}
+
+async function resolveShzalHubUrl(alias, requestFn = null) {
+  const aliasError = shzalHubAliasError(alias);
+  if (aliasError) throw new Error(aliasError);
+  const headers = { Accept: 'text/plain', 'User-Agent': 'curl/8.5.0', 'Accept-Encoding': 'identity' };
+  let result;
+  try {
+    result = requestFn ? await requestFn('GET', alias, headers, null) : await httpRequestRaw(
+      'GET', alias, headers, null, 15000, 4096, {
+        totalTimeoutMs: 15000,
+        timeoutError: new Error('请求超过 15s 总超时'),
+        tooLargeError: new Error('响应超过 4096 字节')
+      });
+  } catch (err) {
+    throw new Error('shz.al 别名解析失败: ' + String((err && err.message) || err).slice(0, 200));
+  }
+  if (result.status !== 200) throw new Error(`shz.al 别名解析失败: HTTP ${result.status}`);
+  shzalHubResponseHeaders(result.headers);
+  const body = Buffer.from(result.body || '');
+  if (body.length > 4096) throw new Error('shz.al 别名响应超过 4096 字节');
+  let text;
+  try { text = new TextDecoder('utf-8', { fatal: true }).decode(body); }
+  catch (err) { throw new Error('shz.al 别名响应不是合法 UTF-8'); }
+  return validateResolvedHubUrl(text);
 }
 
 function hubBackoffSeconds(failures, base, max) {
@@ -906,10 +1060,10 @@ class Config {
   // KHUB_PORTS=HUB 组反代白名单 env 下限 (逗号分隔, 缺省空=禁用; 非法条目忽略),
   // KPROXY_PORTS=本地组反代白名单 env 下限 (0.6.7 续批六分组口径), 两组互不影响 (docs/API.MD 20.2);
   // 重试/心跳/限额与 py 端同键名 env 可调
-  static KHUB = (process.env.KHUB || '').trim().replace(/\/+$/, '');
+  static KHUB = normalizeHubUrl(process.env.KHUB || '');
   // KHUB_PUBLIC_URL=hub 对面板/客户端暴露的公网基址覆盖值 (可选, 0.6.6 续批二): 注册时经
-  // public_url 字段上报, hub 拼订阅/页面/ack url 时优先用它; 未配置时缺省自动上报 KHUB 派生
-  // 基址, 本变量用于内网 KHUB 等派生值 ≠ 公网地址的部署; 非法值告警并回退 KHUB 派生 (hubPublicUrlError 判定)
+  // public_url 字段上报, hub 拼订阅/页面/ack url 时优先用它; 未配置时缺省自动上报本轮实际 Hub
+  // 基址, 本变量用于内网 KHUB 等派生值 ≠ 公网地址的部署; 非法值告警并回退本轮实际 Hub 基址 (hubPublicUrlError 判定)
   static KHUB_PUBLIC_URL = (process.env.KHUB_PUBLIC_URL || '').trim().replace(/\/+$/, '');
   static KHUB_PORTS = parseHubPorts(process.env.KHUB_PORTS || '');
   static KPROXY_PORTS = parseHubPorts(process.env.KPROXY_PORTS || '');
@@ -924,7 +1078,7 @@ class Config {
   static DNS_MODE = (process.env.KISAMA_DNS || 'off').trim().toLowerCase();
   static DOH_SERVERS = (process.env.KISAMA_DOH_SERVERS || '').trim();
   static DOH_SERVERS_DEFAULT = ['https://223.5.5.5/resolve', 'https://1.1.1.1/dns-query', 'https://8.8.8.8/resolve'];
-  static AGENT_VERSION = process.env.AGENT_VERSION || '0.6.8-js';
+  static AGENT_VERSION = process.env.AGENT_VERSION || '0.6.9-js';
   static SESSION_KEY = crypto.randomBytes(32).toString('base64');
   // static SESSION_KEY =""
   static NOISE_KEYS_INTERNAL = NoiseKeyGenerator.generatePair();
@@ -1157,7 +1311,7 @@ class Config {
     // 5. KMODE=3 配套参数: KHUB (hub 基址, ws/wss 由 scheme 推导);
     //    KHUB_PORTS (HUB 组白名单 env 下限) / KPROXY_PORTS (本地组白名单 env 下限, 续批六)
     if (options.KHUB !== undefined && options.KHUB !== null) {
-      this.KHUB = String(options.KHUB).trim().replace(/\/+$/, '');
+      this.KHUB = normalizeHubUrl(String(options.KHUB));
     }
     if (options.KHUB_PUBLIC_URL !== undefined && options.KHUB_PUBLIC_URL !== null) {
       this.KHUB_PUBLIC_URL = String(options.KHUB_PUBLIC_URL).trim().replace(/\/+$/, '');
@@ -2647,10 +2801,16 @@ function isPathInsideFileRoot(p) {
     const rootReal = fs.realpathSync.native(path.resolve(Config.FILE_ROOT));
     const abs = path.resolve(p);
     let probe = abs;
-    while (!fs.existsSync(probe)) {
-      const parent = path.dirname(probe);
-      if (parent === probe) return false; // 已到文件系统根仍未命中 (盘符不存在等)
-      probe = parent;
+    while (true) {
+      try {
+        fs.lstatSync(probe);
+        break;
+      } catch (e) {
+        if (e.code !== 'ENOENT' && e.code !== 'ENOTDIR') throw e;
+        const parent = path.dirname(probe);
+        if (parent === probe) return false; // 已到文件系统根仍未命中 (盘符不存在等)
+        probe = parent;
+      }
     }
     const realProbe = fs.realpathSync.native(probe);
     const relReal = path.relative(rootReal, realProbe);
@@ -2761,19 +2921,27 @@ class ZipArchiver {
         return true;
       },
       close() {
-        const centralBuf = Buffer.concat(centralParts);
-        const eocd = Buffer.alloc(22);
-        eocd.writeUInt32LE(0x06054b50, 0); // EOCD signature
-        eocd.writeUInt16LE(0, 4);
-        eocd.writeUInt16LE(0, 6);
-        eocd.writeUInt16LE(count, 8);
-        eocd.writeUInt16LE(count, 10);
-        eocd.writeUInt32LE(centralBuf.length, 12);
-        eocd.writeUInt32LE(offset, 16);
-        eocd.writeUInt16LE(0, 20);
-        writeAll(centralBuf);
-        writeAll(eocd);
-        fs.closeSync(fd);
+        let writeError;
+        try {
+          const centralBuf = Buffer.concat(centralParts);
+          const eocd = Buffer.alloc(22);
+          eocd.writeUInt32LE(0x06054b50, 0); // EOCD signature
+          eocd.writeUInt16LE(0, 4);
+          eocd.writeUInt16LE(0, 6);
+          eocd.writeUInt16LE(count, 8);
+          eocd.writeUInt16LE(count, 10);
+          eocd.writeUInt32LE(centralBuf.length, 12);
+          eocd.writeUInt32LE(offset, 16);
+          eocd.writeUInt16LE(0, 20);
+          writeAll(centralBuf);
+          writeAll(eocd);
+        } catch (e) {
+          writeError = e;
+        }
+        try { fs.closeSync(fd); } catch (e) {
+          if (!writeError) throw e;
+        }
+        if (writeError) throw writeError;
         return count;
       },
     };
@@ -2833,11 +3001,35 @@ class ZipArchiver {
     return entries;
   }
 
-  // 解出单条目; 不支持的压缩方法抛 Error (调用方计入 skipped)
+  // 解出单条目; 不支持的压缩方法或损坏数据抛 Error, 由调用方返回 500。
   static inflate(entry) {
     if (entry.method === 0) return entry.data;
-    if (entry.method === 8) return zlib.inflateRawSync(entry.data);
+    if (entry.method === 8) {
+      return zlib.inflateRawSync(entry.data, { maxOutputLength: ZipArchiver.ZIP_MAX_TOTAL_BYTES + 1 });
+    }
     throw new Error(`Unsupported zip method: ${entry.method}`);
+  }
+}
+
+// 文件系统 errno 的稳定语义映射; 原始 message 仍由调用方保留, 供控制端区分只读/权限/磁盘满等失败。
+function fileErrorReason(err) {
+  switch (err && err.code) {
+    case 'EROFS': return 'read_only_file_system';
+    case 'EACCES':
+    case 'EPERM': return 'permission_denied';
+    case 'ENOTDIR': return 'not_a_directory';
+    case 'EEXIST': return 'file_exists';
+    case 'ENOENT': return 'not_found';
+    case 'ENOSPC': return 'no_space';
+    default: return 'unknown';
+  }
+}
+
+class FileRequestError extends Error {
+  constructor(message, status = 500, cause) {
+    super(message, cause ? { cause } : undefined);
+    this.status = status;
+    this.reason = fileErrorReason(cause || this);
   }
 }
 
@@ -2845,6 +3037,53 @@ class ZipArchiver {
 // 📁 文件管理器
 // ============================================================================
 class FileManager {
+  // move/copy 共用的可测试聚合: 非空全成功 ok, 部分成功 partial, 零成功或空批次 error。
+  static batchResult(results) {
+    const list = Array.isArray(results) ? results : [];
+    const total = list.length;
+    const success = list.filter(item => item && item.status === 'ok').length;
+    const failed = total - success;
+    let status = 'ok';
+    let message = '';
+    if (total === 0) {
+      status = 'error';
+      message = 'No operations requested';
+    } else if (success === 0) {
+      status = 'error';
+      message = `All ${total} operations failed`;
+    } else if (failed > 0) {
+      status = 'partial';
+      message = `${failed} of ${total} operations failed`;
+    }
+    const response = { status, total, success, results: list };
+    if (message) response.message = message;
+    return response;
+  }
+
+  // mountinfo 使用 POSIX 路径与 \ooo 转义; 返回 undefined 表示未知, false 才表示已确认挂载为 rw。
+  static _mountReadOnlyFromMountInfo(targetPath, mountInfoText) {
+    if (targetPath == null || mountInfoText == null) return undefined;
+    const target = path.posix.normalize(String(targetPath));
+    if (!path.posix.isAbsolute(target)) return undefined;
+    const text = Buffer.isBuffer(mountInfoText) ? mountInfoText.toString('utf8') : String(mountInfoText);
+    const escapes = { '040': ' ', '011': '\t', '012': '\n', '134': '\\' };
+    let bestLength = -1;
+    let result;
+    for (const line of text.split(/\r?\n/)) {
+      const fields = line.trim().split(/\s+/);
+      if (fields.length < 6 || !fields[4]) continue;
+      const decodedMountPoint = fields[4].replace(/\\(040|011|012|134)/g, (_, code) => escapes[code]);
+      const mountPoint = path.posix.normalize(decodedMountPoint);
+      if (!path.posix.isAbsolute(mountPoint)) continue;
+      const prefix = mountPoint === '/' ? '/' : mountPoint.replace(/\/+$/, '') + '/';
+      if (target !== mountPoint && !target.startsWith(prefix)) continue;
+      if (mountPoint.length <= bestLength) continue;
+      result = fields[5].split(',').includes('ro');
+      bestLength = mountPoint.length;
+    }
+    return result;
+  }
+
   static async listFiles(dirPath, recursive = false) {
     const fullPath = path.resolve(Config.FILE_ROOT, dirPath || '.');
 
@@ -2888,6 +3127,11 @@ class FileManager {
 
   static async getFilePermissions(paths) {
     const results = [];
+    let mountInfoText = null;
+    if (process.platform === 'linux') {
+      try { mountInfoText = fs.readFileSync('/proc/self/mountinfo', 'utf8'); }
+      catch (e) { /* 读取失败时保持未知, 不伪造 mount_readonly:false */ }
+    }
 
     for (const filePath of paths) {
       const fullPath = path.resolve(Config.FILE_ROOT, filePath);
@@ -2911,6 +3155,15 @@ class FileManager {
         authInfo.readable = readable;
         authInfo.writable = writable;
         authInfo.executable = executable;
+
+        if (mountInfoText !== null) {
+          let realPath;
+          try { realPath = fs.realpathSync.native(fullPath); } catch (e) { /* 无法解析时省略 */ }
+          if (realPath) {
+            const mountReadonly = this._mountReadOnlyFromMountInfo(realPath, mountInfoText);
+            if (mountReadonly !== undefined) authInfo.mount_readonly = mountReadonly;
+          }
+        }
 
         results.push(authInfo);
       } catch (e) {
@@ -3083,16 +3336,16 @@ class FileManager {
       const merged = received === totalCount;
 
       if (merged) {
-        const out = fs.createWriteStream(targetPath);
+        // 与 raw 上传一致: 完整拼接后同步落盘, 写入失败必须抛出, 不能在流 finish 前清理并回成功。
+        const chunks = [];
         for (let i = 0; i < totalCount; i++) {
           const part = path.join(chunkDir, `chunk_${i}`);
           if (!fs.existsSync(part)) {
-            out.close();
             throw new Error(`Missing chunk ${i}`);
           }
-          out.write(fs.readFileSync(part));
+          chunks.push(fs.readFileSync(part));
         }
-        out.end();
+        fs.writeFileSync(targetPath, Buffer.concat(chunks));
 
         // cleanup chunks (rmdir fails silently while other uploads still use .upload_chunks)
         const uploadRoot = path.dirname(chunkDir);
@@ -3260,12 +3513,20 @@ class FileManager {
   static async moveFiles(moveMap) {
     const results = [];
 
-    for (const [src, dest] of Object.entries(moveMap)) {
+    for (const [src, dest] of Object.entries(moveMap || {})) {
       const srcPath = path.resolve(Config.FILE_ROOT, src);
       const destPath = path.resolve(Config.FILE_ROOT, dest);
 
       if (!isPathInsideFileRoot(srcPath) || !isPathInsideFileRoot(destPath)) {
-        results.push({ from: src, to: dest, status: 'access_denied' });
+        results.push({ from: src, to: dest, status: 'denied', error: 'path outside file root', message: 'path outside file root' });
+        continue;
+      }
+
+      try {
+        fs.lstatSync(srcPath);
+      } catch (e) {
+        const error = e.code === 'ENOENT' ? 'source not found' : e.message;
+        results.push({ from: src, to: dest, status: e.code === 'ENOENT' ? 'skipped' : 'failed', error, message: error });
         continue;
       }
 
@@ -3274,11 +3535,16 @@ class FileManager {
         if (!fs.existsSync(destDir)) {
           fs.mkdirSync(destDir, { recursive: true });
         }
+        if (!fs.statSync(destDir).isDirectory()) {
+          const error = 'destination parent is not a directory';
+          results.push({ from: src, to: dest, status: 'denied', error, message: error });
+          continue;
+        }
 
         fs.renameSync(srcPath, destPath);
         results.push({ from: src, to: dest, status: 'ok' });
       } catch (e) {
-        results.push({ from: src, to: dest, status: 'error', message: e.message });
+        results.push({ from: src, to: dest, status: 'failed', error: e.message, message: e.message });
       }
     }
 
@@ -3288,33 +3554,48 @@ class FileManager {
   static async copyFiles(copyMap) {
     const results = [];
 
-    for (const [src, dest] of Object.entries(copyMap)) {
+    for (const [src, dest] of Object.entries(copyMap || {})) {
       const srcPath = path.resolve(Config.FILE_ROOT, src);
       const destPath = path.resolve(Config.FILE_ROOT, dest);
 
       if (!isPathInsideFileRoot(srcPath) || !isPathInsideFileRoot(destPath)) {
-        results.push({ from: src, to: dest, status: 'access_denied' });
+        results.push({ from: src, to: dest, status: 'denied', error: 'path outside file root', message: 'path outside file root' });
         continue;
       }
 
       try {
-        if (!fs.existsSync(srcPath)) {
-          results.push({ from: src, to: dest, status: 'not_found' });
-          continue;
-        }
+        fs.lstatSync(srcPath);
+      } catch (e) {
+        const error = e.code === 'ENOENT' ? 'source not found' : e.message;
+        results.push({ from: src, to: dest, status: e.code === 'ENOENT' ? 'skipped' : 'failed', error, message: error });
+        continue;
+      }
 
+      try {
         const destDir = path.dirname(destPath);
         if (!fs.existsSync(destDir)) {
           fs.mkdirSync(destDir, { recursive: true });
         }
+        if (!fs.statSync(destDir).isDirectory()) {
+          const error = 'destination parent is not a directory';
+          results.push({ from: src, to: dest, status: 'denied', error, message: error });
+          continue;
+        }
 
         const stat = fs.statSync(srcPath);
         if (stat.isDirectory()) {
+          const relToSource = path.relative(srcPath, destPath);
+          if (relToSource === '' || (relToSource !== '..' && !relToSource.startsWith(`..${path.sep}`) && !path.isAbsolute(relToSource))) {
+            throw new Error('destination is inside source directory');
+          }
           if (fs.cpSync) {
             fs.cpSync(srcPath, destPath, { recursive: true });
           } else {
             const copyRecursive = (source, target) => {
-              if (fs.statSync(source).isDirectory()) {
+              const entry = fs.lstatSync(source);
+              if (entry.isSymbolicLink()) {
+                fs.symlinkSync(fs.readlinkSync(source), target);
+              } else if (entry.isDirectory()) {
                 if (!fs.existsSync(target)) fs.mkdirSync(target, { recursive: true });
                 for (const child of fs.readdirSync(source)) {
                   copyRecursive(path.join(source, child), path.join(target, child));
@@ -3331,7 +3612,7 @@ class FileManager {
 
         results.push({ from: src, to: dest, status: 'ok' });
       } catch (e) {
-        results.push({ from: src, to: dest, status: 'error', message: e.message });
+        results.push({ from: src, to: dest, status: 'failed', error: e.message, message: e.message });
       }
     }
 
@@ -3360,48 +3641,76 @@ class FileManager {
   }
 
   // 将文件/目录(递归)打包为 zip (等价 zip -r, 已存在时覆盖重建)
-  // flat=true 时目录内容不带顶层目录名前缀; 单项失败不中断
+  // flat=true 时目录内容不带顶层目录名前缀; 缺项/越界逐项记录, 真实 I/O 失败整体抛出, 禁止吞错回成功。
   static async zipItems(zipPath, items, flat = false) {
-    if (!zipPath) throw new Error('path required');
+    if (!zipPath) throw new FileRequestError('path required', 400);
     if (!Array.isArray(items) || items.length === 0) {
-      throw new Error('items required (non-empty array)');
+      throw new FileRequestError('items required (non-empty array)', 400);
     }
     const fullPath = path.resolve(Config.FILE_ROOT, zipPath);
     if (!isPathInsideFileRoot(fullPath)) {
-      throw new Error('Access denied: path outside root');
+      throw new FileRequestError('Access denied: path outside root', 403);
     }
-    if (fs.existsSync(fullPath) && fs.statSync(fullPath).isDirectory()) {
-      throw new Error(`Target is a directory: ${zipPath}`);
+    let targetStat;
+    try {
+      targetStat = fs.statSync(fullPath);
+    } catch (e) {
+      if (e.code !== 'ENOENT') throw e;
+    }
+    if (targetStat && targetStat.isDirectory()) {
+      throw new FileRequestError(`Target is a directory: ${zipPath}`, 400);
     }
 
     fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-    if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
+    if (targetStat) fs.unlinkSync(fullPath);
 
     const writer = ZipArchiver.openWriter(fullPath);
     const results = [];
     let addedTotal = 0;
+    let failedItems = 0;
     let truncated = false; // 超过条目上限后, 余下 item 整体跳过
+    let closeAttempted = false;
+    const closeWriter = () => {
+      if (closeAttempted) return;
+      closeAttempted = true;
+      writer.close();
+    };
+    const failItem = (item, error, added = 0) => {
+      failedItems++;
+      results.push({ item, status: 'error', error: error.message || String(error), added });
+    };
 
-    for (const item of items) {
-      if (truncated) {
-        results.push({ item, status: 'skipped', added: 0 });
-        continue;
-      }
-      const itemPath = path.resolve(Config.FILE_ROOT, item || '');
-      try {
+    try {
+      for (const item of items) {
+        if (truncated) {
+          results.push({ item, status: 'skipped', added: 0 });
+          continue;
+        }
+        const itemPath = path.resolve(Config.FILE_ROOT, item || '');
         if (!isPathInsideFileRoot(itemPath)) {
-          results.push({ item, status: 'error', added: 0 });
+          failItem(item, new Error('path outside file root'));
           continue;
         }
-        if (!fs.existsSync(itemPath)) {
-          results.push({ item, status: 'not_found', added: 0 });
+        let stats;
+        try {
+          stats = fs.statSync(itemPath);
+        } catch (e) {
+          if (e.code === 'ENOENT') results.push({ item, status: 'not_found', added: 0 });
+          else failItem(item, e);
           continue;
         }
-        const stats = fs.statSync(itemPath);
         let added = 0;
         let partial = false;
+        let itemError = null;
         if (stats.isFile()) {
-          if (!writer.add(path.basename(itemPath), fs.readFileSync(itemPath), stats.mtime)) {
+          let data;
+          try {
+            data = fs.readFileSync(itemPath);
+          } catch (e) {
+            failItem(item, e);
+            continue;
+          }
+          if (!writer.add(path.basename(itemPath), data, stats.mtime)) {
             truncated = true;
             results.push({ item, status: 'skipped', added: 0 });
             continue;
@@ -3411,71 +3720,119 @@ class FileManager {
           // 递归打包, 非flat时条目名带顶层目录名前缀; 目录本身写条目 (带尾 /) 保留空目录
           const topName = path.basename(itemPath);
           const walk = (dir, base) => {
-            for (const name of fs.readdirSync(dir)) {
+            let names;
+            try {
+              names = fs.readdirSync(dir);
+            } catch (e) {
+              itemError = itemError || e;
+              return;
+            }
+            for (const name of names) {
+              if (partial) return;
               const child = path.join(dir, name);
               const rel = base ? `${base}/${name}` : name;
-              const st = fs.statSync(child);
+              let st;
+              try {
+                st = fs.lstatSync(child);
+              } catch (e) {
+                itemError = itemError || e;
+                continue;
+              }
+              if (st.isSymbolicLink()) {
+                itemError = itemError || new Error(`symbolic link not supported: ${rel}`);
+                continue;
+              }
+              if (!isPathInsideFileRoot(child)) {
+                itemError = itemError || new Error('path outside file root');
+                continue;
+              }
               if (st.isDirectory()) {
                 if (!writer.add(`${rel}/`, Buffer.alloc(0), st.mtime, true)) { partial = true; return; }
                 walk(child, rel);
-                if (partial) return;
               } else if (st.isFile()) {
-                if (!writer.add(rel, fs.readFileSync(child), st.mtime)) { partial = true; return; }
+                let data;
+                try {
+                  data = fs.readFileSync(child);
+                } catch (e) {
+                  itemError = itemError || e;
+                  continue;
+                }
+                if (!writer.add(rel, data, st.mtime)) { partial = true; return; }
                 added++;
+              } else {
+                itemError = itemError || new Error(`Unsupported file type: ${rel}`);
               }
             }
           };
           walk(itemPath, flat ? '' : topName);
         } else {
-          results.push({ item, status: 'error', added: 0 });
+          failItem(item, new Error('Unsupported file type'));
           continue;
         }
-        if (partial) {
+        if (itemError) {
+          failItem(item, itemError, added);
+        } else if (partial) {
           truncated = true;
-          addedTotal += added;
           results.push({ item, status: 'partial', added });
-          continue;
+        } else {
+          results.push({ item, status: 'ok', added });
         }
         addedTotal += added;
-        results.push({ item, status: 'ok', added });
-      } catch (e) {
-        results.push({ item, status: 'error', added: 0 });
+      }
+      closeWriter();
+    } finally {
+      if (!closeAttempted) {
+        try { closeWriter(); } catch (_) { /* 保留原始 I/O 错误 */ }
       }
     }
-    writer.close();
 
-    return {
-      status: 'ok',
+    const successfulItems = results.filter(item => item.status === 'ok' || item.status === 'partial').length;
+    let status = 'ok';
+    if (failedItems > 0) status = successfulItems > 0 ? 'partial' : 'error';
+    const response = {
+      status,
       path: FileManager._displayPath(fullPath),
       entries: addedTotal,
-      size: fs.existsSync(fullPath) ? fs.statSync(fullPath).size : 0,
+      size: fs.statSync(fullPath).size,
       results,
     };
+    if (failedItems > 0) response.message = `${failedItems} of ${items.length} items failed`;
+    return response;
   }
 
   // 解压 zip 到指定目录 (缺省解压到 zip 所在目录)
   // 防 zip-slip: 归一化后逃出目标目录的条目计入 skipped; 限额 20000 条目 / 512MB
   static async unzipArchive(zipPath, destPath, overwrite = true, entriesFilter = null) {
-    if (!zipPath) throw new Error('path required');
+    if (!zipPath) throw new FileRequestError('path required', 400);
     const fullPath = path.resolve(Config.FILE_ROOT, zipPath);
     if (!isPathInsideFileRoot(fullPath)) {
-      throw new Error('Access denied: path outside root');
+      throw new FileRequestError('Access denied: path outside root', 403);
     }
-    if (!fs.existsSync(fullPath)) {
-      throw new Error(`Zip not found: ${zipPath}`);
+    let zipStat;
+    try {
+      zipStat = fs.statSync(fullPath);
+    } catch (e) {
+      if (e.code === 'ENOENT') throw new FileRequestError(`Zip not found: ${zipPath}`, 400, e);
+      throw e;
     }
-    if (fs.statSync(fullPath).isDirectory()) {
-      throw new Error(`Path is a directory: ${zipPath}`);
+    if (zipStat.isDirectory()) {
+      throw new FileRequestError(`Path is a directory: ${zipPath}`, 400);
     }
 
     let dest;
     if (destPath) {
       dest = path.resolve(Config.FILE_ROOT, destPath);
       if (!isPathInsideFileRoot(dest)) {
-        throw new Error('Access denied: path outside root');
+        throw new FileRequestError('Access denied: path outside root', 403);
       }
-      if (fs.existsSync(dest) && !fs.statSync(dest).isDirectory()) {
-        throw new Error(`Destination is a file: ${destPath}`);
+      let destStat;
+      try {
+        destStat = fs.statSync(dest);
+      } catch (e) {
+        if (e.code !== 'ENOENT') throw e;
+      }
+      if (destStat && !destStat.isDirectory()) {
+        throw new FileRequestError(`Destination is a file: ${destPath}`, 400);
       }
     } else {
       dest = path.dirname(fullPath);
@@ -3486,7 +3843,8 @@ class FileManager {
     try {
       entries = ZipArchiver.parse(fullPath);
     } catch (e) {
-      throw new Error(`Not a zip file: ${zipPath}`);
+      if (e.code) throw e;
+      throw new FileRequestError(`Not a zip file: ${zipPath}`, 400, e);
     }
 
     const filters = (entriesFilter || []).filter((e) => e);
@@ -3529,26 +3887,40 @@ class FileManager {
       try {
         data = ZipArchiver.inflate(entry);
       } catch (e) {
-        skipped++;
-        continue;
+        throw new FileRequestError(`Failed to read zip entry '${entry.name}': ${e.message}`, 500, e);
       }
-      if (ZipArchiver._crc32(data) !== entry.crc) {
-        skipped++;
-        continue;
+      if (data.length !== entry.size || totalBytes + data.length > ZipArchiver.ZIP_MAX_TOTAL_BYTES ||
+          ZipArchiver._crc32(data) !== entry.crc) {
+        throw new FileRequestError(`Invalid zip entry '${entry.name}': size or CRC mismatch`, 500);
       }
       if (!overwrite && fs.existsSync(out)) {
         skipped++;
         continue;
       }
+      // 写盘失败必须上抛到路由并携带 reason; 打开后的失败会删除不完整目标文件。
+      fs.mkdirSync(path.dirname(out), { recursive: true });
+      let fd;
+      let writeError;
       try {
-        fs.mkdirSync(path.dirname(out), { recursive: true });
-        fs.writeFileSync(out, data);
-      } catch (e) {
-        skipped++;
-        continue;
+        fd = fs.openSync(out, 'w');
+        try {
+          fs.writeFileSync(fd, data);
+        } catch (e) {
+          writeError = e;
+        }
+        try {
+          fs.closeSync(fd);
+        } catch (e) {
+          writeError = writeError || e;
+        }
+      } finally {
+        if (writeError) {
+          try { fs.unlinkSync(out); } catch (_) { /* 保留原始写错误 */ }
+          throw writeError;
+        }
       }
       extracted++;
-      totalBytes += entry.size;
+      totalBytes += data.length;
       if (files.length < ZipArchiver.ZIP_MAX_LISTED_FILES) {
         files.push(FileManager._displayPath(out));
       } else {
@@ -9074,23 +9446,24 @@ class HubTunnelManager {
   // - _wsFactory(url) → WebSocket 实例 (生产 → new WebSocket(url))
   // - _request(method, url, headers, body) → Promise<{status, headers, body}>
   constructor(hubUrl, kname, port, ports, logger, source = 'startup') {
-    this.hubUrl = (hubUrl || '').trim().replace(/\/+$/, '');
+    this.hubUrl = normalizeHubUrl(hubUrl);
     this.kname = (kname || '').trim().toLowerCase();
     this.port = parseInt(port, 10);
     this.ports = Array.isArray(ports) ? [...ports] : parseHubPorts(ports);
     this.source = source;              // startup (KMODE=3 静态) | dynamic (POST /api/hub 动态)
     this.log = logger || Logger;
     // KHUB_PUBLIC_URL 公网基址覆盖值 (可选): 注册时上报 public_url, hub 拼订阅/页面/ack url 优先用
-    // (0.6.6 续批二起缺省自动上报 KHUB 派生基址; 此变量用于内网 KHUB 等派生值 ≠ 公网地址的部署)
+    // 未配置时自动上报本轮实际 Hub 基址：直连为配置基址，别名为本轮解析出的真实基址
     const pubErr = hubPublicUrlError(Config.KHUB_PUBLIC_URL);
     if (pubErr) {
-      this.log.warn(`[KMODE3] ⚠️ KHUB_PUBLIC_URL ${pubErr}, 回退 KHUB 派生基址上报`);
+      this.log.warn(`[KMODE3] ⚠️ KHUB_PUBLIC_URL ${pubErr}, 回退本轮实际 Hub 基址上报`);
       this.publicUrl = null;
     } else {
       this.publicUrl = (Config.KHUB_PUBLIC_URL || '').trim().replace(/\/+$/, '') || null;
     }
-    // 中继地址: 上报基址 = 覆盖值 || KHUB 派生 (与注册帧 public_url 字段一致)
-    this.relayUrl = `${this.publicUrl || this.hubUrl}/${this.kname}`;
+    // 中继地址: 上报基址 = 覆盖值 || 本轮解析基址 (与注册帧 public_url 字段一致)
+    this.resolvedHubUrl = isShzalHubAlias(this.hubUrl) ? null : this.hubUrl;
+    this.relayUrl = `${this.publicUrl || this.resolvedHubUrl || this.hubUrl}/${this.kname}`;
     // 🛡️ 状态透明: 三态 + 失败原因, 供 GET /api/hub 暴露给 Panel
     this.status = 'reconnecting';      // alive | reconnecting | failed
     this.lastError = null;
@@ -9119,9 +9492,10 @@ class HubTunnelManager {
       tunnel_status: this.status,   // alive | reconnecting | failed
       source: this.source,          // startup | dynamic
       hub: this.hubUrl,
+      resolved_hub: this.resolvedHubUrl,
       kname: this.kname,
       url: this.relayUrl,
-      public_url: this.publicUrl || this.hubUrl,   // 注册帧实际上报基址 (KHUB_PUBLIC_URL 覆盖值 || KHUB 派生)
+      public_url: this.publicUrl || this.resolvedHubUrl || this.hubUrl,
       ports: [...this.ports].sort((a, b) => a - b),
       consecutive_failures: this.consecutiveFailures,
       last_error: this.lastError,
@@ -9223,9 +9597,15 @@ class HubTunnelManager {
   // close 事件才 resolve (正常断线 → _loop 重连)；注册失败/建连错误 reject。
   // ⚠️ 若在 ack 后立即 resolve，_loop 会立即重连并用新连接覆盖 _hubWs —— 旧连接的
   // 心跳 _send 全部落空，hub 60s 读超时踢人，重连则 name_taken 打转 (0.6.6 实测教训)。
-  _connectOnce() {
+  async _connectOnce() {
+    const aliasError = shzalHubAliasError(this.hubUrl);
+    if (aliasError) throw new Error(aliasError);
+    const effectiveHubUrl = isShzalHubAlias(this.hubUrl)
+      ? await resolveShzalHubUrl(this.hubUrl, this._request) : this.hubUrl;
+    this.resolvedHubUrl = effectiveHubUrl;
+    this.relayUrl = `${this.publicUrl || effectiveHubUrl}/${this.kname}`;
     return new Promise((resolve, reject) => {
-      const url = deriveHubWsUrl(this.hubUrl);
+      const url = deriveHubWsUrl(effectiveHubUrl);
       let ws;
       try {
         ws = this._wsFactory ? this._wsFactory(url) : new WebSocket(url);
@@ -9255,7 +9635,7 @@ class HubTunnelManager {
           t: 'register', v: 1, kname: this.kname,
           version: Config.AGENT_VERSION, ports: [...this.ports].sort((a, b) => a - b)
         };
-        reg.public_url = this.publicUrl || this.hubUrl;  // 公网基址: 覆盖值优先, 缺省 KHUB 派生 (0.6.6 续批二起恒携带)
+        reg.public_url = this.publicUrl || effectiveHubUrl;
         this._send(reg);
       });
 
@@ -9274,7 +9654,7 @@ class HubTunnelManager {
           this.consecutiveFailures = 0;
           this.lastError = null;
           this.lastConnectedAt = hubNowIso();
-          this.log.info(`[KMODE3] ✅ 已连接 hub ${this.hubUrl} (注册名 ${this.kname}, 中继地址 ${this.relayUrl})`);
+          this.log.info(`[KMODE3] ✅ 已连接 hub ${effectiveHubUrl} (注册名 ${this.kname}, 中继地址 ${this.relayUrl})`);
           pingTimer = setInterval(() => {
             if (this._stopFlag || ws.readyState !== WebSocket.OPEN) return;
             this._send({ t: 'ping' });
@@ -9515,8 +9895,9 @@ class HubTunnelRegistrar {
     // 返回 {snapshot, code, message}: code=null 成功; 'unreachable'=网络类 (保留);
     // 其余为 HubRegisterError.code / name_taken (不保留)
     const nameErr = hubKnameError(kname);
+    const normHubUrl = normalizeHubUrl(hubUrl);
     if (nameErr) {
-      return { snapshot: { kname: (kname || '').trim().toLowerCase(), hub: (hubUrl || '').trim().replace(/\/+$/, ''),
+      return { snapshot: { kname: (kname || '').trim().toLowerCase(), hub: normHubUrl,
                            source, tunnel_status: 'failed', ports: [...(ports || [])].sort((a, b) => a - b) },
                code: 'invalid_name', message: nameErr };
     }
@@ -9525,8 +9906,8 @@ class HubTunnelRegistrar {
       return { snapshot: this.items.get(normKname).snapshot(), code: 'name_taken', message: 'KNAME 已在本 agent 注册表中 (kname 唯一)' };
     }
     const manager = this._managerFactory
-      ? this._managerFactory(hubUrl, kname, Config.PORT, ports, this.log, source)
-      : new HubTunnelManager(hubUrl, kname, Config.PORT, ports, this.log, source);
+      ? this._managerFactory(normHubUrl, kname, Config.PORT, ports, this.log, source)
+      : new HubTunnelManager(normHubUrl, kname, Config.PORT, ports, this.log, source);
     manager.start();
     const { ok, err } = await manager.waitConnected(waitTimeout);
     if (ok) {
@@ -10718,7 +11099,7 @@ async function main(options = {}) {
       );
       res.json(result);
     } catch (e) {
-      res.status(500).json({ status: 'error', message: e.message });
+      res.status(500).json({ status: 'error', message: e.message, reason: fileErrorReason(e) });
     }
   });
   // ============================================================================
@@ -10736,7 +11117,8 @@ async function main(options = {}) {
         return res.status(400).json({ 
           status: 'error', 
           completed: false, 
-          message: 'Missing required custom headers: X-File-Path and X-File-Name' 
+          message: 'Missing required custom headers: X-File-Path and X-File-Name',
+          reason: 'unknown'
         });
       }
 
@@ -10749,7 +11131,8 @@ async function main(options = {}) {
         return res.status(400).json({ 
           status: 'error', 
           completed: false, 
-          message: 'Invalid binary stream request body' 
+          message: 'Invalid binary stream request body',
+          reason: 'unknown'
         });
       }
 
@@ -10757,7 +11140,7 @@ async function main(options = {}) {
       const result = await FileManager.uploadFileRaw(filePath, filename, buffer, chunkId, totalChunks);
       res.json(result);
     } catch (e) {
-      res.status(500).json({ status: 'error', completed: false, message: e.message });
+      res.status(500).json({ status: 'error', completed: false, message: e.message, reason: fileErrorReason(e) });
     }
   });
   // 下载文件
@@ -10805,30 +11188,21 @@ async function main(options = {}) {
   // 移动/重命名文件
   app.put('/api/file', async (req, res) => {
     try {
-      const results = await FileManager.moveFiles(req.body.move_map || req.body);
-      res.json({
-        status: 'ok',
-        total: results.length,
-        success: results.filter(r => r.status === 'ok').length,
-        results
-      });
+      const body = req.body || {};
+      const results = await FileManager.moveFiles(body.move_map || body);
+      res.json(FileManager.batchResult(results));
     } catch (e) {
-      res.status(500).json({ status: 'error', message: e.message });
+      res.status(500).json({ status: 'error', message: e.message, reason: fileErrorReason(e) });
     }
   });
 
   // 复制文件
   app.post('/api/file/cp', async (req, res) => {
     try {
-      const results = await FileManager.copyFiles(req.body);
-      res.json({
-        status: 'ok',
-        total: results.length,
-        success: results.filter(r => r.status === 'ok').length,
-        results
-      });
+      const results = await FileManager.copyFiles(req.body || {});
+      res.json(FileManager.batchResult(results));
     } catch (e) {
-      res.status(500).json({ status: 'error', message: e.message });
+      res.status(500).json({ status: 'error', message: e.message, reason: fileErrorReason(e) });
     }
   });
 
@@ -10838,7 +11212,7 @@ async function main(options = {}) {
       const result = await FileManager.createDirectory(req.body.path);
       res.json(result);
     } catch (e) {
-      res.status(500).json({ status: 'error', message: e.message });
+      res.status(500).json({ status: 'error', message: e.message, reason: fileErrorReason(e) });
     }
   });
 
@@ -10846,15 +11220,17 @@ async function main(options = {}) {
   app.post('/api/file/zip', async (req, res) => {
     try {
       const body = req.body || {};
-      if (!body.path) return res.status(400).json({ error: 'path required' });
+      if (!body.path) return res.status(400).json({ error: 'path required', reason: 'unknown' });
       if (!Array.isArray(body.items) || body.items.length === 0) {
-        return res.status(400).json({ error: 'items required (non-empty array)' });
+        return res.status(400).json({ error: 'items required (non-empty array)', reason: 'unknown' });
       }
       const result = await FileManager.zipItems(body.path, body.items, !!body.flat);
       res.json(result);
     } catch (e) {
-      const code = /Access denied/.test(e.message) ? 403 : 400;
-      res.status(code).json({ status: 'error', message: e.message });
+      res.status(e.status || 500).json({
+        status: 'error', error: e.message, message: e.message,
+        reason: e.reason || fileErrorReason(e)
+      });
     }
   });
 
@@ -10862,7 +11238,7 @@ async function main(options = {}) {
   app.post('/api/file/unzip', async (req, res) => {
     try {
       const body = req.body || {};
-      if (!body.path) return res.status(400).json({ error: 'path required' });
+      if (!body.path) return res.status(400).json({ error: 'path required', reason: 'unknown' });
       const result = await FileManager.unzipArchive(
         body.path,
         body.dest_path,
@@ -10871,8 +11247,10 @@ async function main(options = {}) {
       );
       res.json(result);
     } catch (e) {
-      const code = /Access denied/.test(e.message) ? 403 : 400;
-      res.status(code).json({ status: 'error', message: e.message });
+      res.status(e.status || 500).json({
+        status: 'error', error: e.message, message: e.message,
+        reason: e.reason || fileErrorReason(e)
+      });
     }
   });
 
@@ -11012,7 +11390,7 @@ async function main(options = {}) {
   // 注册成功立即落盘 kstore data.hubregs (KSTORE 启用时), 重启自动恢复; 未启用 persisted=false。
   app.post('/api/hub', async (req, res) => {
     const body = parseJsonBody(req.body) || {};
-    const hubUrl = String(body.hub || '').trim().replace(/\/+$/, '');
+    const hubUrl = normalizeHubUrl(body.hub);
     if (!/^https?:\/\//i.test(hubUrl)) {
       return res.status(422).json({ status: 'error', code: 'invalid_hub', message: 'hub 必须以 http:// 或 https:// 开头' });
     }
@@ -11443,4 +11821,4 @@ if (require.main === module||require.main?.filename?.includes('ts-node')) {
   main().catch(Logger.error);
 }
 
-module.exports = { main, loadCurves, Config, CryptoManager, SystemInfoCollector, CommandExecutor, FileManager, TaskManager, TaskStore, ArgoTunnelManager, argoBackoffSeconds, argoTruncateError, argoRetryBaseSeconds, argoRetryMaxSeconds, argoReregisterAfter, argoBindName, argoBindKey, argoBindError, KModeController, HubTunnelManager, HubWSStream, HubRegisterError, HubTunnelRegistrar, hubKnameError, hubPublicUrlError, deriveHubWsUrl, filterLoopbackHeaders, hubBackoffSeconds, parseHubPorts, PROXY_STRIPPED_AUTH_HEADERS, makeRelayError, httpRequestRaw, httpRequestStream, relayLoopbackPrepare, filterProxyResponseHeaders, relayLoopbackHttp, proxyRuntimePorts, proxyEffectivePorts, proxySetRuntimePorts, proxyMergeRuntimePorts, proxyGroupsSnapshot, cleanPortList, PROXY_GROUP_HUB, PROXY_GROUP_LOCAL, PROXY_RUNTIME_PORTS, proxyWsRelayHandler, ZipArchiver, TempKeyManager, SecureDns, installDnsHook, patchDnsLookup, QuicConnection, QuicSession, QuicTlsClient, QuicKeys, QuicReader, quicInitialKeys, quicNextKeys, quicWriteVarint, quicReadVarint, quicDecodePacketNumber, quicApplyProtection, quicRemoveProtection, quicEncodeTransportParameters, quicDecodeTransportParameters, quicEncodeAck, quicRangesFromAck, hkdfExpandLabel, CapnpBuilder, capnpMessages, capnpWords, capnpStruct, capnpText, capnpStructList, capnpReturnResult, capnpConnectRequest, capnpConnectResponse, connectEdgeQuic, buildQuicRequest, verifyEdgeQuicCertificate, QUIC_DATA_STREAM_PREAMBLE, QUIC_SERVER_NAME, QUIC_ALPN, __ptySelector: { detectLinuxLibc, ptyCandidateOrder, probePtyModule, ensurePty, PTY_QWQO_VERSION, PTY_CLOSE_REASON, qwqoPlatformBinaryPath, selectPtyImplementation, getState: () => ({ ready: !!pty, reason: ptyUnavailableReason }) } };
+module.exports = { main, loadCurves, Config, CryptoManager, SystemInfoCollector, CommandExecutor, FileManager, fileErrorReason, TaskManager, TaskStore, ArgoTunnelManager, argoBackoffSeconds, argoTruncateError, argoRetryBaseSeconds, argoRetryMaxSeconds, argoReregisterAfter, argoBindName, argoBindKey, argoBindError, KModeController, HubTunnelManager, HubWSStream, HubRegisterError, HubTunnelRegistrar, hubKnameError, hubPublicUrlError, isShzalHubAlias, shzalHubAliasError, validateResolvedHubUrl, resolveShzalHubUrl, deriveHubWsUrl, filterLoopbackHeaders, hubBackoffSeconds, parseHubPorts, PROXY_STRIPPED_AUTH_HEADERS, makeRelayError, httpRequestRaw, httpRequestStream, relayLoopbackPrepare, filterProxyResponseHeaders, relayLoopbackHttp, proxyRuntimePorts, proxyEffectivePorts, proxySetRuntimePorts, proxyMergeRuntimePorts, proxyGroupsSnapshot, cleanPortList, PROXY_GROUP_HUB, PROXY_GROUP_LOCAL, PROXY_RUNTIME_PORTS, proxyWsRelayHandler, ZipArchiver, TempKeyManager, SecureDns, installDnsHook, patchDnsLookup, QuicConnection, QuicSession, QuicTlsClient, QuicKeys, QuicReader, quicInitialKeys, quicNextKeys, quicWriteVarint, quicReadVarint, quicDecodePacketNumber, quicApplyProtection, quicRemoveProtection, quicEncodeTransportParameters, quicDecodeTransportParameters, quicEncodeAck, quicRangesFromAck, hkdfExpandLabel, CapnpBuilder, capnpMessages, capnpWords, capnpStruct, capnpText, capnpStructList, capnpReturnResult, capnpConnectRequest, capnpConnectResponse, connectEdgeQuic, buildQuicRequest, verifyEdgeQuicCertificate, QUIC_DATA_STREAM_PREAMBLE, QUIC_SERVER_NAME, QUIC_ALPN, __ptySelector: { detectLinuxLibc, ptyCandidateOrder, probePtyModule, ensurePty, PTY_QWQO_VERSION, PTY_CLOSE_REASON, qwqoPlatformBinaryPath, selectPtyImplementation, getState: () => ({ ready: !!pty, reason: ptyUnavailableReason }) } };
